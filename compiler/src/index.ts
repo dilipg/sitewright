@@ -7,3 +7,16 @@ export const COMPILER_PACKAGE = "@website-generator/compiler";
 
 export { deriveTokens } from "./derive-tokens";
 export type { DeriveTokensResult, TailwindTheme } from "./derive-tokens";
+
+export { EDITABLE_CHANNELS, commit, createManifest, propose, tombstone } from "./manifest";
+export type {
+  EditableChannel,
+  Manifest,
+  ManifestEntryProposal,
+  ManifestNode,
+  OwnershipMap,
+  ProposalConfig,
+  ProposalResult,
+  ValidationIssue,
+  ValidationRule,
+} from "./manifest";

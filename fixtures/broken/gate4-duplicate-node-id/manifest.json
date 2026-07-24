@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "nodes": {
+    "home.hero": {
+      "route": "/",
+      "file": "src/pages/home/sections/Hero.tsx",
+      "component": "Hero",
+      "element": "section",
+      "editable": ["style"],
+      "status": "active"
+    },
+    "home.hero.headline": {
+      "route": "/",
+      "file": "src/pages/home/sections/Hero.tsx",
+      "component": "Hero",
+      "element": "Heading",
+      "editable": ["text", "style"],
+      "status": "active"
+    }
+  }
+}

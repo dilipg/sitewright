@@ -1,0 +1,12 @@
+[project]
+name = "orchestrator"
+version = "0.0.0"
+description = "Agent pipeline orchestrator (Kitaru-instrumented, built starting in milestone 3)"
+requires-python = ">=3.12,<3.13"
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

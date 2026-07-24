@@ -1,0 +1,13 @@
+{
+  "name": "website-generator",
+  "private": true,
+  "version": "0.0.0",
+  "workspaces": [
+    "compiler",
+    "editor"
+  ],
+  "scripts": {
+    "check": "npm run test -w compiler && npm run test -w editor && npm run check:orchestrator",
+    "check:orchestrator": "uv run --directory orchestrator pytest"
+  }
+}

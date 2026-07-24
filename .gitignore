@@ -1,0 +1,18 @@
+# Node
+node_modules/
+dist/
+
+# Generated project output workspace (disposable, per CLAUDE.md)
+generated/*
+!generated/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# Misc
+coverage/
+*.local
+.DS_Store

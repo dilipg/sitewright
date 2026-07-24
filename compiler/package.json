@@ -5,9 +5,11 @@
   "type": "module",
   "main": "src/index.ts",
   "scripts": {
-    "test": "vitest run"
+    "test": "tsc --noEmit && vitest run",
+    "derive:fixture": "node scripts/derive-fixture-tokens.ts"
   },
   "devDependencies": {
+    "@types/node": "^26.1.1",
     "typescript": "^7.0.2",
     "vitest": "^4.1.10"
   }

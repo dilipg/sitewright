@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "nodes": {
+    "home.hero": {
+      "route": "/",
+      "file": "src/pages/home/sections/Hero.tsx",
+      "component": "Hero",
+      "element": "section",
+      "editable": ["style", "layout", "visibility"],
+      "status": "active"
+    },
+    "home.hero.eyebrow": {
+      "route": "/",
+      "file": "src/pages/home/sections/Hero.tsx",
+      "component": "Hero",
+      "element": "Text",
+      "editable": ["text", "style", "visibility"],
+      "status": "active"
+    },
+    "home.hero.headline": {
+      "route": "/",
+      "file": "src/pages/home/sections/Hero.tsx",
+      "component": "Hero",
+      "element": "Heading",
+      "editable": ["text", "style", "layout", "visibility"],
+      "status": "active"
+    },
+    "home.hero.subheadline": {
+      "route": "/",
+      "file": "src/pages/home/sections/Hero.tsx",
+      "component": "Hero",
+      "element": "Text",
+      "editable": ["text", "style", "layout", "visibility"],
+      "status": "active"
+    },
+    "home.hero.cta-primary": {
+      "route": "/",
+      "file": "src/pages/home/sections/Hero.tsx",
+      "component": "Hero",
+      "element": "Button",
+      "editable": ["text", "style", "layout", "visibility"],
+      "status": "active"
+    },
+    "home.hero.cta-secondary": {
+      "route": "/",
+      "file": "src/pages/home/sections/Hero.tsx",
+      "component": "Hero",
+      "element": "Button",
+      "editable": ["text", "style", "layout", "visibility"],
+      "status": "active"
+    }
+  }
+}

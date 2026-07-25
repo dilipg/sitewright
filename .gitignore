@@ -12,6 +12,10 @@ __pycache__/
 .venv/
 .pytest_cache/
 
+# Playwright artifacts
+test-results/
+playwright-report/
+
 # Misc
 coverage/
 *.local

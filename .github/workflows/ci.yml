@@ -21,4 +21,11 @@ jobs:
 
       - run: npm ci
 
+      # Fixture is a standalone project (not a workspace); the preview
+      # server and export verification build resolve its dependencies.
+      - run: npm ci
+        working-directory: fixtures/acme-landing
+
+      - run: npx playwright install --with-deps chromium
+
       - run: npm run check

@@ -8,14 +8,19 @@
     "test": "tsc --noEmit && vitest run",
     "derive:fixture": "node scripts/derive-fixture-tokens.ts",
     "gates": "node scripts/gates.ts",
-    "export": "node scripts/export.ts"
+    "export": "node scripts/export.ts",
+    "preview": "node scripts/preview.ts",
+    "test:e2e": "playwright test"
   },
   "devDependencies": {
+    "@playwright/test": "^1.62.0",
     "@types/node": "^26.1.1",
     "typescript": "^7.0.2",
     "vitest": "^4.1.10"
   },
   "dependencies": {
-    "ts-morph": "^28.0.0"
+    "esbuild": "^0.28.1",
+    "ts-morph": "^28.0.0",
+    "vite": "^8.1.5"
   }
 }

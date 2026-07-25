@@ -10,7 +10,12 @@ export type ShimMode = "edit" | "interact";
 
 export interface NodeGeometry {
   nodeId: string;
-  /** Page coordinates (document space, scroll included). */
+  /**
+   * Iframe-viewport coordinates (what getBoundingClientRect returns). The
+   * editor is cross-origin to the preview and cannot read the frame's
+   * scroll position, so the shim re-reports on scroll and the overlay maps
+   * these rects 1:1 onto the frame's box in the parent document.
+   */
   rect: { x: number; y: number; width: number; height: number };
 }
 

@@ -55,12 +55,7 @@ function reportGeometry(): void {
     const rect = element.getBoundingClientRect();
     return {
       nodeId: element.getAttribute("data-node-id")!,
-      rect: {
-        x: rect.left + window.scrollX,
-        y: rect.top + window.scrollY,
-        width: rect.width,
-        height: rect.height,
-      },
+      rect: { x: rect.left, y: rect.top, width: rect.width, height: rect.height },
     };
   });
   // Before the app mounts there is nothing to report; stay quiet so the
@@ -194,6 +189,7 @@ new MutationObserver(() => reindex()).observe(document.body, {
   attributes: true,
 });
 window.addEventListener("resize", () => scheduleGeometryReport());
+window.addEventListener("scroll", () => scheduleGeometryReport(), true);
 
 post({ type: "frame:ready", protocolVersion: PROTOCOL_VERSION });
 reindex();

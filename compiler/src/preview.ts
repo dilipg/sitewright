@@ -30,7 +30,9 @@ export async function startPreviewServer(
     root,
     configFile,
     plugins: [bridgeShimPlugin()],
-    server: { port: options.port ?? 5273, strictPort: true },
+    // The editor runs on a different origin (port) and fetches manifest.json
+    // from this server; cors must be explicit.
+    server: { port: options.port ?? 5273, strictPort: true, cors: true },
   });
   await server.listen();
   return server;

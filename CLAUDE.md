@@ -8,7 +8,7 @@ An AI website-generator: a user types a one-line brief, an agent pipeline genera
 
 ## Current state
 
-The repo is scaffolded (prompt P0 done): all packages exist with **placeholder tests only — no product logic yet**. The build order and exact per-step prompts live in [docs/build-prompts-v1.md](docs/build-prompts-v1.md); work through them in sequence (next: P2, then milestone 1). Do not invent structure; follow the docs.
+**Milestone 1 is complete** (prompts P0–P2 and 1.1–1.5): the fixture project (`fixtures/acme-landing/`), token deriver, manifest service, validation gates 1–6 + `gates` CLI, and exporter core all exist in `compiler/` with green tests, plus broken-fixture variants in `fixtures/broken/`. `npm run spine` runs derive → gates → export → verification build on the fixture. The build order and exact per-step prompts live in [docs/build-prompts-v1.md](docs/build-prompts-v1.md); work through them in sequence (next: milestone 2 — preview server + bridge shim). Do not invent structure; follow the docs.
 
 ## Documents and their authority
 

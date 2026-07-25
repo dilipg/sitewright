@@ -7,7 +7,8 @@
   "scripts": {
     "test": "tsc --noEmit && vitest run",
     "derive:fixture": "node scripts/derive-fixture-tokens.ts",
-    "gates": "node scripts/gates.ts"
+    "gates": "node scripts/gates.ts",
+    "export": "node scripts/export.ts"
   },
   "devDependencies": {
     "@types/node": "^26.1.1",

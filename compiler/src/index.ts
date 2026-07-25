@@ -8,6 +8,9 @@ export const COMPILER_PACKAGE = "@website-generator/compiler";
 export { deriveTokens } from "./derive-tokens";
 export type { DeriveTokensResult, TailwindTheme } from "./derive-tokens";
 
+export { ExportError, exportProject } from "./exporter";
+export type { ExportOptions, ExportResult, OverrideEntry } from "./exporter";
+
 export { runGates } from "./gates";
 export type { GateFailure, GateReport, GateResult, RunGatesOptions } from "./gates";
 

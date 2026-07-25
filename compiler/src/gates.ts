@@ -178,7 +178,10 @@ function gateTokensOnly(root: string, files: string[]): GateFailure[] {
     const relPath = rel(root, file);
     if (relPath.startsWith("src/tokens/")) continue;
     const lines = readFileSync(file, "utf8").split(/\r?\n/);
-    lines.forEach((lineText, index) => {
+    lines.forEach((rawLine, index) => {
+      // Arbitrary-value utility classes (w-[480px]) are the compiled form of
+      // the user's deliberate free-value escape (contract 6.1/7.2) — exempt.
+      const lineText = rawLine.replace(/-\[[^\]]*\]/g, "-[]");
       const hex = RAW_HEX.exec(lineText);
       if (hex !== null) {
         failures.push({

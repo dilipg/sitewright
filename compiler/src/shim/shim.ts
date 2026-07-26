@@ -53,9 +53,24 @@ function scheduleGeometryReport(): void {
 function reportGeometry(): void {
   const nodes: NodeGeometry[] = indexedNodes().map((element) => {
     const rect = element.getBoundingClientRect();
+    const computed = getComputedStyle(element);
     return {
       nodeId: element.getAttribute("data-node-id")!,
       rect: { x: rect.left, y: rect.top, width: rect.width, height: rect.height },
+      spacing: {
+        padding: {
+          top: parseFloat(computed.paddingTop),
+          right: parseFloat(computed.paddingRight),
+          bottom: parseFloat(computed.paddingBottom),
+          left: parseFloat(computed.paddingLeft),
+        },
+        margin: {
+          top: parseFloat(computed.marginTop),
+          right: parseFloat(computed.marginRight),
+          bottom: parseFloat(computed.marginBottom),
+          left: parseFloat(computed.marginLeft),
+        },
+      },
     };
   });
   // Before the app mounts there is nothing to report; stay quiet so the

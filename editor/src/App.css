@@ -192,3 +192,153 @@ body {
 .inspector-empty {
   color: #9a9aa8;
 }
+
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.header-actions button {
+  background: #3a3a46;
+  border: none;
+  color: #e8e8ee;
+  border-radius: 4px;
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.header-actions button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.save-status {
+  font-size: 11px;
+  color: #9a9aa8;
+  min-width: 52px;
+}
+
+.control-section {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid #333340;
+}
+
+.control-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+
+.control-label {
+  width: 88px;
+  flex-shrink: 0;
+  color: #9a9aa8;
+  font-size: 12px;
+}
+
+.swatches {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.swatch {
+  width: 18px;
+  height: 18px;
+  border-radius: 4px;
+  border: 1px solid #4a4a56;
+  cursor: pointer;
+  padding: 0;
+}
+
+.swatch.active {
+  outline: 2px solid #4f8ef7;
+  outline-offset: 1px;
+}
+
+.stepper {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.stepper button {
+  width: 22px;
+  height: 22px;
+  background: #3a3a46;
+  border: none;
+  color: #e8e8ee;
+  border-radius: 4px;
+  cursor: pointer;
+  line-height: 1;
+}
+
+.stepper-value {
+  min-width: 34px;
+  text-align: center;
+  font-size: 12px;
+}
+
+.variant-row {
+  display: flex;
+  gap: 6px;
+}
+
+.variant-btn {
+  background: #3a3a46;
+  border: none;
+  color: #e8e8ee;
+  border-radius: 4px;
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.variant-btn.active {
+  background: #4f8ef7;
+}
+
+.custom-toggle {
+  background: none;
+  border: none;
+  color: #9a9aa8;
+  font-size: 11px;
+  cursor: pointer;
+  text-decoration: underline dotted;
+}
+
+.custom-input {
+  width: 110px;
+  background: #1e1e24;
+  border: 1px solid #4a4a56;
+  color: #e8e8ee;
+  border-radius: 4px;
+  padding: 3px 6px;
+  font-size: 12px;
+}
+
+.badge-warn {
+  background: #5a4632;
+  color: #ffcf9e;
+}
+
+.spacing-overlay {
+  position: absolute;
+  pointer-events: none;
+}
+
+.pad-band {
+  position: absolute;
+  background: rgba(99, 189, 138, 0.28);
+}
+
+.margin-band {
+  position: absolute;
+  background: rgba(255, 170, 80, 0.28);
+}

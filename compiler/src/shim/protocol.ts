@@ -8,6 +8,13 @@ export const PROTOCOL_VERSION = 1;
 
 export type ShimMode = "edit" | "interact";
 
+export interface BoxEdges {
+  top: number;
+  right: number;
+  bottom: number;
+  left: number;
+}
+
 export interface NodeGeometry {
   nodeId: string;
   /**
@@ -17,6 +24,8 @@ export interface NodeGeometry {
    * these rects 1:1 onto the frame's box in the parent document.
    */
   rect: { x: number; y: number; width: number; height: number };
+  /** Computed padding/margin in px — drives the inspector's spacing overlay. */
+  spacing: { padding: BoxEdges; margin: BoxEdges };
 }
 
 export interface ShimOverride {

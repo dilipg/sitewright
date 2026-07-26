@@ -6,9 +6,10 @@
  * shim code (see docs/decisions.md).
  */
 
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import { join, resolve } from "node:path";
-import type { ViteDevServer } from "vite";
+import type { Plugin, ViteDevServer } from "vite";
 import { createServer } from "vite";
 import { bridgeShimPlugin } from "./shim/vite-plugin.ts";
 
@@ -29,11 +30,95 @@ export async function startPreviewServer(
   const server = await createServer({
     root,
     configFile,
-    plugins: [bridgeShimPlugin()],
+    plugins: [bridgeShimPlugin(), overridesApiPlugin(root)],
     // The editor runs on a different origin (port) and fetches manifest.json
-    // from this server; cors must be explicit.
-    server: { port: options.port ?? 5273, strictPort: true, cors: true },
+    // from this server; cors must be explicit. overrides/ is written by the
+    // editor while the preview is live — the preview app never consumes it,
+    // so the watcher must not react (a reload would interrupt editing).
+    server: {
+      port: options.port ?? 5273,
+      strictPort: true,
+      cors: true,
+      watch: { ignored: ["**/overrides/**"] },
+    },
   });
   await server.listen();
   return server;
+}
+
+const ROUTE_SLUG = /^[a-z0-9-]+$/;
+
+/**
+ * Editor persistence endpoints (PRD 6): the preview server owns the project
+ * directory, so it is the natural writer for the editor's two files —
+ * GET/PUT /__overrides/<route-slug>  -> overrides/<route-slug>.overrides.json
+ * GET/PUT /__overrides-history       -> overrides/.editor-history.json
+ * Only the editor writes overrides; agents never touch this directory.
+ */
+function overridesApiPlugin(projectRoot: string): Plugin {
+  return {
+    name: "website-generator:overrides-api",
+    apply: "serve",
+    configureServer(server) {
+      server.middlewares.use((req, res, next) => {
+        const url = req.url?.split("?")[0] ?? "";
+        if (url === "/__overrides-history") {
+          handleFileEndpoint(req, res, join(projectRoot, "overrides", ".editor-history.json"), {
+            version: 1,
+            snapshots: [{}],
+            index: 0,
+          });
+          return;
+        }
+        const match = /^\/__overrides\/([^/]+)$/.exec(url);
+        if (match !== null) {
+          const slug = match[1]!;
+          if (!ROUTE_SLUG.test(slug)) {
+            res.statusCode = 400;
+            res.end("invalid route slug");
+            return;
+          }
+          handleFileEndpoint(req, res, join(projectRoot, "overrides", `${slug}.overrides.json`), {
+            version: 1,
+            route: "/",
+            overrides: [],
+          });
+          return;
+        }
+        next();
+      });
+    },
+  };
+}
+
+function handleFileEndpoint(
+  req: IncomingMessage,
+  res: ServerResponse,
+  filePath: string,
+  emptyDefault: unknown,
+): void {
+  if (req.method === "GET") {
+    res.setHeader("Content-Type", "application/json");
+    res.end(existsSync(filePath) ? readFileSync(filePath, "utf8") : JSON.stringify(emptyDefault));
+    return;
+  }
+  if (req.method === "PUT") {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("end", () => {
+      try {
+        const body: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        mkdirSync(join(filePath, ".."), { recursive: true });
+        writeFileSync(filePath, `${JSON.stringify(body, null, 2)}\n`);
+        res.statusCode = 204;
+        res.end();
+      } catch {
+        res.statusCode = 400;
+        res.end("invalid JSON body");
+      }
+    });
+    return;
+  }
+  res.statusCode = 405;
+  res.end();
 }

@@ -12,9 +12,17 @@ __pycache__/
 .venv/
 .pytest_cache/
 
+# Orchestrator runtime state (local kitaru store + run logs)
+orchestrator/.kitaru/
+orchestrator/runlog/
+
 # Playwright artifacts
 test-results/
 playwright-report/
+
+# Secrets — never committed
+.env
+*.env
 
 # Misc
 coverage/

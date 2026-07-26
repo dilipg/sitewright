@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Run Log Viewer</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; background: #141418; color: #e8e8ee; }
+  header { padding: 12px 20px; background: #26262e; border-bottom: 1px solid #333340; display: flex; gap: 16px; align-items: center; }
+  h1 { font-size: 15px; margin: 0; }
+  #meta { color: #9a9aa8; font-size: 12px; }
+  main { padding: 16px 20px; }
+  table { border-collapse: collapse; width: 100%; font-size: 12px; }
+  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid #2c2c36; vertical-align: top; }
+  th { color: #9a9aa8; font-weight: 600; text-transform: uppercase; font-size: 10px; }
+  tr.event { cursor: pointer; }
+  tr.event:hover { background: #1e1e26; }
+  .type { font-weight: 600; }
+  .type.generated { color: #9ab4ff; } .type.validated { color: #7fd3a0; } .type.failed { color: #ff9d8a; }
+  .pass { color: #7fd3a0; } .fail { color: #ff9d8a; }
+  .detail { display: none; }
+  .detail.open { display: table-row; }
+  .detail td { background: #101014; }
+  pre { white-space: pre-wrap; font-size: 11px; max-height: 340px; overflow: auto; background: #0a0a0d; padding: 10px; border-radius: 6px; margin: 6px 0; }
+  .hash { font-family: monospace; color: #9a9aa8; }
+  #drop { color: #9a9aa8; font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Run Log Viewer</h1>
+  <span id="meta">no run loaded</span>
+  <label id="drop">open JSONL: <input type="file" id="file" accept=".jsonl,.json" /></label>
+</header>
+<main>
+  <table id="events" hidden>
+    <thead>
+      <tr><th>time</th><th>event</th><th>section</th><th>template</th><th>prompt</th><th>model</th><th>tokens in/out (cache r/w)</th><th>gates</th><th>checkpoint</th></tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+</main>
+<script>
+function render(lines) {
+  const events = lines.filter(Boolean).map((line) => JSON.parse(line));
+  const runIds = [...new Set(events.map((event) => event.run_id).filter(Boolean))];
+  document.getElementById("meta").textContent =
+    `${events.length} events — run ${runIds.join(", ") || "(unknown)"}`;
+  const tbody = document.querySelector("#events tbody");
+  tbody.innerHTML = "";
+  for (const event of events) {
+    const row = document.createElement("tr");
+    row.className = "event";
+    const typeClass = /validated/.test(event.event_type) ? "validated"
+      : /fail/.test(event.event_type) ? "failed" : "generated";
+    const usage = event.usage
+      ? `${event.usage.input_tokens ?? "–"}/${event.usage.output_tokens ?? "–"}` +
+        ` (${event.usage.cache_read_input_tokens ?? 0}r/${event.usage.cache_creation_input_tokens ?? 0}w)`
+      : "";
+    const gates = event.gate_results == null ? ""
+      : event.gate_results.passed
+        ? '<span class="pass">pass</span>'
+        : `<span class="fail">fail (${(event.gate_results.failures || []).length})</span>`;
+    row.innerHTML =
+      `<td>${(event.timestamp || "").slice(11, 19)}</td>` +
+      `<td class="type ${typeClass}">${event.event_type ?? ""}</td>` +
+      `<td>${event.section ?? ""}</td>` +
+      `<td>${event.template_name ? `${event.template_name}@${event.template_version} <span class="hash">${event.template_hash ?? ""}</span>` : ""}</td>` +
+      `<td class="hash">${event.prompt_hash ?? ""}</td>` +
+      `<td>${event.model ?? ""}</td>` +
+      `<td>${usage}</td>` +
+      `<td>${gates}</td>` +
+      `<td class="hash">${event.checkpoint_ref ?? ""}</td>`;
+    const detail = document.createElement("tr");
+    detail.className = "detail";
+    const parts = [];
+    if (event.system_prompt) parts.push(`<h4>system</h4><pre>${escapeHtml(event.system_prompt)}</pre>`);
+    if (event.user_prompt) parts.push(`<h4>user</h4><pre>${escapeHtml(event.user_prompt)}</pre>`);
+    if (event.params) parts.push(`<h4>params</h4><pre>${escapeHtml(JSON.stringify(event.params, null, 2))}</pre>`);
+    if (event.gate_results) parts.push(`<h4>gate results</h4><pre>${escapeHtml(JSON.stringify(event.gate_results, null, 2))}</pre>`);
+    if (event.raw_output) parts.push(`<h4>raw output</h4><pre>${escapeHtml(event.raw_output)}</pre>`);
+    detail.innerHTML = `<td colspan="9">${parts.join("") || "<em>no detail payload</em>"}</td>`;
+    row.addEventListener("click", () => detail.classList.toggle("open"));
+    tbody.append(row, detail);
+  }
+  document.getElementById("events").hidden = false;
+}
+
+function escapeHtml(text) {
+  return String(text).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]);
+}
+
+document.getElementById("file").addEventListener("change", async (changeEvent) => {
+  const file = changeEvent.target.files[0];
+  if (file) render((await file.text()).split("\n"));
+});
+
+const src = new URLSearchParams(location.search).get("src");
+if (src) {
+  fetch(src)
+    .then((response) => response.text())
+    .then((text) => render(text.split("\n")))
+    .catch((error) => (document.getElementById("meta").textContent = `failed to load ${src}: ${error}`));
+}
+</script>
+</body>
+</html>

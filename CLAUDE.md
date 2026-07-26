@@ -8,7 +8,7 @@ An AI website-generator: a user types a one-line brief, an agent pipeline genera
 
 ## Current state
 
-**Milestone 1 is complete** (prompts P0–P2 and 1.1–1.5): the fixture project (`fixtures/acme-landing/`), token deriver, manifest service, validation gates 1–6 + `gates` CLI, and exporter core all exist in `compiler/` with green tests, plus broken-fixture variants in `fixtures/broken/`. `npm run spine` runs derive → gates → export → verification build on the fixture. The build order and exact per-step prompts live in [docs/build-prompts-v1.md](docs/build-prompts-v1.md); work through them in sequence (next: milestone 2 — preview server + bridge shim). Do not invent structure; follow the docs.
+**Milestones 1 and 2 are complete** (prompts P0–P2, 1.1–1.5, 2.1–2.4). `compiler/` holds the deterministic spine (token deriver, manifest service, gates 1–6 + CLI, exporter, bridge shim + typed protocol, preview server with overrides file-API); `editor/` is a working single-frame editor (selection, breadcrumb, style channel with token swatches/steppers/variants, persisted undo/redo). The invariant suite ([editor/e2e/invariant.spec.ts](editor/e2e/invariant.spec.ts), cases in invariant-cases.ts) proves preview=export pixel fidelity and runs in `npm run check`/CI. `npm run spine` runs derive → gates → export → verification build on the fixture. The build order and exact per-step prompts live in [docs/build-prompts-v1.md](docs/build-prompts-v1.md); work through them in sequence (next: milestone 3 — orchestrator + first LLM agent). Do not invent structure; follow the docs.
 
 ## Documents and their authority
 

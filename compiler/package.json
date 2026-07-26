@@ -9,6 +9,7 @@
     "derive:fixture": "node scripts/derive-fixture-tokens.ts",
     "gates": "node scripts/gates.ts",
     "export": "node scripts/export.ts",
+    "manifest": "node scripts/manifest.ts",
     "preview": "node scripts/preview.ts",
     "test:e2e": "playwright test"
   },

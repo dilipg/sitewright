@@ -12,7 +12,9 @@ import { runGates } from "../src/gates.ts";
 const args = process.argv.slice(2);
 const json = args.includes("--json");
 const regenFlag = args.indexOf("--regen");
-const positional = args.filter((arg, i) => !arg.startsWith("--") && i !== regenFlag + 1);
+const positional = args.filter(
+  (arg, i) => !arg.startsWith("--") && (regenFlag === -1 || i !== regenFlag + 1),
+);
 const dir = positional[0];
 
 if (dir === undefined) {

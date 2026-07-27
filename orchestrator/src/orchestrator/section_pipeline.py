@@ -232,7 +232,10 @@ def _run_compiler_cli(script_args: list[str]) -> subprocess.CompletedProcess:
 
 
 @checkpoint
-def prepare_workspace(run_id: str) -> str:
+def prepare_workspace(run_id: str, workspace_token: str = "") -> str:
+    """workspace_token distinguishes checkpoint inputs when the caller needs
+    a REAL reset: a cache-hit plays back the recorded path without re-running
+    the reset side effect (learned in the 4.3 stress runner's rebase)."""
     return prepare_workspace_dir(str(GENERATED_DIR / run_id))
 
 
@@ -361,7 +364,12 @@ def run_gates_step(
 
     result = _run_compiler_cli(args)
     regen_file.unlink(missing_ok=True)
-    report = json.loads(result.stdout)
+    try:
+        report = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        raise RuntimeError(
+            f"gates CLI produced no JSON report (exit {result.returncode}): {result.stderr or result.stdout}"
+        ) from None
     report["declaredOrphans"] = declared_orphans
     append_run_event(
         default_run_log_path(run_id),
@@ -397,6 +405,7 @@ def generate_section_flow(
     section_brief: str,
     regen_block: str = FIRST_GENERATION_REGEN_BLOCK,
     regen_overridden_ids: list[str] | None = None,
+    workspace_token: str = "",
 ) -> dict:
     """First generation by default; a regeneration is this same flow forked
     via Kitaru replay-with-overrides at the generate_section checkpoint with
@@ -404,7 +413,7 @@ def generate_section_flow(
     inside a regen keep both the regen context and the failure report."""
     print(f"exec_id: {kitaru.current_execution_id()}", flush=True)
     is_regen = regen_block != FIRST_GENERATION_REGEN_BLOCK
-    project_dir = materialize(prepare_workspace(run_id))
+    project_dir = materialize(prepare_workspace(run_id, workspace_token))
 
     template = load_template("hero")
     rendered = render_template(

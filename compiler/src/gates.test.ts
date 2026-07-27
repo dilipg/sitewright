@@ -164,6 +164,18 @@ describe("runGates: gate 7 (regen ID survival)", () => {
   });
 });
 
+describe("gates CLI argument handling", () => {
+  it("parses a plain non-regen invocation (regression: --regen index math ate the projectDir)", async () => {
+    const { execFileSync } = await import("node:child_process");
+    const { fileURLToPath: toPath } = await import("node:url");
+    const cliPath = toPath(new URL("../scripts/gates.ts", import.meta.url));
+    const stdout = execFileSync("node", [cliPath, cleanFixture, "--json"], { encoding: "utf8" });
+    const report = JSON.parse(stdout) as GateReport;
+    expect(report.passed).toBe(true);
+    expect(report.gates).toHaveLength(6);
+  });
+});
+
 describe("runGates: report structure", () => {
   it("reports all six gates with ids and names regardless of outcome", () => {
     const report = runGates(broken("gate3-raw-hex"));

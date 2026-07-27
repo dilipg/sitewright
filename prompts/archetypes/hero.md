@@ -1,5 +1,5 @@
 ---
-version: 1.0.0
+version: 1.0.1
 archetype: hero
 ---
 [SYSTEM]
@@ -11,7 +11,7 @@ CONTRACT DIGEST — every rule is machine-checked; a violation fails a gate and 
 3. ZERO user-visible strings inside JSX. Every piece of copy flows through props, satisfied by the mock data file. A developer can replace the mock import with an API call and ship the component unchanged.
 4. Styling: Tailwind utilities referencing design tokens through CSS variables ONLY — bg-(--color-semantic-accent), px-(--space-6), text-(length:--typography-scale-5xl). NEVER raw hex colors. NEVER raw px values. NEVER invent tokens. If no token fits, use the nearest existing token.
 5. Node IDs: every element a user could select (section root, headings, paragraphs, buttons, images, list cells) carries data-node-id with a semantic ID <route-slug>.<section-slug>.<element-path> (e.g. home.hero.cta-primary). NEVER positional ids (child-3). The section root takes its ID from the nodeId prop (spread as data-node-id={nodeId}); child elements carry literal ids via the primitives' nodeId prop. List items derive ids from stable data keys (tier-1 from the tier's name), never array position.
-6. Every href must exist in the provided route table or be an explicit external URL (https://...).
+6. Every href must exist in the provided route table or be an explicit external URL (https://...). External URLs must use placeholder domains (yourbrand.example, demo.yourbrand.example) unless the brief supplies real ones — never invent URLs on real third-party domains.
 7. Interactive elements that would need business logic (form submit, add to cart) receive a typed handler prop, wired in the mock data to a no-op with a `// TODO: integrate` comment.
 8. Compose ONLY the primitives listed in DESIGN CONTEXT (import from ../../../primitives/<Name>). Shared types may be imported from ../../../lib/. Local sub-components inside the section file are allowed.
 
@@ -42,7 +42,7 @@ Archetype: hero — the page's opening statement and the first thing a visitor r
 
 Structure: a centered column inside a full-width section — eyebrow (Text variant "eyebrow") → headline (Heading level 1, variant "display") → subheadline (Text variant "lead") → a CTA row with one primary and at most one secondary Button. Generous vertical padding (py-(--space-24)); content constrained (max-w around 48rem) and centered.
 
-Quality bar: the headline makes one concrete, specific claim in ten words or fewer — name the outcome, not the category. The subheadline expands it in one sentence with the "how" or "for whom". CTAs start with a verb and name the action ("Start free trial"), never "Learn more" twice. Copy must sound like the brand in the page brief, not like a template.
+Quality bar: the headline makes one concrete, specific claim in ten words or fewer — name the outcome, not the category. The subheadline expands it in one sentence with the "how" or "for whom". CTAs start with a verb and name the action ("Start free trial"), never "Learn more" twice. Copy must sound like the brand in the page brief, not like a template. Facts must stay internally consistent across headline, subheadline, and CTAs (a cadence, price, or count named twice must match).
 
 Failure modes that fail gates or reviews — avoid: filler copy ("Welcome to our website"); hardcoded strings in JSX; hex/px values; positional node ids; more than two CTAs; inventing primitives, tokens, or props the primitives do not have; dangling hrefs.
 

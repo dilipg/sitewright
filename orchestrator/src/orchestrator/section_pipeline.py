@@ -200,6 +200,7 @@ def generate_section(
         model=result["model"],
         params={"tool": "emit_section"},
         usage=result["usage"],
+        raw_output=json.dumps(result["data"], indent=2),
         checkpoint_ref=f"{kitaru.current_execution_id()}/generate_section#a{attempt}",
     )
     return result

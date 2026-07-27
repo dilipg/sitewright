@@ -19,8 +19,13 @@ import { PREVIEW, openEditor, resetOverrides, waitForSaved } from "./helpers";
 import { INVARIANT_CASES } from "./invariant-cases";
 
 const compilerDir = fileURLToPath(new URL("../../compiler", import.meta.url));
-const projectDir = fileURLToPath(new URL("../../generated/editor-e2e-project", import.meta.url));
-const exportDir = fileURLToPath(new URL("../../generated/invariant-export", import.meta.url));
+// Soak runs (3.4+) point the suite at a generated project via env
+const projectDir =
+  process.env.WG_PROJECT_DIR ??
+  fileURLToPath(new URL("../../generated/editor-e2e-project", import.meta.url));
+const exportDir =
+  process.env.WG_EXPORT_DIR ??
+  fileURLToPath(new URL("../../generated/invariant-export", import.meta.url));
 const EXPORT_PORT = 5390;
 
 /** Max fraction of differing pixels. Same browser, same widths — headroom is for antialiasing only. */

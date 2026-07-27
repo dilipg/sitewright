@@ -32,6 +32,14 @@ export function applyStyleProperty(
   return { ...map, [nodeId]: { ...nodeChannels, style } };
 }
 
+/** Drops every channel for a node — used when the user discards an orphaned override. */
+export function removeNodeOverrides(map: OverridesMap, nodeId: string): OverridesMap {
+  const next = { ...map };
+  delete next[nodeId];
+  return next;
+}
+
+
 export function toOverrideFile(map: OverridesMap, route: string): OverrideFileJson {
   const updatedAt = new Date().toISOString();
   const overrides: OverrideFileEntry[] = [];

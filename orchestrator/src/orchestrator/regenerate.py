@@ -63,16 +63,17 @@ def main() -> None:
         if (node_id == args.section or node_id.startswith(f"{args.section}."))
         and node["status"] == "tombstoned"
     )
-    print(
-        json.dumps(
-            {
-                "passed": last["gate_results"]["passed"],
-                "orphanedOverrides": last.get("declared_orphans", []),
-                "tombstoned": tombstoned,
-            },
-            indent=2,
-        )
-    )
+    summary = {
+        "passed": last["gate_results"]["passed"],
+        "orphanedOverrides": last.get("declared_orphans", []),
+        "tombstoned": tombstoned,
+        "failureReport": ""
+        if last["gate_results"]["passed"]
+        else "\n".join(f["message"] for f in last["gate_results"]["failures"]),
+    }
+    print(json.dumps(summary, indent=2))
+    # machine-readable single line for the preview server's regen endpoint
+    print(f"REGEN_RESULT {json.dumps(summary)}")
 
 
 if __name__ == "__main__":

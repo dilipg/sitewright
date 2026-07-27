@@ -333,6 +333,135 @@ body {
   pointer-events: none;
 }
 
+.regen-progress {
+  position: absolute;
+  pointer-events: auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(20, 20, 24, 0.72);
+  color: #e8e8ee;
+  font-size: 14px;
+  letter-spacing: 0.04em;
+  z-index: 4;
+}
+
+.regen-open {
+  width: 100%;
+  margin-bottom: 12px;
+  background: #4f8ef7;
+  border: none;
+  color: white;
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.regen-box {
+  margin-bottom: 16px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid #333340;
+}
+
+.regen-instruction {
+  width: 100%;
+  background: #1e1e24;
+  border: 1px solid #4a4a56;
+  color: #e8e8ee;
+  border-radius: 6px;
+  padding: 8px;
+  font-size: 12px;
+  font-family: inherit;
+  resize: vertical;
+}
+
+.regen-cost {
+  color: #9a9aa8;
+  font-size: 11px;
+  margin: 8px 0;
+}
+
+.regen-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.regen-actions button,
+.regen-failed button {
+  background: #3a3a46;
+  border: none;
+  color: #e8e8ee;
+  border-radius: 4px;
+  padding: 6px 12px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.regen-actions button[data-testid="regen-confirm"] {
+  background: #4f8ef7;
+  color: white;
+}
+
+.regen-failure {
+  color: #ffb4a0;
+  font-size: 12px;
+  white-space: pre-wrap;
+}
+
+.orphan-dialog {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  width: 380px;
+  background: #26262e;
+  border: 1px solid #4a4a56;
+  border-radius: 8px;
+  padding: 14px 16px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
+  z-index: 10;
+}
+
+.orphan-dialog h3 {
+  margin: 0 0 4px;
+  font-size: 14px;
+}
+
+.orphan-dialog p {
+  margin: 0 0 10px;
+  font-size: 12px;
+  color: #9a9aa8;
+}
+
+.orphan-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
+  border-top: 1px solid #333340;
+  font-size: 12px;
+}
+
+.orphan-item code {
+  flex: 1;
+  font-size: 11px;
+}
+
+.orphan-channels {
+  color: #9a9aa8;
+  font-size: 11px;
+}
+
+.orphan-item button {
+  background: #3a3a46;
+  border: none;
+  color: #e8e8ee;
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-size: 11px;
+  cursor: pointer;
+}
+
 .pad-band {
   position: absolute;
   background: rgba(99, 189, 138, 0.28);

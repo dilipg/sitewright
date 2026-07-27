@@ -11,6 +11,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { join, resolve } from "node:path";
 import type { Plugin, ViteDevServer } from "vite";
 import { createServer } from "vite";
+import { regenApiPlugin } from "./regen-api.ts";
 import { bridgeShimPlugin } from "./shim/vite-plugin.ts";
 
 export interface PreviewOptions {
@@ -30,7 +31,7 @@ export async function startPreviewServer(
   const server = await createServer({
     root,
     configFile,
-    plugins: [bridgeShimPlugin(), overridesApiPlugin(root)],
+    plugins: [bridgeShimPlugin(), overridesApiPlugin(root), regenApiPlugin(root)],
     // The editor runs on a different origin (port) and fetches manifest.json
     // from this server; cors must be explicit. overrides/ is written by the
     // editor while the preview is live — the preview app never consumes it,
@@ -39,7 +40,7 @@ export async function startPreviewServer(
       port: options.port ?? 5273,
       strictPort: true,
       cors: true,
-      watch: { ignored: ["**/overrides/**"] },
+      watch: { ignored: ["**/overrides/**", "**/.regen-backup/**"] },
     },
   });
   await server.listen();

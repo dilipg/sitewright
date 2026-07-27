@@ -15,6 +15,7 @@ export default defineConfig({
       command: process.env.WG_PROJECT_DIR
         ? `node scripts/preview.ts ${JSON.stringify(process.env.WG_PROJECT_DIR)} --port 5273`
         : "node ../editor/e2e/prepare-project.ts && node scripts/preview.ts ../generated/editor-e2e-project --port 5273",
+      env: { WG_REGEN_MOCK: "1" },
       cwd: "../compiler",
       url: "http://localhost:5273",
       reuseExistingServer: false,

@@ -7,6 +7,8 @@ import type {
 } from "@website-generator/compiler/src/shim/protocol.ts";
 import { PROTOCOL_VERSION } from "@website-generator/compiler/src/shim/protocol.ts";
 import Inspector from "./components/Inspector";
+import type { RegenPhase } from "./components/Regen";
+import { OrphanDialog, RegenControls } from "./components/Regen";
 import { expandStyleValue } from "./lib/inventory";
 import { breadcrumbFor, humanizeSegment, parentNodeId } from "./lib/labels";
 import type { History, OverridesMap } from "./lib/store";
@@ -17,6 +19,7 @@ import {
   initHistory,
   pushHistory,
   redo,
+  removeNodeOverrides,
   toOverrideFile,
   undo,
 } from "./lib/store";
@@ -32,6 +35,11 @@ const PREVIEW_URL =
 
 type ShimStatus = "connecting" | "ready" | "version-mismatch";
 type SaveStatus = "Loading…" | "Saving…" | "Saved";
+
+/** Canned planner brief for the walking skeleton's single hero section
+ * (real briefs arrive with the Site Planner in M5). */
+const CANNED_SECTION_BRIEF =
+  "Bold opening hero introducing the product with a primary trial CTA and a secondary demo CTA.";
 
 /** Nearest active manifest node at or above the given ID. */
 function selectableId(nodeId: string, manifest: Manifest | null): string | undefined {
@@ -76,6 +84,10 @@ export default function App() {
   const [shimStatus, setShimStatus] = useState<ShimStatus>("connecting");
   const [history, setHistory] = useState<History | null>(null);
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("Loading…");
+  const [regen, setRegen] = useState<RegenPhase>({ phase: "idle" });
+  const [orphans, setOrphans] = useState<string[]>([]);
+  const [revertSection, setRevertSection] = useState<string>();
+  const [frameReadySeq, setFrameReadySeq] = useState(0);
 
   const manifestRef = useRef<Manifest | null>(null);
   const historyRef = useRef<History | null>(null);
@@ -123,6 +135,8 @@ export default function App() {
       switch (data.type) {
         case "frame:ready":
           setShimStatus(data.protocolVersion === PROTOCOL_VERSION ? "ready" : "version-mismatch");
+          // regen/HMR reloads re-handshake: bump so overrides re-apply
+          setFrameReadySeq((sequence) => sequence + 1);
           break;
         case "nodes:geometry":
           setGeometry(Object.fromEntries(data.nodes.map((node) => [node.nodeId, node])));
@@ -184,7 +198,7 @@ export default function App() {
       "*",
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [history, shimStatus]);
+  }, [history, shimStatus, frameReadySeq]);
 
   /* ---------- debounced persistence (overrides file + history file) ---------- */
 
@@ -221,9 +235,83 @@ export default function App() {
     });
   }
 
+  /* ---------- regeneration (PRD section 4) ---------- */
+
+  async function refreshManifest() {
+    const loaded = (await fetch(`${PREVIEW_URL}/manifest.json`, { cache: "no-store" }).then((r) =>
+      r.json(),
+    )) as Manifest;
+    manifestRef.current = loaded;
+    setManifest(loaded);
+  }
+
+  /** Deterministic frame reload after regen/revert — HMR is not a reliable
+   * carrier for whole-section rewrites; frame:ready re-applies overrides. */
+  function reloadPreview() {
+    const frame = iframeRef.current;
+    if (frame !== null) frame.src = `${PREVIEW_URL}/?regen=${Date.now()}`;
+  }
+
+  async function confirmRegen() {
+    if (regen.phase !== "prompt") return;
+    const { section, instruction } = regen;
+    setRegen({ phase: "running", section });
+    try {
+      const response = await fetch(`${PREVIEW_URL}/__regen`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ section, instruction }),
+      });
+      const outcome = (await response.json()) as {
+        passed?: boolean;
+        orphanedOverrides?: string[];
+        failureReport?: string;
+        error?: string;
+      };
+      if (outcome.error !== undefined) throw new Error(outcome.error);
+      await refreshManifest();
+      if (outcome.passed !== true) {
+        setRegen({ phase: "failed", section, report: outcome.failureReport ?? "unknown failure", instruction });
+        return;
+      }
+      setRevertSection(section);
+      setOrphans(outcome.orphanedOverrides ?? []);
+      setRegen({ phase: "idle" });
+      reloadPreview();
+    } catch (error) {
+      setRegen({ phase: "failed", section, report: String(error), instruction });
+    }
+  }
+
+  async function revertRegen() {
+    if (revertSection === undefined) return;
+    await fetch(`${PREVIEW_URL}/__regen-revert`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ section: revertSection }),
+    });
+    await refreshManifest();
+    setRevertSection(undefined);
+    setOrphans([]);
+    reloadPreview();
+  }
+
+  function discardOrphan(nodeId: string) {
+    setHistory((h) => (h === null ? h : pushHistory(h, removeNodeOverrides(currentSnapshot(h), nodeId))));
+    setOrphans((current) => current.filter((id) => id !== nodeId));
+  }
+
+  function copyOrphan(nodeId: string) {
+    const value = JSON.stringify(map[nodeId] ?? {}, null, 2);
+    void navigator.clipboard?.writeText(value).catch(() => undefined);
+  }
+
   const crumbs = manifest === null ? [] : breadcrumbFor(selectedId, manifest);
   const selectedNode = selectedId !== undefined ? manifest?.nodes[selectedId] : undefined;
   const selectedGeom = selectedId !== undefined ? geometry[selectedId] : undefined;
+  const sectionSelected =
+    selectedId !== undefined && selectedId.split(".").length === 2 ? selectedId : undefined;
+  const regenGeom = regen.phase === "running" ? geometry[regen.section] : undefined;
   const hoverGeom = hoverId !== undefined && hoverId !== selectedId ? geometry[hoverId] : undefined;
   const selectedStyle =
     selectedId !== undefined
@@ -277,6 +365,11 @@ export default function App() {
           >
             Redo
           </button>
+          {revertSection !== undefined && (
+            <button type="button" data-testid="revert-regen-button" onClick={() => void revertRegen()}>
+              Revert regeneration
+            </button>
+          )}
           <span data-testid="save-status" className="save-status">
             {saveStatus}
           </span>
@@ -307,6 +400,20 @@ export default function App() {
                   <span data-testid="hover-label" className="hover-label">
                     {humanizeSegment(hoverId.split(".").pop()!)}
                   </span>
+                </div>
+              )}
+              {regenGeom !== undefined && (
+                <div
+                  data-testid="regen-progress"
+                  className="regen-progress"
+                  style={{
+                    left: regenGeom.rect.x,
+                    top: regenGeom.rect.y,
+                    width: regenGeom.rect.width,
+                    height: regenGeom.rect.height,
+                  }}
+                >
+                  <span>Regenerating…</span>
                 </div>
               )}
               {selectedGeom !== undefined && (
@@ -349,6 +456,27 @@ export default function App() {
         </div>
 
         <aside className="inspector" data-testid="inspector">
+          <RegenControls
+            regen={regen}
+            sectionSelected={sectionSelected}
+            onOpen={(section) =>
+              setRegen({ phase: "prompt", section, instruction: CANNED_SECTION_BRIEF })
+            }
+            onEdit={(instruction) =>
+              setRegen((current) =>
+                current.phase === "prompt" ? { ...current, instruction } : current,
+              )
+            }
+            onConfirm={() => void confirmRegen()}
+            onCancel={() => setRegen({ phase: "idle" })}
+            onTryAgain={() =>
+              setRegen((current) =>
+                current.phase === "failed"
+                  ? { phase: "prompt", section: current.section, instruction: current.instruction }
+                  : current,
+              )
+            }
+          />
           {selectedNode !== undefined && selectedId !== undefined && tokens !== null ? (
             <Inspector
               nodeId={selectedId}
@@ -363,6 +491,13 @@ export default function App() {
           )}
         </aside>
       </div>
+
+      <OrphanDialog
+        orphans={orphans}
+        overrides={map}
+        onDiscard={discardOrphan}
+        onCopy={copyOrphan}
+      />
     </div>
   );
 }

@@ -6,6 +6,7 @@ import {
   initHistory,
   pushHistory,
   redo,
+  removeNodeOverrides,
   toOverrideFile,
   undo,
 } from "./store";
@@ -51,6 +52,17 @@ describe("override store: contract 6.1 serialization", () => {
     let map = applyStyleProperty({}, "home.hero", "background", "color.semantic.accent");
     const file = toOverrideFile(map, "/");
     expect(fromOverrideFile(file)).toEqual(map);
+  });
+});
+
+describe("override store: orphan discard", () => {
+  it("removeNodeOverrides drops every channel for the node, immutably", () => {
+    let map = applyStyleProperty({}, "home.hero.subheadline", "color", "color.semantic.accent");
+    map = applyStyleProperty(map, "home.hero.headline", "background", "color.semantic.surface");
+    const next = removeNodeOverrides(map, "home.hero.subheadline");
+    expect(next["home.hero.subheadline"]).toBeUndefined();
+    expect(next["home.hero.headline"]).toBeDefined();
+    expect(map["home.hero.subheadline"]).toBeDefined(); // input untouched
   });
 });
 

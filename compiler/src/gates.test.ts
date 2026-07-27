@@ -117,6 +117,53 @@ describe("runGates: ownership boundary via written-files log", () => {
   });
 });
 
+describe("runGates: gate 7 (regen ID survival)", () => {
+  it("passes when every previously-overridden ID is still attached", () => {
+    const report = runGates(cleanFixture, {
+      regen: { overriddenNodeIds: ["home.hero.headline", "home.hero.cta-primary"], declaredOrphans: [] },
+    });
+    expect(report.passed).toBe(true);
+    expect(report.gates.map((g) => g.gate)).toContain(7);
+  });
+
+  it("fails when an overridden ID is missing and undeclared", () => {
+    const report = runGates(cleanFixture, {
+      regen: { overriddenNodeIds: ["home.hero.vanished"], declaredOrphans: [] },
+    });
+    expect(failedGates(report)).toEqual([7]);
+    const failure = failuresOf(report, 7)[0]!;
+    expect(failure.reason).toBe("undeclared-orphan");
+    expect(failure.message).toContain("home.hero.vanished");
+    expect(failure.message).toContain("orphanedOverrides");
+  });
+
+  it("passes when a removed overridden ID is declared in orphanedOverrides", () => {
+    const report = runGates(cleanFixture, {
+      regen: {
+        overriddenNodeIds: ["home.hero.headline", "home.hero.vanished"],
+        declaredOrphans: ["home.hero.vanished"],
+      },
+    });
+    expect(report.passed).toBe(true);
+  });
+
+  it("fails when a declared orphan is actually still attached (false orphan)", () => {
+    const report = runGates(cleanFixture, {
+      regen: {
+        overriddenNodeIds: ["home.hero.headline"],
+        declaredOrphans: ["home.hero.headline"],
+      },
+    });
+    expect(failedGates(report)).toEqual([7]);
+    expect(failuresOf(report, 7)[0]?.reason).toBe("false-orphan");
+  });
+
+  it("gate 7 is absent from non-regen runs", () => {
+    const report = runGates(cleanFixture);
+    expect(report.gates.map((g) => g.gate)).toEqual([1, 2, 3, 4, 5, 6]);
+  });
+});
+
 describe("runGates: report structure", () => {
   it("reports all six gates with ids and names regardless of outcome", () => {
     const report = runGates(broken("gate3-raw-hex"));

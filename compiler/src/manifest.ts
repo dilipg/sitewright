@@ -159,6 +159,63 @@ export function commit(
   return { version: manifest.version, nodes };
 }
 
+export interface ReplaceSectionResult {
+  ok: boolean;
+  issues: ValidationIssue[];
+  manifest?: Manifest;
+  tombstoned: string[];
+}
+
+/**
+ * Regeneration commit (contract 5.2/5.3): a section's entries are replaced
+ * wholesale — surviving IDs update in place (immutable IDs, refreshed
+ * file/component/editable), removed IDs tombstone, new IDs register.
+ * Tombstone-resurrection rules still apply across regenerations.
+ */
+export function replaceSection(
+  manifest: Manifest,
+  sectionPrefix: string,
+  proposals: ManifestEntryProposal[],
+  config: ProposalConfig,
+): ReplaceSectionResult {
+  const inSection = (nodeId: string): boolean =>
+    nodeId === sectionPrefix || nodeId.startsWith(`${sectionPrefix}.`);
+
+  const strayIssues: ValidationIssue[] = proposals
+    .filter((proposal) => !inSection(proposal.nodeId))
+    .map((proposal) => ({
+      nodeId: proposal.nodeId,
+      rule: "ownership" as const,
+      message: `Proposal "${proposal.nodeId}" is outside the section being regenerated (${sectionPrefix}); a regeneration may only touch its own section's entries.`,
+    }));
+  if (strayIssues.length > 0) {
+    return { ok: false, issues: strayIssues, tombstoned: [] };
+  }
+
+  // Validate against the manifest with the section's ACTIVE entries removed:
+  // surviving IDs must not trip the duplicate guard, while tombstoned entries
+  // stay in place so resurrection rules keep applying.
+  const activeSectionIds = Object.entries(manifest.nodes)
+    .filter(([nodeId, node]) => inSection(nodeId) && node.status === "active")
+    .map(([nodeId]) => nodeId);
+  const strippedNodes = { ...manifest.nodes };
+  for (const nodeId of activeSectionIds) delete strippedNodes[nodeId];
+  const stripped: Manifest = { version: manifest.version, nodes: strippedNodes };
+
+  const validation = propose(stripped, proposals, config);
+  if (!validation.valid) {
+    return { ok: false, issues: validation.issues, tombstoned: [] };
+  }
+
+  const committed = commit(stripped, proposals, config);
+  const proposalIds = new Set(proposals.map((proposal) => proposal.nodeId));
+  const tombstoned = activeSectionIds.filter((nodeId) => !proposalIds.has(nodeId)).sort();
+  for (const nodeId of tombstoned) {
+    committed.nodes[nodeId] = { ...manifest.nodes[nodeId]!, status: "tombstoned" };
+  }
+  return { ok: true, issues: [], manifest: committed, tombstoned };
+}
+
 /** Marks nodes tombstoned, returning a new manifest. Idempotent for already-tombstoned IDs. */
 export function tombstone(manifest: Manifest, nodeIds: string[]): Manifest {
   const nodes = { ...manifest.nodes };

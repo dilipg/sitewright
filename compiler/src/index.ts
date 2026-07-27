@@ -12,9 +12,10 @@ export { ExportError, exportProject } from "./exporter";
 export type { ExportOptions, ExportResult, OverrideEntry } from "./exporter";
 
 export { runGates } from "./gates";
-export type { GateFailure, GateReport, GateResult, RunGatesOptions } from "./gates";
+export type { GateFailure, GateReport, GateResult, RegenGateContext, RunGatesOptions } from "./gates";
 
-export { EDITABLE_CHANNELS, commit, createManifest, propose, tombstone } from "./manifest";
+export { EDITABLE_CHANNELS, commit, createManifest, propose, replaceSection, tombstone } from "./manifest";
+export type { ReplaceSectionResult } from "./manifest";
 export type {
   EditableChannel,
   Manifest,

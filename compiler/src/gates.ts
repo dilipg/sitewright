@@ -33,10 +33,19 @@ export interface GateReport {
   gates: GateResult[];
 }
 
+export interface RegenGateContext {
+  /** Node IDs carrying user overrides before this regeneration. */
+  overriddenNodeIds: string[];
+  /** IDs the regenerating agent declared as removed (orphanedOverrides). */
+  declaredOrphans: string[];
+}
+
 export interface RunGatesOptions {
   ownershipMap?: OwnershipMap;
   /** Orchestrator-side write log per owner; boundary check is skipped without it. */
   writtenFiles?: Record<string, string[]>;
+  /** Present only on regeneration runs; enables gate 7 (contract 5.3/8.7). */
+  regen?: RegenGateContext;
 }
 
 const GATE_NAMES: Record<number, string> = {
@@ -46,6 +55,7 @@ const GATE_NAMES: Record<number, string> = {
   4: "node-ids-registered",
   5: "content-via-props",
   6: "ownership-boundaries",
+  7: "regen-id-survival",
 };
 
 const EXTERNAL_HREF = /^(?:https?:\/\/|mailto:|tel:|#)/;
@@ -71,14 +81,60 @@ export function runGates(projectDir: string, options: RunGatesOptions = {}): Gat
     ...gateNodeIdsRegistered(root, sourceFiles),
     ...gateContentViaProps(root, sourceFiles),
     ...gateOwnership(root, sourceFiles, options),
+    ...(options.regen !== undefined ? gateRegenIdSurvival(sourceFiles, options.regen) : []),
   ];
 
-  const gates: GateResult[] = [1, 2, 3, 4, 5, 6].map((gate) => {
+  const gateIds = options.regen !== undefined ? [1, 2, 3, 4, 5, 6, 7] : [1, 2, 3, 4, 5, 6];
+  const gates: GateResult[] = gateIds.map((gate) => {
     const gateFailures = failures.filter((failure) => failure.gate === gate);
     return { gate, name: GATE_NAMES[gate]!, passed: gateFailures.length === 0, failures: gateFailures };
   });
 
   return { projectDir: root, passed: failures.length === 0, gates };
+}
+
+/**
+ * Gate 7 (contract 5.3/8.7): on regeneration, every previously-overridden
+ * node ID must either be attached in the output or declared in the agent's
+ * orphanedOverrides — never silently dropped. A declared orphan that is
+ * still attached is equally a failure: the editor would surface a false
+ * orphan and the user would discard a live edit.
+ */
+function gateRegenIdSurvival(
+  sourceFiles: import("ts-morph").SourceFile[],
+  regen: RegenGateContext,
+): GateFailure[] {
+  const attached = new Set<string>();
+  for (const sourceFile of sourceFiles) {
+    for (const attribute of sourceFile.getDescendantsOfKind(SyntaxKind.JsxAttribute)) {
+      const name = attribute.getNameNode().getText();
+      if (name !== "data-node-id" && name !== "nodeId") continue;
+      const literal = attribute.getInitializer()?.asKind(SyntaxKind.StringLiteral);
+      if (literal !== undefined) attached.add(literal.getLiteralValue());
+    }
+  }
+
+  const declared = new Set(regen.declaredOrphans);
+  const failures: GateFailure[] = [];
+  for (const nodeId of regen.overriddenNodeIds) {
+    if (!attached.has(nodeId) && !declared.has(nodeId)) {
+      failures.push({
+        gate: 7,
+        reason: "undeclared-orphan",
+        message: `Previously-overridden node "${nodeId}" is missing from the regenerated output and was not declared in orphanedOverrides. Preserve the ID if the element still exists conceptually; if it was legitimately removed, declare it in orphanedOverrides (contract 5.3).`,
+      });
+    }
+  }
+  for (const nodeId of declared) {
+    if (attached.has(nodeId)) {
+      failures.push({
+        gate: 7,
+        reason: "false-orphan",
+        message: `Node "${nodeId}" is declared in orphanedOverrides but is still attached in the output. Remove it from orphanedOverrides — a false orphan would make the user discard a live edit.`,
+      });
+    }
+  }
+  return failures;
 }
 
 /** Gate 1: every relative import resolves to a file; bare imports appear in package.json. */

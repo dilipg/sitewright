@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import type { Manifest, ManifestEntryProposal } from "./manifest";
-import { commit, createManifest, propose, tombstone } from "./manifest";
+import { commit, createManifest, propose, replaceSection, tombstone } from "./manifest";
 
 const fixtureManifestPath = fileURLToPath(
   new URL("../../fixtures/acme-landing/manifest.json", import.meta.url),
@@ -172,6 +172,88 @@ describe("manifest service: tombstones", () => {
     expect(result.valid).toBe(true);
     const committed = commit(tombstonedManifest(), [entry], homePageConfig);
     expect(committed.nodes["home.hero.subheadline"]?.status).toBe("active");
+  });
+});
+
+describe("manifest service: replaceSection (regeneration)", () => {
+  function committedManifest(): Manifest {
+    return commit(createManifest(), fixtureProposals(), homePageConfig);
+  }
+
+  it("updates surviving IDs, adds new ones, tombstones the removed", () => {
+    const manifest = committedManifest();
+    const proposals = fixtureProposals()
+      .filter((p) => p.nodeId !== "home.hero.subheadline")
+      .concat([
+        {
+          nodeId: "home.hero.badge",
+          route: "/",
+          file: "src/pages/home/sections/Hero.tsx",
+          component: "Hero",
+          element: "Text",
+          editable: ["text", "style"],
+        },
+      ]);
+    const result = replaceSection(manifest, "home.hero", proposals, homePageConfig);
+    expect(result.ok).toBe(true);
+    expect(result.tombstoned).toEqual(["home.hero.subheadline"]);
+    expect(result.manifest!.nodes["home.hero.subheadline"]?.status).toBe("tombstoned");
+    expect(result.manifest!.nodes["home.hero.badge"]?.status).toBe("active");
+    expect(result.manifest!.nodes["home.hero.headline"]?.status).toBe("active");
+  });
+
+  it("does not trip the duplicate-id guard for surviving section IDs", () => {
+    const manifest = committedManifest();
+    const result = replaceSection(manifest, "home.hero", fixtureProposals(), homePageConfig);
+    expect(result.ok).toBe(true);
+    expect(result.tombstoned).toEqual([]);
+  });
+
+  it("rejects proposals outside the section prefix", () => {
+    const manifest = committedManifest();
+    const stray = { ...fixtureProposals()[0]!, nodeId: "pricing.tiers.cta" };
+    const result = replaceSection(manifest, "home.hero", [stray], homePageConfig);
+    expect(result.ok).toBe(false);
+    expect(result.issues[0]?.message).toContain("home.hero");
+  });
+
+  it("still enforces tombstone-resurrection rules across regenerations", () => {
+    let manifest = committedManifest();
+    // first regen removes the subheadline
+    manifest = replaceSection(
+      manifest,
+      "home.hero",
+      fixtureProposals().filter((p) => p.nodeId !== "home.hero.subheadline"),
+      homePageConfig,
+    ).manifest!;
+    // second regen tries to resurrect it as a different file/component
+    const resurrect = fixtureProposals().map((p) =>
+      p.nodeId === "home.hero.subheadline"
+        ? { ...p, file: "src/pages/home/sections/Intro.tsx", component: "Intro" }
+        : p,
+    );
+    const result = replaceSection(manifest, "home.hero", resurrect, homePageConfig);
+    expect(result.ok).toBe(false);
+    expect(result.issues[0]?.rule).toBe("tombstone-resurrection");
+  });
+
+  it("leaves other sections' entries untouched", () => {
+    let manifest = commit(
+      committedManifest(),
+      [
+        {
+          nodeId: "home.features.grid",
+          route: "/",
+          file: "src/pages/home/sections/Features.tsx",
+          component: "Features",
+          element: "Grid",
+          editable: ["style"],
+        },
+      ],
+      homePageConfig,
+    );
+    const result = replaceSection(manifest, "home.hero", fixtureProposals(), homePageConfig);
+    expect(result.manifest!.nodes["home.features.grid"]?.status).toBe("active");
   });
 });
 

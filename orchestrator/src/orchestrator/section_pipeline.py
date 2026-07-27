@@ -135,6 +135,77 @@ def format_gate_failures(report: dict) -> str:
     return "\n".join(lines)
 
 
+FIRST_GENERATION_REGEN_BLOCK = "(first generation — no regeneration context)"
+
+
+def build_regen_block(
+    project_dir: str | Path, section_prefix: str, instruction: str
+) -> tuple[str, list[str]]:
+    """REGEN BLOCK per pipeline 4.1 anatomy: user instruction, previously
+    overridden node IDs (with channels), the section's active manifest
+    entries, and the current section source. Returns (block, overridden_ids)."""
+    project = Path(project_dir)
+
+    def in_section(node_id: str) -> bool:
+        return node_id == section_prefix or node_id.startswith(f"{section_prefix}.")
+
+    manifest = json.loads((project / "manifest.json").read_text(encoding="utf-8"))
+    section_entries = {
+        node_id: node
+        for node_id, node in manifest["nodes"].items()
+        if in_section(node_id) and node["status"] == "active"
+    }
+
+    route_slug = section_prefix.split(".")[0]
+    overrides_path = project / "overrides" / f"{route_slug}.overrides.json"
+    override_entries = (
+        json.loads(overrides_path.read_text(encoding="utf-8"))["overrides"]
+        if overrides_path.exists()
+        else []
+    )
+    channels_by_id: dict[str, set[str]] = {}
+    for entry in override_entries:
+        if in_section(entry["nodeId"]):
+            channels_by_id.setdefault(entry["nodeId"], set()).add(entry["channel"])
+    overridden_ids = sorted(channels_by_id)
+
+    overridden_lines = (
+        "\n".join(
+            f"- {node_id} (channels: {', '.join(sorted(channels))})"
+            for node_id, channels in sorted(channels_by_id.items())
+        )
+        or "(none)"
+    )
+
+    source_files = sorted({node["file"] for node in section_entries.values()})
+    components = sorted({node["component"] for node in section_entries.values()})
+    for component in components:
+        mock_path = f"src/pages/{route_slug}/mock/{component}.data.ts"
+        if (project / mock_path).exists() and mock_path not in source_files:
+            source_files.append(mock_path)
+    source_blocks = "\n".join(
+        f"--- {file_path} ---\n{(project / file_path).read_text(encoding='utf-8')}"
+        for file_path in source_files
+        if (project / file_path).exists()
+    )
+
+    block = (
+        "REGENERATION REQUEST — this section already exists; regenerate it per the "
+        "user's instruction while preserving continuity.\n"
+        f"User instruction: {instruction}\n\n"
+        "Previously overridden node IDs — the user has edits attached to each of "
+        "these. Preserve every ID whose element still exists conceptually in your "
+        "new output. If your new output legitimately removes one, declare it in "
+        "orphanedOverrides. Never silently drop or falsely declare one (machine-checked, gate 7):\n"
+        f"{overridden_lines}\n\n"
+        "Current manifest entries for this section:\n"
+        f"{json.dumps(section_entries, indent=2)}\n\n"
+        "Current section source (your files fully replace these):\n"
+        f"{source_blocks}"
+    )
+    return block, overridden_ids
+
+
 def user_prompt_with_failures(base_user: str, failure_report: str) -> str:
     if not failure_report:
         return base_user
@@ -232,10 +303,14 @@ def write_section_output(project_dir: str, model_result: dict, attempt: int) -> 
 
 
 @checkpoint
-def commit_section_manifest(project_dir: str, model_result: dict, attempt: int) -> dict:
+def commit_section_manifest(
+    project_dir: str, model_result: dict, attempt: int, regen_section: str = ""
+) -> dict:
     """Validates + commits proposals through the manifest service CLI —
-    manifest.json changes only through the service (contract 5.4). Returns
-    the pre-commit manifest so a failed attempt can be rolled back."""
+    manifest.json changes only through the service (contract 5.4). On
+    regeneration this is a replace-section commit: surviving IDs update,
+    removed IDs tombstone. Returns the pre-commit manifest so a failed
+    attempt can be rolled back."""
     manifest_path = Path(project_dir) / "manifest.json"
     previous = manifest_path.read_text(encoding="utf-8")
 
@@ -243,21 +318,51 @@ def commit_section_manifest(project_dir: str, model_result: dict, attempt: int) 
     proposals_file.write_text(
         json.dumps(model_result["data"]["manifestProposals"]), encoding="utf-8"
     )
-    result = _run_compiler_cli(
-        ["scripts/manifest.ts", "commit", project_dir, "--proposals", str(proposals_file), "--owner", "page:home"]
+    command = (
+        ["scripts/manifest.ts", "replace-section", project_dir, "--proposals", str(proposals_file), "--owner", "page:home", "--section", regen_section]
+        if regen_section
+        else ["scripts/manifest.ts", "commit", project_dir, "--proposals", str(proposals_file), "--owner", "page:home"]
     )
+    result = _run_compiler_cli(command)
     proposals_file.unlink(missing_ok=True)
     try:
         payload = json.loads(result.stdout.strip().splitlines()[-1])
     except (json.JSONDecodeError, IndexError):
         raise RuntimeError(f"manifest CLI produced no result: {result.stderr}") from None
-    return {"ok": payload["ok"], "issues": payload["issues"], "previous_manifest": previous}
+    return {
+        "ok": payload["ok"],
+        "issues": payload["issues"],
+        "tombstoned": payload.get("tombstoned", []),
+        "previous_manifest": previous,
+    }
 
 
 @checkpoint
-def run_gates_step(project_dir: str, run_id: str, attempt: int) -> dict:
-    result = _run_compiler_cli(["scripts/gates.ts", project_dir, "--json"])
+def run_gates_step(
+    project_dir: str,
+    run_id: str,
+    attempt: int,
+    model_result: dict | None = None,
+    overridden_ids: list[str] | None = None,
+) -> dict:
+    """Gates 1-6, plus gate 7 on regeneration runs (overridden_ids present):
+    every previously-overridden ID must be attached in the output or declared
+    in the agent's orphanedOverrides."""
+    args = ["scripts/gates.ts", project_dir, "--json"]
+    declared_orphans: list[str] = []
+    regen_file = Path(project_dir) / ".regen-context.json"
+    if overridden_ids:
+        declared_orphans = list((model_result or {}).get("data", {}).get("orphanedOverrides") or [])
+        regen_file.write_text(
+            json.dumps({"overriddenNodeIds": overridden_ids, "declaredOrphans": declared_orphans}),
+            encoding="utf-8",
+        )
+        args += ["--regen", str(regen_file)]
+
+    result = _run_compiler_cli(args)
+    regen_file.unlink(missing_ok=True)
     report = json.loads(result.stdout)
+    report["declaredOrphans"] = declared_orphans
     append_run_event(
         default_run_log_path(run_id),
         run_id=run_id,
@@ -268,6 +373,7 @@ def run_gates_step(project_dir: str, run_id: str, attempt: int) -> dict:
             "passed": report["passed"],
             "failures": [f for gate in report["gates"] for f in gate["failures"]],
         },
+        declared_orphans=declared_orphans,
         checkpoint_ref=f"{kitaru.current_execution_id()}/run_gates_step#a{attempt}",
     )
     return report
@@ -289,8 +395,15 @@ def generate_section_flow(
     run_id: str,
     page_brief: str,
     section_brief: str,
+    regen_block: str = FIRST_GENERATION_REGEN_BLOCK,
+    regen_overridden_ids: list[str] | None = None,
 ) -> dict:
+    """First generation by default; a regeneration is this same flow forked
+    via Kitaru replay-with-overrides at the generate_section checkpoint with
+    regen_block/regen_overridden_ids overridden (pipeline 5.5). Retries
+    inside a regen keep both the regen context and the failure report."""
     print(f"exec_id: {kitaru.current_execution_id()}", flush=True)
+    is_regen = regen_block != FIRST_GENERATION_REGEN_BLOCK
     project_dir = materialize(prepare_workspace(run_id))
 
     template = load_template("hero")
@@ -307,7 +420,7 @@ def generate_section_flow(
             "route_table": fixture_route_table(),
             "section_slug": "hero",
             "section_brief": section_brief,
-            "regen_block": "(first generation — no regeneration context)",
+            "regen_block": regen_block,
         },
     )
 
@@ -326,16 +439,34 @@ def generate_section_flow(
         )
         write_section_output(project_dir, generated, attempt)
 
-        manifest_result = materialize(commit_section_manifest(project_dir, generated, attempt))
+        manifest_result = materialize(
+            commit_section_manifest(
+                project_dir, generated, attempt, regen_section="home.hero" if is_regen else ""
+            )
+        )
         if not manifest_result["ok"]:
             failure_report = "\n".join(
                 f"- manifest: {issue['message']}" for issue in manifest_result["issues"]
             )
             continue
 
-        report = materialize(run_gates_step(project_dir, run_id, attempt))
+        report = materialize(
+            run_gates_step(
+                project_dir,
+                run_id,
+                attempt,
+                model_result=generated if is_regen else None,
+                overridden_ids=regen_overridden_ids if is_regen else None,
+            )
+        )
         if report["passed"]:
-            return {"passed": True, "attempts": attempt, "project_dir": project_dir}
+            return {
+                "passed": True,
+                "attempts": attempt,
+                "project_dir": project_dir,
+                "orphanedOverrides": report.get("declaredOrphans", []),
+                "tombstoned": manifest_result.get("tombstoned", []),
+            }
 
         failure_report = format_gate_failures(report)
         rollback_manifest(project_dir, manifest_result["previous_manifest"], attempt)

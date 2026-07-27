@@ -32,14 +32,18 @@ def call_model_structured_impl(
     function: callers wrap it in their own checkpointed steps."""
     model = resolve_model(role)
     client = Anthropic()
-    response = client.messages.create(
+    # streamed: large-output calls (e.g. the 15-primitive set) exceed the
+    # SDK's non-streaming time guard; get_final_message() yields the same
+    # Message object either way
+    with client.messages.stream(
         model=model,
         max_tokens=max_tokens,
         system=build_cached_system(system),
         messages=[{"role": "user", "content": user}],
         tools=[{"name": tool_name, "description": tool_description, "input_schema": tool_schema}],
         tool_choice={"type": "tool", "name": tool_name},
-    )
+    ) as stream:
+        response = stream.get_final_message()
     tool_use = next(block for block in response.content if block.type == "tool_use")
     usage = {
         "input_tokens": response.usage.input_tokens,

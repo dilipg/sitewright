@@ -421,6 +421,7 @@ def generate_section_flow(
     regen_block: str = FIRST_GENERATION_REGEN_BLOCK,
     regen_overridden_ids: list[str] | None = None,
     workspace_token: str = "",
+    reuse_workspace: bool = False,
 ) -> dict:
     """First generation by default; a regeneration is this same flow forked
     via Kitaru replay-with-overrides at the generate_section checkpoint with
@@ -428,15 +429,30 @@ def generate_section_flow(
     inside a regen keep both the regen context and the failure report."""
     print(f"exec_id: {kitaru.current_execution_id()}", flush=True)
     is_regen = regen_block != FIRST_GENERATION_REGEN_BLOCK
-    project_dir = materialize(prepare_workspace(run_id, workspace_token))
+    # reuse_workspace: a Design System Agent already built this workspace —
+    # do not reset it back to the fixture (build prompt 5.2 re-pointing)
+    project_dir = (
+        str(GENERATED_DIR / run_id)
+        if reuse_workspace
+        else materialize(prepare_workspace(run_id, workspace_token))
+    )
+
+    inventory_path = Path(project_dir) / "design-inventory.json"
+    if reuse_workspace and inventory_path.exists():
+        # generated tokens/primitives replace the fixture stub in context
+        context_tokens = json.loads(
+            (Path(project_dir) / "src" / "tokens" / "tokens.json").read_text(encoding="utf-8")
+        )
+        context_signatures = json.loads(inventory_path.read_text(encoding="utf-8"))["primitives"]
+    else:
+        context_tokens = fixture_tokens()
+        context_signatures = fixture_primitive_signatures()
 
     template = load_template("hero")
     rendered = render_template(
         template,
         {
-            "design_context": build_design_context(
-                fixture_tokens(), fixture_primitive_signatures()
-            ),
+            "design_context": build_design_context(context_tokens, context_signatures),
             "route_slug": "home",
             "route_path": "/",
             "page_brief": page_brief,

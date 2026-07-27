@@ -7,6 +7,8 @@ import type {
 } from "@website-generator/compiler/src/shim/protocol.ts";
 import { PROTOCOL_VERSION } from "@website-generator/compiler/src/shim/protocol.ts";
 import Inspector from "./components/Inspector";
+import type { PlanBrief, PlanRoute } from "./components/PlanApproval";
+import PlanApproval from "./components/PlanApproval";
 import type { RegenPhase } from "./components/Regen";
 import { OrphanDialog, RegenControls } from "./components/Regen";
 import { expandStyleValue } from "./lib/inventory";
@@ -88,6 +90,9 @@ export default function App() {
   const [orphans, setOrphans] = useState<string[]>([]);
   const [revertSection, setRevertSection] = useState<string>();
   const [frameReadySeq, setFrameReadySeq] = useState(0);
+  const [pendingPlan, setPendingPlan] = useState<{ brief: PlanBrief; routes: PlanRoute[] } | null>(
+    null,
+  );
 
   const manifestRef = useRef<Manifest | null>(null);
   const historyRef = useRef<History | null>(null);
@@ -102,6 +107,14 @@ export default function App() {
 
   useEffect(() => {
     async function bootstrap() {
+      // an unapproved plan gates the whole editor (generation spend gate)
+      const plan = (await fetch(`${PREVIEW_URL}/__plan`, { cache: "no-store" }).then((r) =>
+        r.json(),
+      )) as { exists: boolean; approved: boolean; brief?: PlanBrief; siteplan?: { routes: PlanRoute[] } };
+      if (plan.exists && !plan.approved && plan.brief !== undefined && plan.siteplan !== undefined) {
+        setPendingPlan({ brief: plan.brief, routes: plan.siteplan.routes });
+      }
+
       const [manifestJson, tokensJson] = await Promise.all([
         fetch(`${PREVIEW_URL}/manifest.json`).then((r) => r.json() as Promise<Manifest>),
         fetch(`${PREVIEW_URL}/src/tokens/tokens.json`).then((r) => r.json() as Promise<TokensJson>),
@@ -306,6 +319,19 @@ export default function App() {
     void navigator.clipboard?.writeText(value).catch(() => undefined);
   }
 
+  function editPlanBrief(routeSlug: string, sectionSlug: string, brief: string) {
+    void fetch(`${PREVIEW_URL}/__plan/section-brief`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ routeSlug, sectionSlug, brief }),
+    });
+  }
+
+  async function approvePlan() {
+    await fetch(`${PREVIEW_URL}/__plan/approve`, { method: "POST" });
+    setPendingPlan(null);
+  }
+
   const crumbs = manifest === null ? [] : breadcrumbFor(selectedId, manifest);
   const selectedNode = selectedId !== undefined ? manifest?.nodes[selectedId] : undefined;
   const selectedGeom = selectedId !== undefined ? geometry[selectedId] : undefined;
@@ -317,6 +343,19 @@ export default function App() {
     selectedId !== undefined
       ? ((map[selectedId]?.style as Record<string, string> | undefined) ?? {})
       : {};
+
+  if (pendingPlan !== null) {
+    return (
+      <div className="editor-root">
+        <PlanApproval
+          brief={pendingPlan.brief}
+          routes={pendingPlan.routes}
+          onEditBrief={editPlanBrief}
+          onApprove={() => void approvePlan()}
+        />
+      </div>
+    );
+  }
 
   return (
     <div className="editor-root">

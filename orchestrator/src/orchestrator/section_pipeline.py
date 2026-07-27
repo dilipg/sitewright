@@ -90,8 +90,18 @@ def materialize(value):
 def prepare_workspace_dir(project_dir: str) -> str:
     """Fixture copy with a blank page: tokens/primitives/shell stay
     hand-written (M3 stub table); pages/home content, manifest, and
-    overrides are emptied. Full replace — idempotent under replay."""
+    overrides are emptied. Full replace — idempotent under replay. The
+    plan/ directory (brief, siteplan, approval) is part of the project's
+    atomic state and survives the reset."""
     target = Path(project_dir)
+    preserved_plan: dict[str, str] = {}
+    plan_dir = target / "plan"
+    if plan_dir.exists():
+        preserved_plan = {
+            entry.name: entry.read_text(encoding="utf-8")
+            for entry in plan_dir.iterdir()
+            if entry.is_file()
+        }
     if target.exists():
         shutil.rmtree(target)
     shutil.copytree(
@@ -109,6 +119,11 @@ def prepare_workspace_dir(project_dir: str) -> str:
         json.dumps({"version": 1, "route": "/", "overrides": []}, indent=2) + "\n",
         encoding="utf-8",
     )
+    if preserved_plan:
+        plan_dir = target / "plan"
+        plan_dir.mkdir(parents=True, exist_ok=True)
+        for name, content in preserved_plan.items():
+            (plan_dir / name).write_text(content, encoding="utf-8")
     return str(target)
 
 

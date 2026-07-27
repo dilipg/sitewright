@@ -39,6 +39,22 @@ def test_prepare_workspace_fully_replaces_a_stale_dir(tmp_path: Path) -> None:
     assert not (project / "stale.txt").exists()
 
 
+def test_prepare_workspace_preserves_the_plan_directory(tmp_path: Path) -> None:
+    """The approved plan is part of the project's atomic state (PRD 6) and
+    must survive workspace resets."""
+    project = tmp_path / "run-x"
+    plan_dir = project / "plan"
+    plan_dir.mkdir(parents=True)
+    (plan_dir / "siteplan.json").write_text('{"routes": []}')
+    (plan_dir / "plan-status.json").write_text('{"approved": true}')
+
+    prepare_workspace_dir(str(project))
+
+    assert (project / "plan" / "siteplan.json").read_text() == '{"routes": []}'
+    assert (project / "plan" / "plan-status.json").exists()
+    assert (project / "src" / "tokens" / "tokens.json").exists()
+
+
 def test_build_index_source_assembles_the_section() -> None:
     source = build_index_source(
         route_slug="home",

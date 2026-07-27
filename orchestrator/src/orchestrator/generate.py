@@ -12,7 +12,8 @@ gate-failing generation and exercise the bounded-retry path.
 import argparse
 import json
 
-from orchestrator.section_pipeline import generate_section_flow
+from orchestrator.plan_pipeline import require_plan_approval
+from orchestrator.section_pipeline import GENERATED_DIR, generate_section_flow
 
 DEFAULT_SECTION_BRIEF = (
     "Bold opening hero introducing the product with a primary trial CTA and a "
@@ -27,6 +28,10 @@ def main() -> None:
     parser.add_argument("--section-brief", default=DEFAULT_SECTION_BRIEF)
     parser.add_argument("--inject", default="", help="extra instruction appended to the section brief (testing hook)")
     args = parser.parse_args()
+
+    # plan approval gates generation spend (pipeline 2.2); plan-less
+    # canned-brief runs (M3 skeleton, soak, stress) remain allowed
+    require_plan_approval(GENERATED_DIR / args.run_id)
 
     section_brief = args.section_brief
     if args.inject:

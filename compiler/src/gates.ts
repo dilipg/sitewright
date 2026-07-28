@@ -46,6 +46,29 @@ export interface RunGatesOptions {
   writtenFiles?: Record<string, string[]>;
   /** Present only on regeneration runs; enables gate 7 (contract 5.3/8.7). */
   regen?: RegenGateContext;
+  /** Restricts gate 4 to one route (build prompt 5.3 fan-out) — see gateNodeIdsRegistered's doc comment. */
+  scopeRoute?: string;
+  /**
+   * Exempts section-ROOT node ids (exactly `<route>.<section>`, two dot
+   * segments) from gate 4's "missing-node-id" direction (build prompt 5.3
+   * fan-out): a root id is only ever literally attached via the page's
+   * index.tsx (`<Hero nodeId="home.hero" />`) — inside the section's own
+   * file the root carries `data-node-id={nodeId}`, a JSX EXPRESSION, never
+   * a literal, by contract design (the id comes from the nodeId prop). A
+   * section's own gate check runs BEFORE page assembly in fan-out, so
+   * index.tsx does not exist yet and every root on the route (including
+   * already-committed siblings) would always look "missing" regardless of
+   * scoping. Child ids (3+ segments) are NOT exempted — their literal
+   * `nodeId="..."` attachments (or contract-5.2 map-derived attachments,
+   * see gateNodeIdsRegistered) live in the section file itself and must
+   * already be correct within the section's own retry budget; letting them
+   * slip through here would only surface a genuine defect too late, at
+   * assembly time, with no retries left. "unregistered-node-id" and
+   * "duplicate-node-id" stay fully enforced regardless. The deferred
+   * whole-page/whole-project check (after assembly) always runs without
+   * this flag.
+   */
+  skipMissingCheck?: boolean;
 }
 
 const GATE_NAMES: Record<number, string> = {
@@ -78,7 +101,7 @@ export function runGates(projectDir: string, options: RunGatesOptions = {}): Gat
     ...gateImportsResolve(root, sourceFiles),
     ...gateHrefsValid(root, sourceFiles),
     ...gateTokensOnly(root, styleScanFiles),
-    ...gateNodeIdsRegistered(root, sourceFiles),
+    ...gateNodeIdsRegistered(root, sourceFiles, options.scopeRoute, options.skipMissingCheck),
     ...gateContentViaProps(root, sourceFiles),
     ...gateOwnership(root, sourceFiles, options),
     ...(options.regen !== undefined ? gateRegenIdSurvival(sourceFiles, options.regen) : []),
@@ -263,10 +286,95 @@ function gateTokensOnly(root: string, files: string[]): GateFailure[] {
   return failures;
 }
 
-/** Gate 4: node-ID literals and manifest actives match 1:1, no duplicates. */
+/** True when `node` is lexically inside an arrow/function expression passed as a `.map(...)` callback. */
+function isInsideMapCallback(node: import("ts-morph").Node): boolean {
+  let current: import("ts-morph").Node | undefined = node;
+  while (current !== undefined) {
+    if (current.isKind(SyntaxKind.ArrowFunction) || current.isKind(SyntaxKind.FunctionExpression)) {
+      const parent = current.getParent();
+      if (parent !== undefined && parent.isKind(SyntaxKind.CallExpression)) {
+        const callee = parent.getExpression();
+        if (callee.isKind(SyntaxKind.PropertyAccessExpression) && callee.getName() === "map") {
+          return true;
+        }
+      }
+    }
+    current = current.getParent();
+  }
+  return false;
+}
+
+const REGEX_SPECIAL = /[.*+?^${}()|[\]\\]/g;
+
+/**
+ * Builds a match-any-instance regex from a template literal's static spans,
+ * e.g. `` `${nodeId}.card-${key}` `` -> /^.+\.card\-.+$/ — used to recognize
+ * a manifest id as "plausibly produced by this list's nodeId expression"
+ * without statically evaluating the substitutions (contract 5.2: list items
+ * derive ids from data keys, so the exact value isn't known until runtime).
+ */
+function templateToPattern(template: import("ts-morph").TemplateExpression): RegExp {
+  const spans = [
+    template.getHead().getLiteralText(),
+    ...template.getTemplateSpans().map((span) => span.getLiteral().getLiteralText()),
+  ];
+  return new RegExp(`^${spans.map((span) => span.replace(REGEX_SPECIAL, "\\$&")).join(".+")}$`);
+}
+
+const isSectionRootId = (id: string): boolean => id.split(".").length === 2;
+
+/**
+ * Resolves an expression to the template literal that actually produces its
+ * value: either the expression itself, or — when the model factors a list
+ * item's id into a local `const itemId = `${nodeId}.card-${key}`` and
+ * references it by name on every sub-element (idiomatic, semantically
+ * identical to repeating the literal) — the template literal that local
+ * const was declared with.
+ */
+function resolveTemplateExpression(
+  expression: import("ts-morph").Expression | undefined,
+): import("ts-morph").TemplateExpression | undefined {
+  if (expression === undefined) return undefined;
+  const direct = expression.asKind(SyntaxKind.TemplateExpression);
+  if (direct !== undefined) return direct;
+  const identifier = expression.asKind(SyntaxKind.Identifier);
+  if (identifier === undefined) return undefined;
+  for (const definition of identifier.getDefinitionNodes()) {
+    const declaration =
+      definition.asKind(SyntaxKind.VariableDeclaration) ??
+      definition.getParentIfKind(SyntaxKind.VariableDeclaration);
+    const template = declaration?.getInitializer()?.asKind(SyntaxKind.TemplateExpression);
+    if (template !== undefined) return template;
+  }
+  return undefined;
+}
+
+/**
+ * Gate 4: node-ID literals and manifest actives match 1:1, no duplicates.
+ *
+ * scopeRoute (build prompt 5.3 fan-out): when a section's own gate check
+ * runs while SIBLING page workers are concurrently writing/committing
+ * elsewhere in the same project, an unscoped project-wide scan can catch a
+ * sibling's transient mid-commit or just-rolled-back state — a false
+ * failure that has nothing to do with THIS section. Scoping restricts both
+ * which files are scanned for attached IDs and which manifest entries are
+ * expected to be attached to exactly this route, so a section only ever
+ * fails gate 4 for its OWN problems. The final whole-project gate run
+ * (after every worker finishes, contract 5.4/pipeline 5.3) stays unscoped.
+ *
+ * List-item ids (contract 5.2): a `nodeId`/`data-node-id` attribute whose
+ * value is a template literal built inside a `.map(...)` callback is a
+ * sanctioned dynamic attachment — the exact string isn't known statically,
+ * it's derived from mock data at runtime. Such an attribute can't be
+ * checked against a single literal id; instead every active manifest id
+ * matching its static spans is treated as attached, so genuinely
+ * unattached ids (typos, forgotten elements) still fail.
+ */
 function gateNodeIdsRegistered(
   root: string,
   sourceFiles: import("ts-morph").SourceFile[],
+  scopeRoute?: string,
+  skipMissingCheck?: boolean,
 ): GateFailure[] {
   const manifestPath = join(root, "manifest.json");
   if (!existsSync(manifestPath)) {
@@ -279,23 +387,43 @@ function gateNodeIdsRegistered(
     ];
   }
   const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as Manifest;
+  const inScope = (nodeId: string): boolean =>
+    scopeRoute === undefined || nodeId === scopeRoute || nodeId.startsWith(`${scopeRoute}.`);
   const activeIds = new Set(
     Object.entries(manifest.nodes)
-      .filter(([, node]) => node.status === "active")
+      .filter(([nodeId, node]) => node.status === "active" && inScope(nodeId))
       .map(([nodeId]) => nodeId),
   );
+  const scannedFiles =
+    scopeRoute === undefined
+      ? sourceFiles
+      : sourceFiles.filter((sourceFile) =>
+          rel(root, sourceFile.getFilePath()).startsWith(`src/pages/${scopeRoute}/`),
+        );
 
   const attachments = new Map<string, Array<{ file: string; line: number }>>();
-  for (const sourceFile of sourceFiles) {
+  const dynamicPatternsByFile = new Map<string, RegExp[]>();
+  for (const sourceFile of scannedFiles) {
+    const relPath = rel(root, sourceFile.getFilePath());
     for (const attribute of sourceFile.getDescendantsOfKind(SyntaxKind.JsxAttribute)) {
       const name = attribute.getNameNode().getText();
       if (name !== "data-node-id" && name !== "nodeId") continue;
-      const literal = attribute.getInitializer()?.asKind(SyntaxKind.StringLiteral);
-      if (literal === undefined) continue;
-      const id = literal.getLiteralValue();
-      const list = attachments.get(id) ?? [];
-      list.push({ file: sourceFile.getFilePath(), line: attribute.getStartLineNumber() });
-      attachments.set(id, list);
+      const initializer = attribute.getInitializer();
+      const literal = initializer?.asKind(SyntaxKind.StringLiteral);
+      if (literal !== undefined) {
+        const id = literal.getLiteralValue();
+        const list = attachments.get(id) ?? [];
+        list.push({ file: sourceFile.getFilePath(), line: attribute.getStartLineNumber() });
+        attachments.set(id, list);
+        continue;
+      }
+      const expression = initializer?.asKind(SyntaxKind.JsxExpression)?.getExpression();
+      const template = resolveTemplateExpression(expression);
+      if (template !== undefined && isInsideMapCallback(attribute)) {
+        const patterns = dynamicPatternsByFile.get(relPath) ?? [];
+        patterns.push(templateToPattern(template));
+        dynamicPatternsByFile.set(relPath, patterns);
+      }
     }
   }
 
@@ -323,15 +451,17 @@ function gateNodeIdsRegistered(
     }
   }
   for (const id of activeIds) {
-    if (!attachments.has(id)) {
-      const node = manifest.nodes[id]!;
-      failures.push({
-        gate: 4,
-        reason: "missing-node-id",
-        file: node.file,
-        message: `Manifest node "${id}" is never attached: no element carries data-node-id="${id}" (expected in ${node.file}). Attach it or tombstone the manifest entry (contract 5.1).`,
-      });
-    }
+    if (attachments.has(id)) continue;
+    if (skipMissingCheck && isSectionRootId(id)) continue;
+    const node = manifest.nodes[id]!;
+    const patterns = dynamicPatternsByFile.get(node.file) ?? [];
+    if (patterns.some((pattern) => pattern.test(id))) continue;
+    failures.push({
+      gate: 4,
+      reason: "missing-node-id",
+      file: node.file,
+      message: `Manifest node "${id}" is never attached: no element carries data-node-id="${id}" (expected in ${node.file}). Attach it or tombstone the manifest entry (contract 5.1).`,
+    });
   }
   return failures;
 }

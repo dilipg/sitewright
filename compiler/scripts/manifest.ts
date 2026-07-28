@@ -9,14 +9,24 @@
  *
  * propose validates only; commit validates then writes manifest.json;
  * replace-section is the regeneration commit (surviving IDs update, removed
- * IDs tombstone). Output: JSON { ok, issues, committed, tombstoned } on
- * stdout. Exit 0 valid / 1 invalid.
+ * IDs tombstone). Output: JSON { ok, issues, committed, tombstoned,
+ * previousManifest } on stdout. Exit 0 valid / 1 invalid.
  * The owner's boundary is derived: "page:<slug>" -> src/pages/<slug>/.
+ *
+ * previousManifest is the file's exact content immediately before this
+ * locked operation, captured ATOMICALLY inside the lock — never read by the
+ * caller beforehand. Under concurrent page workers (build prompt 5.3
+ * fan-out), a caller-side pre-read would go stale the instant another
+ * worker commits in between; a caller that then rolls back a failed gate
+ * check using that stale snapshot would silently erase the other worker's
+ * commit. Rollback must always restore to "state right before MY commit",
+ * which only the locked critical section can observe correctly.
  */
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import type { Manifest, ManifestEntryProposal } from "../src/manifest.ts";
-import { commit, createManifest, propose, replaceSection } from "../src/manifest.ts";
+import { commit, createManifest, propose, removeNodes, replaceSection } from "../src/manifest.ts";
+import { withManifestLock } from "../src/manifest-lock.ts";
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -25,15 +35,16 @@ const proposalsFlag = args.indexOf("--proposals");
 const ownerFlag = args.indexOf("--owner");
 const sectionFlag = args.indexOf("--section");
 
+const KNOWN_COMMANDS = ["propose", "commit", "replace-section", "rollback-commit"];
 if (
-  (command !== "propose" && command !== "commit" && command !== "replace-section") ||
+  !KNOWN_COMMANDS.includes(command ?? "") ||
   projectDir === undefined ||
   proposalsFlag === -1 ||
   ownerFlag === -1 ||
   (command === "replace-section" && sectionFlag === -1)
 ) {
   console.error(
-    "Usage: manifest <propose|commit|replace-section> <projectDir> --proposals <file.json> --owner <owner> [--section <prefix>]",
+    `Usage: manifest <${KNOWN_COMMANDS.join("|")}> <projectDir> --proposals <file.json> --owner <owner> [--section <prefix>]`,
   );
   process.exit(2);
 }
@@ -51,40 +62,77 @@ const proposals = JSON.parse(
 ) as ManifestEntryProposal[];
 
 const manifestPath = join(resolve(projectDir), "manifest.json");
-const manifest: Manifest = existsSync(manifestPath)
-  ? (JSON.parse(readFileSync(manifestPath, "utf8")) as Manifest)
-  : createManifest();
+
+// The whole read -> validate -> write cycle is the critical section: parallel
+// page-agent processes (build prompt 5.3 fan-out) commit to this ONE file
+// concurrently, and an unlocked read-modify-write would silently lose a
+// writer's proposals. propose (read-only) does not need the lock.
+function loadManifest(): { manifest: Manifest; raw: string } {
+  const raw = existsSync(manifestPath)
+    ? readFileSync(manifestPath, "utf8")
+    : `${JSON.stringify(createManifest(), null, 2)}\n`;
+  return { manifest: JSON.parse(raw) as Manifest, raw };
+}
+
+if (command === "rollback-commit") {
+  // Undoes exactly THIS attempt's own additions (by node ID), never a
+  // concurrent worker's — see removeNodes' doc comment for why a blind
+  // file-overwrite rollback is unsafe under parallel fan-out.
+  const nodeIds = proposals.map((proposal) => proposal.nodeId);
+  withManifestLock(manifestPath, () => {
+    const { manifest } = loadManifest();
+    const next = removeNodes(manifest, nodeIds);
+    writeFileSync(manifestPath, `${JSON.stringify(next, null, 2)}\n`);
+  });
+  console.log(JSON.stringify({ ok: true, issues: [], committed: true, tombstoned: [], removed: nodeIds }));
+  process.exit(0);
+}
 
 if (command === "replace-section") {
   const section = args[sectionFlag + 1]!;
-  const result = replaceSection(manifest, section, proposals, { owner, ownershipMap });
-  if (result.ok) {
-    writeFileSync(manifestPath, `${JSON.stringify(result.manifest, null, 2)}\n`);
-  }
+  const outcome = withManifestLock(manifestPath, () => {
+    const { manifest, raw } = loadManifest();
+    const result = replaceSection(manifest, section, proposals, { owner, ownershipMap });
+    if (result.ok) {
+      writeFileSync(manifestPath, `${JSON.stringify(result.manifest, null, 2)}\n`);
+    }
+    return { ...result, previousManifest: raw };
+  });
   console.log(
     JSON.stringify({
-      ok: result.ok,
-      issues: result.issues,
-      committed: result.ok,
-      tombstoned: result.tombstoned,
+      ok: outcome.ok,
+      issues: outcome.issues,
+      committed: outcome.ok,
+      tombstoned: outcome.tombstoned,
+      previousManifest: outcome.previousManifest,
     }),
   );
-  process.exit(result.ok ? 0 : 1);
+  process.exit(outcome.ok ? 0 : 1);
 }
 
-const result = propose(manifest, proposals, { owner, ownershipMap });
-
-if (result.valid && command === "commit") {
-  const next = commit(manifest, proposals, { owner, ownershipMap });
-  writeFileSync(manifestPath, `${JSON.stringify(next, null, 2)}\n`);
+if (command === "commit") {
+  const outcome = withManifestLock(manifestPath, () => {
+    const { manifest, raw } = loadManifest();
+    const result = propose(manifest, proposals, { owner, ownershipMap });
+    if (result.valid) {
+      const next = commit(manifest, proposals, { owner, ownershipMap });
+      writeFileSync(manifestPath, `${JSON.stringify(next, null, 2)}\n`);
+    }
+    return { ...result, previousManifest: raw };
+  });
+  console.log(
+    JSON.stringify({
+      ok: outcome.valid,
+      issues: outcome.issues,
+      committed: outcome.valid,
+      tombstoned: [],
+      previousManifest: outcome.previousManifest,
+    }),
+  );
+  process.exit(outcome.valid ? 0 : 1);
 }
 
-console.log(
-  JSON.stringify({
-    ok: result.valid,
-    issues: result.issues,
-    committed: result.valid && command === "commit",
-    tombstoned: [],
-  }),
-);
+// propose: validation only, no write — safe to read without the lock
+const result = propose(loadManifest().manifest, proposals, { owner, ownershipMap });
+console.log(JSON.stringify({ ok: result.valid, issues: result.issues, committed: false, tombstoned: [] }));
 process.exit(result.valid ? 0 : 1);

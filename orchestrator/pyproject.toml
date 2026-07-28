@@ -5,6 +5,7 @@ description = "Agent pipeline orchestrator (Kitaru-instrumented, built starting 
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "anthropic>=0.120.0",
+    "google-genai>=2.14.0",
     "kitaru>=0.21.0",
     "python-dotenv>=1.2.2",
 ]

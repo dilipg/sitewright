@@ -216,6 +216,22 @@ export function replaceSection(
   return { ok: true, issues: [], manifest: committed, tombstoned };
 }
 
+/**
+ * Removes nodes entirely (not tombstone — truly gone), for undoing a
+ * first-generation commit whose gates then failed. Safe under concurrency:
+ * it deletes exactly the given IDs and nothing else, so a rollback can
+ * never erase a concurrent worker's unrelated commit that landed in
+ * between (contract 5.3's "no manifest garbage" under parallel fan-out).
+ * NOT for regeneration undo — replace-section commits can update an
+ * EXISTING node in place, and removing it would lose the original entry,
+ * not just this attempt's change.
+ */
+export function removeNodes(manifest: Manifest, nodeIds: string[]): Manifest {
+  const nodes = { ...manifest.nodes };
+  for (const nodeId of nodeIds) delete nodes[nodeId];
+  return { version: manifest.version, nodes };
+}
+
 /** Marks nodes tombstoned, returning a new manifest. Idempotent for already-tombstoned IDs. */
 export function tombstone(manifest: Manifest, nodeIds: string[]): Manifest {
   const nodes = { ...manifest.nodes };

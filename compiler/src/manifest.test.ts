@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import type { Manifest, ManifestEntryProposal } from "./manifest";
-import { commit, createManifest, propose, replaceSection, tombstone } from "./manifest";
+import { commit, createManifest, propose, removeNodes, replaceSection, tombstone } from "./manifest";
 
 const fixtureManifestPath = fileURLToPath(
   new URL("../../fixtures/acme-landing/manifest.json", import.meta.url),
@@ -254,6 +254,28 @@ describe("manifest service: replaceSection (regeneration)", () => {
     );
     const result = replaceSection(manifest, "home.hero", fixtureProposals(), homePageConfig);
     expect(result.manifest!.nodes["home.features.grid"]?.status).toBe("active");
+  });
+});
+
+describe("manifest service: removeNodes (concurrent-safe commit rollback)", () => {
+  it("deletes exactly the given IDs, leaving everything else untouched", () => {
+    const manifest = commit(createManifest(), fixtureProposals(), homePageConfig);
+    const next = removeNodes(manifest, ["home.hero.headline"]);
+    expect(next.nodes["home.hero.headline"]).toBeUndefined();
+    expect(next.nodes["home.hero"]).toBeDefined();
+    expect(Object.keys(next.nodes)).toHaveLength(Object.keys(manifest.nodes).length - 1);
+  });
+
+  it("does not mutate the input manifest", () => {
+    const manifest = commit(createManifest(), fixtureProposals(), homePageConfig);
+    removeNodes(manifest, ["home.hero.headline"]);
+    expect(manifest.nodes["home.hero.headline"]).toBeDefined();
+  });
+
+  it("is a no-op for IDs it does not know about (never erases a concurrent worker's entries)", () => {
+    const manifest = commit(createManifest(), fixtureProposals(), homePageConfig);
+    const next = removeNodes(manifest, ["pricing.tiers.tier-1"]);
+    expect(next.nodes).toEqual(manifest.nodes);
   });
 });
 

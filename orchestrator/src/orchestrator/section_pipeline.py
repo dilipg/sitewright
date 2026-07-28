@@ -13,6 +13,7 @@ input-hash caching can never play back a stale result across retries.
 """
 
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -87,13 +88,21 @@ def materialize(value):
 # ---------- pure helpers (unit-tested) ----------
 
 
-def prepare_workspace_dir(project_dir: str) -> str:
-    """Fixture copy with a blank page: tokens/primitives/shell stay
-    hand-written (M3 stub table); pages/home content, manifest, and
-    overrides are emptied. Full replace — idempotent under replay. The
-    plan/ directory (brief, siteplan, approval) is part of the project's
-    atomic state and survives the reset."""
+DEFAULT_ROUTES = [{"slug": "home", "path": "/"}]
+
+
+def prepare_workspace_dir(project_dir: str, routes: list[dict] | None = None) -> str:
+    """Fixture copy with blank pages: tokens/primitives/shell stay
+    hand-written (M3 stub table); manifest is emptied. Full replace —
+    idempotent under replay. The plan/ directory (brief, siteplan, approval)
+    is part of the project's atomic state and survives the reset.
+
+    `routes` (each {"slug", "path"}) scaffolds an empty pages/<slug>/ +
+    overrides/<slug>.overrides.json for every planned route (build prompt
+    5.3 fan-out) — the fixture itself only ships "home". Defaults to just
+    home for every M3/M4/soak/stress call site that predates multi-route."""
     target = Path(project_dir)
+    resolved_routes = routes if routes is not None else DEFAULT_ROUTES
     preserved_plan: dict[str, str] = {}
     plan_dir = target / "plan"
     if plan_dir.exists():
@@ -109,16 +118,20 @@ def prepare_workspace_dir(project_dir: str) -> str:
         target,
         ignore=shutil.ignore_patterns("node_modules", "dist", "sections", "mock"),
     )
-    home = target / "src" / "pages" / "home"
-    index = home / "index.tsx"
-    index.unlink(missing_ok=True)
+    # the fixture ships only "home"; every other planned route's page dir
+    # must be created fresh
+    (target / "src" / "pages" / "home" / "index.tsx").unlink(missing_ok=True)
+    for route in resolved_routes:
+        (target / "src" / "pages" / route["slug"]).mkdir(parents=True, exist_ok=True)
+
     (target / "manifest.json").write_text(
         json.dumps({"version": 1, "nodes": {}}, indent=2) + "\n", encoding="utf-8"
     )
-    (target / "overrides" / "home.overrides.json").write_text(
-        json.dumps({"version": 1, "route": "/", "overrides": []}, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    for route in resolved_routes:
+        (target / "overrides" / f"{route['slug']}.overrides.json").write_text(
+            json.dumps({"version": 1, "route": route["path"], "overrides": []}, indent=2) + "\n",
+            encoding="utf-8",
+        )
     if preserved_plan:
         plan_dir = target / "plan"
         plan_dir.mkdir(parents=True, exist_ok=True)
@@ -139,6 +152,128 @@ def build_index_source(*, route_slug: str, section_slug: str, component: str) ->
         f"export default function {route_slug.capitalize()}Page() {{\n"
         f'  return <{component} nodeId="{route_slug}.{section_slug}" {{...{data_var}}} />;\n'
         "}\n"
+    )
+
+
+def ensure_route_page_dirs(project_dir: str, routes: list[dict]) -> None:
+    """Idempotent, non-destructive scaffolding for routes BEYOND the ones
+    the initial prepare_workspace already created (which only ever creates
+    "home" — the fixture's one route). Fan-out (build prompt 5.3) calls this
+    after the Design System/Shell agents have already written tokens,
+    primitives, and shell into this same workspace — a full reset here
+    would destroy their output, so this only ever creates what's missing."""
+    target = Path(project_dir)
+    for route in routes:
+        (target / "src" / "pages" / route["slug"]).mkdir(parents=True, exist_ok=True)
+        overrides_path = target / "overrides" / f"{route['slug']}.overrides.json"
+        if not overrides_path.exists():
+            overrides_path.write_text(
+                json.dumps({"version": 1, "route": route["path"], "overrides": []}, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+
+def write_section_files(
+    project_dir: str, *, route_slug: str, component: str, files: dict[str, str]
+) -> list[str]:
+    """Writes one section's files, replacing ONLY that section's own prior
+    attempt (by component name) — never a sibling section's files (contract
+    5.3: a section rewrite fully replaces its own files, never appends, and
+    multiple sections coexist per page once fan-out is in play)."""
+    page = Path(project_dir) / "src" / "pages" / route_slug
+    for stale in (page / "sections" / f"{component}.tsx", page / "mock" / f"{component}.data.ts"):
+        stale.unlink(missing_ok=True)
+
+    written = []
+    for rel_path, content in files.items():
+        target = Path(project_dir) / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8", newline="\n")
+        written.append(rel_path)
+    return sorted(written)
+
+
+def assemble_page_index_source(*, route_slug: str, sections: list[dict]) -> str:
+    """Deterministic multi-section page assembly (pipeline 2.5's per-page
+    assembly step). Each section dict is either {"slug","component"} (a
+    generated section, imported normally) or {"slug","failed": True} (bounded
+    retries exhausted — pipeline 5.4: rendered as a labeled placeholder
+    instead of blocking the rest of the page)."""
+    imports = []
+    renders = []
+    needs_placeholder = False
+    for section in sections:
+        node_id = f"{route_slug}.{section['slug']}"
+        if section.get("failed"):
+            needs_placeholder = True
+            renders.append(f'      <FailedSectionPlaceholder nodeId="{node_id}" />')
+            continue
+        component = section["component"]
+        data_var = component[0].lower() + component[1:] + "Data"
+        imports.append(f'import {{ {data_var} }} from "./mock/{component}.data";')
+        imports.append(f'import {component} from "./sections/{component}";')
+        renders.append(f'      <{component} nodeId="{node_id}" {{...{data_var}}} />')
+
+    if needs_placeholder:
+        imports.insert(0, 'import FailedSectionPlaceholder from "../../lib/FailedSectionPlaceholder";')
+
+    imports_source = "\n".join(imports)
+    renders_source = "\n".join(renders)
+    return (
+        f"{imports_source}\n\n"
+        "/** Page assembly only, no styling decisions (contract section 2). */\n"
+        f"export default function {route_slug.capitalize()}Page() {{\n"
+        "  return (\n"
+        "    <>\n"
+        f"{renders_source}\n"
+        "    </>\n"
+        "  );\n"
+        "}\n"
+    )
+
+
+def files_of(model_result: dict) -> dict[str, str]:
+    """Defensive accessor, same rationale as proposals_of: under retry
+    pressure a live run returned "files" as a JSON-encoded STRING (double-
+    encoded) instead of the native object the tool schema declares — Claude's
+    tool-use does not hard-enforce declared types. Parses that form back into
+    a dict; an unparseable or non-dict result becomes {} (no files written),
+    which the following commit+gates cycle then fails cleanly, driving a
+    retry — never an unhandled AttributeError on `.items()`."""
+    files = model_result["data"].get("files", {})
+    if isinstance(files, str):
+        try:
+            files = json.loads(files)
+        except json.JSONDecodeError:
+            return {}
+    return files if isinstance(files, dict) else {}
+
+
+def proposals_of(model_result: dict) -> list[dict]:
+    """Defensive accessor: the tool schema declares manifestProposals
+    required, but Claude's tool-use does not hard-enforce required fields —
+    the model can still omit it (observed live, under retry pressure with a
+    large failure-report appended). An absent key must become an empty list
+    a downstream check can fail cleanly on, never an unhandled KeyError that
+    crashes the whole page worker mid-fan-out."""
+    return model_result["data"].get("manifestProposals", [])
+
+
+def validate_root_proposal(section_id: str, manifest_proposals: list[dict]) -> str:
+    """Every section must propose a manifest entry for its own root node id
+    (contract 5.2: "child elements carry literal ids"; the root is what the
+    nodeId prop supplies). Without a root proposal the root id never becomes
+    an active manifest node — gate 4 can't catch this during the section's
+    own pre-assembly check (skipMissingCheck exempts root ids precisely
+    because they aren't literally attached yet), so it only surfaces as
+    "unregistered-node-id" at page-assembly time, with no retry budget left.
+    Returns a failure-report line, or "" when the root proposal is present."""
+    if any(proposal["nodeId"] == section_id for proposal in manifest_proposals):
+        return ""
+    return (
+        f'- content: manifestProposals is missing an entry for this section\'s own '
+        f'root node id "{section_id}". Every section must register its own root '
+        "element, not just its children (contract 5.2/5.4)."
     )
 
 
@@ -265,6 +400,7 @@ def generate_section(
     template_version: str,
     template_hash: str,
     prompt_hash: str,
+    section: str = "home.hero",
 ) -> dict:
     result = call_model_structured_impl(
         role="page",
@@ -278,7 +414,7 @@ def generate_section(
         default_run_log_path(run_id),
         run_id=run_id,
         event_type="section.generated",
-        section="home.hero",
+        section=section,
         attempt=attempt,
         template_name=template_name,
         template_version=template_version,
@@ -296,17 +432,19 @@ def generate_section(
 
 
 @checkpoint
-def write_section_output(project_dir: str, model_result: dict, attempt: int) -> dict:
-    """Writes the generated files + deterministic index.tsx. The section's
-    sections/ and mock/ dirs are fully replaced (pipeline 5.3)."""
+def write_section_output(project_dir: str, model_result: dict, attempt: int, route_slug: str = "home") -> dict:
+    """Single-section skeleton path (M3/M4/soak/stress): wipes the whole
+    page (only ever one section) and writes its own index.tsx. Fan-out pages
+    with multiple sections use write_section_only + a separate assembly step
+    instead (a sibling section's files must survive this section's retries)."""
     data = model_result["data"]
-    home = Path(project_dir) / "src" / "pages" / "home"
+    page = Path(project_dir) / "src" / "pages" / route_slug
     for sub in ("sections", "mock"):
-        if (home / sub).exists():
-            shutil.rmtree(home / sub)
+        if (page / sub).exists():
+            shutil.rmtree(page / sub)
 
     written = []
-    for rel_path, content in data["files"].items():
+    for rel_path, content in files_of(model_result).items():
         target = Path(project_dir) / rel_path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8", newline="\n")
@@ -314,32 +452,51 @@ def write_section_output(project_dir: str, model_result: dict, attempt: int) -> 
 
     meta = data["sectionMeta"]
     index_source = build_index_source(
-        route_slug="home", section_slug=meta["slug"], component=meta["component"]
+        route_slug=route_slug, section_slug=meta["slug"], component=meta["component"]
     )
-    (home / "index.tsx").write_text(index_source, encoding="utf-8", newline="\n")
+    (page / "index.tsx").write_text(index_source, encoding="utf-8", newline="\n")
     return {"written": sorted(written), "sectionMeta": meta}
 
 
 @checkpoint
+def write_section_only(project_dir: str, model_result: dict, attempt: int, route_slug: str = "home") -> dict:
+    """Fan-out path: writes just this section's own files (contract 5.3),
+    leaving siblings and page assembly (a separate later step) untouched."""
+    data = model_result["data"]
+    meta = data["sectionMeta"]
+    written = write_section_files(
+        project_dir, route_slug=route_slug, component=meta["component"], files=files_of(model_result)
+    )
+    return {"written": written, "sectionMeta": meta}
+
+
+@checkpoint
 def commit_section_manifest(
-    project_dir: str, model_result: dict, attempt: int, regen_section: str = ""
+    project_dir: str,
+    model_result: dict,
+    attempt: int,
+    regen_section: str = "",
+    owner: str = "page:home",
 ) -> dict:
     """Validates + commits proposals through the manifest service CLI —
-    manifest.json changes only through the service (contract 5.4). On
-    regeneration this is a replace-section commit: surviving IDs update,
-    removed IDs tombstone. Returns the pre-commit manifest so a failed
-    attempt can be rolled back."""
-    manifest_path = Path(project_dir) / "manifest.json"
-    previous = manifest_path.read_text(encoding="utf-8")
-
-    proposals_file = Path(project_dir) / ".proposals.json"
+    manifest.json changes only through the service (contract 5.4), lock-
+    serialized against concurrent page workers (build prompt 5.3 fan-out).
+    On regeneration this is a replace-section commit: surviving IDs update,
+    removed IDs tombstone. The pre-commit snapshot for rollback comes from
+    the CLI's own atomic read (inside its lock) — a Python-side pre-read
+    here would go stale the instant a concurrent worker commits in between,
+    and rolling back to a stale snapshot would erase that worker's commit.
+    """
+    # unique per (project, attempt, owner): concurrent page workers must
+    # never share a proposals file
+    proposals_file = Path(project_dir) / f".proposals-{owner.replace(':', '-')}-{attempt}.json"
     proposals_file.write_text(
-        json.dumps(model_result["data"]["manifestProposals"]), encoding="utf-8"
+        json.dumps(proposals_of(model_result)), encoding="utf-8"
     )
     command = (
-        ["scripts/manifest.ts", "replace-section", project_dir, "--proposals", str(proposals_file), "--owner", "page:home", "--section", regen_section]
+        ["scripts/manifest.ts", "replace-section", project_dir, "--proposals", str(proposals_file), "--owner", owner, "--section", regen_section]
         if regen_section
-        else ["scripts/manifest.ts", "commit", project_dir, "--proposals", str(proposals_file), "--owner", "page:home"]
+        else ["scripts/manifest.ts", "commit", project_dir, "--proposals", str(proposals_file), "--owner", owner]
     )
     result = _run_compiler_cli(command)
     proposals_file.unlink(missing_ok=True)
@@ -351,7 +508,7 @@ def commit_section_manifest(
         "ok": payload["ok"],
         "issues": payload["issues"],
         "tombstoned": payload.get("tombstoned", []),
-        "previous_manifest": previous,
+        "previous_manifest": payload["previousManifest"],
     }
 
 
@@ -362,11 +519,32 @@ def run_gates_step(
     attempt: int,
     model_result: dict | None = None,
     overridden_ids: list[str] | None = None,
+    section: str = "home.hero",
+    scope_route: str | None = None,
+    skip_missing_check: bool = False,
 ) -> dict:
     """Gates 1-6, plus gate 7 on regeneration runs (overridden_ids present):
     every previously-overridden ID must be attached in the output or declared
-    in the agent's orphanedOverrides."""
+    in the agent's orphanedOverrides.
+
+    scope_route (fan-out, build prompt 5.3): restricts gate 4 to this route
+    so a section's own check can't fail on a SIBLING page worker's transient
+    mid-commit state elsewhere in the same concurrently-mutating project.
+
+    skip_missing_check: a section's own root node id is only literally
+    attached once the PAGE is assembled (index.tsx's `<Hero nodeId="home.hero" />`);
+    inside the section file itself the root carries `data-node-id={nodeId}`,
+    a JSX expression by contract design, never a literal. In fan-out, a
+    section's own gate check runs before assembly, so without this flag the
+    root would always look "missing" regardless of scoping. Child ids stay
+    fully checked. assemble_page's own (post-assembly) gate check never
+    passes this.
+    """
     args = ["scripts/gates.ts", project_dir, "--json"]
+    if scope_route is not None:
+        args += ["--scope-route", scope_route]
+    if skip_missing_check:
+        args += ["--skip-missing-check"]
     declared_orphans: list[str] = []
     regen_file = Path(project_dir) / ".regen-context.json"
     if overridden_ids:
@@ -390,7 +568,7 @@ def run_gates_step(
         default_run_log_path(run_id),
         run_id=run_id,
         event_type="section.validated",
-        section="home.hero",
+        section=section,
         attempt=attempt,
         gate_results={
             "passed": report["passed"],
@@ -403,10 +581,33 @@ def run_gates_step(
 
 
 @checkpoint
-def rollback_manifest(project_dir: str, previous_manifest: str, attempt: int) -> bool:
-    """Restores the manifest service's pre-attempt state after a failed
-    attempt: proposals only stay committed at section.validated."""
-    (Path(project_dir) / "manifest.json").write_text(previous_manifest, encoding="utf-8")
+def rollback_manifest(
+    project_dir: str,
+    previous_manifest: str,
+    attempt: int,
+    proposals: list[dict] | None = None,
+    owner: str = "page:home",
+) -> bool:
+    """Undoes a failed attempt's commit: proposals only stay committed at
+    section.validated (contract 5.3).
+
+    First-generation commits (proposals given, the fan-out path) undo via
+    the manifest CLI's rollback-commit — lock-protected deletion of exactly
+    this attempt's own node IDs, so a concurrent sibling page worker's
+    commit landing in between is never erased. Regeneration commits (no
+    proposals — replace-section can update an EXISTING node in place, so
+    "just delete the new IDs" would lose the original entry) fall back to
+    restoring the pre-attempt snapshot directly; regen is always a single
+    interactive session, never concurrent, so this stays safe."""
+    if proposals is not None:
+        proposals_file = Path(project_dir) / f".rollback-{owner.replace(':', '-')}-{attempt}.json"
+        proposals_file.write_text(json.dumps(proposals), encoding="utf-8")
+        _run_compiler_cli(
+            ["scripts/manifest.ts", "rollback-commit", project_dir, "--proposals", str(proposals_file), "--owner", owner]
+        )
+        proposals_file.unlink(missing_ok=True)
+    else:
+        (Path(project_dir) / "manifest.json").write_text(previous_manifest, encoding="utf-8")
     return True
 
 
@@ -422,15 +623,36 @@ def generate_section_flow(
     regen_overridden_ids: list[str] | None = None,
     workspace_token: str = "",
     reuse_workspace: bool = False,
+    route_slug: str = "home",
+    route_path: str = "/",
+    section_slug: str = "hero",
+    archetype: str = "hero",
+    prior_sections_text: str = "(none — this is the first section on the page)",
+    route_table_text: str = "",
+    assemble_index: bool = True,
+    crash_after_model_call: bool = False,
 ) -> dict:
     """First generation by default; a regeneration is this same flow forked
     via Kitaru replay-with-overrides at the generate_section checkpoint with
     regen_block/regen_overridden_ids overridden (pipeline 5.5). Retries
-    inside a regen keep both the regen context and the failure report."""
+    inside a regen keep both the regen context and the failure report.
+
+    Reused per-section by page fan-out (build prompt 5.3, pipeline 2.5): a
+    route's N sections are N separate executions of THIS flow (route_slug/
+    section_slug/archetype/assemble_index=False), each independently
+    checkpointed and resumable — the page-level "worker" is the orchestrating
+    caller looping over them, not a single monolithic flow. assemble_index
+    controls whether this call also writes the page's index.tsx (the M3
+    single-section skeleton's own behavior) or leaves assembly to a later,
+    separate step once every section on the page has completed.
+    """
     print(f"exec_id: {kitaru.current_execution_id()}", flush=True)
     is_regen = regen_block != FIRST_GENERATION_REGEN_BLOCK
-    # reuse_workspace: a Design System Agent already built this workspace —
-    # do not reset it back to the fixture (build prompt 5.2 re-pointing)
+    owner = f"page:{route_slug}"
+    section_id = f"{route_slug}.{section_slug}"
+    # reuse_workspace: an earlier stage (Design System/Shell Agent, or an
+    # already-prepared multi-route workspace) built this project — do not
+    # reset it back to the fixture (build prompt 5.2 re-pointing)
     project_dir = (
         str(GENERATED_DIR / run_id)
         if reuse_workspace
@@ -448,21 +670,25 @@ def generate_section_flow(
         context_tokens = fixture_tokens()
         context_signatures = fixture_primitive_signatures()
 
-    template = load_template("hero")
-    rendered = render_template(
-        template,
-        {
-            "design_context": build_design_context(context_tokens, context_signatures),
-            "route_slug": "home",
-            "route_path": "/",
-            "page_brief": page_brief,
-            "prior_sections": "(none — this is the first section on the page)",
-            "route_table": fixture_route_table(),
-            "section_slug": "hero",
-            "section_brief": section_brief,
-            "regen_block": regen_block,
-        },
-    )
+    from orchestrator.catalog import ARCHETYPE_CATALOG
+    from orchestrator.page_pipeline import select_template
+
+    template = select_template(archetype)
+    context = {
+        "design_context": build_design_context(context_tokens, context_signatures),
+        "route_slug": route_slug,
+        "route_path": route_path,
+        "page_brief": page_brief,
+        "prior_sections": prior_sections_text,
+        "route_table": route_table_text or fixture_route_table(),
+        "section_slug": section_slug,
+        "section_brief": section_brief,
+        "regen_block": regen_block,
+    }
+    if template.archetype == "generic-section":
+        context["archetype_name"] = archetype
+        context["archetype_description"] = ARCHETYPE_CATALOG.get(archetype, "a page section")
+    rendered = render_template(template, context)
 
     failure_report = ""
     for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -476,12 +702,32 @@ def generate_section_flow(
             template_version=rendered.template_version,
             template_hash=rendered.template_hash,
             prompt_hash=rendered.prompt_hash,
+            section=section_id,
         )
-        write_section_output(project_dir, generated, attempt)
+        if crash_after_model_call and not kitaru.is_replay():
+            # testing hook (build prompt 5.3 crash test): same guarded
+            # os._exit pattern proven in 3.1's demo.py — is_replay() keeps a
+            # resumed execution from crashing itself again
+            print("simulated crash (kill -9) mid-section, after the model call", flush=True)
+            os._exit(13)
+
+        root_failure = validate_root_proposal(section_id, proposals_of(materialize(generated)))
+        if root_failure:
+            failure_report = root_failure
+            continue
+
+        if assemble_index:
+            write_section_output(project_dir, generated, attempt, route_slug=route_slug)
+        else:
+            write_section_only(project_dir, generated, attempt, route_slug=route_slug)
 
         manifest_result = materialize(
             commit_section_manifest(
-                project_dir, generated, attempt, regen_section="home.hero" if is_regen else ""
+                project_dir,
+                generated,
+                attempt,
+                regen_section=section_id if is_regen else "",
+                owner=owner,
             )
         )
         if not manifest_result["ok"]:
@@ -497,6 +743,14 @@ def generate_section_flow(
                 attempt,
                 model_result=generated if is_regen else None,
                 overridden_ids=regen_overridden_ids if is_regen else None,
+                section=section_id,
+                # fan-out (assemble_index=False): sibling page workers are
+                # concurrently mutating the rest of the project, so this
+                # section's own check must be scoped to its own route, and
+                # its own root id isn't literally attached until the page
+                # is assembled later — see run_gates_step's doc comment
+                scope_route=None if assemble_index else route_slug,
+                skip_missing_check=not assemble_index,
             )
         )
         if report["passed"]:
@@ -506,12 +760,30 @@ def generate_section_flow(
                 "project_dir": project_dir,
                 "orphanedOverrides": report.get("declaredOrphans", []),
                 "tombstoned": manifest_result.get("tombstoned", []),
+                "sectionMeta": materialize(generated)["data"]["sectionMeta"],
             }
 
         failure_report = format_gate_failures(report)
-        rollback_manifest(project_dir, manifest_result["previous_manifest"], attempt)
+        rollback_manifest(
+            project_dir,
+            manifest_result["previous_manifest"],
+            attempt,
+            proposals=None if is_regen else proposals_of(materialize(generated)),
+            owner=owner,
+        )
 
-    # max retries exhausted: surfaced to the caller; the site continues (pipeline 5.4)
+    # max retries exhausted: surfaced to the caller; the site continues
+    # (pipeline 5.4). In fan-out mode nothing will ever reference this
+    # section again — its last (failed) attempt's own files must not
+    # linger on disk, or their still-present data-node-id attributes trip
+    # gate 4 forever even though the page assembles a placeholder instead.
+    if not assemble_index:
+        last_component = materialize(generated)["data"].get("sectionMeta", {}).get("component")
+        if last_component:
+            page = Path(project_dir) / "src" / "pages" / route_slug
+            (page / "sections" / f"{last_component}.tsx").unlink(missing_ok=True)
+            (page / "mock" / f"{last_component}.data.ts").unlink(missing_ok=True)
+
     return {
         "passed": False,
         "attempts": MAX_ATTEMPTS,

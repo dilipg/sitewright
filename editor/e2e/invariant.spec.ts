@@ -34,6 +34,16 @@ const MAX_DIFF_RATIO = 0.01;
 const previewShots = new Map<string, Buffer>();
 const exportShots = new Map<string, Buffer>();
 
+// The default 1280px viewport isn't wide enough for the 1280px-wide canvas
+// stage plus the 280px inspector panel (same issue layout.spec.ts documents)
+// — a layout-drag case's move-handle can fall outside the interactable
+// viewport, or its click coordinates can resolve against a partially
+// off-screen element. previewPage/exportPage (bare page loads of the actual
+// site, not the editor) inherit the same viewport, which is fine: the
+// comparison is preview vs export at matching width, not against a fixed
+// absolute size.
+test.use({ viewport: { width: 1700, height: 900 } });
+
 test.describe.configure({ mode: "serial" });
 
 test("apply all invariant-case edits in the editor and capture preview nodes", async ({ page }) => {
@@ -97,6 +107,10 @@ test("export builds and the same nodes render in the served export", async ({ pa
     await exportPage.goto(`http://localhost:${EXPORT_PORT}/`);
     for (const invariantCase of INVARIANT_CASES) {
       const locator = exportPage.locator(`[data-node-id="${invariantCase.screenshotNode}"]`);
+      if (invariantCase.expectRemovedFromExport === true) {
+        await expect(locator).toHaveCount(0);
+        continue;
+      }
       await expect(locator).toBeVisible();
       exportShots.set(invariantCase.name, await locator.screenshot());
     }
@@ -107,6 +121,15 @@ test("export builds and the same nodes render in the served export", async ({ pa
 });
 
 for (const invariantCase of INVARIANT_CASES) {
+  if (invariantCase.expectRemovedFromExport === true) {
+    test(`removed-from-export: ${invariantCase.name}`, () => {
+      // The absence assertion already ran in the "export builds..." step
+      // above (must happen before the export server closes); this test
+      // exists so a visibility case still gets its own pass/fail line.
+      expect(exportShots.has(invariantCase.name), "expected no export screenshot for a removed node").toBe(false);
+    });
+    continue;
+  }
   test(`pixel-diff: ${invariantCase.name}`, () => {
     const previewShot = previewShots.get(invariantCase.name);
     const exportShot = exportShots.get(invariantCase.name);

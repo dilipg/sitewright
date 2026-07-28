@@ -15,6 +15,15 @@ export interface BoxEdges {
   left: number;
 }
 
+export interface TextStyle {
+  fontFamily: string;
+  fontSize: string;
+  fontWeight: string;
+  lineHeight: string;
+  color: string;
+  textAlign: string;
+}
+
 export interface NodeGeometry {
   nodeId: string;
   /**
@@ -26,6 +35,8 @@ export interface NodeGeometry {
   rect: { x: number; y: number; width: number; height: number };
   /** Computed padding/margin in px — drives the inspector's spacing overlay. */
   spacing: { padding: BoxEdges; margin: BoxEdges };
+  /** Computed text style — lets the text-channel edit overlay render "styled exactly as rendered" (PRD 3.1) from the cross-origin parent document. */
+  textStyle: TextStyle;
 }
 
 export interface ShimOverride {
@@ -51,7 +62,15 @@ export interface NodeHitMessage {
   type: "node:hit";
   protocolVersion: number;
   nodeId: string;
-  kind: "click" | "hover";
+  kind: "click" | "hover" | "dblclick";
+  /**
+   * Current rendered text content — sent only for "dblclick" (PRD 3.1: text
+   * channel activation). The editor is cross-origin and cannot read the
+   * frame's DOM directly, so the shim carries the value the inline
+   * contentEditable overlay should pre-fill, reflecting any already-applied
+   * text override.
+   */
+  text?: string;
 }
 
 export type ShimToParentMessage = FrameReadyMessage | NodesGeometryMessage | NodeHitMessage;

@@ -27,6 +27,16 @@ let geometryScheduled = false;
 let lastReportedCount = 0;
 let lastHoverId: string | undefined;
 const originalTexts = new Map<Element, string>();
+/**
+ * The last overrides list received from the parent. `overrides:apply` can
+ * race React's own mount inside the frame — the node a given override
+ * targets may not exist in the DOM yet when the message arrives, so the
+ * override is silently unappliable at that instant. Remembering it and
+ * re-running applyOverrides whenever reindex() sees new [data-node-id]
+ * elements (below) catches those nodes up once they do mount, instead of
+ * dropping the override forever.
+ */
+let lastOverrides: ShimOverride[] = [];
 
 const overrideSheet = document.createElement("style");
 overrideSheet.setAttribute("data-wg-shim", "overrides");
@@ -71,6 +81,14 @@ function reportGeometry(): void {
           left: parseFloat(computed.marginLeft),
         },
       },
+      textStyle: {
+        fontFamily: computed.fontFamily,
+        fontSize: computed.fontSize,
+        fontWeight: computed.fontWeight,
+        lineHeight: computed.lineHeight,
+        color: computed.color,
+        textAlign: computed.textAlign,
+      },
     };
   });
   // Before the app mounts there is nothing to report; stay quiet so the
@@ -85,11 +103,16 @@ function reindex(): void {
   resizeObserver.observe(document.documentElement);
   for (const element of indexedNodes()) resizeObserver.observe(element);
   scheduleGeometryReport();
+  // catches up any node that mounted after the last overrides:apply message
+  // (see lastOverrides doc comment); applyOverrides' own writes are
+  // idempotent, so this never fights the mutation observer that triggers it
+  applyOverrides(lastOverrides);
 }
 
 /* ---------- overrides ---------- */
 
 function applyOverrides(overrides: ShimOverride[]): void {
+  lastOverrides = overrides;
   applyTextOverrides(overrides);
 
   const rules: string[] = [];
@@ -101,7 +124,17 @@ function applyOverrides(overrides: ShimOverride[]): void {
         .join(" ");
       rules.push(`${selector} { ${declarations} }`);
     } else if (override.channel === "visibility" && override.value !== false) {
-      rules.push(`${selector} { display: none !important; }`);
+      // PRD 3.4: hidden nodes render ghosted in edit mode (still visible and
+      // selectable, so the user can find and un-hide them) and are only
+      // fully removed in interact mode, matching how the export compiles
+      // them out entirely (contract 6.1) — the same distinction the exported
+      // build itself has no edit mode for, so it always gets the interact
+      // behavior.
+      rules.push(
+        mode === "interact"
+          ? `${selector} { display: none !important; }`
+          : `${selector} { opacity: 0.35 !important; outline: 1px dashed currentColor !important; outline-offset: -1px !important; }`,
+      );
     }
   }
   overrideSheet.textContent = rules.join("\n");
@@ -118,7 +151,10 @@ function applyTextOverrides(overrides: ShimOverride[]): void {
   for (const [element, original] of originalTexts) {
     const nodeId = element.getAttribute("data-node-id");
     if (nodeId === null || !textByNode.has(nodeId)) {
-      element.textContent = original;
+      // idempotent: reindex() re-runs this on every DOM mutation it observes
+      // (to catch up late-mounting nodes) — an unconditional write here would
+      // re-trigger that same observer every time, looping forever
+      if (element.textContent !== original) element.textContent = original;
       originalTexts.delete(element);
     }
   }
@@ -126,7 +162,7 @@ function applyTextOverrides(overrides: ShimOverride[]): void {
     const element = document.querySelector(`[data-node-id="${nodeId}"]`);
     if (element === null) continue;
     if (!originalTexts.has(element)) originalTexts.set(element, element.textContent ?? "");
-    element.textContent = text;
+    if (element.textContent !== text) element.textContent = text;
   }
 }
 
@@ -156,6 +192,26 @@ document.addEventListener(
     if (nodeId !== undefined) {
       post({ type: "node:hit", protocolVersion: PROTOCOL_VERSION, nodeId, kind: "click" });
     }
+  },
+  true,
+);
+
+document.addEventListener(
+  "dblclick",
+  (event) => {
+    if (mode !== "edit") return;
+    event.preventDefault();
+    event.stopPropagation();
+    const nodeId = nearestNodeId(event.target);
+    if (nodeId === undefined) return;
+    const element = document.querySelector(`[data-node-id="${nodeId}"]`);
+    post({
+      type: "node:hit",
+      protocolVersion: PROTOCOL_VERSION,
+      nodeId,
+      kind: "dblclick",
+      text: element?.textContent ?? "",
+    });
   },
   true,
 );
@@ -193,6 +249,7 @@ window.addEventListener("message", (event) => {
     applyOverrides(data.overrides);
   } else if (data.type === "mode:set") {
     mode = data.mode;
+    applyOverrides(lastOverrides); // refresh visibility's mode-dependent rule
   }
 });
 

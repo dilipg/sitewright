@@ -366,7 +366,7 @@ def write_primitives(project_dir: str, primitives_result: dict, attempt: int) ->
     ensure_node_modules(project)
     tsc = subprocess.run(
         ["cmd", "/c", "npx", "tsc", "--noEmit"],
-        cwd=project, capture_output=True, text=True, timeout=300,
+        cwd=project, capture_output=True, text=True, encoding="utf-8", timeout=300,
     )
     issues: list[str] = []
     if tsc.returncode != 0:

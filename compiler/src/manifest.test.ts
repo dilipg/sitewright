@@ -12,16 +12,30 @@ function fixtureManifest(): Manifest {
   return JSON.parse(readFileSync(fixtureManifestPath, "utf8")) as Manifest;
 }
 
-/** Rebuilds the fixture's manifest entries as agent-style proposals. */
+/** Rebuilds the fixture's home-page entries as agent-style proposals, scoped
+ * to "home." — these tests exercise a single page agent (homePageConfig,
+ * below) whose ownership boundary is src/pages/home/; the fixture also
+ * carries an "about" page owned by a different agent (contract section 2:
+ * one writer per path), which a home-page agent's proposals must exclude. */
 function fixtureProposals(): ManifestEntryProposal[] {
-  return Object.entries(fixtureManifest().nodes).map(([nodeId, node]) => ({
-    nodeId,
-    route: node.route,
-    file: node.file,
-    component: node.component,
-    element: node.element,
-    editable: node.editable,
-  }));
+  return Object.entries(fixtureManifest().nodes)
+    .filter(([nodeId]) => nodeId.startsWith("home."))
+    .map(([nodeId, node]) => ({
+      nodeId,
+      route: node.route,
+      file: node.file,
+      component: node.component,
+      element: node.element,
+      editable: node.editable,
+    }));
+}
+
+/** Scoped to just the hero section — the fixture's home page now carries six
+ * sections (one per catalog archetype, for the invariant suite's coverage),
+ * but replaceSection's own job is regenerating exactly ONE section, so its
+ * tests need proposals for that one section, not the whole page. */
+function heroProposals(): ManifestEntryProposal[] {
+  return fixtureProposals().filter((p) => p.nodeId === "home.hero" || p.nodeId.startsWith("home.hero."));
 }
 
 const homePageConfig = {
@@ -36,9 +50,12 @@ describe("manifest service: round-trip against the fixture", () => {
     expect(result.valid).toBe(true);
   });
 
-  it("commit reproduces the fixture manifest exactly", () => {
+  it("commit reproduces the fixture's home-page entries exactly", () => {
     const committed = commit(createManifest(), fixtureProposals(), homePageConfig);
-    expect(committed).toEqual(fixtureManifest());
+    const expectedNodes = Object.fromEntries(
+      Object.entries(fixtureManifest().nodes).filter(([nodeId]) => nodeId.startsWith("home.")),
+    );
+    expect(committed.nodes).toEqual(expectedNodes);
   });
 
   it("commit does not mutate the input manifest", () => {
@@ -182,7 +199,7 @@ describe("manifest service: replaceSection (regeneration)", () => {
 
   it("updates surviving IDs, adds new ones, tombstones the removed", () => {
     const manifest = committedManifest();
-    const proposals = fixtureProposals()
+    const proposals = heroProposals()
       .filter((p) => p.nodeId !== "home.hero.subheadline")
       .concat([
         {
@@ -204,7 +221,7 @@ describe("manifest service: replaceSection (regeneration)", () => {
 
   it("does not trip the duplicate-id guard for surviving section IDs", () => {
     const manifest = committedManifest();
-    const result = replaceSection(manifest, "home.hero", fixtureProposals(), homePageConfig);
+    const result = replaceSection(manifest, "home.hero", heroProposals(), homePageConfig);
     expect(result.ok).toBe(true);
     expect(result.tombstoned).toEqual([]);
   });
@@ -223,11 +240,11 @@ describe("manifest service: replaceSection (regeneration)", () => {
     manifest = replaceSection(
       manifest,
       "home.hero",
-      fixtureProposals().filter((p) => p.nodeId !== "home.hero.subheadline"),
+      heroProposals().filter((p) => p.nodeId !== "home.hero.subheadline"),
       homePageConfig,
     ).manifest!;
     // second regen tries to resurrect it as a different file/component
-    const resurrect = fixtureProposals().map((p) =>
+    const resurrect = heroProposals().map((p) =>
       p.nodeId === "home.hero.subheadline"
         ? { ...p, file: "src/pages/home/sections/Intro.tsx", component: "Intro" }
         : p,
@@ -252,7 +269,7 @@ describe("manifest service: replaceSection (regeneration)", () => {
       ],
       homePageConfig,
     );
-    const result = replaceSection(manifest, "home.hero", fixtureProposals(), homePageConfig);
+    const result = replaceSection(manifest, "home.hero", heroProposals(), homePageConfig);
     expect(result.manifest!.nodes["home.features.grid"]?.status).toBe("active");
   });
 });

@@ -7,9 +7,15 @@ import { PROTOCOL_VERSION } from "../src/shim/protocol.ts";
 const manifestPath = fileURLToPath(
   new URL("../../fixtures/acme-landing/manifest.json", import.meta.url),
 );
-const manifestNodeIds = Object.keys(
-  (JSON.parse(readFileSync(manifestPath, "utf8")) as { nodes: Record<string, unknown> }).nodes,
-).sort();
+type FixtureManifest = { nodes: Record<string, { route: string }> };
+const fixtureManifest = JSON.parse(readFileSync(manifestPath, "utf8")) as FixtureManifest;
+// These tests only ever navigate to "/" (home) — scope expected node ids to
+// that route; the fixture also carries an "about" route the shim never
+// mounts here.
+const manifestNodeIds = Object.entries(fixtureManifest.nodes)
+  .filter(([, node]) => node.route === "/")
+  .map(([nodeId]) => nodeId)
+  .sort();
 
 declare global {
   interface Window {
@@ -72,6 +78,17 @@ test("geometry report covers every manifest node with non-empty rects", async ({
   }
 });
 
+test("geometry report carries computed text style for the edit overlay (PRD 3.1)", async ({ page }) => {
+  await page.waitForFunction(() => window.__shimMessages.some((m) => m.type === "nodes:geometry"));
+  const geometry = (await latestMessage(page, "nodes:geometry")) as
+    | { nodes: Array<{ nodeId: string; textStyle: { fontFamily: string; fontSize: string; color: string } }> }
+    | undefined;
+  const headline = geometry!.nodes.find((n) => n.nodeId === "home.hero.headline");
+  expect(headline?.textStyle.fontFamily).toBeTruthy();
+  expect(headline?.textStyle.fontSize).toMatch(/px$/);
+  expect(headline?.textStyle.color).toMatch(/^rgb/);
+});
+
 test("style override applies via injected stylesheet", async ({ page }) => {
   await applyOverrides(page, [
     { nodeId: "home.hero", channel: "style", value: { background: "color.semantic.accent" } },
@@ -106,13 +123,39 @@ test("text override substitutes content and an empty list restores the original"
   await expect(headline).toHaveText(original!);
 });
 
-test("visibility override hides the element", async ({ page }) => {
+test("visibility override ghosts (not hides) the element in edit mode (PRD 3.4)", async ({ page }) => {
   const subheadline = page.locator('[data-node-id="home.hero.subheadline"]');
   await expect(subheadline).toBeVisible();
   await applyOverrides(page, [
     { nodeId: "home.hero.subheadline", channel: "visibility", value: true },
   ]);
+  // still visible and selectable — a hidden node must stay findable to be
+  // un-hidden again, unlike interact mode / export, which remove it outright
+  await expect(subheadline).toBeVisible();
+  await expect
+    .poll(() => subheadline.evaluate((el) => getComputedStyle(el).opacity))
+    .toBe("0.35");
+});
+
+test("visibility override fully hides the element in interact mode", async ({ page }) => {
+  const subheadline = page.locator('[data-node-id="home.hero.subheadline"]');
+  await applyOverrides(page, [
+    { nodeId: "home.hero.subheadline", channel: "visibility", value: true },
+  ]);
+  await expect(subheadline).toBeVisible(); // ghosted in edit mode first
+  await setMode(page, "interact");
   await expect(subheadline).toBeHidden();
+});
+
+test("switching back to edit mode un-ghosts a visibility override that was hidden in interact mode", async ({ page }) => {
+  const subheadline = page.locator('[data-node-id="home.hero.subheadline"]');
+  await applyOverrides(page, [
+    { nodeId: "home.hero.subheadline", channel: "visibility", value: true },
+  ]);
+  await setMode(page, "interact");
+  await expect(subheadline).toBeHidden();
+  await setMode(page, "edit");
+  await expect(subheadline).toBeVisible();
 });
 
 test("edit mode suppresses navigation and forwards node hits", async ({ page }) => {
@@ -131,6 +174,36 @@ test("edit mode suppresses navigation and forwards node hits", async ({ page }) 
   );
   const hit = (await latestMessage(page, "node:hit")) as { kind: string } | undefined;
   expect(hit?.kind).toBe("click");
+});
+
+test("double-click forwards a dblclick node hit carrying the current text", async ({ page }) => {
+  const headline = page.locator('[data-node-id="home.hero.headline"]');
+  const original = await headline.textContent();
+
+  await headline.dblclick();
+  await page.waitForFunction(() =>
+    window.__shimMessages.some((m) => m.type === "node:hit" && m["kind"] === "dblclick"),
+  );
+  const hit = (await latestMessage(page, "node:hit")) as
+    | { nodeId: string; kind: string; text: string }
+    | undefined;
+  expect(hit?.nodeId).toBe("home.hero.headline");
+  expect(hit?.text).toBe(original);
+});
+
+test("double-click on a node with an active text override carries the overridden text", async ({ page }) => {
+  await applyOverrides(page, [
+    { nodeId: "home.hero.headline", channel: "text", value: "Already overridden" },
+  ]);
+  const headline = page.locator('[data-node-id="home.hero.headline"]');
+  await expect(headline).toHaveText("Already overridden");
+
+  await headline.dblclick();
+  await page.waitForFunction(() =>
+    window.__shimMessages.some((m) => m.type === "node:hit" && m["kind"] === "dblclick"),
+  );
+  const hit = (await latestMessage(page, "node:hit")) as { text: string } | undefined;
+  expect(hit?.text).toBe("Already overridden");
 });
 
 test("interact mode restores real navigation", async ({ page }) => {

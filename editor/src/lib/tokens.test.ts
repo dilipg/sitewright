@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { isTokenRef, resolveTokenValue, scaleKeys, semanticColorOptions, tokenPathSet } from "./tokens";
+import {
+  isTokenRef,
+  nearestSpaceStep,
+  resolveTokenValue,
+  scaleKeys,
+  semanticColorOptions,
+  tokenPathSet,
+} from "./tokens";
 
 const tokens = {
   color: {
@@ -51,6 +58,24 @@ describe("scaleKeys", () => {
   it("returns ordered keys for a token group", () => {
     expect(scaleKeys(tokens, ["space"])).toEqual(["0", "4", "8"]);
     expect(scaleKeys(tokens, ["typography", "scale"])).toEqual(["sm", "base", "lg"]);
+  });
+});
+
+describe("nearestSpaceStep", () => {
+  // space: 0 -> 0px, 4 -> 1rem (16px), 8 -> 2rem (32px)
+  it("snaps a raw pixel delta to the nearest space-scale magnitude, in px", () => {
+    expect(nearestSpaceStep(tokens, 0)).toBe(0);
+    expect(nearestSpaceStep(tokens, 20)).toBe(16); // closer to 16 than to 32
+    expect(nearestSpaceStep(tokens, 30)).toBe(32); // closer to 32 than to 16
+  });
+
+  it("preserves the sign of the input", () => {
+    expect(nearestSpaceStep(tokens, -20)).toBe(-16);
+  });
+
+  it("clamps to the largest available step when the delta exceeds every step", () => {
+    expect(nearestSpaceStep(tokens, 1000)).toBe(32);
+    expect(nearestSpaceStep(tokens, -1000)).toBe(-32);
   });
 });
 

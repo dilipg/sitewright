@@ -45,6 +45,26 @@ export function scaleKeys(tokens: TokensJson, groupPath: string[]): string[] {
   return Object.keys(group);
 }
 
+/**
+ * Snaps a raw pixel delta (from a drag/resize gesture) to the nearest
+ * space-scale magnitude, in px, preserving sign (PRD 3.3: "gestures snap to
+ * the space scale"). The layout channel stores computed px deltas, not
+ * token paths — the SNAP quantizes the gesture to the design system's
+ * rhythm, it doesn't require the final value to resolve to a clean token.
+ */
+export function nearestSpaceStep(tokens: TokensJson, rawDeltaPx: number): number {
+  const magnitudes = scaleKeys(tokens, ["space"])
+    .map((key) => resolveTokenValue(tokens, `space.${key}`))
+    .filter((value): value is string | number => value !== undefined)
+    .map((value) => parseFloat(String(value)) * (String(value).endsWith("rem") ? 16 : 1));
+  if (magnitudes.length === 0) return rawDeltaPx;
+  const target = Math.abs(rawDeltaPx);
+  const nearest = magnitudes.reduce((best, candidate) =>
+    Math.abs(candidate - target) < Math.abs(best - target) ? candidate : best,
+  );
+  return Math.sign(rawDeltaPx) * nearest;
+}
+
 export function tokenPathSet(tokens: TokensJson): Set<string> {
   const paths = new Set<string>();
   collectPaths(tokens, [], paths);

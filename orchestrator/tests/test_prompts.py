@@ -83,3 +83,21 @@ def test_no_unresolved_placeholders_survive_rendering() -> None:
     rendered = render_template(template, fixture_render_context())
     assert "{{" not in rendered.system
     assert "{{" not in rendered.user
+
+
+NEW_5_4_ARCHETYPES = ["feature-grid", "cta-band", "pricing-tiers", "faq-accordion", "social-proof"]
+
+
+@pytest.mark.parametrize("archetype", NEW_5_4_ARCHETYPES)
+def test_new_archetype_templates_load_and_render_cleanly(archetype: str) -> None:
+    template = load_template(archetype)
+    assert template.archetype == archetype
+    assert template.version.count(".") == 2
+
+    context = fixture_render_context() | {"section_slug": archetype, "section_brief": f"Test brief for {archetype}."}
+    rendered = render_template(template, context)
+    assert "{{" not in rendered.system
+    assert "{{" not in rendered.user
+    # canonical example must be present (few-shot quality bar, pipeline 4.1)
+    assert "Canonical example" in rendered.user
+    assert "manifestProposals for that example" in rendered.user

@@ -71,23 +71,58 @@ body {
 
 .stage {
   flex: 1;
-  overflow: auto;
-  padding: 24px;
+  position: relative;
+  overflow: hidden;
+  cursor: grab;
+}
+
+.stage:active {
+  cursor: grabbing;
+}
+
+/* The transformed layer (PRD 2.1: DOM-based, CSS-transformed pan/zoom
+   stage) — frame-wraps are absolutely positioned children, so this element
+   has no intrinsic size of its own and never intercepts background clicks. */
+.canvas-surface {
+  position: absolute;
+  top: 0;
+  left: 0;
+  transform-origin: 0 0;
 }
 
 .frame-wrap {
-  position: relative;
-  width: 1280px;
-  height: 100%;
-  min-height: 600px;
+  position: absolute;
+  top: 0;
+}
+
+.frame-label {
+  position: absolute;
+  top: -24px;
+  left: 0;
+  font-size: 12px;
+  color: #9a9aa8;
+  white-space: nowrap;
 }
 
 .preview-frame {
-  width: 1280px;
+  width: 100%;
   height: 100%;
   border: 0;
   background: white;
   display: block;
+}
+
+.frame-placeholder {
+  width: 100%;
+  height: 100%;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #1c1c22;
+  border: 1px dashed #3a3a46;
+  color: #666672;
+  font-size: 13px;
 }
 
 .overlay {
@@ -120,12 +155,84 @@ body {
   border: 2px solid #4f8ef7;
 }
 
+.move-handle {
+  /* Inset within the element's own bounds, not protruding above it — a
+     handle positioned outside the selection box gets clipped by .overlay's
+     overflow:hidden whenever the selected element sits at the top of the
+     page (e.g. a hero section), which is a common case, not an edge case. */
+  position: absolute;
+  left: 6px;
+  top: 6px;
+  width: 20px;
+  height: 16px;
+  border-radius: 3px;
+  background: #4f8ef7;
+  pointer-events: auto;
+  cursor: move;
+}
+
+.move-handle::before {
+  content: "";
+  position: absolute;
+  inset: 4px 5px;
+  background:
+    radial-gradient(circle, white 1px, transparent 1.2px) 0 0 / 6px 6px,
+    radial-gradient(circle, white 1px, transparent 1.2px) 0 100% / 6px 6px;
+  background-repeat: repeat-x;
+}
+
 .handle {
   position: absolute;
   width: 8px;
   height: 8px;
   background: white;
   border: 1px solid #4f8ef7;
+  pointer-events: auto;
+}
+
+.handle-n, .handle-s { cursor: ns-resize; }
+.handle-e, .handle-w { cursor: ew-resize; }
+.handle-nw, .handle-se { cursor: nwse-resize; }
+.handle-ne, .handle-sw { cursor: nesw-resize; }
+
+.drag-ghost {
+  position: absolute;
+  pointer-events: none;
+  border: 2px dashed #4f8ef7;
+  background: rgba(79, 142, 247, 0.1);
+}
+
+.drag-ghost.rejected {
+  border-color: #e35d5d;
+  background: rgba(227, 93, 93, 0.1);
+}
+
+.gesture-toast {
+  position: absolute;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #26262e;
+  color: white;
+  padding: 8px 16px;
+  border-radius: 6px;
+  font-size: 13px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+.text-edit-overlay {
+  position: absolute;
+  pointer-events: auto;
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  border: 2px solid #4f8ef7;
+  border-radius: 2px;
+  background: white;
+  outline: none;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .handle-nw { left: -5px; top: -5px; }
@@ -213,6 +320,46 @@ body {
 .header-actions button:disabled {
   opacity: 0.4;
   cursor: default;
+}
+
+.mode-toggle {
+  display: flex;
+  background: #1c1c22;
+  border-radius: 4px;
+  padding: 2px;
+  margin-right: 8px;
+}
+
+.mode-btn {
+  background: transparent;
+  border: none;
+  color: #9a9aa8;
+  border-radius: 3px;
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.mode-btn.active {
+  background: #4f8ef7;
+  color: white;
+}
+
+.visibility-toggle {
+  width: 100%;
+  background: #3a3a46;
+  border: none;
+  color: #e8e8ee;
+  border-radius: 4px;
+  padding: 8px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.visibility-toggle[aria-pressed="true"] {
+  background: #4a3a3a;
+  color: #f0b8b8;
 }
 
 .save-status {

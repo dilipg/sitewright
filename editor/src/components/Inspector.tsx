@@ -12,6 +12,8 @@ export interface InspectorProps {
   tokenPaths: Set<string>;
   styleValue: Record<string, string>;
   onCommit: (property: string, value: string) => void;
+  hidden: boolean;
+  onToggleVisibility: () => void;
 }
 
 export default function Inspector({
@@ -21,8 +23,11 @@ export default function Inspector({
   tokenPaths,
   styleValue,
   onCommit,
+  hidden,
+  onToggleVisibility,
 }: InspectorProps) {
   const styleEditable = node.editable.includes("style");
+  const visibilityEditable = node.editable.includes("visibility");
   const variants = PRIMITIVE_VARIANTS[node.element];
 
   return (
@@ -41,6 +46,21 @@ export default function Inspector({
           </span>
         ))}
       </div>
+
+      {visibilityEditable && (
+        <section className="control-section">
+          <h3 className="inspector-subheading">Visibility</h3>
+          <button
+            type="button"
+            data-testid="visibility-toggle"
+            className="visibility-toggle"
+            aria-pressed={hidden}
+            onClick={onToggleVisibility}
+          >
+            {hidden ? "Hidden — click to show" : "Visible — click to hide"}
+          </button>
+        </section>
+      )}
 
       {styleEditable && (
         <>

@@ -158,6 +158,81 @@ describe("exportProject: visibility channel", () => {
   });
 });
 
+describe("exportProject: list-item overrides", () => {
+  it("text: rewrites the matching array element's field, leaving sibling items untouched", { timeout: 60_000 }, () => {
+    const source = fixtureCopyWithOverrides([
+      { nodeId: "home.pricing.tier-starter.name", channel: "text", value: "Starter Plus" },
+    ]);
+    const outDir = join(tempDir("export-out-"), "export");
+    exportProject(source, { outDir, skipBuild: true });
+
+    const mock = readOut(outDir, "src/pages/home/mock/Pricing.data.ts");
+    expect(mock).toContain('"Starter Plus"');
+    expect(mock).not.toContain('"Starter"');
+    expect(mock).toContain('"Growth"'); // sibling tier untouched
+    expect(mock).toContain('"Scale"');
+  });
+
+  it("visibility on a list item's own root: sets hidden on that item's mock entry only", { timeout: 60_000 }, () => {
+    const source = fixtureCopyWithOverrides([
+      { nodeId: "home.testimonials.testimonial-elena", channel: "visibility", value: true },
+    ]);
+    const outDir = join(tempDir("export-out-"), "export");
+    const result = exportProject(source, { outDir, skipBuild: true });
+
+    const mock = readOut(outDir, "src/pages/home/mock/Testimonials.data.ts");
+    expect(mock).toMatch(/key:\s*"elena"[\s\S]*?hidden:\s*true/);
+    const priyaBlock = mock.split('key: "priya"')[1]?.split('key: "marcus"')[0] ?? "";
+    expect(priyaBlock).not.toContain("hidden");
+    expect(result.tombstoned).toEqual([]); // list items have no manifest entry of their own to tombstone
+  });
+
+  it("visibility on a list item's child: sets childHidden keyed by the child suffix", { timeout: 60_000 }, () => {
+    const source = fixtureCopyWithOverrides([
+      { nodeId: "home.pricing.tier-growth.badge", channel: "visibility", value: true },
+    ]);
+    const outDir = join(tempDir("export-out-"), "export");
+    exportProject(source, { outDir, skipBuild: true });
+
+    const mock = readOut(outDir, "src/pages/home/mock/Pricing.data.ts");
+    expect(mock).toMatch(/key:\s*"growth"[\s\S]*?childHidden:\s*\{\s*"badge":\s*true/);
+  });
+
+  it("style on a list item's own root: merges a compiled utility class into that item's className field", { timeout: 60_000 }, () => {
+    const source = fixtureCopyWithOverrides([
+      { nodeId: "home.pricing.tier-growth", channel: "style", value: { background: "color.semantic.accent" } },
+    ]);
+    const outDir = join(tempDir("export-out-"), "export");
+    exportProject(source, { outDir, skipBuild: true });
+
+    const mock = readOut(outDir, "src/pages/home/mock/Pricing.data.ts");
+    expect(mock).toMatch(/key:\s*"growth"[\s\S]*?className:\s*"bg-\(--color-semantic-accent\)!"/);
+  });
+
+  it("layout on a list item's child: merges a compiled utility class into childClassNames keyed by suffix", { timeout: 60_000 }, () => {
+    const source = fixtureCopyWithOverrides([
+      { nodeId: "home.capabilities.feature-realtime-sync.title", channel: "layout", value: { width: "480px" } },
+    ]);
+    const outDir = join(tempDir("export-out-"), "export");
+    exportProject(source, { outDir, skipBuild: true });
+
+    const mock = readOut(outDir, "src/pages/home/mock/Capabilities.data.ts");
+    expect(mock).toMatch(/key:\s*"realtime-sync"[\s\S]*?childClassNames:\s*\{\s*"title":\s*"w-\[480px\]!"/);
+  });
+
+  it("a second style override on the same item merges rather than replacing the first (different properties)", { timeout: 60_000 }, () => {
+    const source = fixtureCopyWithOverrides([
+      { nodeId: "home.pricing.tier-growth", channel: "style", value: { background: "color.semantic.accent" } },
+      { nodeId: "home.pricing.tier-growth", channel: "layout", value: { width: "480px" } },
+    ]);
+    const outDir = join(tempDir("export-out-"), "export");
+    exportProject(source, { outDir, skipBuild: true });
+
+    const mock = readOut(outDir, "src/pages/home/mock/Pricing.data.ts");
+    expect(mock).toMatch(/key:\s*"growth"[\s\S]*?className:\s*"bg-\(--color-semantic-accent\)! w-\[480px\]!"/);
+  });
+});
+
 describe("exportProject: failure behavior", () => {
   it("a gate-failing project aborts with a report and leaves no output directory", { timeout: 60_000 }, () => {
     const outDir = join(tempDir("export-out-"), "export");

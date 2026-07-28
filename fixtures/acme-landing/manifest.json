@@ -6,7 +6,11 @@
       "file": "src/pages/home/sections/Hero.tsx",
       "component": "Hero",
       "element": "section",
-      "editable": ["style", "layout", "visibility"],
+      "editable": [
+        "style",
+        "layout",
+        "visibility"
+      ],
       "status": "active"
     },
     "home.hero.eyebrow": {
@@ -14,7 +18,11 @@
       "file": "src/pages/home/sections/Hero.tsx",
       "component": "Hero",
       "element": "Text",
-      "editable": ["text", "style", "visibility"],
+      "editable": [
+        "text",
+        "style",
+        "visibility"
+      ],
       "status": "active"
     },
     "home.hero.headline": {
@@ -22,7 +30,12 @@
       "file": "src/pages/home/sections/Hero.tsx",
       "component": "Hero",
       "element": "Heading",
-      "editable": ["text", "style", "layout", "visibility"],
+      "editable": [
+        "text",
+        "style",
+        "layout",
+        "visibility"
+      ],
       "status": "active"
     },
     "home.hero.subheadline": {
@@ -30,7 +43,12 @@
       "file": "src/pages/home/sections/Hero.tsx",
       "component": "Hero",
       "element": "Text",
-      "editable": ["text", "style", "layout", "visibility"],
+      "editable": [
+        "text",
+        "style",
+        "layout",
+        "visibility"
+      ],
       "status": "active"
     },
     "home.hero.cta-primary": {
@@ -38,7 +56,12 @@
       "file": "src/pages/home/sections/Hero.tsx",
       "component": "Hero",
       "element": "Button",
-      "editable": ["text", "style", "layout", "visibility"],
+      "editable": [
+        "text",
+        "style",
+        "layout",
+        "visibility"
+      ],
       "status": "active"
     },
     "home.hero.cta-secondary": {
@@ -46,7 +69,795 @@
       "file": "src/pages/home/sections/Hero.tsx",
       "component": "Hero",
       "element": "Button",
-      "editable": ["text", "style", "layout", "visibility"],
+      "editable": [
+        "text",
+        "style",
+        "layout",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "about.intro": {
+      "route": "/about",
+      "file": "src/pages/about/sections/AboutIntro.tsx",
+      "component": "AboutIntro",
+      "element": "section",
+      "editable": [
+        "style",
+        "layout",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "about.intro.heading": {
+      "route": "/about",
+      "file": "src/pages/about/sections/AboutIntro.tsx",
+      "component": "AboutIntro",
+      "element": "Heading",
+      "editable": [
+        "text",
+        "style",
+        "layout",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "about.intro.body": {
+      "route": "/about",
+      "file": "src/pages/about/sections/AboutIntro.tsx",
+      "component": "AboutIntro",
+      "element": "Text",
+      "editable": [
+        "text",
+        "style",
+        "layout",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.capabilities": {
+      "route": "/",
+      "file": "src/pages/home/sections/Capabilities.tsx",
+      "component": "Capabilities",
+      "element": "section",
+      "editable": [
+        "style",
+        "layout",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.capabilities.eyebrow": {
+      "route": "/",
+      "file": "src/pages/home/sections/Capabilities.tsx",
+      "component": "Capabilities",
+      "element": "Text",
+      "editable": [
+        "text",
+        "style",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.capabilities.heading": {
+      "route": "/",
+      "file": "src/pages/home/sections/Capabilities.tsx",
+      "component": "Capabilities",
+      "element": "Heading",
+      "editable": [
+        "text",
+        "style",
+        "layout",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.capabilities.description": {
+      "route": "/",
+      "file": "src/pages/home/sections/Capabilities.tsx",
+      "component": "Capabilities",
+      "element": "Text",
+      "editable": [
+        "text",
+        "style",
+        "layout",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.capabilities.grid": {
+      "route": "/",
+      "file": "src/pages/home/sections/Capabilities.tsx",
+      "component": "Capabilities",
+      "element": "Grid",
+      "editable": [
+        "style"
+      ],
+      "status": "active"
+    },
+    "home.capabilities.feature-realtime-sync": {
+      "route": "/",
+      "file": "src/pages/home/sections/Capabilities.tsx",
+      "component": "Capabilities",
+      "element": "Card",
+      "editable": [
+        "style",
+        "layout",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.capabilities.feature-realtime-sync.title": {
+      "route": "/",
+      "file": "src/pages/home/sections/Capabilities.tsx",
+      "component": "Capabilities",
+      "element": "Heading",
+      "editable": [
+        "text",
+        "style",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.capabilities.feature-realtime-sync.description": {
+      "route": "/",
+      "file": "src/pages/home/sections/Capabilities.tsx",
+      "component": "Capabilities",
+      "element": "Text",
+      "editable": [
+        "text",
+        "style",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.capabilities.feature-one-click-import": {
+      "route": "/",
+      "file": "src/pages/home/sections/Capabilities.tsx",
+      "component": "Capabilities",
+      "element": "Card",
+      "editable": [
+        "style",
+        "layout",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.capabilities.feature-one-click-import.title": {
+      "route": "/",
+      "file": "src/pages/home/sections/Capabilities.tsx",
+      "component": "Capabilities",
+      "element": "Heading",
+      "editable": [
+        "text",
+        "style",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.capabilities.feature-one-click-import.description": {
+      "route": "/",
+      "file": "src/pages/home/sections/Capabilities.tsx",
+      "component": "Capabilities",
+      "element": "Text",
+      "editable": [
+        "text",
+        "style",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.capabilities.feature-role-based-access": {
+      "route": "/",
+      "file": "src/pages/home/sections/Capabilities.tsx",
+      "component": "Capabilities",
+      "element": "Card",
+      "editable": [
+        "style",
+        "layout",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.capabilities.feature-role-based-access.title": {
+      "route": "/",
+      "file": "src/pages/home/sections/Capabilities.tsx",
+      "component": "Capabilities",
+      "element": "Heading",
+      "editable": [
+        "text",
+        "style",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.capabilities.feature-role-based-access.description": {
+      "route": "/",
+      "file": "src/pages/home/sections/Capabilities.tsx",
+      "component": "Capabilities",
+      "element": "Text",
+      "editable": [
+        "text",
+        "style",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.cta-band": {
+      "route": "/",
+      "file": "src/pages/home/sections/CtaBand.tsx",
+      "component": "CtaBand",
+      "element": "section",
+      "editable": [
+        "style",
+        "layout",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.cta-band.heading": {
+      "route": "/",
+      "file": "src/pages/home/sections/CtaBand.tsx",
+      "component": "CtaBand",
+      "element": "Heading",
+      "editable": [
+        "text",
+        "style",
+        "layout",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.cta-band.subheading": {
+      "route": "/",
+      "file": "src/pages/home/sections/CtaBand.tsx",
+      "component": "CtaBand",
+      "element": "Text",
+      "editable": [
+        "text",
+        "style",
+        "layout",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.cta-band.cta": {
+      "route": "/",
+      "file": "src/pages/home/sections/CtaBand.tsx",
+      "component": "CtaBand",
+      "element": "Button",
+      "editable": [
+        "text",
+        "style",
+        "layout",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.pricing": {
+      "route": "/",
+      "file": "src/pages/home/sections/Pricing.tsx",
+      "component": "Pricing",
+      "element": "section",
+      "editable": [
+        "style",
+        "layout",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.pricing.heading": {
+      "route": "/",
+      "file": "src/pages/home/sections/Pricing.tsx",
+      "component": "Pricing",
+      "element": "Heading",
+      "editable": [
+        "text",
+        "style",
+        "layout",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.pricing.description": {
+      "route": "/",
+      "file": "src/pages/home/sections/Pricing.tsx",
+      "component": "Pricing",
+      "element": "Text",
+      "editable": [
+        "text",
+        "style",
+        "layout",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.pricing.grid": {
+      "route": "/",
+      "file": "src/pages/home/sections/Pricing.tsx",
+      "component": "Pricing",
+      "element": "Grid",
+      "editable": [
+        "style"
+      ],
+      "status": "active"
+    },
+    "home.pricing.tier-starter": {
+      "route": "/",
+      "file": "src/pages/home/sections/Pricing.tsx",
+      "component": "Pricing",
+      "element": "Card",
+      "editable": [
+        "style",
+        "layout",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.pricing.tier-starter.name": {
+      "route": "/",
+      "file": "src/pages/home/sections/Pricing.tsx",
+      "component": "Pricing",
+      "element": "Heading",
+      "editable": [
+        "text",
+        "style",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.pricing.tier-starter.price": {
+      "route": "/",
+      "file": "src/pages/home/sections/Pricing.tsx",
+      "component": "Pricing",
+      "element": "Text",
+      "editable": [
+        "text",
+        "style",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.pricing.tier-starter.description": {
+      "route": "/",
+      "file": "src/pages/home/sections/Pricing.tsx",
+      "component": "Pricing",
+      "element": "Text",
+      "editable": [
+        "text",
+        "style",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.pricing.tier-starter.cta": {
+      "route": "/",
+      "file": "src/pages/home/sections/Pricing.tsx",
+      "component": "Pricing",
+      "element": "Button",
+      "editable": [
+        "text",
+        "style",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.pricing.tier-growth": {
+      "route": "/",
+      "file": "src/pages/home/sections/Pricing.tsx",
+      "component": "Pricing",
+      "element": "Card",
+      "editable": [
+        "style",
+        "layout",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.pricing.tier-growth.badge": {
+      "route": "/",
+      "file": "src/pages/home/sections/Pricing.tsx",
+      "component": "Pricing",
+      "element": "Text",
+      "editable": [
+        "text",
+        "style",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.pricing.tier-growth.name": {
+      "route": "/",
+      "file": "src/pages/home/sections/Pricing.tsx",
+      "component": "Pricing",
+      "element": "Heading",
+      "editable": [
+        "text",
+        "style",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.pricing.tier-growth.price": {
+      "route": "/",
+      "file": "src/pages/home/sections/Pricing.tsx",
+      "component": "Pricing",
+      "element": "Text",
+      "editable": [
+        "text",
+        "style",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.pricing.tier-growth.description": {
+      "route": "/",
+      "file": "src/pages/home/sections/Pricing.tsx",
+      "component": "Pricing",
+      "element": "Text",
+      "editable": [
+        "text",
+        "style",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.pricing.tier-growth.cta": {
+      "route": "/",
+      "file": "src/pages/home/sections/Pricing.tsx",
+      "component": "Pricing",
+      "element": "Button",
+      "editable": [
+        "text",
+        "style",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.pricing.tier-scale": {
+      "route": "/",
+      "file": "src/pages/home/sections/Pricing.tsx",
+      "component": "Pricing",
+      "element": "Card",
+      "editable": [
+        "style",
+        "layout",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.pricing.tier-scale.name": {
+      "route": "/",
+      "file": "src/pages/home/sections/Pricing.tsx",
+      "component": "Pricing",
+      "element": "Heading",
+      "editable": [
+        "text",
+        "style",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.pricing.tier-scale.price": {
+      "route": "/",
+      "file": "src/pages/home/sections/Pricing.tsx",
+      "component": "Pricing",
+      "element": "Text",
+      "editable": [
+        "text",
+        "style",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.pricing.tier-scale.description": {
+      "route": "/",
+      "file": "src/pages/home/sections/Pricing.tsx",
+      "component": "Pricing",
+      "element": "Text",
+      "editable": [
+        "text",
+        "style",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.pricing.tier-scale.cta": {
+      "route": "/",
+      "file": "src/pages/home/sections/Pricing.tsx",
+      "component": "Pricing",
+      "element": "Button",
+      "editable": [
+        "text",
+        "style",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.testimonials": {
+      "route": "/",
+      "file": "src/pages/home/sections/Testimonials.tsx",
+      "component": "Testimonials",
+      "element": "section",
+      "editable": [
+        "style",
+        "layout",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.testimonials.heading": {
+      "route": "/",
+      "file": "src/pages/home/sections/Testimonials.tsx",
+      "component": "Testimonials",
+      "element": "Heading",
+      "editable": [
+        "text",
+        "style",
+        "layout",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.testimonials.grid": {
+      "route": "/",
+      "file": "src/pages/home/sections/Testimonials.tsx",
+      "component": "Testimonials",
+      "element": "Grid",
+      "editable": [
+        "style"
+      ],
+      "status": "active"
+    },
+    "home.testimonials.testimonial-priya": {
+      "route": "/",
+      "file": "src/pages/home/sections/Testimonials.tsx",
+      "component": "Testimonials",
+      "element": "Card",
+      "editable": [
+        "style",
+        "layout",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.testimonials.testimonial-priya.quote": {
+      "route": "/",
+      "file": "src/pages/home/sections/Testimonials.tsx",
+      "component": "Testimonials",
+      "element": "Text",
+      "editable": [
+        "text",
+        "style",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.testimonials.testimonial-priya.attribution": {
+      "route": "/",
+      "file": "src/pages/home/sections/Testimonials.tsx",
+      "component": "Testimonials",
+      "element": "Text",
+      "editable": [
+        "text",
+        "style",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.testimonials.testimonial-marcus": {
+      "route": "/",
+      "file": "src/pages/home/sections/Testimonials.tsx",
+      "component": "Testimonials",
+      "element": "Card",
+      "editable": [
+        "style",
+        "layout",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.testimonials.testimonial-marcus.quote": {
+      "route": "/",
+      "file": "src/pages/home/sections/Testimonials.tsx",
+      "component": "Testimonials",
+      "element": "Text",
+      "editable": [
+        "text",
+        "style",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.testimonials.testimonial-marcus.attribution": {
+      "route": "/",
+      "file": "src/pages/home/sections/Testimonials.tsx",
+      "component": "Testimonials",
+      "element": "Text",
+      "editable": [
+        "text",
+        "style",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.testimonials.testimonial-elena": {
+      "route": "/",
+      "file": "src/pages/home/sections/Testimonials.tsx",
+      "component": "Testimonials",
+      "element": "Card",
+      "editable": [
+        "style",
+        "layout",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.testimonials.testimonial-elena.quote": {
+      "route": "/",
+      "file": "src/pages/home/sections/Testimonials.tsx",
+      "component": "Testimonials",
+      "element": "Text",
+      "editable": [
+        "text",
+        "style",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.testimonials.testimonial-elena.attribution": {
+      "route": "/",
+      "file": "src/pages/home/sections/Testimonials.tsx",
+      "component": "Testimonials",
+      "element": "Text",
+      "editable": [
+        "text",
+        "style",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.faq": {
+      "route": "/",
+      "file": "src/pages/home/sections/Faq.tsx",
+      "component": "Faq",
+      "element": "section",
+      "editable": [
+        "style",
+        "layout",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.faq.heading": {
+      "route": "/",
+      "file": "src/pages/home/sections/Faq.tsx",
+      "component": "Faq",
+      "element": "Heading",
+      "editable": [
+        "text",
+        "style",
+        "layout",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.faq.list": {
+      "route": "/",
+      "file": "src/pages/home/sections/Faq.tsx",
+      "component": "Faq",
+      "element": "Stack",
+      "editable": [
+        "style"
+      ],
+      "status": "active"
+    },
+    "home.faq.item-trial-length": {
+      "route": "/",
+      "file": "src/pages/home/sections/Faq.tsx",
+      "component": "Faq",
+      "element": "Card",
+      "editable": [
+        "style",
+        "layout",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.faq.item-trial-length.question": {
+      "route": "/",
+      "file": "src/pages/home/sections/Faq.tsx",
+      "component": "Faq",
+      "element": "Heading",
+      "editable": [
+        "text",
+        "style",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.faq.item-trial-length.answer": {
+      "route": "/",
+      "file": "src/pages/home/sections/Faq.tsx",
+      "component": "Faq",
+      "element": "Text",
+      "editable": [
+        "text",
+        "style",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.faq.item-cancel-anytime": {
+      "route": "/",
+      "file": "src/pages/home/sections/Faq.tsx",
+      "component": "Faq",
+      "element": "Card",
+      "editable": [
+        "style",
+        "layout",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.faq.item-cancel-anytime.question": {
+      "route": "/",
+      "file": "src/pages/home/sections/Faq.tsx",
+      "component": "Faq",
+      "element": "Heading",
+      "editable": [
+        "text",
+        "style",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.faq.item-cancel-anytime.answer": {
+      "route": "/",
+      "file": "src/pages/home/sections/Faq.tsx",
+      "component": "Faq",
+      "element": "Text",
+      "editable": [
+        "text",
+        "style",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.faq.item-data-export": {
+      "route": "/",
+      "file": "src/pages/home/sections/Faq.tsx",
+      "component": "Faq",
+      "element": "Card",
+      "editable": [
+        "style",
+        "layout",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.faq.item-data-export.question": {
+      "route": "/",
+      "file": "src/pages/home/sections/Faq.tsx",
+      "component": "Faq",
+      "element": "Heading",
+      "editable": [
+        "text",
+        "style",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "home.faq.item-data-export.answer": {
+      "route": "/",
+      "file": "src/pages/home/sections/Faq.tsx",
+      "component": "Faq",
+      "element": "Text",
+      "editable": [
+        "text",
+        "style",
+        "visibility"
+      ],
       "status": "active"
     }
   }

@@ -91,6 +91,31 @@ def materialize(value):
 DEFAULT_ROUTES = [{"slug": "home", "path": "/"}]
 
 
+def _humanize_slug(slug: str) -> str:
+    return " ".join(word.capitalize() for word in slug.split("-"))
+
+
+def _provisional_routes_ts(routes: list[dict]) -> str:
+    """A minimal routes.ts for the pre-Shell-Agent workspace state — the real
+    ground truth (with real titles) is written deterministically from the
+    approved site plan by shell_pipeline.build_routes_ts once the Shell
+    Agent runs; call sites that never reach that stage (M3/M4/soak/stress,
+    single-section testing) keep this provisional version."""
+    entries = ",\n".join(
+        f'  {{ slug: "{r["slug"]}", path: "{r["path"]}", title: "{r.get("title") or _humanize_slug(r["slug"])}" }}'
+        for r in routes
+    )
+    return (
+        "/** Ground-truth route table (contract section 2). Every internal href must exist here. */\n"
+        "export interface RouteDef {\n"
+        "  slug: string;\n"
+        "  path: string;\n"
+        "  title: string;\n"
+        "}\n\n"
+        f"export const routes: RouteDef[] = [\n{entries},\n];\n"
+    )
+
+
 def prepare_workspace_dir(project_dir: str, routes: list[dict] | None = None) -> str:
     """Fixture copy with blank pages: tokens/primitives/shell stay
     hand-written (M3 stub table); manifest is emptied. Full replace —
@@ -99,7 +124,12 @@ def prepare_workspace_dir(project_dir: str, routes: list[dict] | None = None) ->
 
     `routes` (each {"slug", "path"}) scaffolds an empty pages/<slug>/ +
     overrides/<slug>.overrides.json for every planned route (build prompt
-    5.3 fan-out) — the fixture itself only ships "home". Defaults to just
+    5.3 fan-out). The fixture may ship more pages than a given caller's
+    route list (it's a multi-route hand fixture, reused as the compiler
+    test bed) — every page directory is wiped and only the requested routes
+    are recreated, and routes.ts is rewritten to match exactly, so a
+    single-route caller never inherits a stray fixture page or a nav link
+    to a route that doesn't exist in its own workspace. Defaults to just
     home for every M3/M4/soak/stress call site that predates multi-route."""
     target = Path(project_dir)
     resolved_routes = routes if routes is not None else DEFAULT_ROUTES
@@ -118,11 +148,17 @@ def prepare_workspace_dir(project_dir: str, routes: list[dict] | None = None) ->
         target,
         ignore=shutil.ignore_patterns("node_modules", "dist", "sections", "mock"),
     )
-    # the fixture ships only "home"; every other planned route's page dir
-    # must be created fresh
-    (target / "src" / "pages" / "home" / "index.tsx").unlink(missing_ok=True)
+    # the fixture may ship pages beyond what this caller asked for (or none
+    # of what it asked for) — replace wholesale rather than special-casing
+    # whichever page(s) the fixture happens to include today
+    pages_dir = target / "src" / "pages"
+    if pages_dir.exists():
+        shutil.rmtree(pages_dir)
     for route in resolved_routes:
-        (target / "src" / "pages" / route["slug"]).mkdir(parents=True, exist_ok=True)
+        (pages_dir / route["slug"]).mkdir(parents=True, exist_ok=True)
+    (target / "src" / "shell" / "routes.ts").write_text(
+        _provisional_routes_ts(resolved_routes), encoding="utf-8", newline="\n"
+    )
 
     (target / "manifest.json").write_text(
         json.dumps({"version": 1, "nodes": {}}, indent=2) + "\n", encoding="utf-8"
@@ -374,6 +410,7 @@ def _run_compiler_cli(script_args: list[str]) -> subprocess.CompletedProcess:
         cwd=COMPILER_DIR,
         capture_output=True,
         text=True,
+        encoding="utf-8",
         timeout=300,
     )
 

@@ -20,11 +20,22 @@ from orchestrator.section_pipeline import (
 
 _TEMPLATE_CACHE: dict[str, Template] = {}
 
+# Archetypes with a dedicated, gate-passing-canonical-example template
+# (build prompt 5.4: catalog to six). Everything else in the twenty-
+# archetype catalog (agent-pipeline-spec 4.2) still falls back to the
+# generic scaffold until it earns its own template (decisions.md).
+DEDICATED_TEMPLATES = {
+    "hero",
+    "feature-grid",
+    "cta-band",
+    "pricing-tiers",
+    "faq-accordion",
+    "social-proof",
+}
+
 
 def select_template(archetype: str) -> Template:
-    """hero has its own tuned template; every other archetype falls back to
-    the generic scaffold until M5.4 adds dedicated templates (decisions.md)."""
-    name = archetype if archetype == "hero" else "generic-section"
+    name = archetype if archetype in DEDICATED_TEMPLATES else "generic-section"
     if name not in _TEMPLATE_CACHE:
         _TEMPLATE_CACHE[name] = load_template(name)
     return _TEMPLATE_CACHE[name]

@@ -5,4 +5,7 @@ export interface RouteDef {
   title: string;
 }
 
-export const routes: RouteDef[] = [{ slug: "home", path: "/", title: "Home" }];
+export const routes: RouteDef[] = [
+  { slug: "home", path: "/", title: "Home" },
+  { slug: "about", path: "/about", title: "About" },
+];

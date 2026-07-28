@@ -287,7 +287,7 @@ function gateTokensOnly(root: string, files: string[]): GateFailure[] {
 }
 
 /** True when `node` is lexically inside an arrow/function expression passed as a `.map(...)` callback. */
-function isInsideMapCallback(node: import("ts-morph").Node): boolean {
+export function isInsideMapCallback(node: import("ts-morph").Node): boolean {
   let current: import("ts-morph").Node | undefined = node;
   while (current !== undefined) {
     if (current.isKind(SyntaxKind.ArrowFunction) || current.isKind(SyntaxKind.FunctionExpression)) {
@@ -308,17 +308,34 @@ const REGEX_SPECIAL = /[.*+?^${}()|[\]\\]/g;
 
 /**
  * Builds a match-any-instance regex from a template literal's static spans,
- * e.g. `` `${nodeId}.card-${key}` `` -> /^.+\.card\-.+$/ — used to recognize
- * a manifest id as "plausibly produced by this list's nodeId expression"
- * without statically evaluating the substitutions (contract 5.2: list items
- * derive ids from data keys, so the exact value isn't known until runtime).
+ * e.g. `` `${nodeId}.card-${key}` `` -> /^.+\.card\-[^.]+$/ — used to
+ * recognize a manifest id as "plausibly produced by this list's nodeId
+ * expression" without statically evaluating the substitutions (contract
+ * 5.2: list items derive ids from data keys, so the exact value isn't known
+ * until runtime).
+ *
+ * Only the FIRST substitution gap is unrestricted (`.+`): by convention
+ * (contract 5.2) it's always a reference to an already-built, legitimately
+ * dotted id (nodeId, or a parent id computed one map-nesting level up).
+ * Every subsequent gap is a single data-derived slug and must NOT match a
+ * literal dot (`[^.]+`) — otherwise the wildcard can span across a dot
+ * boundary it shouldn't, and greedily swallow an unrelated sibling id from
+ * elsewhere in the same file. Live-observed: a section slug "feature-grid"
+ * made `home.feature-grid.eyebrow` satisfy `^.+\.feature\-.+$` (the list
+ * pattern for `${nodeId}.feature-${feature.key}`) purely by coincidence,
+ * wrongly exempting a genuinely unattached, non-list child from "missing".
  */
-function templateToPattern(template: import("ts-morph").TemplateExpression): RegExp {
+export function templateToPattern(template: import("ts-morph").TemplateExpression): RegExp {
   const spans = [
     template.getHead().getLiteralText(),
     ...template.getTemplateSpans().map((span) => span.getLiteral().getLiteralText()),
-  ];
-  return new RegExp(`^${spans.map((span) => span.replace(REGEX_SPECIAL, "\\$&")).join(".+")}$`);
+  ].map((span) => span.replace(REGEX_SPECIAL, "\\$&"));
+
+  let pattern = spans[0]!;
+  for (let gap = 0; gap < spans.length - 1; gap++) {
+    pattern += (gap === 0 ? ".+" : "[^.]+") + spans[gap + 1]!;
+  }
+  return new RegExp(`^${pattern}$`);
 }
 
 const isSectionRootId = (id: string): boolean => id.split(".").length === 2;
@@ -331,7 +348,7 @@ const isSectionRootId = (id: string): boolean => id.split(".").length === 2;
  * identical to repeating the literal) — the template literal that local
  * const was declared with.
  */
-function resolveTemplateExpression(
+export function resolveTemplateExpression(
   expression: import("ts-morph").Expression | undefined,
 ): import("ts-morph").TemplateExpression | undefined {
   if (expression === undefined) return undefined;

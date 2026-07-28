@@ -32,6 +32,28 @@ export function applyStyleProperty(
   return { ...map, [nodeId]: { ...nodeChannels, style } };
 }
 
+export function applyTextValue(map: OverridesMap, nodeId: string, value: string): OverridesMap {
+  const nodeChannels = map[nodeId] ?? {};
+  return { ...map, [nodeId]: { ...nodeChannels, text: value } };
+}
+
+/** Size/position deltas from drag/resize gestures (contract 6.1) — same shape as style, distinct channel key. */
+export function applyLayoutProperty(
+  map: OverridesMap,
+  nodeId: string,
+  property: string,
+  value: string,
+): OverridesMap {
+  const nodeChannels = map[nodeId] ?? {};
+  const layout = { ...(nodeChannels.layout as Record<string, string> | undefined), [property]: value };
+  return { ...map, [nodeId]: { ...nodeChannels, layout } };
+}
+
+export function applyVisibility(map: OverridesMap, nodeId: string, hidden: boolean): OverridesMap {
+  const nodeChannels = map[nodeId] ?? {};
+  return { ...map, [nodeId]: { ...nodeChannels, visibility: hidden } };
+}
+
 /** Drops every channel for a node — used when the user discards an orphaned override. */
 export function removeNodeOverrides(map: OverridesMap, nodeId: string): OverridesMap {
   const next = { ...map };

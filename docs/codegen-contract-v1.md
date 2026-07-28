@@ -211,6 +211,25 @@ The node registry, maintained through a small deterministic service (not by LLM 
 
 `editable` declares which override channels the editor may offer for this node. Agents propose manifest entries in structured output; the manifest service validates uniqueness, format, and tombstone rules, then commits. This keeps the registry consistent even when an agent misbehaves.
 
+### 5.5 List-item override compilation
+
+A list item (5.2: an ID built from a stable data key, e.g. `home.pricing.tier-growth`) has no literal JSX element per instance — one `.map()` body renders every item, so an override cannot be baked into source as a per-instance edit the way a literal node's can. Every list item's data type therefore carries four optional fields, written only by the exporter — never hand-authored with real values, never emitted by the model:
+
+```ts
+export interface Tier {
+  key: string;
+  // ...content fields (name, price, description, ...)...
+  className?: string;                       // compiled style/layout classes for the item's OWN root
+  childClassNames?: Record<string, string>; // compiled style/layout classes for a CHILD, keyed by its id suffix
+  hidden?: boolean;                         // visibility override for the item's OWN root
+  childHidden?: Record<string, boolean>;    // visibility override for a CHILD, keyed by its id suffix
+}
+```
+
+The section component must read these back: the item's root element merges `className` (`cx(base, item.className)`); every style/layout-editable child reads `item.childClassNames?.<suffix>` as its own `className`; the `.map()` skips rendering an item entirely when `item.hidden`; each visibility-editable child wraps its render in `!item.childHidden?.<suffix> && (...)`. Text overrides need no new field — they rewrite the matching content field directly, the same mechanism 4.3's props/mock-data seam already provides for section-level text.
+
+This convention depends on the canonical `.map()` shape from 5.2: a local `const itemId = `${nodeId}.slug-${item.key}`` referenced directly on the item's own root (`nodeId={itemId}`) and via further template literals on its children (`` nodeId={`${itemId}.suffix`} ``). The exporter locates the correct array element and field purely from this shape — it does not evaluate arbitrary expressions, so an archetype that deviates from it (a differently-named key field, an indirect array reference) cannot have its list items edited through export and must be corrected, not worked around.
+
 ---
 
 ## 6. Override layer
@@ -267,6 +286,8 @@ Deterministic pipeline, no LLM in the loop for steps 1 to 4:
 3. **Visibility channel**: remove the element's JSX and tombstone its manifest entry.
 4. **Verification build**: run typecheck, lint (section 8), and a production build. Export fails loudly on any error; a failed export never ships silently degraded code.
 5. **LLM cleanup pass (optional, flagged)**: a single low-cost pass that renames awkward compiled classes into tidier form. Off by default in v1; determinism beats polish.
+
+Steps 1-3 above describe compilation for a node with a literal `data-node-id`. A list-item node (5.2, 5.5) has no literal JSX element to locate or remove — all three channels instead compile into that one item's own mock-data array element (5.5): text rewrites its content field directly; style/layout merge into its `className`/`childClassNames`; visibility sets its `hidden`/`childHidden`. Nothing is removed from source, so a list-item visibility override never tombstones a manifest entry — the id's pattern-based attachment is unchanged, only its current data is.
 
 Post-export, override files are archived, not deleted, so the user can trace what changed.
 

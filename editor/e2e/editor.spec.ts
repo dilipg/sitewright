@@ -2,7 +2,7 @@ import type { FrameLocator, Page } from "@playwright/test";
 import { expect, test } from "@playwright/test";
 
 function previewFrame(page: Page): FrameLocator {
-  return page.frameLocator('iframe[title="preview"]');
+  return page.frameLocator('iframe[title="preview-home"]');
 }
 
 async function openEditor(page: Page): Promise<void> {

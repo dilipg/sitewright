@@ -58,6 +58,7 @@ def run_invariant(project_dir: Path, export_dir: Path) -> bool:
         env=env,
         capture_output=True,
         text=True,
+        encoding="utf-8",
         timeout=900,
     )
     return result.returncode == 0

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { Manifest } from "@website-generator/compiler/src/manifest.ts";
 import type {
   NodeGeometry,
@@ -11,11 +11,25 @@ import type { PlanBrief, PlanRoute } from "./components/PlanApproval";
 import PlanApproval from "./components/PlanApproval";
 import type { RegenPhase } from "./components/Regen";
 import { OrphanDialog, RegenControls } from "./components/Regen";
+import type { RouteInfo, Viewport } from "./lib/canvas";
+import {
+  clampZoom,
+  FRAME_GAP,
+  FRAME_WIDTH,
+  frameOffsetX,
+  isFrameNearViewport,
+  routesFromManifest,
+  splitOverridesByRoute,
+  zoomAt,
+} from "./lib/canvas";
 import { expandStyleValue } from "./lib/inventory";
 import { breadcrumbFor, humanizeSegment, parentNodeId } from "./lib/labels";
 import type { History, OverridesMap } from "./lib/store";
 import {
+  applyLayoutProperty,
   applyStyleProperty,
+  applyTextValue,
+  applyVisibility,
   currentSnapshot,
   fromOverrideFile,
   initHistory,
@@ -26,7 +40,7 @@ import {
   undo,
 } from "./lib/store";
 import type { TokensJson } from "./lib/tokens";
-import { tokenPathSet } from "./lib/tokens";
+import { nearestSpaceStep, tokenPathSet } from "./lib/tokens";
 import "./App.css";
 
 // guarded: unit tests import this module in a windowless environment
@@ -43,6 +57,12 @@ type SaveStatus = "Loading…" | "Saving…" | "Saved";
 const CANNED_SECTION_BRIEF =
   "Bold opening hero introducing the product with a primary trial CTA and a secondary demo CTA.";
 
+/** Nominal frame height on the canvas (PRD 2.1: frames render at desktop
+ * width in v1) — generous enough that typical pages don't need internal
+ * iframe scrolling to reach their footer. */
+const FRAME_HEIGHT = 2000;
+const ZOOM_WHEEL_SENSITIVITY = 0.002;
+
 /** Nearest active manifest node at or above the given ID. */
 function selectableId(nodeId: string, manifest: Manifest | null): string | undefined {
   if (manifest === null) return undefined;
@@ -52,6 +72,12 @@ function selectableId(nodeId: string, manifest: Manifest | null): string | undef
     current = current.includes(".") ? current.slice(0, current.lastIndexOf(".")) : undefined;
   }
   return undefined;
+}
+
+/** Node ids are globally unique and route-slug-prefixed (contract 5.2) — the
+ * route a node belongs to is always recoverable from its own id. */
+function routeOf(nodeId: string): string {
+  return nodeId.split(".")[0]!;
 }
 
 /** Persisted entries -> shim message list, with variant choices expanded to declarations. */
@@ -76,14 +102,43 @@ function expandForShim(map: OverridesMap, manifest: Manifest | null): ShimOverri
 }
 
 const HANDLES = ["nw", "n", "ne", "e", "se", "s", "sw", "w"] as const;
+type Handle = (typeof HANDLES)[number];
+
+/** Which dimension each resize handle drives, and in which drag direction it grows (PRD 3.3). */
+const HANDLE_DELTA: Record<Handle, { width: number; height: number }> = {
+  n: { width: 0, height: -1 },
+  s: { width: 0, height: 1 },
+  e: { width: 1, height: 0 },
+  w: { width: -1, height: 0 },
+  ne: { width: 1, height: -1 },
+  nw: { width: -1, height: -1 },
+  se: { width: 1, height: 1 },
+  sw: { width: -1, height: 1 },
+};
+
+const MIN_SIZE_PX = 20;
+// Beyond this, a drag reads as an attempted reparent/reorder, which v1 does
+// not support (contract 6.1: layout edits are size/position DELTAS only,
+// PRD risk 3.3) — constrain the gesture visually instead of applying it.
+const REJECT_THRESHOLD_PX = 200;
+const REJECTED_GESTURE_HINT = "Regenerate the section to change its structure";
 
 export default function App() {
   const [manifest, setManifest] = useState<Manifest | null>(null);
   const [tokens, setTokens] = useState<TokensJson | null>(null);
-  const [geometry, setGeometry] = useState<Record<string, NodeGeometry>>({});
+  const [geometryByRoute, setGeometryByRoute] = useState<Record<string, Record<string, NodeGeometry>>>({});
   const [hoverId, setHoverId] = useState<string>();
   const [selectedId, setSelectedId] = useState<string>();
-  const [shimStatus, setShimStatus] = useState<ShimStatus>("connecting");
+  const [editingId, setEditingId] = useState<string>();
+  const [editingDraft, setEditingDraft] = useState("");
+  const [dragGhost, setDragGhost] = useState<{ rect: NodeGeometry["rect"]; rejected: boolean } | null>(
+    null,
+  );
+  const [gestureToast, setGestureToast] = useState<string>();
+  const [previewMode, setPreviewModeState] = useState<"edit" | "interact">("edit");
+  const [frameStatus, setFrameStatus] = useState<Record<string, ShimStatus>>({});
+  const [viewport, setViewport] = useState<Viewport>({ x: 40, y: 40, zoom: 1 });
+  const [stageSize, setStageSize] = useState({ width: 1200, height: 800 });
   const [history, setHistory] = useState<History | null>(null);
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("Loading…");
   const [regen, setRegen] = useState<RegenPhase>({ phase: "idle" });
@@ -96,12 +151,43 @@ export default function App() {
 
   const manifestRef = useRef<Manifest | null>(null);
   const historyRef = useRef<History | null>(null);
-  const iframeRef = useRef<HTMLIFrameElement | null>(null);
+  const iframeRefs = useRef<Record<string, HTMLIFrameElement | null>>({});
+  const editOverlayRef = useRef<HTMLDivElement | null>(null);
+  const stageRef = useRef<HTMLDivElement | null>(null);
   const hydratedRef = useRef(false);
+  // Bootstrap's own setHistory(persisted) is itself a `history` change, so
+  // it would otherwise trigger the persistence effect below to immediately
+  // write the just-loaded data straight back — a redundant "startup save"
+  // racing the very first real edit. If that edit's click lands more than
+  // 300ms after hydration (routine under load), both saves are in flight
+  // together, and whichever settles last wins on disk — sometimes the
+  // stale pre-edit one, silently dropping the edit. Skipping the effect for
+  // exactly this one, first post-hydration render removes the race instead
+  // of trying to out-race it.
+  const skipNextSaveRef = useRef(false);
   historyRef.current = history;
 
   const map = history !== null ? currentSnapshot(history) : {};
-  const routeSlug = manifest !== null ? Object.keys(manifest.nodes)[0]?.split(".")[0] : undefined;
+  const routes = useMemo<RouteInfo[]>(() => (manifest === null ? [] : routesFromManifest(manifest)), [manifest]);
+  const geometry = useMemo<Record<string, NodeGeometry>>(
+    () => Object.assign({}, ...Object.values(geometryByRoute)) as Record<string, NodeGeometry>,
+    [geometryByRoute],
+  );
+
+  /* ---------- stage size (drives virtualization) ---------- */
+
+  useEffect(() => {
+    const element = stageRef.current;
+    if (element === null) return;
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (entry !== undefined) {
+        setStageSize({ width: entry.contentRect.width, height: entry.contentRect.height });
+      }
+    });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
 
   /* ---------- bootstrap: manifest, tokens, persisted overrides + history ---------- */
 
@@ -123,15 +209,19 @@ export default function App() {
       setManifest(manifestJson);
       setTokens(tokensJson);
 
-      const slug = Object.keys(manifestJson.nodes)[0]?.split(".")[0] ?? "home";
-      const [overrideFile, historyFile] = await Promise.all([
-        fetch(`${PREVIEW_URL}/__overrides/${slug}`).then((r) => r.json()),
+      const routeList = routesFromManifest(manifestJson);
+      const [overrideFiles, historyFile] = await Promise.all([
+        Promise.all(
+          routeList.map((route) => fetch(`${PREVIEW_URL}/__overrides/${route.slug}`).then((r) => r.json())),
+        ),
         fetch(`${PREVIEW_URL}/__overrides-history`).then((r) => r.json()),
       ]);
+      const mergedOverrides: OverridesMap = Object.assign({}, ...overrideFiles.map(fromOverrideFile));
       const persisted =
         Array.isArray(historyFile?.snapshots) && typeof historyFile.index === "number"
           ? { snapshots: historyFile.snapshots as OverridesMap[], index: historyFile.index as number }
-          : initHistory(fromOverrideFile(overrideFile));
+          : initHistory(mergedOverrides);
+      skipNextSaveRef.current = true;
       setHistory(persisted);
       setSaveStatus("Saved");
       hydratedRef.current = true;
@@ -139,26 +229,49 @@ export default function App() {
     void bootstrap();
   }, []);
 
-  /* ---------- shim messages ---------- */
+  /* ---------- shim messages (multiple cross-origin iframes, one per route) ---------- */
 
   useEffect(() => {
+    function slugForSource(source: MessageEventSource | null): string | undefined {
+      return Object.entries(iframeRefs.current).find(([, el]) => el?.contentWindow === source)?.[0];
+    }
     function onMessage(event: MessageEvent) {
       const data = event.data as ShimToParentMessage | null | undefined;
       if (data === null || data === undefined || typeof data !== "object") return;
       switch (data.type) {
-        case "frame:ready":
-          setShimStatus(data.protocolVersion === PROTOCOL_VERSION ? "ready" : "version-mismatch");
+        case "frame:ready": {
+          const slug = slugForSource(event.source);
+          if (slug === undefined) break;
+          setFrameStatus((prev) => ({
+            ...prev,
+            [slug]: data.protocolVersion === PROTOCOL_VERSION ? "ready" : "version-mismatch",
+          }));
           // regen/HMR reloads re-handshake: bump so overrides re-apply
           setFrameReadySeq((sequence) => sequence + 1);
           break;
-        case "nodes:geometry":
-          setGeometry(Object.fromEntries(data.nodes.map((node) => [node.nodeId, node])));
+        }
+        case "nodes:geometry": {
+          const slug = slugForSource(event.source);
+          if (slug === undefined) break;
+          setGeometryByRoute((prev) => ({
+            ...prev,
+            [slug]: Object.fromEntries(data.nodes.map((node) => [node.nodeId, node])),
+          }));
           break;
+        }
         case "node:hit": {
           const resolved = selectableId(data.nodeId, manifestRef.current);
           if (data.kind === "click") {
             if (resolved !== undefined) setSelectedId(resolved);
             // reclaim keyboard focus from the cross-origin frame so Esc works
+            window.focus();
+          } else if (data.kind === "dblclick") {
+            const editable = resolved !== undefined && manifestRef.current?.nodes[resolved]?.editable.includes("text");
+            if (resolved !== undefined && editable === true) {
+              setSelectedId(resolved);
+              setEditingId(resolved);
+              setEditingDraft(data.text ?? "");
+            }
             window.focus();
           } else {
             setHoverId(resolved);
@@ -198,34 +311,63 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
 
-  /* ---------- live application through overrides:apply ---------- */
+  /* ---------- text edit overlay: uncontrolled contentEditable ---------- */
 
+  // The overlay's content is set imperatively, ONCE per edit session, never
+  // from `editingDraft` in JSX — a contentEditable whose children are driven
+  // by React state resets the caret to the start on every keystroke (React
+  // reconciles the text node fresh each render). onInput still tracks the
+  // draft in state for commitTextEdit to read; it just never feeds back in.
   useEffect(() => {
-    if (shimStatus !== "ready" || history === null) return;
-    iframeRef.current?.contentWindow?.postMessage(
-      {
-        type: "overrides:apply",
-        protocolVersion: PROTOCOL_VERSION,
-        overrides: expandForShim(map, manifest),
-      },
-      "*",
-    );
+    if (editingId === undefined) return;
+    const node = editOverlayRef.current;
+    if (node === null) return;
+    node.textContent = editingDraft;
+    node.focus();
+    const range = document.createRange();
+    range.selectNodeContents(node);
+    const selection = window.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [history, shimStatus, frameReadySeq]);
+  }, [editingId]);
 
-  /* ---------- debounced persistence (overrides file + history file) ---------- */
+  /* ---------- live application through overrides:apply (broadcast to every ready frame) ---------- */
 
   useEffect(() => {
-    if (!hydratedRef.current || history === null || routeSlug === undefined) return;
+    if (history === null || routes.length === 0) return;
+    const overrides = expandForShim(map, manifest);
+    for (const route of routes) {
+      if (frameStatus[route.slug] !== "ready") continue;
+      iframeRefs.current[route.slug]?.contentWindow?.postMessage(
+        { type: "overrides:apply", protocolVersion: PROTOCOL_VERSION, overrides },
+        "*",
+      );
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [history, frameStatus, frameReadySeq, routes]);
+
+  /* ---------- debounced persistence (one overrides file per route + one history file) ---------- */
+
+  useEffect(() => {
+    if (!hydratedRef.current || history === null || routes.length === 0) return;
+    if (skipNextSaveRef.current) {
+      skipNextSaveRef.current = false;
+      return;
+    }
     setSaveStatus("Saving…");
-    const routePath = manifest?.nodes[Object.keys(manifest.nodes)[0]!]?.route ?? "/";
+    const grouped = splitOverridesByRoute(map, routes);
     const timer = setTimeout(() => {
       void (async () => {
-        await fetch(`${PREVIEW_URL}/__overrides/${routeSlug}`, {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(toOverrideFile(map, routePath)),
-        });
+        await Promise.all(
+          routes.map((route) =>
+            fetch(`${PREVIEW_URL}/__overrides/${route.slug}`, {
+              method: "PUT",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(toOverrideFile(grouped[route.slug] ?? {}, route.path)),
+            }),
+          ),
+        );
         await fetch(`${PREVIEW_URL}/__overrides-history`, {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
@@ -248,6 +390,207 @@ export default function App() {
     });
   }
 
+  function toggleVisibility() {
+    if (selectedId === undefined) return;
+    setHistory((h) => {
+      if (h === null) return h;
+      const previous = currentSnapshot(h);
+      const currentlyHidden = previous[selectedId]?.visibility === true;
+      return pushHistory(h, applyVisibility(previous, selectedId, !currentlyHidden));
+    });
+  }
+
+  /** PRD 2.2: interact mode lets the user try the page's real behavior with
+   * editing disabled — the shim itself stops forwarding node hits once it's
+   * not "edit" (so clicks navigate for real instead of selecting), but the
+   * editor's own chrome (selection, hover, an in-progress text edit) is
+   * stale the instant the mode changes and must be cleared explicitly. */
+  function setPreviewMode(next: "edit" | "interact") {
+    setPreviewModeState(next);
+    if (next === "interact") {
+      setSelectedId(undefined);
+      setHoverId(undefined);
+      setEditingId(undefined);
+    }
+    for (const frame of Object.values(iframeRefs.current)) {
+      frame?.contentWindow?.postMessage(
+        { type: "mode:set", protocolVersion: PROTOCOL_VERSION, mode: next },
+        "*",
+      );
+    }
+  }
+
+  /** Enter/blur commits (PRD 3.1); an unchanged draft is a no-op, not a history entry. */
+  function commitTextEdit() {
+    const nodeId = editingId;
+    setEditingId(undefined);
+    if (nodeId === undefined) return;
+    setHistory((h) => {
+      if (h === null) return h;
+      const previous = currentSnapshot(h);
+      if ((previous[nodeId]?.text as string | undefined) === editingDraft) return h;
+      return pushHistory(h, applyTextValue(previous, nodeId, editingDraft));
+    });
+  }
+
+  function cancelTextEdit() {
+    setEditingId(undefined);
+  }
+
+  /** One gesture (a move or a corner-handle resize can touch two properties
+   * at once) is one history entry, not one per property. */
+  function commitLayoutProperties(nodeId: string, properties: Record<string, string>) {
+    setHistory((h) => {
+      if (h === null) return h;
+      let next = currentSnapshot(h);
+      for (const [property, value] of Object.entries(properties)) {
+        next = applyLayoutProperty(next, nodeId, property, value);
+      }
+      return pushHistory(h, next);
+    });
+  }
+
+  function showGestureRejectedHint(nodeId: string, kind: "move" | "resize", rawDx: number, rawDy: number) {
+    setGestureToast(REJECTED_GESTURE_HINT);
+    window.setTimeout(() => setGestureToast((current) => (current === REJECTED_GESTURE_HINT ? undefined : current)), 2500);
+    // roadmap signal (PRD risk 3.3): every rejected gesture is worth knowing
+    // about when prioritizing v2's layout-channel expressiveness
+    console.info("[layout] rejected gesture (exceeds v1's no-reparenting bound)", { nodeId, kind, rawDx, rawDy });
+  }
+
+  /** Drag-to-reposition (mousedown on the selection body) and resize-via-
+   * handle (mousedown on a handle) share one gesture loop (PRD 3.3): track
+   * the raw pixel delta, snap it to the space scale unless a modifier key is
+   * held, preview it as a ghost rect, and on release either commit it as a
+   * layout-channel override or reject it (PRD risk 3) if it exceeds the
+   * bound that would imply reparenting/reordering, which v1 cannot express.
+   *
+   * Deltas are read from raw client-pixel movement and divided by the
+   * canvas zoom factor — at zoom !== 1 a screen pixel of drag no longer
+   * equals a document pixel of the (unscaled) iframe content. */
+  function startLayoutDrag(
+    event: React.PointerEvent<HTMLSpanElement>,
+    nodeId: string,
+    kind: "move" | "resize",
+    handle?: Handle,
+  ) {
+    event.preventDefault();
+    event.stopPropagation();
+    const startRect = geometry[nodeId]?.rect;
+    if (startRect === undefined || tokens === null) return;
+    const startX = event.clientX;
+    const startY = event.clientY;
+    const zoom = viewport.zoom;
+    // Pointer capture, not a window-level listener: the cursor crosses over
+    // the click-through overlay (pointer-events:none) and the cross-origin
+    // iframe during a real drag, which would otherwise route move/up events
+    // to whatever's underneath instead of back to this element.
+    const target: HTMLSpanElement = event.currentTarget;
+    target.setPointerCapture(event.pointerId);
+
+    function nextRect(rawDx: number, rawDy: number, snap: boolean): NodeGeometry["rect"] {
+      const dx = snap ? nearestSpaceStep(tokens!, rawDx) : rawDx;
+      const dy = snap ? nearestSpaceStep(tokens!, rawDy) : rawDy;
+      if (kind === "move") {
+        return { ...startRect!, x: startRect!.x + Math.max(0, dx), y: startRect!.y + Math.max(0, dy) };
+      }
+      const weight = HANDLE_DELTA[handle!];
+      return {
+        ...startRect!,
+        width: Math.max(MIN_SIZE_PX, startRect!.width + weight.width * dx),
+        height: Math.max(MIN_SIZE_PX, startRect!.height + weight.height * dy),
+      };
+    }
+
+    function onPointerMove(moveEvent: PointerEvent) {
+      const rawDx = (moveEvent.clientX - startX) / zoom;
+      const rawDy = (moveEvent.clientY - startY) / zoom;
+      const rejected = Math.abs(rawDx) > REJECT_THRESHOLD_PX || Math.abs(rawDy) > REJECT_THRESHOLD_PX;
+      setDragGhost({
+        rect: rejected ? startRect! : nextRect(rawDx, rawDy, !moveEvent.altKey),
+        rejected,
+      });
+    }
+
+    function onPointerUp(upEvent: PointerEvent) {
+      target.releasePointerCapture(upEvent.pointerId);
+      target.removeEventListener("pointermove", onPointerMove);
+      target.removeEventListener("pointerup", onPointerUp);
+      setDragGhost(null);
+      const rawDx = (upEvent.clientX - startX) / zoom;
+      const rawDy = (upEvent.clientY - startY) / zoom;
+      if (Math.abs(rawDx) > REJECT_THRESHOLD_PX || Math.abs(rawDy) > REJECT_THRESHOLD_PX) {
+        showGestureRejectedHint(nodeId, kind, rawDx, rawDy);
+        return;
+      }
+      const snap = !upEvent.altKey;
+      const dx = snap ? nearestSpaceStep(tokens!, rawDx) : rawDx;
+      const dy = snap ? nearestSpaceStep(tokens!, rawDy) : rawDy;
+      if (dx === 0 && dy === 0) return; // no-op gesture, not a history entry
+      if (kind === "move") {
+        commitLayoutProperties(nodeId, {
+          marginLeft: `${Math.max(0, dx)}px`,
+          marginTop: `${Math.max(0, dy)}px`,
+        });
+      } else {
+        const weight = HANDLE_DELTA[handle!];
+        const properties: Record<string, string> = {};
+        if (weight.width !== 0) {
+          properties.width = `${Math.max(MIN_SIZE_PX, startRect.width + weight.width * dx)}px`;
+        }
+        if (weight.height !== 0) {
+          properties.height = `${Math.max(MIN_SIZE_PX, startRect.height + weight.height * dy)}px`;
+        }
+        if (Object.keys(properties).length > 0) commitLayoutProperties(nodeId, properties);
+      }
+    }
+
+    target.addEventListener("pointermove", onPointerMove);
+    target.addEventListener("pointerup", onPointerUp);
+  }
+
+  /* ---------- canvas pan/zoom (PRD 2.1: DOM-based, CSS-transformed stage) ---------- */
+
+  /** Two-finger trackpad scroll / mouse wheel pans; Ctrl/Cmd+wheel (pinch on
+   * most trackpads reports this way) zooms toward the cursor. */
+  function onStageWheel(event: React.WheelEvent<HTMLDivElement>) {
+    if (event.ctrlKey || event.metaKey) {
+      event.preventDefault();
+      const rect = event.currentTarget.getBoundingClientRect();
+      setViewport((v) => zoomAt(v, event.clientX - rect.left, event.clientY - rect.top, -event.deltaY * ZOOM_WHEEL_SENSITIVITY));
+    } else {
+      setViewport((v) => ({ ...v, x: v.x - event.deltaX, y: v.y - event.deltaY }));
+    }
+  }
+
+  /** Drag-to-pan from empty canvas background only — a click that starts on
+   * a frame or its chrome is handled by that element (and stops propagation
+   * where it needs to), so this only ever fires for genuine background drags. */
+  function onStagePointerDown(event: React.PointerEvent<HTMLDivElement>) {
+    if (event.target !== event.currentTarget) return;
+    event.preventDefault();
+    const target = event.currentTarget;
+    target.setPointerCapture(event.pointerId);
+    const startX = event.clientX;
+    const startY = event.clientY;
+    const startViewport = viewport;
+
+    function onPointerMove(moveEvent: PointerEvent) {
+      setViewport({
+        ...startViewport,
+        x: startViewport.x + (moveEvent.clientX - startX),
+        y: startViewport.y + (moveEvent.clientY - startY),
+      });
+    }
+    function onPointerUp(upEvent: PointerEvent) {
+      target.releasePointerCapture(upEvent.pointerId);
+      target.removeEventListener("pointermove", onPointerMove);
+      target.removeEventListener("pointerup", onPointerUp);
+    }
+    target.addEventListener("pointermove", onPointerMove);
+    target.addEventListener("pointerup", onPointerUp);
+  }
+
   /* ---------- regeneration (PRD section 4) ---------- */
 
   async function refreshManifest() {
@@ -260,9 +603,13 @@ export default function App() {
 
   /** Deterministic frame reload after regen/revert — HMR is not a reliable
    * carrier for whole-section rewrites; frame:ready re-applies overrides. */
-  function reloadPreview() {
-    const frame = iframeRef.current;
-    if (frame !== null) frame.src = `${PREVIEW_URL}/?regen=${Date.now()}`;
+  function reloadPreview(section: string) {
+    const slug = routeOf(section);
+    const frame = iframeRefs.current[slug];
+    const routePath = routes.find((route) => route.slug === slug)?.path ?? "/";
+    if (frame !== null && frame !== undefined) {
+      frame.src = `${PREVIEW_URL}${routePath}?regen=${Date.now()}`;
+    }
   }
 
   async function confirmRegen() {
@@ -290,7 +637,7 @@ export default function App() {
       setRevertSection(section);
       setOrphans(outcome.orphanedOverrides ?? []);
       setRegen({ phase: "idle" });
-      reloadPreview();
+      reloadPreview(section);
     } catch (error) {
       setRegen({ phase: "failed", section, report: String(error), instruction });
     }
@@ -304,9 +651,10 @@ export default function App() {
       body: JSON.stringify({ section: revertSection }),
     });
     await refreshManifest();
+    const section = revertSection;
     setRevertSection(undefined);
     setOrphans([]);
-    reloadPreview();
+    reloadPreview(section);
   }
 
   function discardOrphan(nodeId: string) {
@@ -335,6 +683,9 @@ export default function App() {
   const crumbs = manifest === null ? [] : breadcrumbFor(selectedId, manifest);
   const selectedNode = selectedId !== undefined ? manifest?.nodes[selectedId] : undefined;
   const selectedGeom = selectedId !== undefined ? geometry[selectedId] : undefined;
+  const layoutEditable = selectedNode?.editable.includes("layout") ?? false;
+  const editingGeom = editingId !== undefined ? geometry[editingId] : undefined;
+  const editingMultiline = editingId !== undefined && manifest?.nodes[editingId]?.element === "Text";
   const sectionSelected =
     selectedId !== undefined && selectedId.split(".").length === 2 ? selectedId : undefined;
   const regenGeom = regen.phase === "running" ? geometry[regen.section] : undefined;
@@ -343,6 +694,8 @@ export default function App() {
     selectedId !== undefined
       ? ((map[selectedId]?.style as Record<string, string> | undefined) ?? {})
       : {};
+  const selectedHidden = selectedId !== undefined && map[selectedId]?.visibility === true;
+  const anyVersionMismatch = Object.values(frameStatus).some((status) => status === "version-mismatch");
 
   if (pendingPlan !== null) {
     return (
@@ -388,6 +741,26 @@ export default function App() {
           })}
         </nav>
         <div className="header-actions">
+          <div className="mode-toggle" data-testid="mode-toggle" role="group" aria-label="Preview mode">
+            <button
+              type="button"
+              data-testid="mode-edit"
+              className={previewMode === "edit" ? "mode-btn active" : "mode-btn"}
+              aria-pressed={previewMode === "edit"}
+              onClick={() => setPreviewMode("edit")}
+            >
+              Edit
+            </button>
+            <button
+              type="button"
+              data-testid="mode-interact"
+              className={previewMode === "interact" ? "mode-btn active" : "mode-btn"}
+              aria-pressed={previewMode === "interact"}
+              onClick={() => setPreviewMode("interact")}
+            >
+              Interact
+            </button>
+          </div>
           <button
             type="button"
             data-testid="undo-button"
@@ -413,7 +786,7 @@ export default function App() {
             {saveStatus}
           </span>
         </div>
-        {shimStatus === "version-mismatch" && (
+        {anyVersionMismatch && (
           <span data-testid="version-warning" className="version-warning">
             Preview shim protocol mismatch — rebuild the preview.
           </span>
@@ -421,76 +794,182 @@ export default function App() {
       </header>
 
       <div className="editor-main">
-        <div className="stage" onMouseLeave={() => setHoverId(undefined)}>
-          <div className="frame-wrap">
-            <iframe ref={iframeRef} title="preview" src={PREVIEW_URL} className="preview-frame" />
-            <div className="overlay">
-              {hoverGeom !== undefined && hoverId !== undefined && (
+        <div
+          ref={stageRef}
+          className="stage"
+          data-testid="canvas-stage"
+          onMouseLeave={() => setHoverId(undefined)}
+          onWheel={onStageWheel}
+          onPointerDown={onStagePointerDown}
+        >
+          <div
+            className="canvas-surface"
+            data-testid="canvas-surface"
+            style={{ transform: `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.zoom})` }}
+          >
+            {routes.map((route, index) => {
+              const offsetX = frameOffsetX(index);
+              const near = isFrameNearViewport(offsetX, FRAME_WIDTH, viewport, stageSize.width);
+              return (
                 <div
-                  data-testid="hover-outline"
-                  className="hover-outline"
-                  style={{
-                    left: hoverGeom.rect.x,
-                    top: hoverGeom.rect.y,
-                    width: hoverGeom.rect.width,
-                    height: hoverGeom.rect.height,
-                  }}
+                  key={route.slug}
+                  className="frame-wrap"
+                  data-testid={`frame-${route.slug}`}
+                  style={{ left: offsetX, width: FRAME_WIDTH, height: FRAME_HEIGHT }}
                 >
-                  <span data-testid="hover-label" className="hover-label">
-                    {humanizeSegment(hoverId.split(".").pop()!)}
-                  </span>
-                </div>
-              )}
-              {regenGeom !== undefined && (
-                <div
-                  data-testid="regen-progress"
-                  className="regen-progress"
-                  style={{
-                    left: regenGeom.rect.x,
-                    top: regenGeom.rect.y,
-                    width: regenGeom.rect.width,
-                    height: regenGeom.rect.height,
-                  }}
-                >
-                  <span>Regenerating…</span>
-                </div>
-              )}
-              {selectedGeom !== undefined && (
-                <>
-                  <div
-                    data-testid="spacing-overlay"
-                    className="spacing-overlay"
-                    style={{
-                      left: selectedGeom.rect.x,
-                      top: selectedGeom.rect.y,
-                      width: selectedGeom.rect.width,
-                      height: selectedGeom.rect.height,
-                    }}
-                  >
-                    <span className="pad-band" style={{ top: 0, left: 0, right: 0, height: selectedGeom.spacing.padding.top }} />
-                    <span className="pad-band" style={{ bottom: 0, left: 0, right: 0, height: selectedGeom.spacing.padding.bottom }} />
-                    <span className="pad-band" style={{ top: 0, bottom: 0, left: 0, width: selectedGeom.spacing.padding.left }} />
-                    <span className="pad-band" style={{ top: 0, bottom: 0, right: 0, width: selectedGeom.spacing.padding.right }} />
-                    <span className="margin-band" style={{ top: -selectedGeom.spacing.margin.top, left: 0, right: 0, height: selectedGeom.spacing.margin.top }} />
-                    <span className="margin-band" style={{ bottom: -selectedGeom.spacing.margin.bottom, left: 0, right: 0, height: selectedGeom.spacing.margin.bottom }} />
+                  <span className="frame-label">{route.path === "/" ? route.slug : route.path}</span>
+                  {near ? (
+                    <iframe
+                      ref={(el) => {
+                        iframeRefs.current[route.slug] = el;
+                      }}
+                      title={`preview-${route.slug}`}
+                      data-route-slug={route.slug}
+                      src={`${PREVIEW_URL}${route.path}`}
+                      className="preview-frame"
+                      style={{ height: FRAME_HEIGHT }}
+                    />
+                  ) : (
+                    <div className="frame-placeholder" style={{ height: FRAME_HEIGHT }}>
+                      {route.slug}
+                    </div>
+                  )}
+                  <div className="overlay">
+                    {hoverGeom !== undefined && hoverId !== undefined && routeOf(hoverId) === route.slug && (
+                      <div
+                        data-testid="hover-outline"
+                        className="hover-outline"
+                        style={{
+                          left: hoverGeom.rect.x,
+                          top: hoverGeom.rect.y,
+                          width: hoverGeom.rect.width,
+                          height: hoverGeom.rect.height,
+                        }}
+                      >
+                        <span data-testid="hover-label" className="hover-label">
+                          {humanizeSegment(hoverId.split(".").pop()!)}
+                        </span>
+                      </div>
+                    )}
+                    {regenGeom !== undefined && regen.phase === "running" && routeOf(regen.section) === route.slug && (
+                      <div
+                        data-testid="regen-progress"
+                        className="regen-progress"
+                        style={{
+                          left: regenGeom.rect.x,
+                          top: regenGeom.rect.y,
+                          width: regenGeom.rect.width,
+                          height: regenGeom.rect.height,
+                        }}
+                      >
+                        <span>Regenerating…</span>
+                      </div>
+                    )}
+                    {selectedGeom !== undefined && selectedId !== undefined && routeOf(selectedId) === route.slug && (
+                      <>
+                        <div
+                          data-testid="spacing-overlay"
+                          className="spacing-overlay"
+                          style={{
+                            left: selectedGeom.rect.x,
+                            top: selectedGeom.rect.y,
+                            width: selectedGeom.rect.width,
+                            height: selectedGeom.rect.height,
+                          }}
+                        >
+                          <span className="pad-band" style={{ top: 0, left: 0, right: 0, height: selectedGeom.spacing.padding.top }} />
+                          <span className="pad-band" style={{ bottom: 0, left: 0, right: 0, height: selectedGeom.spacing.padding.bottom }} />
+                          <span className="pad-band" style={{ top: 0, bottom: 0, left: 0, width: selectedGeom.spacing.padding.left }} />
+                          <span className="pad-band" style={{ top: 0, bottom: 0, right: 0, width: selectedGeom.spacing.padding.right }} />
+                          <span className="margin-band" style={{ top: -selectedGeom.spacing.margin.top, left: 0, right: 0, height: selectedGeom.spacing.margin.top }} />
+                          <span className="margin-band" style={{ bottom: -selectedGeom.spacing.margin.bottom, left: 0, right: 0, height: selectedGeom.spacing.margin.bottom }} />
+                        </div>
+                        <div
+                          data-testid="selection-outline"
+                          className="selection-outline"
+                          style={{
+                            left: selectedGeom.rect.x,
+                            top: selectedGeom.rect.y,
+                            width: selectedGeom.rect.width,
+                            height: selectedGeom.rect.height,
+                          }}
+                        >
+                          {/* A dedicated handle, not the whole outline body: the
+                              body must stay click-through so selecting a CHILD
+                              inside an already-selected parent's bounding box
+                              still reaches the iframe underneath. */}
+                          {layoutEditable && (
+                            <span
+                              data-testid="move-handle"
+                              className="move-handle"
+                              title="Drag to reposition"
+                              onPointerDown={(event) => startLayoutDrag(event, selectedId, "move")}
+                            />
+                          )}
+                          {layoutEditable &&
+                            HANDLES.map((handle) => (
+                              <span
+                                key={handle}
+                                data-testid={`handle-${handle}`}
+                                className={`handle handle-${handle}`}
+                                onPointerDown={(event) => startLayoutDrag(event, selectedId, "resize", handle)}
+                              />
+                            ))}
+                        </div>
+                      </>
+                    )}
+                    {dragGhost !== null && selectedId !== undefined && routeOf(selectedId) === route.slug && (
+                      <div
+                        data-testid="drag-ghost"
+                        className={dragGhost.rejected ? "drag-ghost rejected" : "drag-ghost"}
+                        style={{
+                          left: dragGhost.rect.x,
+                          top: dragGhost.rect.y,
+                          width: dragGhost.rect.width,
+                          height: dragGhost.rect.height,
+                        }}
+                      />
+                    )}
+                    {editingGeom !== undefined && editingId !== undefined && routeOf(editingId) === route.slug && (
+                      <div
+                        ref={editOverlayRef}
+                        data-testid="text-edit-overlay"
+                        className="text-edit-overlay"
+                        contentEditable
+                        suppressContentEditableWarning
+                        style={{
+                          left: editingGeom.rect.x,
+                          top: editingGeom.rect.y,
+                          width: editingGeom.rect.width,
+                          height: editingGeom.rect.height,
+                          fontFamily: editingGeom.textStyle.fontFamily,
+                          fontSize: editingGeom.textStyle.fontSize,
+                          fontWeight: editingGeom.textStyle.fontWeight,
+                          lineHeight: editingGeom.textStyle.lineHeight,
+                          color: editingGeom.textStyle.color,
+                          textAlign: editingGeom.textStyle.textAlign as "left" | "right" | "center",
+                        }}
+                        onInput={(event) => setEditingDraft(event.currentTarget.textContent ?? "")}
+                        onBlur={commitTextEdit}
+                        onKeyDown={(event) => {
+                          event.stopPropagation();
+                          if (event.key === "Escape") {
+                            event.preventDefault();
+                            cancelTextEdit();
+                          } else if (event.key === "Enter" && (!editingMultiline || event.shiftKey)) {
+                            // single-line elements: Enter always commits. Multi-line
+                            // elements: only Shift+Enter commits, plain Enter inserts
+                            // a newline (PRD 3.1's "multi-line allowed" case).
+                            event.preventDefault();
+                            event.currentTarget.blur();
+                          }
+                        }}
+                      />
+                    )}
                   </div>
-                  <div
-                    data-testid="selection-outline"
-                    className="selection-outline"
-                    style={{
-                      left: selectedGeom.rect.x,
-                      top: selectedGeom.rect.y,
-                      width: selectedGeom.rect.width,
-                      height: selectedGeom.rect.height,
-                    }}
-                  >
-                    {HANDLES.map((handle) => (
-                      <span key={handle} className={`handle handle-${handle}`} />
-                    ))}
-                  </div>
-                </>
-              )}
-            </div>
+                </div>
+              );
+            })}
           </div>
         </div>
 
@@ -524,6 +1003,8 @@ export default function App() {
               tokenPaths={tokenPathSet(tokens)}
               styleValue={selectedStyle}
               onCommit={commitStyle}
+              hidden={selectedHidden}
+              onToggleVisibility={toggleVisibility}
             />
           ) : (
             <p className="inspector-empty">Click an element in the preview to select it.</p>
@@ -537,6 +1018,12 @@ export default function App() {
         onDiscard={discardOrphan}
         onCopy={copyOrphan}
       />
+
+      {gestureToast !== undefined && (
+        <div data-testid="gesture-toast" className="gesture-toast">
+          {gestureToast}
+        </div>
+      )}
     </div>
   );
 }

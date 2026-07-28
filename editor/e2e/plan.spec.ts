@@ -98,7 +98,7 @@ test("approve dismisses the plan screen, reveals the canvas, and persists approv
 
   await expect(page.getByTestId("plan-approval")).toHaveCount(0);
   await expect(
-    page.frameLocator('iframe[title="preview"]').locator('[data-node-id="home.hero.headline"]'),
+    page.frameLocator('iframe[title="preview-home"]').locator('[data-node-id="home.hero.headline"]'),
   ).toBeVisible();
 
   const status = JSON.parse(readFileSync(join(planDir, "plan-status.json"), "utf8"));

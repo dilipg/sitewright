@@ -27,10 +27,11 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
-import type { JsxOpeningElement, JsxSelfClosingElement, SourceFile } from "ts-morph";
-import { Project, SyntaxKind, ts } from "ts-morph";
+import type { CallExpression, JsxOpeningElement, JsxSelfClosingElement, ObjectLiteralExpression, SourceFile } from "ts-morph";
+import { Node, Project, SyntaxKind, ts } from "ts-morph";
 // Runtime imports carry explicit .ts extensions: scripts/ run this module
 // through Node's native type-stripping, which resolves ESM paths literally.
+import { isInsideMapCallback, resolveTemplateExpression } from "./gates.ts";
 import type { GateReport } from "./gates.ts";
 import { runGates } from "./gates.ts";
 import type { Manifest, ManifestNode } from "./manifest.ts";
@@ -224,8 +225,8 @@ function applyOverrides(outDir: string, overrides: OverrideEntry[], manifest: Ma
   }
   for (const override of byChannel("visibility")) {
     if (override.value === false) continue;
-    removeElement(project, override.nodeId, changed);
-    tombstoned.push(override.nodeId);
+    const removedFromSource = removeElement(project, outDir, override.nodeId, manifest.nodes[override.nodeId]!, changed);
+    if (removedFromSource) tombstoned.push(override.nodeId);
   }
 
   for (const sourceFile of changed) sourceFile.saveSync();
@@ -257,6 +258,209 @@ function findAttachedElement(
   return undefined;
 }
 
+/*
+ * ---------- list-item overrides (contract 5.2 + the per-item override-slot
+ * convention, docs/codegen-contract-v1.md section 5.2) ----------
+ *
+ * A list item's node id only exists as a template-literal pattern inside a
+ * `.map()` callback — there is no literal JSX element per rendered instance,
+ * since one `.map()` body renders every item. findAttachedElement (literal
+ * match only) can never resolve one. Overrides on a list-item node instead
+ * compile into that ONE item's own mock-data array element:
+ *
+ *   text                -> rewrite the matching field directly (same
+ *                           "content flows through props" model as a
+ *                           section-level text override, contract 4.3)
+ *   visibility           -> set `hidden: true` (item root) or
+ *                           `childHidden: { "<suffix>": true }` (a child)
+ *   style / layout        -> merge a compiled utility class into
+ *                           `className` (item root) or
+ *                           `childClassNames: { "<suffix>": "..." }` (a child)
+ *
+ * The section component must read these fields back (className/hidden on
+ * the item's own root, childClassNames/childHidden indexed by each child's
+ * id suffix) — the convention every list-based archetype template teaches.
+ */
+
+interface ListItemContext {
+  /** The array element's own stable key value (e.g. "growth"). */
+  key: string;
+  /** The suffix after the item's own id (e.g. "name"), or undefined when the override targets the item's own root. */
+  childSuffix: string | undefined;
+  /** The destructured prop holding the array (e.g. "tiers"). */
+  arrayPropName: string;
+  /** The field on each item used as its stable key (e.g. "key"). */
+  keyPropName: string;
+}
+
+const REGEX_SPECIAL_CHARS = /[.*+?^${}()|[\]\\]/g;
+
+/**
+ * Prefix-capturing counterpart to gates.ts's exact-match templateToPattern:
+ * matches only as far as the item-id template's own shape reaches (the
+ * first substitution — a reference to the section's own nodeId — stays
+ * unrestricted `.+`; the item's own key substitution is captured and
+ * restricted to `[^.]+`, contract 5.2's dot-boundary rule), leaving any
+ * remainder (a child's ".suffix") for the caller to interpret.
+ */
+function templateToPrefixPattern(template: import("ts-morph").TemplateExpression): RegExp {
+  const headText = template.getHead().getLiteralText().replace(REGEX_SPECIAL_CHARS, "\\$&");
+  const spans = template.getTemplateSpans();
+  let pattern = headText;
+  spans.forEach((span, index) => {
+    const literal = span.getLiteral().getLiteralText().replace(REGEX_SPECIAL_CHARS, "\\$&");
+    pattern += (index === 0 ? "(?:.+)" : "([^.]+)") + literal;
+  });
+  return new RegExp(`^${pattern}`);
+}
+
+/** Walks up to the nearest enclosing `X.map(...)` call, mirroring gates.ts's isInsideMapCallback but returning the call itself. */
+function findEnclosingMapCall(node: Node): CallExpression | undefined {
+  let current: Node | undefined = node;
+  while (current !== undefined) {
+    if (current.isKind(SyntaxKind.ArrowFunction) || current.isKind(SyntaxKind.FunctionExpression)) {
+      const parent = current.getParent();
+      if (parent?.isKind(SyntaxKind.CallExpression)) {
+        const callee = parent.getExpression();
+        if (callee.isKind(SyntaxKind.PropertyAccessExpression) && callee.getName() === "map") {
+          return parent;
+        }
+      }
+    }
+    current = current.getParent();
+  }
+  return undefined;
+}
+
+/**
+ * Resolves a list-item node id to the array/key/child-suffix it was derived
+ * from. Only recognizes the shape every archetype template teaches (contract
+ * 5.2's canonical example): a local `const itemId = `${nodeId}.slug-${item.key}``
+ * declared inside a `.map()` callback, referenced directly on the item's own
+ * root (`nodeId={itemId}`) and via further template literals on its children
+ * (`` nodeId={`${itemId}.suffix`} ``).
+ */
+function resolveListItemContext(project: Project, nodeId: string): ListItemContext | undefined {
+  for (const sourceFile of project.getSourceFiles()) {
+    for (const declaration of sourceFile.getDescendantsOfKind(SyntaxKind.VariableDeclaration)) {
+      const template = declaration.getInitializer()?.asKind(SyntaxKind.TemplateExpression);
+      if (template === undefined || !isInsideMapCallback(declaration)) continue;
+      const spans = template.getTemplateSpans();
+      if (spans.length !== 2) continue;
+      const keyAccess = spans[1]!.getExpression().asKind(SyntaxKind.PropertyAccessExpression);
+      if (keyAccess === undefined) continue;
+
+      const mapCall = findEnclosingMapCall(declaration);
+      if (mapCall === undefined) continue;
+      const callee = mapCall.getExpression().asKind(SyntaxKind.PropertyAccessExpression);
+      const arrayPropName = callee?.getExpression().getText();
+      if (arrayPropName === undefined) continue;
+
+      const prefixPattern = templateToPrefixPattern(template);
+      const match = prefixPattern.exec(nodeId);
+      if (match === null) continue;
+
+      const matchedLength = match[0]!.length;
+      const remainder = nodeId.slice(matchedLength);
+      if (remainder !== "" && !remainder.startsWith(".")) continue;
+
+      return {
+        key: match[1]!,
+        childSuffix: remainder === "" ? undefined : remainder.slice(1),
+        arrayPropName,
+        keyPropName: keyAccess.getName(),
+      };
+    }
+  }
+  return undefined;
+}
+
+/** Locates the ONE mock-data array element matching a resolved list-item context. */
+function findMockArrayElement(
+  project: Project,
+  outDir: string,
+  node: ManifestNode,
+  context: ListItemContext,
+): { element: ObjectLiteralExpression; mockFile: SourceFile } {
+  const mockPath = join(outDir, dirname(node.file), "..", "mock", `${node.component}.data.ts`);
+  const mockFile = project.getSourceFile(mockPath.replace(/\\/g, "/"));
+  if (mockFile === undefined) {
+    throw new ExportError(`Mock data file for "${node.component}" not found at ${mockPath}.`);
+  }
+  const dataObject = mockFile
+    .getVariableDeclarations()
+    .find((declaration) => declaration.getTypeNode()?.getText() === `${node.component}Props`)
+    ?.getInitializer()
+    ?.asKind(SyntaxKind.ObjectLiteralExpression);
+  if (dataObject === undefined) {
+    throw new ExportError(`No ${node.component}Props mock object found in ${mockPath}.`);
+  }
+  const array = dataObject
+    .getProperty(context.arrayPropName)
+    ?.asKind(SyntaxKind.PropertyAssignment)
+    ?.getInitializer()
+    ?.asKind(SyntaxKind.ArrayLiteralExpression);
+  if (array === undefined) {
+    throw new ExportError(`Mock array "${context.arrayPropName}" not found in ${mockPath}.`);
+  }
+  for (const element of array.getElements()) {
+    const object = element.asKind(SyntaxKind.ObjectLiteralExpression);
+    const keyLiteral = object
+      ?.getProperty(context.keyPropName)
+      ?.asKind(SyntaxKind.PropertyAssignment)
+      ?.getInitializer()
+      ?.asKind(SyntaxKind.StringLiteral);
+    if (keyLiteral?.getLiteralValue() === context.key) {
+      return { element: object!, mockFile };
+    }
+  }
+  throw new ExportError(
+    `No item with ${context.keyPropName}="${context.key}" found in mock array "${context.arrayPropName}" (${mockPath}).`,
+  );
+}
+
+/** Finds a direct property on an object literal by its exact source name (handles quoted keys like `"one-click-import"`, which ts-morph's own getProperty does not match against a plain-string argument). */
+function findProperty(
+  object: ObjectLiteralExpression,
+  name: string,
+): import("ts-morph").PropertyAssignment | undefined {
+  return object
+    .getProperties()
+    .find(
+      (property): property is import("ts-morph").PropertyAssignment =>
+        property.isKind(SyntaxKind.PropertyAssignment) && property.getName() === name,
+    );
+}
+
+/** Gets the nested object-literal value of a property, creating an empty one if the property is absent. */
+function getOrCreateNestedObject(object: ObjectLiteralExpression, groupName: string): ObjectLiteralExpression {
+  const existing = findProperty(object, groupName)?.getInitializer()?.asKind(SyntaxKind.ObjectLiteralExpression);
+  if (existing !== undefined) return existing;
+  const added = object.addPropertyAssignment({ name: groupName, initializer: "{}" });
+  return added.getInitializerOrThrow().asKindOrThrow(SyntaxKind.ObjectLiteralExpression);
+}
+
+/** Sets (or inserts) a plain property on an object literal to a boolean literal. */
+function setBooleanProperty(object: ObjectLiteralExpression, name: string, value: boolean): void {
+  const existing = findProperty(object, name);
+  if (existing !== undefined) existing.setInitializer(String(value));
+  else object.addPropertyAssignment({ name, initializer: String(value) });
+}
+
+/** Merges compiled utility classes into a string-literal property (creating it if absent), replacing same-category utilities — the mock-data analogue of mergeClassName for a literal JSX attribute. */
+function mergeIntoStringProperty(object: ObjectLiteralExpression, propertyName: string, newClasses: string[]): void {
+  const existing = findProperty(object, propertyName);
+  const existingLiteral = existing?.getInitializer()?.asKind(SyntaxKind.StringLiteral);
+  let kept = (existingLiteral?.getLiteralValue() ?? "").split(/\s+/).filter((cls) => cls.length > 0);
+  for (const cls of newClasses) {
+    kept = kept.filter((current) => !conflictsWith(current, cls));
+    kept.push(cls);
+  }
+  const value = kept.join(" ");
+  if (existingLiteral !== undefined) existingLiteral.setLiteralValue(value);
+  else object.addPropertyAssignment({ name: propertyName, initializer: JSON.stringify(value) });
+}
+
 /**
  * Resolves the element whose className receives compiled classes. When the
  * manifest says the node is a native element ("section") but the literal
@@ -269,11 +473,9 @@ function findClassTarget(
   outDir: string,
   nodeId: string,
   node: ManifestNode,
-): JsxOpeningElement | JsxSelfClosingElement {
+): JsxOpeningElement | JsxSelfClosingElement | undefined {
   const attached = findAttachedElement(project, nodeId);
-  if (attached === undefined) {
-    throw new ExportError(`No element carries data-node-id "${nodeId}"; cannot compile its override.`);
-  }
+  if (attached === undefined) return undefined;
   const isComponentUsage = /^[A-Z]/.test(attached.getTagNameNode().getText());
   const isNativeNode = /^[a-z]/.test(node.element);
   if (!isComponentUsage || !isNativeNode) return attached;
@@ -293,6 +495,34 @@ function findClassTarget(
   throw new ExportError(`No data-node-id root element found in "${node.file}" for node "${nodeId}".`);
 }
 
+function applyListItemTextOverride(
+  project: Project,
+  outDir: string,
+  override: OverrideEntry,
+  node: ManifestNode,
+  context: ListItemContext,
+  changed: Set<SourceFile>,
+): void {
+  if (context.childSuffix === undefined) {
+    throw new ExportError(
+      `Text override on "${override.nodeId}" targets a list item's own root; text overrides need a child field to rewrite.`,
+    );
+  }
+  const { element, mockFile } = findMockArrayElement(project, outDir, node, context);
+  const leaf = element
+    .getProperty(context.childSuffix)
+    ?.asKind(SyntaxKind.PropertyAssignment)
+    ?.getInitializer()
+    ?.asKind(SyntaxKind.StringLiteral);
+  if (leaf === undefined) {
+    throw new ExportError(
+      `Mock field "${context.childSuffix}" for node "${override.nodeId}" is not a string literal; text overrides rewrite string literals only.`,
+    );
+  }
+  leaf.setLiteralValue(override.value as string);
+  changed.add(mockFile);
+}
+
 function applyTextOverride(
   project: Project,
   outDir: string,
@@ -302,6 +532,11 @@ function applyTextOverride(
 ): void {
   const attached = findAttachedElement(project, override.nodeId);
   if (attached === undefined) {
+    const context = resolveListItemContext(project, override.nodeId);
+    if (context !== undefined) {
+      applyListItemTextOverride(project, outDir, override, node, context, changed);
+      return;
+    }
     throw new ExportError(`No element carries data-node-id "${override.nodeId}"; cannot apply text override.`);
   }
 
@@ -375,6 +610,40 @@ function expressionToPath(text: string): string[] | undefined {
   return text.split(".");
 }
 
+function applyListItemClassOverride(
+  project: Project,
+  outDir: string,
+  override: OverrideEntry,
+  node: ManifestNode,
+  context: ListItemContext,
+  tokenVars: Set<string>,
+  changed: Set<SourceFile>,
+): void {
+  const { element, mockFile } = findMockArrayElement(project, outDir, node, context);
+  // Trailing "!" (Tailwind v4's important modifier): a literal node's base
+  // classes and override classes live in the SAME className string, so
+  // mergeClassName can resolve conflicts by physically removing the old
+  // same-category utility (compileUtilityClass alone is enough there). A
+  // list item's base classes are hardcoded in the component's shared JSX —
+  // one template, rendered for every item — so the exporter has no source
+  // location to remove them FROM for just this one instance; the override
+  // class ends up concatenated alongside the base class instead of replacing
+  // it, and without a forced-important tiebreaker, Tailwind's stylesheet
+  // order (not source order) decides the winner, same failure mode the live
+  // shim's !important-injected override stylesheet exists to avoid.
+  const compiled = Object.entries(override.value as Record<string, unknown>).map(
+    ([property, rawValue]) => `${compileUtilityClass(override.nodeId, property, String(rawValue), tokenVars)}!`,
+  );
+
+  if (context.childSuffix === undefined) {
+    mergeIntoStringProperty(element, "className", compiled);
+  } else {
+    const group = getOrCreateNestedObject(element, "childClassNames");
+    mergeIntoStringProperty(group, JSON.stringify(context.childSuffix), compiled);
+  }
+  changed.add(mockFile);
+}
+
 function applyClassOverride(
   project: Project,
   outDir: string,
@@ -384,6 +653,14 @@ function applyClassOverride(
   changed: Set<SourceFile>,
 ): void {
   const target = findClassTarget(project, outDir, override.nodeId, node);
+  if (target === undefined) {
+    const context = resolveListItemContext(project, override.nodeId);
+    if (context !== undefined) {
+      applyListItemClassOverride(project, outDir, override, node, context, tokenVars, changed);
+      return;
+    }
+    throw new ExportError(`No element carries data-node-id "${override.nodeId}"; cannot compile its override.`);
+  }
 
   for (const [property, rawValue] of Object.entries(override.value as Record<string, unknown>)) {
     const compiled = compileUtilityClass(override.nodeId, property, String(rawValue), tokenVars);
@@ -468,16 +745,47 @@ function utilityCategory(cls: string): string {
   return root;
 }
 
-function removeElement(project: Project, nodeId: string, changed: Set<SourceFile>): void {
+/** Hides one item (or one of its children) via mock data — the item's own JSX template still renders every OTHER item, so nothing is removed from source (and nothing needs tombstoning: the id's pattern-based attachment is untouched, only its current data is). */
+function applyListItemVisibilityOverride(
+  project: Project,
+  outDir: string,
+  node: ManifestNode,
+  context: ListItemContext,
+  changed: Set<SourceFile>,
+): void {
+  const { element, mockFile } = findMockArrayElement(project, outDir, node, context);
+  if (context.childSuffix === undefined) {
+    setBooleanProperty(element, "hidden", true);
+  } else {
+    const group = getOrCreateNestedObject(element, "childHidden");
+    setBooleanProperty(group, JSON.stringify(context.childSuffix), true);
+  }
+  changed.add(mockFile);
+}
+
+/** Returns true when the manifest entry should be tombstoned (a literal element was actually removed from source); false for a list-item data-only hide. */
+function removeElement(
+  project: Project,
+  outDir: string,
+  nodeId: string,
+  node: ManifestNode,
+  changed: Set<SourceFile>,
+): boolean {
   const attached = findAttachedElement(project, nodeId);
   if (attached === undefined) {
+    const context = resolveListItemContext(project, nodeId);
+    if (context !== undefined) {
+      applyListItemVisibilityOverride(project, outDir, node, context, changed);
+      return false;
+    }
     throw new ExportError(`No element carries data-node-id "${nodeId}"; cannot apply visibility override.`);
   }
-  const node = attached.isKind(SyntaxKind.JsxOpeningElement)
+  const jsxNode = attached.isKind(SyntaxKind.JsxOpeningElement)
     ? attached.getFirstAncestorByKind(SyntaxKind.JsxElement)!
     : attached;
-  changed.add(node.getSourceFile());
-  node.replaceWithText("");
+  changed.add(jsxNode.getSourceFile());
+  jsxNode.replaceWithText("");
+  return true;
 }
 
 function readTokenVars(outDir: string): Set<string> {

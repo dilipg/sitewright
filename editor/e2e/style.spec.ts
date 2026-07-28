@@ -20,13 +20,13 @@ function previewFrame(page: Page): Frame {
 async function openEditor(page: Page): Promise<void> {
   await page.goto("/");
   await expect(
-    page.frameLocator('iframe[title="preview"]').locator('[data-node-id="home.hero.headline"]'),
+    page.frameLocator('iframe[title="preview-home"]').locator('[data-node-id="home.hero.headline"]'),
   ).toBeVisible();
 }
 
 async function selectHero(page: Page): Promise<void> {
   await page
-    .frameLocator('iframe[title="preview"]')
+    .frameLocator('iframe[title="preview-home"]')
     .locator('[data-node-id="home.hero"] > div')
     .first()
     .click({ position: { x: 8, y: 8 } });
@@ -152,7 +152,7 @@ test("spacing stepper applies a token value and the spacing overlay renders", as
 
 test("variant switcher applies live through the shim", async ({ page }) => {
   await page
-    .frameLocator('iframe[title="preview"]')
+    .frameLocator('iframe[title="preview-home"]')
     .locator('[data-node-id="home.hero.cta-secondary"]')
     .click();
   await expect(page.getByTestId("breadcrumb")).toContainText("CTA Secondary");

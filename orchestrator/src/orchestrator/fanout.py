@@ -30,6 +30,7 @@ def spawn_worker(run_id: str, route_slug: str) -> subprocess.Popen:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
         shell=True,
     )
 

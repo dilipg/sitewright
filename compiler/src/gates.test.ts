@@ -425,6 +425,65 @@ describe("runGates: gate 4 recognizes map-derived list-item node ids (contract 5
     expect(failures[0]?.message).toContain("shop.products.eyebrow");
     rmSync(dir, { recursive: true, force: true });
   });
+
+  it("a list-item pattern's wildcard does not accidentally swallow an unrelated sibling id", () => {
+    // Live-observed real bug: section slug "feature-grid" contains the
+    // literal substring ".feature-" once dotted onto its route (routeSlug
+    // + "." + "feature-grid..."), which is ALSO the static text in the
+    // list-item pattern `${nodeId}.feature-${feature.key}`. The OLD
+    // unrestricted `.+...+` wildcard pattern matched that coincidence and
+    // wrongly exempted a completely unrelated, non-list, still-missing
+    // "eyebrow" child from the same file. Only a genuine list-item id
+    // (ending in a dot-free slug right after ".feature-") may be exempted.
+    const dir = mkdtempSync(join(tmpdir(), "gate4-wildcard-collision-"));
+    mkdirSync(join(dir, "src", "pages", "home", "sections"), { recursive: true });
+    writeFileSync(
+      join(dir, "manifest.json"),
+      JSON.stringify({
+        version: 1,
+        nodes: {
+          "home.feature-grid.eyebrow": {
+            route: "/",
+            file: "src/pages/home/sections/FeatureGrid.tsx",
+            component: "FeatureGrid",
+            element: "Text",
+            editable: ["text"],
+            status: "active",
+          },
+          "home.feature-grid.feature-sync": {
+            route: "/",
+            file: "src/pages/home/sections/FeatureGrid.tsx",
+            component: "FeatureGrid",
+            element: "Card",
+            editable: ["style"],
+            status: "active",
+          },
+        },
+      }),
+    );
+    writeFileSync(
+      join(dir, "src", "pages", "home", "sections", "FeatureGrid.tsx"),
+      'export default function FeatureGrid({ nodeId, eyebrow, features }: { nodeId?: string; eyebrow: string; features: { key: string }[] }) {\n' +
+        '  return (\n' +
+        '    <section data-node-id={nodeId}>\n' +
+        // "eyebrow" is a real defect (non-list child, never actually attached
+        // by a literal) that must still be caught, even though this same
+        // file legitimately uses the ".feature-<key>" list pattern below.
+        '      <p nodeId={`${nodeId}.eyebrow`}>{eyebrow}</p>\n' +
+        '      {features.map((feature) => (\n' +
+        '        <div key={feature.key} nodeId={`${nodeId}.feature-${feature.key}`} />\n' +
+        '      ))}\n' +
+        '    </section>\n' +
+        '  );\n' +
+        '}\n',
+    );
+
+    const report = runGates(dir, { scopeRoute: "home" });
+    const failures = failuresOf(report, 4);
+    expect(failures.map((f) => f.reason)).toEqual(["missing-node-id"]);
+    expect(failures[0]?.message).toContain("home.feature-grid.eyebrow");
+    rmSync(dir, { recursive: true, force: true });
+  });
 });
 
 describe("runGates: gate 7 (regen ID survival)", () => {

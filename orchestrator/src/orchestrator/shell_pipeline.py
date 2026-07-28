@@ -168,7 +168,7 @@ def write_shell(project_dir: str, routes_ts: str, shell_result: dict, attempt: i
 
     ensure_node_modules(project)
     tsc = subprocess.run(
-        ["cmd", "/c", "npx", "tsc", "--noEmit"], cwd=project, capture_output=True, text=True, timeout=300
+        ["cmd", "/c", "npx", "tsc", "--noEmit"], cwd=project, capture_output=True, text=True, encoding="utf-8", timeout=300
     )
     issues: list[str] = []
     if tsc.returncode != 0:

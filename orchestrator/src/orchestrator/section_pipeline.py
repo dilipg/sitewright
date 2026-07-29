@@ -242,7 +242,14 @@ def assemble_page_index_source(*, route_slug: str, sections: list[dict]) -> str:
         node_id = f"{route_slug}.{section['slug']}"
         if section.get("failed"):
             needs_placeholder = True
-            renders.append(f'      <FailedSectionPlaceholder nodeId="{node_id}" />')
+            # No agent ever proposed a manifest entry for this node (there
+            # was no successful structured output to propose one from), so
+            # it must not carry a data-node-id either -- same "deterministic,
+            # non-agent-authored content stays outside manifest jurisdiction"
+            # precedent as the design-system gallery page. A stray nodeId
+            # here fails gate 4 (node-ids-registered) at fanout's
+            # whole-project check.
+            renders.append("      <FailedSectionPlaceholder />")
             continue
         component = section["component"]
         data_var = component[0].lower() + component[1:] + "Data"
@@ -311,6 +318,27 @@ def validate_root_proposal(section_id: str, manifest_proposals: list[dict]) -> s
         f'root node id "{section_id}". Every section must register its own root '
         "element, not just its children (contract 5.2/5.4)."
     )
+
+
+def validate_section_meta(model_result: dict) -> str:
+    """Defensive check, same principle as proposals_of() above: the tool
+    schema declares sectionMeta (with slug and component) required, but
+    Claude's tool-use does not hard-enforce required fields — the model can
+    omit sectionMeta entirely, or leave slug/component empty within it
+    (observed live: write_section_only's bare data["sectionMeta"] raised an
+    unhandled KeyError that crashed the whole page worker process, silently
+    dropping every remaining section queued behind it on that route — no
+    retry, no FailedSectionPlaceholder, since the crash happened outside the
+    retry loop's own try/except-free body). Returns a failure-report line,
+    or "" when sectionMeta is present and complete."""
+    meta = model_result["data"].get("sectionMeta")
+    if not isinstance(meta, dict) or not meta.get("slug") or not meta.get("component"):
+        return (
+            '- content: sectionMeta is missing or incomplete (must include non-empty '
+            '"slug" and "component" fields). This section cannot be written or '
+            "assembled without it."
+        )
+    return ""
 
 
 def format_gate_failures(report: dict) -> str:
@@ -747,6 +775,11 @@ def generate_section_flow(
             # resumed execution from crashing itself again
             print("simulated crash (kill -9) mid-section, after the model call", flush=True)
             os._exit(13)
+
+        meta_failure = validate_section_meta(materialize(generated))
+        if meta_failure:
+            failure_report = meta_failure
+            continue
 
         root_failure = validate_root_proposal(section_id, proposals_of(materialize(generated)))
         if root_failure:

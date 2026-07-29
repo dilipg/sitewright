@@ -123,6 +123,7 @@ Each primitive:
 - Accepts `nodeId?: string` and spreads it as `data-node-id` on its root element (see section 5).
 - Accepts `className?: string` merged last, so override compilation can inject classes.
 - Has variants expressed as a `variant` prop with a closed union type, not free-form styling props.
+- Is a **default export**. A section imports a primitive as `import Text from "../../../primitives/Text"` — never `import { Text } from "../../../primitives/Text"`, which `tsc` rejects (`TS2614: has no exported member`) against a default-only module and is caught only at export's production build, the same late-surfacing failure mode as 5.6's `nodeId`-prop gap.
 
 ### 4.2 Section components
 
@@ -229,6 +230,12 @@ export interface Tier {
 The section component must read these back: the item's root element merges `className` (`cx(base, item.className)`); every style/layout-editable child reads `item.childClassNames?.<suffix>` as its own `className`; the `.map()` skips rendering an item entirely when `item.hidden`; each visibility-editable child wraps its render in `!item.childHidden?.<suffix> && (...)`. Text overrides need no new field — they rewrite the matching content field directly, the same mechanism 4.3's props/mock-data seam already provides for section-level text.
 
 This convention depends on the canonical `.map()` shape from 5.2: a local `const itemId = `${nodeId}.slug-${item.key}`` referenced directly on the item's own root (`nodeId={itemId}`) and via further template literals on its children (`` nodeId={`${itemId}.suffix`} ``). The exporter locates the correct array element and field purely from this shape — it does not evaluate arbitrary expressions, so an archetype that deviates from it (a differently-named key field, an indirect array reference) cannot have its list items edited through export and must be corrected, not worked around.
+
+### 5.6 The section root's `nodeId` prop is never part of `<SectionName>Props`
+
+A section's exported `<SectionName>Props` interface (4.2/4.3: the type the mock data file is annotated with) must declare **only content fields** — it must never declare `nodeId` itself. The section root's own node ID is a separate, structural concern: it is supplied by `NodeProps` (`src/lib/types.ts`, `{ nodeId?: string }`), intersected at the function signature (`export default function Hero({ nodeId, ...content }: HeroProps & NodeProps)`), and passed by the page-assembly layer as a literal JSX attribute distinct from the content spread (`<Hero nodeId="home.hero" {...heroData} />`, `index.tsx`, 4.4).
+
+If `nodeId` were folded into `<SectionName>Props` instead, the mock data object would need a `nodeId` field to satisfy that type — and page assembly's `{...heroData}` spread would then re-declare the same prop the preceding literal `nodeId="home.hero"` attribute already set, which `tsc` rejects (`TS2783: 'nodeId' is specified more than once`) at export's production-build gate (8's final step), the only point in the pipeline that runs a real compile. No earlier gate catches this, so a template that gets this wrong fails silently through every generation attempt and only surfaces at export — after the section has otherwise passed. Every prompt that authors a section component (dedicated archetype templates and `generic-section.md` alike) must state this split explicitly; do not rely on an LLM inferring it from the `data-node-id={nodeId}` rendering rule in 5.1/5.2 alone (that rule describes the render target, not where the prop's type comes from) — see decisions.md's 2026-07-29 row for the incident this documents.
 
 ---
 

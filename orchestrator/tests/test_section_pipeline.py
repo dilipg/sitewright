@@ -14,6 +14,7 @@ from orchestrator.section_pipeline import (
     proposals_of,
     user_prompt_with_failures,
     validate_root_proposal,
+    validate_section_meta,
     write_section_files,
 )
 
@@ -202,7 +203,17 @@ def test_assemble_page_index_source_handles_a_failed_section_placeholder() -> No
     )
     assert 'import Hero from "./sections/Hero";' in source
     assert "FailedSectionPlaceholder" in source
-    assert '"home.broken"' in source
+    # No manifest proposal is ever generated for a failed section (there was
+    # no successful agent output to propose one from), so the placeholder
+    # must not carry a data-node-id either — the deterministic gallery page
+    # sets the same precedent for non-agent-authored content (decisions.md).
+    # A stray nodeId here fails gate 4 (node-ids-registered) at the
+    # whole-project check in fanout.py, discovered live in 5.5 acceptance.
+    assert "nodeId=" not in source[source.rindex("FailedSectionPlaceholder") :]
+    # The failed section's would-be node id never appears anywhere in the
+    # output -- it was never registered in the manifest, so there is
+    # nothing for that id to identify.
+    assert "home.broken" not in source
 
 
 def test_build_index_source_assembles_the_section() -> None:
@@ -295,4 +306,30 @@ def test_validate_root_proposal_fails_when_the_model_only_proposes_children() ->
     ]
     failure = validate_root_proposal("shop.collection-header", proposals)
     assert "shop.collection-header" in failure
+    assert failure != ""
+
+
+def test_validate_section_meta_passes_when_complete() -> None:
+    model_result = {"data": {"sectionMeta": {"slug": "hero", "component": "Hero", "summary": "x"}}}
+    assert validate_section_meta(model_result) == ""
+
+
+def test_validate_section_meta_fails_when_the_model_omits_sectionMeta() -> None:
+    # Live-observed: the tool schema declares sectionMeta required, but
+    # Claude's tool-use does not hard-enforce required fields — the model
+    # omitted it entirely on a live run. write_section_only's bare
+    # data["sectionMeta"] then raised an unhandled KeyError that crashed the
+    # whole page worker process, silently dropping every remaining section
+    # queued behind it on that route (no retry, no FailedSectionPlaceholder
+    # — the retry loop never got a chance to run again). Same
+    # defensive-accessor principle as proposals_of(), applied to the field
+    # that never got it.
+    model_result = {"data": {"files": {}, "manifestProposals": []}}
+    failure = validate_section_meta(model_result)
+    assert failure != ""
+
+
+def test_validate_section_meta_fails_when_slug_or_component_is_missing() -> None:
+    model_result = {"data": {"sectionMeta": {"summary": "x"}}}
+    failure = validate_section_meta(model_result)
     assert failure != ""

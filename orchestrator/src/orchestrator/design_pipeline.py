@@ -39,6 +39,18 @@ _SHADOW_KEYS = ["sm", "md", "lg"]
 _BREAKPOINT_KEYS = ["sm", "md", "lg", "xl"]
 
 
+def _keyed_object_schema(keys: list[str], value_type: str = "string") -> dict:
+    """A JSON-schema object requiring exactly these keys. Built from the
+    SAME constants validate_tokens_json checks, so the tool schema and the
+    validator can never drift apart. Necessary because a bare {"type":
+    "object"} with no nested properties/required lets an empty {} satisfy
+    the schema outright under a structured-output-strict provider — Gemini
+    returned {"tokens": {}} verbatim, unprompted, on 3 consecutive attempts
+    against a real brief, something Claude's forced-tool-use (which leans
+    on the system prompt's prose instead) never did across many runs."""
+    return {"type": "object", "properties": {key: {"type": value_type} for key in keys}, "required": list(keys)}
+
+
 def validate_tokens_json(tokens: dict) -> list[str]:
     """Mechanical completeness checks; messages feed the retry prompt.
     Reference resolution is validated separately by the deriver."""
@@ -253,7 +265,38 @@ PRIMITIVES_SYSTEM_TEMPLATE = (
 
 TOKENS_TOOL = {
     "type": "object",
-    "properties": {"tokens": {"type": "object", "description": "tokens.json content per contract 3.1"}},
+    "properties": {
+        "tokens": {
+            "type": "object",
+            "description": "tokens.json content per contract 3.1",
+            "properties": {
+                "color": {
+                    "type": "object",
+                    "properties": {
+                        "primary": _keyed_object_schema(_COLOR_STEPS),
+                        "neutral": _keyed_object_schema(_COLOR_STEPS),
+                        "semantic": _keyed_object_schema(_SEMANTIC_KEYS),
+                    },
+                    "required": ["primary", "neutral", "semantic"],
+                },
+                "typography": {
+                    "type": "object",
+                    "properties": {
+                        "fontFamily": _keyed_object_schema(["heading", "body", "mono"]),
+                        "scale": _keyed_object_schema(_SCALE_KEYS),
+                        "weight": _keyed_object_schema(_WEIGHT_KEYS, "number"),
+                        "leading": _keyed_object_schema(_LEADING_KEYS, "number"),
+                    },
+                    "required": ["fontFamily", "scale", "weight", "leading"],
+                },
+                "space": _keyed_object_schema(_SPACE_KEYS),
+                "radius": _keyed_object_schema(_RADIUS_KEYS),
+                "shadow": _keyed_object_schema(_SHADOW_KEYS),
+                "breakpoint": _keyed_object_schema(_BREAKPOINT_KEYS),
+            },
+            "required": ["color", "typography", "space", "radius", "shadow", "breakpoint"],
+        }
+    },
     "required": ["tokens"],
 }
 
@@ -263,9 +306,15 @@ PRIMITIVES_TOOL = {
         "files": {
             "type": "object",
             "description": "src/primitives/<Name>.tsx -> complete file content, exactly 15 entries",
-            "additionalProperties": {"type": "string"},
+            "properties": {f"src/primitives/{name}.tsx": {"type": "string"} for name in PRIMITIVE_SPECS},
+            "required": [f"src/primitives/{name}.tsx" for name in PRIMITIVE_SPECS],
         },
-        "inventory": {"type": "array", "items": {"type": "string"}},
+        "inventory": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": len(PRIMITIVE_SPECS),
+            "maxItems": len(PRIMITIVE_SPECS),
+        },
     },
     "required": ["files", "inventory"],
 }

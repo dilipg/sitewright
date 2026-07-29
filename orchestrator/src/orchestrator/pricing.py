@@ -51,8 +51,15 @@ def run_cost(events: list[dict]) -> dict:
     """Aggregate cost + tokens across every usage-bearing event (any event
     carrying both "model" and "usage" — intake.complete, plan.complete,
     tokens.complete, primitives.complete, shell.complete, section.generated).
-    Events without both fields (e.g. section.validated) are skipped."""
+    Events without both fields (e.g. section.validated) are skipped.
+
+    A model absent from PRICING_PER_TOKEN (e.g. "gemini-flash-latest" under
+    the ORCH_MODEL_PROVIDER=gemini escape hatch) never raises: its tokens
+    still count toward total_tokens, but its cost_usd is None rather than a
+    misleading 0.0, and its name is listed in unpriced_models so callers can
+    tell total_cost_usd is a partial figure, not a true zero."""
     by_model: dict[str, dict] = {}
+    unpriced_models: list[str] = []
     for event in events:
         model = event.get("model")
         usage = event.get("usage")
@@ -66,7 +73,7 @@ def run_cost(events: list[dict]) -> dict:
                 "cache_read_input_tokens": 0,
                 "cache_creation_input_tokens": 0,
                 "calls": 0,
-                "cost_usd": 0.0,
+                "cost_usd": 0.0 if model in PRICING_PER_TOKEN else None,
             },
         )
         bucket["input_tokens"] += usage.get("input_tokens", 0)
@@ -74,7 +81,10 @@ def run_cost(events: list[dict]) -> dict:
         bucket["cache_read_input_tokens"] += usage.get("cache_read_input_tokens", 0)
         bucket["cache_creation_input_tokens"] += usage.get("cache_creation_input_tokens", 0)
         bucket["calls"] += 1
-        bucket["cost_usd"] += usage_cost(model, usage)
+        if model in PRICING_PER_TOKEN:
+            bucket["cost_usd"] += usage_cost(model, usage)
+        elif model not in unpriced_models:
+            unpriced_models.append(model)
 
     total_tokens = sum(
         v["input_tokens"]
@@ -83,8 +93,13 @@ def run_cost(events: list[dict]) -> dict:
         + v["cache_creation_input_tokens"]
         for v in by_model.values()
     )
-    total_cost = sum(v["cost_usd"] for v in by_model.values())
-    return {"by_model": by_model, "total_tokens": total_tokens, "total_cost_usd": total_cost}
+    total_cost = sum(v["cost_usd"] for v in by_model.values() if v["cost_usd"] is not None)
+    return {
+        "by_model": by_model,
+        "total_tokens": total_tokens,
+        "total_cost_usd": total_cost,
+        "unpriced_models": unpriced_models,
+    }
 
 
 def cost_for_run(run_id: str) -> dict:

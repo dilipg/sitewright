@@ -77,7 +77,37 @@ def test_run_cost_aggregates_across_models_and_ignores_usageless_events() -> Non
 
 def test_run_cost_empty_events() -> None:
     result = run_cost([])
-    assert result == {"by_model": {}, "total_tokens": 0, "total_cost_usd": 0.0}
+    assert result == {"by_model": {}, "total_tokens": 0, "total_cost_usd": 0.0, "unpriced_models": []}
+
+
+def test_run_cost_handles_an_unpriced_model_without_crashing() -> None:
+    # Live-relevant: ORCH_MODEL_PROVIDER=gemini routes every role through
+    # "gemini-flash-latest", a model with no entry in PRICING_PER_TOKEN.
+    # Tokens must still be counted; cost must be reported as unknown (never
+    # silently $0, which would misrepresent an unpriced model as free), and
+    # the caller must be able to tell cost is incomplete for this run.
+    events = [
+        {
+            "event_type": "intake.complete",
+            "model": "gemini-flash-latest",
+            "usage": {"input_tokens": 1000, "output_tokens": 200},
+        },
+        {
+            "event_type": "plan.complete",
+            "model": "claude-haiku-4-5-20251001",
+            "usage": {"input_tokens": 500, "output_tokens": 100},
+        },
+    ]
+    result = run_cost(events)
+    assert result["by_model"]["gemini-flash-latest"]["input_tokens"] == 1000
+    assert result["by_model"]["gemini-flash-latest"]["cost_usd"] is None
+    assert result["by_model"]["claude-haiku-4-5-20251001"]["cost_usd"] is not None
+    assert result["unpriced_models"] == ["gemini-flash-latest"]
+    # total_cost_usd covers only priced models; total_tokens covers all of them
+    assert result["total_tokens"] == 1000 + 200 + 500 + 100
+    assert result["total_cost_usd"] == usage_cost(
+        "claude-haiku-4-5-20251001", {"input_tokens": 500, "output_tokens": 100}
+    )
 
 
 def test_cost_for_run_reads_from_run_log(tmp_path: Path, monkeypatch) -> None:

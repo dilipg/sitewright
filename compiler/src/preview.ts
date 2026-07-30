@@ -11,6 +11,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { join, resolve } from "node:path";
 import type { Plugin, ViteDevServer } from "vite";
 import { createServer } from "vite";
+import { exportApiPlugin } from "./export-api.ts";
 import { planApiPlugin } from "./plan-api.ts";
 import { regenApiPlugin } from "./regen-api.ts";
 import { bridgeShimPlugin } from "./shim/vite-plugin.ts";
@@ -32,7 +33,13 @@ export async function startPreviewServer(
   const server = await createServer({
     root,
     configFile,
-    plugins: [bridgeShimPlugin(), overridesApiPlugin(root), regenApiPlugin(root), planApiPlugin(root)],
+    plugins: [
+      bridgeShimPlugin(),
+      overridesApiPlugin(root),
+      regenApiPlugin(root),
+      planApiPlugin(root),
+      exportApiPlugin(root),
+    ],
     // The editor runs on a different origin (port) and fetches manifest.json
     // from this server; cors must be explicit. overrides/ is written by the
     // editor while the preview is live — the preview app never consumes it,

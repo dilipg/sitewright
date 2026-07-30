@@ -6,6 +6,8 @@ import type {
   ShimToParentMessage,
 } from "@website-generator/compiler/src/shim/protocol.ts";
 import { PROTOCOL_VERSION } from "@website-generator/compiler/src/shim/protocol.ts";
+import type { ExportOutcome } from "./components/ExportPanel";
+import ExportPanel from "./components/ExportPanel";
 import Inspector from "./components/Inspector";
 import type { PlanBrief, PlanRoute } from "./components/PlanApproval";
 import PlanApproval from "./components/PlanApproval";
@@ -148,6 +150,8 @@ export default function App() {
   const [pendingPlan, setPendingPlan] = useState<{ brief: PlanBrief; routes: PlanRoute[] } | null>(
     null,
   );
+  const [exportState, setExportState] = useState<"idle" | "running">("idle");
+  const [exportOutcome, setExportOutcome] = useState<ExportOutcome | null>(null);
 
   const manifestRef = useRef<Manifest | null>(null);
   const historyRef = useRef<History | null>(null);
@@ -359,26 +363,42 @@ export default function App() {
     const grouped = splitOverridesByRoute(map, routes);
     const timer = setTimeout(() => {
       void (async () => {
-        await Promise.all(
-          routes.map((route) =>
-            fetch(`${PREVIEW_URL}/__overrides/${route.slug}`, {
-              method: "PUT",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify(toOverrideFile(grouped[route.slug] ?? {}, route.path)),
-            }),
-          ),
-        );
-        await fetch(`${PREVIEW_URL}/__overrides-history`, {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ version: 1, snapshots: history.snapshots, index: history.index }),
-        });
+        await writeOverrides(grouped, routes, history);
         setSaveStatus("Saved");
       })();
     }, 300);
     return () => clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [history]);
+
+  /** Writes the current override + history state through the preview server's
+   * persistence endpoints. Shared by the debounced autosave above and
+   * runExport's pre-export flush — the exporter reads overrides from DISK,
+   * so an export racing the debounce would ship the previous state. */
+  async function writeOverrides(
+    grouped: Record<string, OverridesMap>,
+    routeList: RouteInfo[],
+    historyState: History,
+  ): Promise<void> {
+    await Promise.all(
+      routeList.map((route) =>
+        fetch(`${PREVIEW_URL}/__overrides/${route.slug}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(toOverrideFile(grouped[route.slug] ?? {}, route.path)),
+        }),
+      ),
+    );
+    await fetch(`${PREVIEW_URL}/__overrides-history`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        version: 1,
+        snapshots: historyState.snapshots,
+        index: historyState.index,
+      }),
+    });
+  }
 
   /* ---------- edits ---------- */
 
@@ -680,6 +700,26 @@ export default function App() {
     setPendingPlan(null);
   }
 
+  /** Export (PRD 5). Flushes pending edits first: the debounced save could
+   * otherwise still be in flight, and the exporter reads overrides from
+   * disk — exporting mid-debounce would silently ship the previous state. */
+  async function runExport() {
+    setExportOutcome(null);
+    setExportState("running");
+    try {
+      if (history !== null && routes.length > 0) {
+        await writeOverrides(splitOverridesByRoute(map, routes), routes, history);
+        setSaveStatus("Saved");
+      }
+      const response = await fetch(`${PREVIEW_URL}/__export`, { method: "POST" });
+      setExportOutcome((await response.json()) as ExportOutcome);
+    } catch (error) {
+      setExportOutcome({ ok: false, message: `Export request failed: ${String(error)}` });
+    } finally {
+      setExportState("idle");
+    }
+  }
+
   const crumbs = manifest === null ? [] : breadcrumbFor(selectedId, manifest);
   const selectedNode = selectedId !== undefined ? manifest?.nodes[selectedId] : undefined;
   const selectedGeom = selectedId !== undefined ? geometry[selectedId] : undefined;
@@ -782,6 +822,15 @@ export default function App() {
               Revert regeneration
             </button>
           )}
+          <button
+            type="button"
+            data-testid="export-button"
+            className="export-button"
+            disabled={exportState === "running"}
+            onClick={() => void runExport()}
+          >
+            {exportState === "running" ? "Exporting…" : "Export"}
+          </button>
           <span data-testid="save-status" className="save-status">
             {saveStatus}
           </span>
@@ -1018,6 +1067,15 @@ export default function App() {
         onDiscard={discardOrphan}
         onCopy={copyOrphan}
       />
+
+      {exportOutcome !== null && (
+        <ExportPanel
+          outcome={exportOutcome}
+          downloadUrl={`${PREVIEW_URL}/__export-download`}
+          onClose={() => setExportOutcome(null)}
+          onRetry={() => void runExport()}
+        />
+      )}
 
       {gestureToast !== undefined && (
         <div data-testid="gesture-toast" className="gesture-toast">

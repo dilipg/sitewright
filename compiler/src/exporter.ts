@@ -34,8 +34,11 @@ import { Node, Project, SyntaxKind, ts } from "ts-morph";
 import { isInsideMapCallback, resolveTemplateExpression } from "./gates.ts";
 import type { GateReport } from "./gates.ts";
 import { runGates } from "./gates.ts";
+import { collectHandoverData, renderHandover } from "./handover.ts";
 import type { Manifest, ManifestNode } from "./manifest.ts";
 import { tombstone as tombstoneNodes } from "./manifest.ts";
+import { isTokenReference } from "./style-value.ts";
+import { createZip } from "./zip.ts";
 
 export interface OverrideEntry {
   nodeId: string;
@@ -55,12 +58,24 @@ export interface ExportOptions {
   outDir: string;
   /** Skips the verification build (gates always run). Test/dev hook. */
   skipBuild?: boolean;
+  /** When set, writes the handover zip here (outside outDir). */
+  zipPath?: string;
 }
 
 export interface ExportResult {
   outDir: string;
   appliedOverrides: number;
   tombstoned: string[];
+  /** Every packaged file, repo-relative with forward slashes, sorted — the editor's file-tree preview. */
+  files: string[];
+  /** Rendered HANDOVER.md content (also written into outDir). */
+  handover: string;
+  /** Set when options.zipPath was provided. */
+  zipPath?: string;
+  /** Handler seams the developer must wire up (HANDOVER.md section 2). */
+  integrationCount: number;
+  /** Edits that compiled to arbitrary-value classes (HANDOVER.md section 3). */
+  offScaleCount: number;
 }
 
 export class ExportError extends Error {
@@ -77,7 +92,34 @@ export class ExportError extends Error {
   }
 }
 
-const COPY_SKIP = new Set(["node_modules", "dist", "overrides", ".git"]);
+/**
+ * Never copied into the export:
+ * - node_modules/dist — regenerable (`npm install && npm run build`), and
+ *   shipping them would make the package huge and non-deterministic.
+ * - overrides/ — consumed by compilation; archived separately (see below).
+ * - plan/ — generator state (the brief, the site plan, an approval flag).
+ *   It describes what was ASKED FOR, not the code being handed over, and
+ *   reads as build-system residue to a receiving developer.
+ * - .regen-backup — a mid-session regeneration snapshot, never part of a
+ *   handover.
+ *
+ * manifest.json and design-inventory.json DO ship: both describe the code in
+ * the package (the node registry and the primitive set), and the manifest is
+ * what makes the export re-importable into the editor (PRD 6).
+ */
+const COPY_SKIP = new Set(["node_modules", "dist", "overrides", ".git", ".regen-backup", "plan"]);
+
+/** Build artifacts the verification build creates INSIDE the export; never packaged. */
+const PACKAGE_SKIP = new Set(["node_modules", "dist"]);
+
+/**
+ * Where the applied override files land inside the export. Contract 7:
+ * "post-export, override files are archived, not deleted, so the user can
+ * trace what changed" — the SOURCE project keeps its own overrides/
+ * untouched (export never writes in place), so the pre-export state stays
+ * fully editable and re-exportable (PRD 5).
+ */
+const OVERRIDE_ARCHIVE_DIR = "overrides-archive";
 
 /** style/layout property -> utility compilation spec. Unknown properties fail loudly. */
 const PROPERTY_UTILITIES: Record<string, { prefix: string; hint?: string; keyword?: boolean }> = {
@@ -112,7 +154,6 @@ const PROPERTY_UTILITIES: Record<string, { prefix: string; hint?: string; keywor
   textAlign: { prefix: "text", keyword: true },
 };
 
-const TOKEN_PATH = /^[a-z][a-zA-Z0-9]*(?:\.[a-zA-Z0-9-]+)+$/;
 
 export function exportProject(projectDir: string, options: ExportOptions): ExportResult {
   const projectRoot = resolve(projectDir);
@@ -151,15 +192,93 @@ export function exportProject(projectDir: string, options: ExportOptions): Expor
       throw new ExportError(`Export failed validation gates:\n${failures}`, gateReport);
     }
 
+    // Manifest is re-read from the output: applyOverrides may have
+    // tombstoned nodes there, and the handover's node count should describe
+    // the package the developer receives, not the pre-compilation project.
+    const exportedManifest = readManifest(outDir);
+    const handoverData = collectHandoverData(outDir, exportedManifest, overrides);
+    const handover = renderHandover(handoverData);
+    writeFileSync(join(outDir, "HANDOVER.md"), handover);
+    archiveOverrides(projectRoot, outDir);
+
     if (options.skipBuild !== true) {
       runVerificationBuild(projectRoot, outDir);
     }
 
-    return { outDir, appliedOverrides: overrides.length, tombstoned };
+    const files = packagedFiles(outDir);
+    let zipPath: string | undefined;
+    if (options.zipPath !== undefined) {
+      zipPath = resolve(options.zipPath);
+      if (zipPath === outDir || zipPath.startsWith(outDir + sep)) {
+        throw new ExportError("Zip target must be outside the export directory.");
+      }
+      mkdirSync(dirname(zipPath), { recursive: true });
+      writeFileSync(
+        zipPath,
+        createZip(files.map((file) => ({ path: file, content: readFileSync(join(outDir, file)) }))),
+      );
+    }
+
+    return {
+      outDir,
+      appliedOverrides: overrides.length,
+      tombstoned,
+      files,
+      handover,
+      ...(zipPath === undefined ? {} : { zipPath }),
+      integrationCount: handoverData.integrations.length,
+      offScaleCount: handoverData.offScale.length,
+    };
   } catch (error) {
     removeOutput(outDir);
     throw error;
   }
+}
+
+/** Copies the applied override files into the export as a read-only record (contract 7). */
+function archiveOverrides(projectRoot: string, outDir: string): void {
+  const overridesDir = join(projectRoot, "overrides");
+  if (!existsSync(overridesDir)) return;
+  // Only files that actually carry edits: a route the user never touched has
+  // an empty overrides array, and archiving those would put a directory of
+  // empty records in every handover package that had nothing to record.
+  const files = readdirSync(overridesDir)
+    .filter((name) => name.endsWith(".overrides.json"))
+    .filter((name) => {
+      const parsed = JSON.parse(readFileSync(join(overridesDir, name), "utf8")) as {
+        overrides?: unknown[];
+      };
+      return (parsed.overrides?.length ?? 0) > 0;
+    })
+    .sort();
+  if (files.length === 0) return;
+  const archiveDir = join(outDir, OVERRIDE_ARCHIVE_DIR);
+  mkdirSync(archiveDir, { recursive: true });
+  for (const name of files) {
+    cpSync(join(overridesDir, name), join(archiveDir, name));
+  }
+  writeFileSync(
+    join(archiveDir, "README.md"),
+    "# Applied overrides (archive)\n\n" +
+      "These are the canvas edits that were compiled into the source of this export.\n" +
+      "They are a record for tracing what changed — the code in `src/` already\n" +
+      "reflects every one of them, and nothing reads these files at runtime.\n",
+  );
+}
+
+/** Every file that goes into the handover package, repo-relative, forward slashes, sorted. */
+function packagedFiles(outDir: string): string[] {
+  const found: string[] = [];
+  const walk = (dir: string, prefix: string): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const relPath = prefix === "" ? entry.name : `${prefix}/${entry.name}`;
+      if (prefix === "" && PACKAGE_SKIP.has(entry.name)) continue;
+      if (entry.isDirectory()) walk(join(dir, entry.name), relPath);
+      else if (entry.isFile()) found.push(relPath);
+    }
+  };
+  walk(outDir, "");
+  return found.sort();
 }
 
 function loadOverrides(projectRoot: string): OverrideEntry[] {
@@ -684,7 +803,7 @@ function compileUtilityClass(
   if (spec.keyword === true) {
     return /^[a-z-]+$/.test(value) ? `${spec.prefix}-${value}` : `${spec.prefix}-[${value}]`;
   }
-  if (TOKEN_PATH.test(value)) {
+  if (isTokenReference(value)) {
     const varName = value.replace(/\./g, "-");
     if (!tokenVars.has(varName)) {
       throw new ExportError(

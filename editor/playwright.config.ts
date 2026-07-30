@@ -15,7 +15,11 @@ export default defineConfig({
       command: process.env.WG_PROJECT_DIR
         ? `node scripts/preview.ts ${JSON.stringify(process.env.WG_PROJECT_DIR)} --port 5273`
         : "node ../editor/e2e/prepare-project.ts && node scripts/preview.ts ../generated/editor-e2e-project --port 5273",
-      env: { WG_REGEN_MOCK: "1" },
+      // WG_EXPORT_SKIP_BUILD: export.spec.ts exercises the real compilation
+      // path (gates always run), but a production build per export would put
+      // minutes on every CI run — the invariant suite is where the real
+      // build-verified export runs.
+      env: { WG_REGEN_MOCK: "1", WG_EXPORT_SKIP_BUILD: "1" },
       cwd: "../compiler",
       url: "http://localhost:5273",
       reuseExistingServer: false,

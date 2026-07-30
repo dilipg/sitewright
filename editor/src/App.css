@@ -729,3 +729,199 @@ body {
   position: absolute;
   background: rgba(255, 170, 80, 0.28);
 }
+
+/* ---------- export (PRD 5) ---------- */
+
+.export-button {
+  background: #4f8ef7;
+  border: none;
+  color: white;
+  border-radius: 4px;
+  padding: 6px 14px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.export-button:disabled {
+  background: #3a3a46;
+  color: #9a9aa8;
+  cursor: default;
+}
+
+.export-panel {
+  position: fixed;
+  inset: 48px 24px 24px;
+  max-width: 760px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  background: #26262e;
+  border: 1px solid #4a4a56;
+  border-radius: 8px;
+  padding: 18px 20px;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.6);
+  z-index: 20;
+  overflow: hidden;
+}
+
+.export-panel-failed {
+  border-color: #a5543c;
+}
+
+.export-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.export-panel-head h2 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.export-panel-failed .export-panel-head h2 {
+  color: #ffb4a0;
+}
+
+.export-panel-head button {
+  background: #3a3a46;
+  border: none;
+  color: #e8e8ee;
+  border-radius: 4px;
+  padding: 5px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.export-summary {
+  margin: 8px 0 12px;
+  font-size: 12px;
+  color: #9a9aa8;
+}
+
+.export-download {
+  align-self: flex-start;
+  background: #4f8ef7;
+  color: white;
+  text-decoration: none;
+  border-radius: 4px;
+  padding: 8px 14px;
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 14px;
+}
+
+.export-tabs {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid #333340;
+  margin-bottom: 10px;
+}
+
+.export-tabs button {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: #9a9aa8;
+  padding: 6px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.export-tabs button.active {
+  color: #e8e8ee;
+  border-bottom-color: #4f8ef7;
+}
+
+.export-file-tree,
+.export-handover {
+  flex: 1;
+  overflow: auto;
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.export-handover {
+  white-space: pre-wrap;
+  color: #c8c8d4;
+  font-family: ui-monospace, monospace;
+}
+
+.file-tree-level {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.file-tree-dir > span {
+  color: #9aa8c8;
+  font-family: ui-monospace, monospace;
+}
+
+.file-tree-file > span {
+  color: #c8c8d4;
+  font-family: ui-monospace, monospace;
+}
+
+.export-failed-message {
+  margin: 8px 0 12px;
+  font-size: 13px;
+  color: #ffb4a0;
+  white-space: pre-wrap;
+}
+
+.export-gate-report {
+  overflow: auto;
+  max-height: 40%;
+}
+
+.export-gate h3 {
+  margin: 10px 0 4px;
+  font-size: 13px;
+  color: #ffb4a0;
+}
+
+.export-gate ul {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.export-gate li {
+  font-size: 12px;
+  color: #c8c8d4;
+  padding: 3px 0;
+}
+
+.export-gate li code {
+  display: block;
+  font-size: 11px;
+  color: #9a9aa8;
+}
+
+.export-build-log {
+  flex: 1;
+  overflow: auto;
+  background: #1c1c22;
+  border-radius: 4px;
+  padding: 10px;
+  font-size: 11px;
+  color: #c8c8d4;
+  white-space: pre-wrap;
+}
+
+.export-actions {
+  margin-top: 12px;
+}
+
+.export-actions button {
+  background: #4f8ef7;
+  border: none;
+  color: white;
+  border-radius: 4px;
+  padding: 7px 14px;
+  font-size: 12px;
+  cursor: pointer;
+}

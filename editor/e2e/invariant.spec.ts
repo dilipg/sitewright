@@ -34,6 +34,34 @@ const MAX_DIFF_RATIO = 0.01;
 const previewShots = new Map<string, Buffer>();
 const exportShots = new Map<string, Buffer>();
 
+// Every InvariantCase's screenshotNode belongs to exactly one route (its
+// first dot-segment). The suite started home-only (M3-5.4); milestone 6.1's
+// contact-form case is the first to live on a different route, so the
+// preview-capture and export-verification steps below now loop per route
+// instead of assuming "home" everywhere. ROUTE_READY_MARKER mirrors the
+// original single-route wait: each route's own STYLE case's override target
+// (not necessarily its screenshotNode — see cta-band/contact-form, which
+// screenshot a child instead of the styled section root) is guaranteed to
+// land in the shim's injected stylesheet once overrides have actually
+// applied, so waiting for that substring is a real condition, not a guess.
+const ROUTE_PATHS: Record<string, string> = { home: "/", support: "/support" };
+const ROUTE_READY_MARKER: Record<string, string> = { home: "home.hero", support: "support.contact-form" };
+
+function routeSlugOf(nodeId: string): string {
+  return nodeId.split(".")[0]!;
+}
+
+function casesByRoute(): Map<string, typeof INVARIANT_CASES> {
+  const grouped = new Map<string, typeof INVARIANT_CASES>();
+  for (const invariantCase of INVARIANT_CASES) {
+    const slug = routeSlugOf(invariantCase.screenshotNode);
+    const existing = grouped.get(slug);
+    if (existing === undefined) grouped.set(slug, [invariantCase]);
+    else existing.push(invariantCase);
+  }
+  return grouped;
+}
+
 // The default 1280px viewport isn't wide enough for the 1280px-wide canvas
 // stage plus the 280px inspector panel (same issue layout.spec.ts documents)
 // — a layout-drag case's move-handle can fall outside the interactable
@@ -59,27 +87,41 @@ test("apply all invariant-case edits in the editor and capture preview nodes", a
   // same viewport, no editor chrome or selection overlays above the frame.
   // The persisted overrides are applied through the same shim protocol the
   // editor uses. (Variant values would need editor-side expansion here —
-  // cases stay variant-free until the exporter compiles variants, M5.)
-  const overrideFile = JSON.parse(
-    readFileSync(join(projectDir, "overrides", "home.overrides.json"), "utf8"),
-  ) as { overrides: unknown[] };
+  // cases stay variant-free until the exporter compiles variants, M5.) One
+  // bare page per route: each route is a separate document, so a route's
+  // own overrides file and its own "ready" marker only ever apply there.
+  for (const [slug, cases] of casesByRoute()) {
+    const routePath = ROUTE_PATHS[slug];
+    if (routePath === undefined) throw new Error(`invariant-cases.ts: no ROUTE_PATHS entry for route "${slug}"`);
+    const readyMarker = ROUTE_READY_MARKER[slug];
+    if (readyMarker === undefined) throw new Error(`invariant-cases.ts: no ROUTE_READY_MARKER entry for route "${slug}"`);
 
-  const previewPage = await page.context().newPage();
-  await previewPage.goto(PREVIEW);
-  await expect(previewPage.locator('[data-node-id="home.hero.headline"]')).toBeVisible();
-  await previewPage.evaluate((overrides) => {
-    window.postMessage({ type: "overrides:apply", protocolVersion: 1, overrides }, "*");
-  }, overrideFile.overrides);
-  await previewPage.waitForFunction(() =>
-    document.querySelector("style[data-wg-shim]")?.textContent?.includes("home.hero"),
-  );
+    const overrideFile = JSON.parse(
+      readFileSync(join(projectDir, "overrides", `${slug}.overrides.json`), "utf8"),
+    ) as { overrides: unknown[] };
 
-  for (const invariantCase of INVARIANT_CASES) {
-    const locator = previewPage.locator(`[data-node-id="${invariantCase.screenshotNode}"]`);
-    await locator.scrollIntoViewIfNeeded();
-    previewShots.set(invariantCase.name, await locator.screenshot());
+    const previewPage = await page.context().newPage();
+    await previewPage.goto(`${PREVIEW}${routePath}`);
+    // Confirms the route's own document has hydrated before posting
+    // overrides (a postMessage sent before the shim's listener is
+    // registered is simply lost) — any case's node in this route group
+    // works as the signal, since all of them render regardless of overrides.
+    await expect(previewPage.locator(`[data-node-id="${cases[0]!.screenshotNode}"]`)).toBeVisible();
+    await previewPage.evaluate((overrides) => {
+      window.postMessage({ type: "overrides:apply", protocolVersion: 1, overrides }, "*");
+    }, overrideFile.overrides);
+    await previewPage.waitForFunction(
+      (marker) => document.querySelector("style[data-wg-shim]")?.textContent?.includes(marker),
+      readyMarker,
+    );
+
+    for (const invariantCase of cases) {
+      const locator = previewPage.locator(`[data-node-id="${invariantCase.screenshotNode}"]`);
+      await locator.scrollIntoViewIfNeeded();
+      previewShots.set(invariantCase.name, await locator.screenshot());
+    }
+    await previewPage.close();
   }
-  await previewPage.close();
 });
 
 test("export builds and the same nodes render in the served export", async ({ page }) => {
@@ -103,18 +145,23 @@ test("export builds and the same nodes render in the served export", async ({ pa
     preview: { port: EXPORT_PORT, strictPort: true },
   });
   try {
-    const exportPage = await page.context().newPage();
-    await exportPage.goto(`http://localhost:${EXPORT_PORT}/`);
-    for (const invariantCase of INVARIANT_CASES) {
-      const locator = exportPage.locator(`[data-node-id="${invariantCase.screenshotNode}"]`);
-      if (invariantCase.expectRemovedFromExport === true) {
-        await expect(locator).toHaveCount(0);
-        continue;
+    for (const [slug, cases] of casesByRoute()) {
+      const routePath = ROUTE_PATHS[slug];
+      if (routePath === undefined) throw new Error(`invariant-cases.ts: no ROUTE_PATHS entry for route "${slug}"`);
+
+      const exportPage = await page.context().newPage();
+      await exportPage.goto(`http://localhost:${EXPORT_PORT}${routePath}`);
+      for (const invariantCase of cases) {
+        const locator = exportPage.locator(`[data-node-id="${invariantCase.screenshotNode}"]`);
+        if (invariantCase.expectRemovedFromExport === true) {
+          await expect(locator).toHaveCount(0);
+          continue;
+        }
+        await expect(locator).toBeVisible();
+        exportShots.set(invariantCase.name, await locator.screenshot());
       }
-      await expect(locator).toBeVisible();
-      exportShots.set(invariantCase.name, await locator.screenshot());
+      await exportPage.close();
     }
-    await exportPage.close();
   } finally {
     await new Promise<void>((resolve) => server.httpServer.close(() => resolve()));
   }

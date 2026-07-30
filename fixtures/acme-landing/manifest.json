@@ -859,6 +859,93 @@
         "visibility"
       ],
       "status": "active"
+    },
+    "support.contact-form": {
+      "route": "/support",
+      "file": "src/pages/support/sections/ContactForm.tsx",
+      "component": "ContactForm",
+      "element": "section",
+      "editable": [
+        "style",
+        "layout",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "support.contact-form.heading": {
+      "route": "/support",
+      "file": "src/pages/support/sections/ContactForm.tsx",
+      "component": "ContactForm",
+      "element": "Heading",
+      "editable": [
+        "text",
+        "style",
+        "layout",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "support.contact-form.description": {
+      "route": "/support",
+      "file": "src/pages/support/sections/ContactForm.tsx",
+      "component": "ContactForm",
+      "element": "Text",
+      "editable": [
+        "text",
+        "style",
+        "layout",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "support.contact-form.name-field": {
+      "route": "/support",
+      "file": "src/pages/support/sections/ContactForm.tsx",
+      "component": "ContactForm",
+      "element": "Input",
+      "editable": [
+        "style",
+        "layout",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "support.contact-form.email-field": {
+      "route": "/support",
+      "file": "src/pages/support/sections/ContactForm.tsx",
+      "component": "ContactForm",
+      "element": "Input",
+      "editable": [
+        "style",
+        "layout",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "support.contact-form.message-field": {
+      "route": "/support",
+      "file": "src/pages/support/sections/ContactForm.tsx",
+      "component": "ContactForm",
+      "element": "Textarea",
+      "editable": [
+        "style",
+        "layout",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "support.contact-form.submit": {
+      "route": "/support",
+      "file": "src/pages/support/sections/ContactForm.tsx",
+      "component": "ContactForm",
+      "element": "Button",
+      "editable": [
+        "text",
+        "style",
+        "layout",
+        "visibility"
+      ],
+      "status": "active"
     }
   }
 }

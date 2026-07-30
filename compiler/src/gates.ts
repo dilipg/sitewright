@@ -236,9 +236,26 @@ function gateHrefsValid(
     }
   }
 
+  // A parameterized route path ("/products/:handle" — the Shell Agent emits
+  // these for storefront product pages) matches any href with the same
+  // segment count where each ":param" segment is filled by exactly one
+  // non-empty segment and every static segment matches literally.
+  const parameterizedRoutes = [...knownRoutes].filter((path) => path.includes("/:"));
+  function matchesParameterizedRoute(href: string): boolean {
+    const hrefSegments = href.split("/");
+    return parameterizedRoutes.some((path) => {
+      const routeSegments = path.split("/");
+      if (routeSegments.length !== hrefSegments.length) return false;
+      return routeSegments.every((segment, i) =>
+        segment.startsWith(":") ? hrefSegments[i] !== "" : segment === hrefSegments[i],
+      );
+    });
+  }
+
   for (const { value, file, line } of collectHrefLiterals(sourceFiles)) {
     if (EXTERNAL_HREF.test(value)) continue;
     if (knownRoutes.has(value)) continue;
+    if (matchesParameterizedRoute(value)) continue;
     failures.push({
       gate: 2,
       reason: "dangling-href",

@@ -6,6 +6,9 @@ export interface ButtonProps extends NodeProps {
   variant?: "primary" | "secondary";
   /** Renders an anchor styled as a button. Must exist in shell/routes.ts or be explicitly external. */
   href?: string;
+  type?: "button" | "submit";
+  disabled?: boolean;
+  onClick?: () => void;
   className?: string;
   children: ReactNode;
 }
@@ -24,8 +27,17 @@ const variants: Record<NonNullable<ButtonProps["variant"]>, string> = {
   ),
 };
 
-export default function Button({ nodeId, variant = "primary", href, className, children }: ButtonProps) {
-  const cls = cx(base, variants[variant], className);
+export default function Button({
+  nodeId,
+  variant = "primary",
+  href,
+  type = "button",
+  disabled,
+  onClick,
+  className,
+  children,
+}: ButtonProps) {
+  const cls = cx(base, variants[variant], className, disabled === true ? "cursor-not-allowed opacity-50" : undefined);
   if (href !== undefined) {
     return (
       <a data-node-id={nodeId} href={href} className={cls}>
@@ -34,7 +46,7 @@ export default function Button({ nodeId, variant = "primary", href, className, c
     );
   }
   return (
-    <button data-node-id={nodeId} type="button" className={cls}>
+    <button data-node-id={nodeId} type={type} disabled={disabled} onClick={onClick} className={cls}>
       {children}
     </button>
   );

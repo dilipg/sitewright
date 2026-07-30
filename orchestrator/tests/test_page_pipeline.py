@@ -20,7 +20,10 @@ def test_each_dedicated_archetype_selects_its_own_template() -> None:
 
 
 def test_an_uncataloged_archetype_falls_back_to_generic_section() -> None:
-    template = select_template("team-grid")
+    # "custom" is the permanent fallback archetype (contract 4.4) — it never
+    # gets a dedicated template by design, unlike the 19 named archetypes,
+    # all of which have one as of build prompt 6.1.
+    template = select_template("custom")
     assert template.archetype == "generic-section"
 
 

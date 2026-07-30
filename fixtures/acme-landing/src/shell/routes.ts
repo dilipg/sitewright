@@ -8,4 +8,5 @@ export interface RouteDef {
 export const routes: RouteDef[] = [
   { slug: "home", path: "/", title: "Home" },
   { slug: "about", path: "/about", title: "About" },
+  { slug: "support", path: "/support", title: "Support" },
 ];

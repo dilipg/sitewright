@@ -80,6 +80,32 @@ function applyStyleSwatch(nodeId: string) {
   };
 }
 
+/** Canvas virtualization (PRD risk 2): a route frame renders a placeholder,
+ * not a live iframe, until it's within a render-ahead margin of the
+ * viewport (canvas.spec.ts's "narrow viewport" test exercises this same
+ * mechanism directly) — this suite's home/about routes always start near
+ * enough, but "support" (the 3rd frame, offset further right) does not at
+ * this viewport width. Pans the stage left by a fixed delta well past the
+ * minimum needed, before any case that touches a route whose frame may not
+ * be mounted yet.
+ *
+ * The mouse position for the wheel event is deliberately the horizontal GAP
+ * between two frames (FRAME_GAP, never covered by ANY frame's DOM at ANY
+ * vertical scroll position — unlike a fixed (x,y) pixel guess), not a fixed
+ * "background" point: earlier cases in this suite include real mouse drags
+ * (applyLayoutMove), which were observed (live, via a throwaway debug
+ * script) to leave the stage panned vertically by several hundred px as a
+ * side effect — invisible to every case before this one, since none needed
+ * pixel-accurate stage awareness afterward. A fixed (400, 60) guess that
+ * was safely on empty background before those drags can land inside a LIVE
+ * cross-origin iframe afterward, which silently swallows the wheel event
+ * (it doesn't bubble to the stage) rather than erroring — the gap position
+ * is immune to this because no frame ever occupies that column, at any Y. */
+async function panStageLeft(page: Page, deltaX: number): Promise<void> {
+  await page.mouse.move(1360, 400);
+  await page.mouse.wheel(deltaX, 0);
+}
+
 export const INVARIANT_CASES: InvariantCase[] = [
   // ---------- hero ----------
   {
@@ -298,6 +324,48 @@ export const INVARIANT_CASES: InvariantCase[] = [
     name: "visibility: a testimonial's attribution ghosted",
     screenshotNode: "home.testimonials.testimonial-marcus.attribution",
     apply: applyVisibilityToggle("home.testimonials.testimonial-marcus.attribution"),
+    expectRemovedFromExport: true,
+  },
+
+  // ---------- contact-form (milestone 6.1: first interactive/handler-prop
+  // archetype in this suite — Input/Textarea primitives, a typed onSubmit
+  // handler prop, and a real <form> wrapper none of the original 6
+  // archetypes exercise) ----------
+  {
+    // Screenshots the heading, not "support.contact-form" itself: this
+    // suite's visibility case below hides the submit button — still
+    // occupying its layout space while ghosted (PRD 3.4) but genuinely gone
+    // once compiled out for export (contract 6.2), which would make the
+    // section's own box shorter in export than in preview (same reason
+    // cta-band's style case screenshots its heading instead of its own
+    // section root, above). Also the group's first case, so it pans the
+    // stage left first (see panStageLeft) to mount "support"'s frame before
+    // any contact-form case tries to interact with it.
+    name: "style: background swatch on the contact-form section root",
+    screenshotNode: "support.contact-form.heading",
+    apply: async (page) => {
+      await panStageLeft(page, 1500);
+      await applyStyleSwatch("support.contact-form")(page);
+    },
+  },
+  {
+    name: "text: contact-form heading",
+    screenshotNode: "support.contact-form.heading",
+    apply: applyTextEdit("support.contact-form.heading", "An invariant-tested heading"),
+  },
+  {
+    name: "layout: contact-form description moved via margin",
+    screenshotNode: "support.contact-form.description",
+    apply: applyLayoutMove("support.contact-form.description", 0, 16),
+  },
+  {
+    // Not the submit button: it's disabled by default (no field has been
+    // filled by any case in this suite), and a real browser never dispatches
+    // click events to a disabled element — Playwright's actionability check
+    // waits for "enabled" forever. The message field has no such state.
+    name: "visibility: contact-form message field ghosted",
+    screenshotNode: "support.contact-form.message-field",
+    apply: applyVisibilityToggle("support.contact-form.message-field"),
     expectRemovedFromExport: true,
   },
 ];

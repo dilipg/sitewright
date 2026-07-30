@@ -28,6 +28,7 @@ Usage: uv run python -m orchestrator.archetype_soak <archetype>
 
 import json
 import sys
+import uuid
 
 from orchestrator.runlog import default_run_log_path, read_run_events
 from orchestrator.section_pipeline import generate_section_flow
@@ -54,6 +55,22 @@ SECTION_BRIEFS: dict[str, str] = {
     "pricing-tiers": "A 3-tier pricing section (a free/entry tier, a highlighted mid tier, a top tier) matching this product's likely price point.",
     "faq-accordion": "An FAQ section answering the questions most likely to block a signup for this product.",
     "social-proof": "A testimonials section with 3 short customer quotes for this product.",
+    # build prompt 6.1: remaining marketing set
+    "feature-spotlight": "Three alternating media/copy rows, each spotlighting one standout feature in depth.",
+    "stats-band": "A row of 3-4 headline stats proving this product's scale or traction.",
+    "team-grid": "A team section introducing the 3-4 people behind this product.",
+    "contact-form": "A contact form for visitors to reach out with questions or a sales inquiry.",
+    # build prompt 6.1: storefront set
+    "product-card-grid": "A grid of 4 best-selling products from this product line.",
+    "product-detail": "A single product's detail page: gallery, price, description, add to cart.",
+    "collection-header": "The header of a product collection page: title, item count, filters, sort.",
+    "cart-drawer": "A shopping cart with 2 line items, subtotal, and a checkout call to action.",
+    "category-nav": "A row of 3 category tiles inviting the visitor into a slice of the catalog.",
+    # build prompt 6.1: saas set
+    "integration-grid": "A grid of 4 integrations this product connects to.",
+    "comparison-table": "A comparison table of this product against 2 competitors across 4 feature rows.",
+    "changelog-list": "A changelog of the 3 most recent product updates.",
+    "docs-toc-page": "A documentation table of contents grouped into 3 topic areas.",
 }
 
 
@@ -88,9 +105,24 @@ def run_archetype_soak(archetype: str) -> list[dict]:
         raise KeyError(f"no soak section brief configured for archetype {archetype!r}")
     section_brief = SECTION_BRIEFS[archetype]
 
+    # A fresh suffix per CLI invocation (shared across this call's 5
+    # personas, never reused across invocations): route_slug feeds both
+    # generate_section's own args AND run_gates_step's, and Kitaru's
+    # checkpoint cache is keyed by function + args, not by file contents on
+    # disk. Re-soaking the SAME archetype+persona after only editing its
+    # PROMPT TEMPLATE (a file generate_section reads at runtime, not one of
+    # its own arguments) left run_gates_step's args byte-identical to a
+    # prior run and replayed its stale, pre-fix gate result without ever
+    # re-invoking the gates CLI -- live-observed: a genuinely fixed template
+    # produced correct, gate-passing code on re-generation, yet the soak
+    # still reported the OLD failure, because validation itself never
+    # re-ran. A unique suffix makes every invocation's route_slug -- and so
+    # every downstream checkpoint's args -- new to Kitaru every time.
+    invocation_suffix = uuid.uuid4().hex[:8]
+
     rows = []
     for persona_slug, brand_brief in PERSONAS:
-        route_slug = f"soak-{archetype}-{persona_slug}"
+        route_slug = f"soak-{archetype}-{persona_slug}-{invocation_suffix}"
         section_id = f"{route_slug}.{archetype}"
         print(f"=== {section_id}: generating...", flush=True)
         handle = generate_section_flow.run(

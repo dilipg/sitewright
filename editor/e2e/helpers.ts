@@ -49,6 +49,9 @@ export async function resetOverrides(page: Page): Promise<void> {
   await page.request.put(`${PREVIEW}/__overrides/about`, {
     data: { version: 1, route: "/about", overrides: [] },
   });
+  await page.request.put(`${PREVIEW}/__overrides/support`, {
+    data: { version: 1, route: "/support", overrides: [] },
+  });
   await page.request.put(`${PREVIEW}/__overrides-history`, {
     data: { version: 1, snapshots: [{}], index: 0 },
   });

@@ -20,17 +20,34 @@ from orchestrator.section_pipeline import (
 
 _TEMPLATE_CACHE: dict[str, Template] = {}
 
-# Archetypes with a dedicated, gate-passing-canonical-example template
-# (build prompt 5.4: catalog to six). Everything else in the twenty-
-# archetype catalog (agent-pipeline-spec 4.2) still falls back to the
-# generic scaffold until it earns its own template (decisions.md).
+# Archetypes with a dedicated, gate-passing-canonical-example template.
+# Build prompt 5.4 grew this to six; build prompt 6.1 completes the full
+# 19-named-archetype catalog (agent-pipeline-spec 4.2) plus the `custom`
+# escape hatch (catalog.py's twentieth, which never gets a dedicated
+# template by design — contract 4.4).
 DEDICATED_TEMPLATES = {
+    # marketing / landing set
     "hero",
     "feature-grid",
-    "cta-band",
+    "feature-spotlight",
+    "social-proof",
     "pricing-tiers",
     "faq-accordion",
-    "social-proof",
+    "cta-band",
+    "stats-band",
+    "team-grid",
+    "contact-form",
+    # storefront set
+    "product-card-grid",
+    "product-detail",
+    "collection-header",
+    "cart-drawer",
+    "category-nav",
+    # saas set
+    "integration-grid",
+    "comparison-table",
+    "changelog-list",
+    "docs-toc-page",
 }
 
 

@@ -89,7 +89,7 @@ _COMMON = (
 )
 
 PRIMITIVE_SPECS: dict[str, str] = {
-    "Button": f'({{ nodeId?, variant?: "primary" | "secondary" | "ghost", href?, className?, children }}) — renders <a> styled as a button when href is set, else <button type="button">. {_COMMON}',
+    "Button": f'({{ nodeId?, variant?: "primary" | "secondary" | "ghost", href?, type?: "button" | "submit", disabled?: boolean, onClick?: () => void, className?, children }}) — renders <a> styled as a button when href is set (type/disabled/onClick apply only to the <button> case, not the <a> case), else <button> (type defaults to "button"; disabled dims and blocks pointer events via CSS, not just the native attribute). {_COMMON}',
     "Card": f'({{ nodeId?, variant?: "default" | "outlined", className?, children }}) — surface panel: padding, radius, subtle shadow (default) or border (outlined). {_COMMON}',
     "Input": f'({{ nodeId?, type?, placeholder?, defaultValue?, onChange?: (value: string) => void, className? }}) — single-line text input; onChange receives the string value. {_COMMON}',
     "Textarea": f'({{ nodeId?, placeholder?, defaultValue?, rows?, onChange?: (value: string) => void, className? }}) — multi-line input. {_COMMON}',

@@ -555,3 +555,63 @@ describe("runGates: report structure", () => {
     }
   });
 });
+
+describe("runGates: gate 2 parameterized routes (storefront product pages)", () => {
+  // The Shell Agent legitimately emits parameterized route paths for
+  // storefront sites — one product-detail page at "/products/:handle"
+  // serving every product URL. Gate 2 must treat an href as valid when it
+  // matches a parameterized route segment-wise (":param" matches exactly
+  // one non-empty segment), not only when it equals a path literally.
+  // See docs/decisions.md (2026-07-30) — first surfaced by the milestone
+  // 6.1 storefront acceptance run, where every product-card link burned
+  // its section's whole retry budget against an exact-match-only gate 2.
+  function paramProject(hrefs: string[]): string {
+    const dir = mkdtempSync(join(tmpdir(), "gate2-param-routes-"));
+    mkdirSync(join(dir, "src", "shell"), { recursive: true });
+    mkdirSync(join(dir, "src", "pages", "home", "mock"), { recursive: true });
+    writeFileSync(join(dir, "manifest.json"), JSON.stringify({ version: 1, nodes: {} }));
+    writeFileSync(
+      join(dir, "src", "shell", "routes.ts"),
+      "export const routes = [\n" +
+        '  { slug: "home", path: "/", title: "Home" },\n' +
+        '  { slug: "shop", path: "/shop", title: "Shop" },\n' +
+        '  { slug: "product", path: "/products/:handle", title: "Product" },\n' +
+        "];\n",
+    );
+    writeFileSync(
+      join(dir, "src", "pages", "home", "mock", "Links.data.ts"),
+      "export const linksData = {\n" +
+        hrefs.map((href, i) => `  link${i}: { label: "L${i}", href: ${JSON.stringify(href)} },\n`).join("") +
+        "};\n",
+    );
+    return dir;
+  }
+
+  it("an href filling a :param segment matches the parameterized route", () => {
+    const dir = paramProject(["/products/driftwood-dusk", "/shop", "/"]);
+    const report = runGates(dir);
+    expect(failuresOf(report, 2)).toEqual([]);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("an href with extra trailing segments does not match", () => {
+    const dir = paramProject(["/products/driftwood-dusk/reviews"]);
+    const report = runGates(dir);
+    expect(failuresOf(report, 2).map((f) => f.reason)).toEqual(["dangling-href"]);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("an href missing the :param segment does not match", () => {
+    const dir = paramProject(["/products"]);
+    const report = runGates(dir);
+    expect(failuresOf(report, 2).map((f) => f.reason)).toEqual(["dangling-href"]);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("an href whose static segment differs does not match", () => {
+    const dir = paramProject(["/prods/driftwood-dusk"]);
+    const report = runGates(dir);
+    expect(failuresOf(report, 2).map((f) => f.reason)).toEqual(["dangling-href"]);
+    rmSync(dir, { recursive: true, force: true });
+  });
+});

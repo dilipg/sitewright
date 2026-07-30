@@ -1,5 +1,5 @@
 ---
-version: 1.0.0
+version: 1.0.1
 archetype: social-proof
 ---
 [SYSTEM]
@@ -40,7 +40,7 @@ Route table — the only valid internal link targets:
 [ARCHETYPE]
 Archetype: social-proof — short customer testimonials (a quote, the customer's name, and their role/company) building trust before a conversion moment.
 
-Structure: a centered intro (Heading level 2 variant "section", optional Text variant "lead") above a Grid (columns 3) of Card testimonials driven by a `testimonials` prop array (data-driven count, typically 3-4 — map over it, never hand-write a fixed number of cards). Each card: the quote itself (Text, variant "lead", the largest/most prominent text in the card), then an attribution row (Image avatar if the primitive set includes one, else skip it — a Heading level 3 variant "subsection" for the name, a Text variant "caption" for role and company). Derive each testimonial's node id from its own stable `key` (never index). Give the Grid `items-start` (CSS Grid's default `align-items: stretch` would otherwise make every card as tall as its tallest sibling, coupling one testimonial's quote length to another's rendered height for no design reason — cards should size to their own content).
+Structure: a centered intro (Heading level 2 variant "section", optional Text variant "lead") above a Grid (columns 3) of Card testimonials driven by a `testimonials` prop array (data-driven count, typically 3-4 — map over it, never hand-write a fixed number of cards). Each card: the quote itself (Text, variant "lead", the largest/most prominent text in the card — the raw quote content only, no surrounding quote-mark characters added in JSX), then an attribution row (Image avatar if the primitive set includes one, else skip it — a Heading level 3 variant "subsection" for the name, a Text variant "caption" for the combined `roleAtCompany` field). Derive each testimonial's node id from its own stable `key` (never index). Give the Grid `items-start` (CSS Grid's default `align-items: stretch` would otherwise make every card as tall as its tallest sibling, coupling one testimonial's quote length to another's rendered height for no design reason — cards should size to their own content).
 
 Node id discipline (contract digest rule 5): the intro heading, description, and the Grid itself are NOT list items — they are fixed, one-per-section elements and must carry ordinary LITERAL string ids (e.g. `nodeId="home.testimonials.heading"`). ONLY the elements inside `testimonials.map(...)` use a computed nodeId built from the testimonial's own id.
 
@@ -48,7 +48,7 @@ Quality bar: quotes sound like something a real person said out loud, not market
 
 Override-slot fields (contract 5.5): a testimonial card has no JSX element of its own in the exported code (one `.map()` body renders every card), so every item in the `Testimonial` array carries four optional fields the exporter writes when the user edits that specific card through the canvas — `className?: string`, `childClassNames?: Record<string, string>`, `hidden?: boolean`, `childHidden?: Record<string, boolean>`. Never set these in the mock data (they are absent until the exporter writes them); the component must still read them back on the Card root and on the quote/name, or that card can never be edited after export.
 
-Failure modes that fail gates or reviews — avoid: a fixed number of hand-written Card elements instead of mapping over `testimonials`; deriving a testimonial's node id from its array index; a computed/template-literal nodeId on the intro heading, description, or Grid (they are not list items — use literal strings); generic unattributed praise with no name/role; hardcoded strings in JSX; hex/px values; inventing primitives, tokens, or props the primitives do not have; using a real, identifiable company or person's name — invented but plausible names only; omitting the override-slot fields (className/childClassNames/hidden/childHidden) from the `Testimonial` interface or forgetting to wire them into the card's render — silently breaks editing for that card after export, with no gate to catch it before then.
+Failure modes that fail gates or reviews — avoid: a fixed number of hand-written Card elements instead of mapping over `testimonials`; deriving a testimonial's node id from its array index; a computed/template-literal nodeId on the intro heading, description, or Grid (they are not list items — use literal strings); generic unattributed praise with no name/role; hardcoded strings in JSX — including literal quote-mark characters wrapped around `{testimonial.quote}` (the quote text itself is the only content; if a visual quote mark is wanted, that's a CSS `::before`/`::after` styling concern, never JSX text) and a literal `", "` (or any other) separator between two content fields (use one combined mock-data field like `roleAtCompany` instead of joining two fields with hardcoded punctuation); hex/px values; inventing primitives, tokens, or props the primitives do not have; using a real, identifiable company or person's name — invented but plausible names only; omitting the override-slot fields (className/childClassNames/hidden/childHidden) from the `Testimonial` interface or forgetting to wire them into the card's render — silently breaks editing for that card after export, with no gate to catch it before then.
 
 Canonical example — a previous gate-passing social-proof section. Match its structure, discipline, and file shapes exactly; do NOT reuse its copy or its "home"/"testimonials" slugs unless they match your section:
 
@@ -66,8 +66,11 @@ export interface Testimonial {
   key: string;
   quote: string;
   name: string;
-  role: string;
-  company: string;
+  // A single combined field, not separate role/company joined by a literal
+  // ", " in JSX (contract 4.3 rule 3 — that comma-space would itself be a
+  // hardcoded user-visible string; the separator is content, so it belongs
+  // in mock data, e.g. "Head of Operations, Ledgerly").
+  roleAtCompany: string;
   // Override-slot fields (contract 5.5) — exporter-written only, never set in mock data.
   className?: string;
   childClassNames?: Record<string, string>;
@@ -103,7 +106,7 @@ export default function Testimonials({ nodeId, heading, description, testimonial
                 <Stack direction="vertical" gap="md">
                   {testimonial.childHidden?.quote !== true && (
                     <Text nodeId={`${testimonialId}.quote`} variant="lead" className={testimonial.childClassNames?.quote}>
-                      "{testimonial.quote}"
+                      {testimonial.quote}
                     </Text>
                   )}
                   <Stack direction="vertical" gap="sm">
@@ -113,7 +116,7 @@ export default function Testimonials({ nodeId, heading, description, testimonial
                       </Heading>
                     )}
                     <Text variant="caption" className="text-(--color-semantic-textMuted)">
-                      {testimonial.role}, {testimonial.company}
+                      {testimonial.roleAtCompany}
                     </Text>
                   </Stack>
                 </Stack>
@@ -135,9 +138,9 @@ export const testimonialsData: TestimonialsProps = {
   heading: "Trusted by teams who used to dread Mondays",
   description: "Real results from teams who switched to Acme in the last year.",
   testimonials: [
-    { key: "priya-mehta", quote: "Cut our onboarding time from three weeks to two days. New hires are productive by their second morning.", name: "Priya Mehta", role: "Head of Operations", company: "Ledgerly" },
-    { key: "tom-osei", quote: "I stopped dreading Monday standups because I actually know what shipped over the weekend now.", name: "Tom Osei", role: "Engineering Manager", company: "Bloomroot" },
-    { key: "dana-price", quote: "Support answered a billing question in four minutes flat, on a Saturday. That never happens.", name: "Dana Price", role: "Founder", company: "Driftless Kayaks" },
+    { key: "priya-mehta", quote: "Cut our onboarding time from three weeks to two days. New hires are productive by their second morning.", name: "Priya Mehta", roleAtCompany: "Head of Operations, Ledgerly" },
+    { key: "tom-osei", quote: "I stopped dreading Monday standups because I actually know what shipped over the weekend now.", name: "Tom Osei", roleAtCompany: "Engineering Manager, Bloomroot" },
+    { key: "dana-price", quote: "Support answered a billing question in four minutes flat, on a Saturday. That never happens.", name: "Dana Price", roleAtCompany: "Founder, Driftless Kayaks" },
   ],
 };
 ```

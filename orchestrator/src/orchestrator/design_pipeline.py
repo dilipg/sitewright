@@ -344,6 +344,7 @@ def generate_tokens(run_id: str, brief_json: str, attempt: int, failure_report: 
         attempt=attempt,
         model=result["model"],
         usage=result["usage"],
+        duration_s=result.get("duration_s"),
         raw_output=json.dumps(result["data"], indent=2),
         checkpoint_ref=f"{kitaru.current_execution_id()}/generate_tokens#a{attempt}",
     )
@@ -386,6 +387,7 @@ def generate_primitives(
         attempt=attempt,
         model=result["model"],
         usage=result["usage"],
+        duration_s=result.get("duration_s"),
         raw_output=json.dumps(result["data"], indent=2)[:20000],
         checkpoint_ref=f"{kitaru.current_execution_id()}/generate_primitives#a{attempt}",
     )

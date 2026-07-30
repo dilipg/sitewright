@@ -12,6 +12,7 @@ default stays Anthropic and every other doc/prompt assumes it."""
 
 import json
 import os
+import time
 
 from anthropic import Anthropic
 from kitaru import checkpoint
@@ -37,9 +38,17 @@ def call_model_structured_impl(
     max_tokens: int = 8192,
 ) -> dict:
     """Structured output, dispatched to the configured provider. Plain
-    function: callers wrap it in their own checkpointed steps."""
+    function: callers wrap it in their own checkpointed steps.
+
+    Adds `duration_s`: the wall-clock latency of this one call. Run-log
+    timestamps are written when a call COMPLETES, so without this a run
+    report can only place a node in time, never show how long it took —
+    and per-call latency is exactly what milestone 5.5 could not measure
+    when fan-out missed its wall-clock target (docs/reports/m5-acceptance.md).
+    Measured around the dispatch so it covers both providers."""
+    started = time.perf_counter()
     if model_provider() == "gemini":
-        return _call_gemini_structured(
+        result = _call_gemini_structured(
             role=role,
             system=system,
             user=user,
@@ -47,15 +56,18 @@ def call_model_structured_impl(
             tool_schema=tool_schema,
             max_tokens=max_tokens,
         )
-    return _call_anthropic_structured(
-        role=role,
-        system=system,
-        user=user,
-        tool_name=tool_name,
-        tool_description=tool_description,
-        tool_schema=tool_schema,
-        max_tokens=max_tokens,
-    )
+    else:
+        result = _call_anthropic_structured(
+            role=role,
+            system=system,
+            user=user,
+            tool_name=tool_name,
+            tool_description=tool_description,
+            tool_schema=tool_schema,
+            max_tokens=max_tokens,
+        )
+    result["duration_s"] = round(time.perf_counter() - started, 3)
+    return result
 
 
 def _call_anthropic_structured(

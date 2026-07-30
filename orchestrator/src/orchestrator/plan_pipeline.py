@@ -217,6 +217,7 @@ def intake_step(run_id: str, user_brief: str, clarification_answers: str) -> dic
         event_type="intake.complete",
         model=result["model"],
         usage=result["usage"],
+        duration_s=result.get("duration_s"),
         raw_output=json.dumps(result["data"], indent=2),
         checkpoint_ref=f"{kitaru.current_execution_id()}/intake_step",
     )
@@ -247,6 +248,7 @@ def planner_step(run_id: str, brief: dict, attempt: int, failure_report: str) ->
         attempt=attempt,
         model=result["model"],
         usage=result["usage"],
+        duration_s=result.get("duration_s"),
         raw_output=json.dumps(result["data"], indent=2),
         checkpoint_ref=f"{kitaru.current_execution_id()}/planner_step#a{attempt}",
     )

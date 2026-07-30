@@ -149,6 +149,7 @@ def generate_shell(
         attempt=attempt,
         model=result["model"],
         usage=result["usage"],
+        duration_s=result.get("duration_s"),
         raw_output=json.dumps(result["data"], indent=2),
         checkpoint_ref=f"{kitaru.current_execution_id()}/generate_shell#a{attempt}",
     )

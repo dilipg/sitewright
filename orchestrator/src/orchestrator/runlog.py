@@ -1,8 +1,20 @@
-"""Run log v1 (pipeline section 7, build-plan stub table): JSONL events plus
-a dumb HTML viewer (orchestrator/runlog-viewer.html). Every model call logs
-its rendered prompt (hash + stored text), template version, model, params,
-token counts; gate results and checkpoint refs land as separate events.
-Without this, dynamic-context prompts are undebuggable."""
+"""Run log (pipeline section 7): append-only JSONL events. Every model call
+logs its rendered prompt (hash + stored text), template version, model,
+params, token counts and wall-clock `duration_s`; gate results and checkpoint
+refs land as separate events. Without this, dynamic-context prompts are
+undebuggable.
+
+Two readers:
+- `orchestrator/run_report.py` — the DAG timeline report (6.3): reconstructs
+  the pipeline DAG, rolls status/cost/latency up per node, drills down to the
+  exact prompts and raw output. The structured view, and the one to reach for.
+- `orchestrator/runlog-viewer.html` — a zero-setup flat event table; open it
+  and drop a JSONL in. Still useful for eyeballing raw events in log order,
+  which the DAG view deliberately reorders.
+
+The log stays append-only and free of DAG structure on purpose: the report
+derives the shape from event types and section ids, so a newer report can
+always re-read an older run."""
 
 import json
 from datetime import datetime, timezone

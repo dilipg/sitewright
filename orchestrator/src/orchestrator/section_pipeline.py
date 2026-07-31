@@ -606,7 +606,14 @@ def run_gates_step(
     fully checked. assemble_page's own (post-assembly) gate check never
     passes this.
     """
-    args = ["scripts/gates.ts", project_dir, "--json"]
+    # --typecheck completes gate 1 ("imports resolve; build passes", contract
+    # section 8): without it a section can reference a field it never declared,
+    # pass every gate, and only abort the EXPORT -- after the whole run's
+    # spend, with no chance for a bounded retry to fix it. Safe under parallel
+    # fan-out because the gates CLI filters tsc diagnostics to scope_route's
+    # own directory, so a sibling worker's half-written page is not this
+    # section's failure (see gates.ts gateTypechecks).
+    args = ["scripts/gates.ts", project_dir, "--json", "--typecheck"]
     if scope_route is not None:
         args += ["--scope-route", scope_route]
     if skip_missing_check:

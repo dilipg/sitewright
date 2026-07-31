@@ -1,5 +1,5 @@
 ---
-version: 1.0.3
+version: 1.0.4
 archetype: cart-drawer
 ---
 [SYSTEM]
@@ -40,7 +40,7 @@ Route table — the only valid internal link targets:
 [ARCHETYPE]
 Archetype: cart-drawer — the panel content of a shopping cart: line items with a remove action, a subtotal, and a checkout CTA. Rendered as a static panel here (a developer wires it into their own slide-out/overlay shell per HANDOVER.md); this generation is about the panel's own content and interactive seams, not the open/close animation.
 
-Structure: a Card or bordered panel. Heading ("Your cart"). If `items` is empty, show the `emptyMessage` instead of the list (Text, centered). Otherwise: a vertical Stack of line items, driven by the `items` prop array (data-driven count — map over it) — each item: a small Image, name, a `priceLine` display (price and quantity combined into ONE mock-data string, e.g. "$28 × 2" — never `{item.price} × {item.quantity}` in JSX, the literal `×` between two expressions is itself a hardcoded user-visible string), and a remove Button labeled by the `removeLabel` prop (never a literal "Remove" in JSX) that calls `onRemoveItem(item.key)`. Below the list: a Divider, the subtotal row (`subtotalLabel` + `subtotal`), and a full-width checkout Button that calls `onCheckout()`.
+Structure: a Card or bordered panel. Heading ("Your cart"). If `items` is empty, show the `emptyMessage` instead of the list (Text, centered). Otherwise: a vertical Stack of line items, driven by the `items` prop array (data-driven count — map over it) — each item: a small Image, name, a `priceLine` display (price and quantity combined into ONE mock-data string, e.g. "$28 × 2" — never `{item.price} × {item.quantity}` in JSX, the literal `×` between two expressions is itself a hardcoded user-visible string), and a remove Button labeled by the `removeLabel` prop (never a literal "Remove" in JSX) that calls `onRemoveItem(item.key)`. When `items` is non-empty, below the list: a Divider, the subtotal row (`subtotalLabel` + `subtotal`), and a full-width checkout Button that calls `onCheckout()` and takes its `disabled` from the optional `checkoutDisabled` prop. The Divider/subtotal/checkout block renders ONLY when there are visible items -- an empty cart showing "Subtotal $0" next to a live checkout button is a bug, not a layout. The component performs NO arithmetic: `subtotal` is a display string supplied by whoever owns the data, so removing a line item does not recompute it (say so in the mock data's own comment).
 
 Node id discipline: heading, empty-state message, subtotal row, and checkout button are static, individually-authored elements — each carries a literal string nodeId in the full `<route-slug>.<section-slug>.<field>` pattern shown in the canonical example below (substitute YOUR OWN route and section slugs, never drop the route-slug prefix). ONLY elements inside `items.map(...)` use a computed nodeId built from the item's own stable `key`. Never build a static (non-list) child's id from a template literal (`` nodeId={`${nodeId}.suffix`} ``) -- gate 4 cannot statically verify a computed id on a non-list element, so it reads as "never attached" and fails every retry identically. Every static child sets ONLY the `nodeId` prop, never a raw `data-node-id` attribute directly — the primitive itself renders `data-node-id` from `nodeId`; setting both causes a duplicate-id gate failure.
 
@@ -48,7 +48,7 @@ Quality bar: line items must be specific, plausible products for the brief's pro
 
 Override-slot fields (contract 5.5): every item in the `CartItem` array carries the four optional exporter-written fields (`className?`, `childClassNames?: Record<string,string>`, `hidden?`, `childHidden?: Record<string,boolean>`), never set in mock data, read back on the item's own root and on every child that carries its own node id (image, name, price).
 
-Failure modes that fail gates or reviews — avoid: calling `onRemoveItem` or `onCheckout` with anything beyond the documented signature; performing a real cart mutation, navigation, or API call inside the component; hardcoded strings — including a literal "Remove" button label (use the `removeLabel` prop) and a literal `×` joining price and quantity in JSX (use the single `priceLine` mock-data field); hex/px values; a fixed number of hand-written line items instead of mapping over `items`; deriving an item's node id from array index; omitting `// TODO: integrate` on the mock handlers.
+Failure modes that fail gates or reviews -- avoid: rendering the subtotal row or the checkout Button when the cart is empty; recomputing the subtotal inside the component; calling `onRemoveItem` or `onCheckout` with anything beyond the documented signature; performing a real cart mutation, navigation, or API call inside the component; hardcoded strings — including a literal "Remove" button label (use the `removeLabel` prop) and a literal `×` joining price and quantity in JSX (use the single `priceLine` mock-data field); hex/px values; a fixed number of hand-written line items instead of mapping over `items`; deriving an item's node id from array index; omitting `// TODO: integrate` on the mock handlers.
 
 Canonical example — a previous gate-passing cart-drawer. Match its structure and file shapes exactly; do NOT reuse its copy or slugs unless they match your section:
 
@@ -89,6 +89,10 @@ export interface CartDrawerProps {
   subtotalLabel: string;
   subtotal: string;
   checkoutLabel: string;
+  // Lets whoever owns the data block a double-submit while a checkout request
+  // is in flight. Optional so mock data never has to set it; forwarded to the
+  // Button primitive's own `disabled`.
+  checkoutDisabled?: boolean;
   // Interactive seams (contract 4.3): wired to no-ops in mock data.
   onRemoveItem: (key: string) => void;
   onCheckout: () => void;
@@ -103,6 +107,7 @@ export default function CartDrawer({
   subtotalLabel,
   subtotal,
   checkoutLabel,
+  checkoutDisabled,
   onRemoveItem,
   onCheckout,
 }: CartDrawerProps & NodeProps) {
@@ -156,16 +161,26 @@ export default function CartDrawer({
               })}
             </Stack>
           )}
-          <Divider className="my-(--space-6)" />
-          <Stack direction="horizontal" gap="sm" nodeId="shop.cart-drawer.subtotal" className="justify-between mb-(--space-6)">
-            <Text variant="body">{subtotalLabel}</Text>
-            <Text variant="body" className="font-(--typography-weight-semibold)">
-              {subtotal}
-            </Text>
-          </Stack>
-          <Button nodeId="shop.cart-drawer.checkout" variant="primary" className="w-full" onClick={onCheckout}>
-            {checkoutLabel}
-          </Button>
+          {visibleItems.length > 0 && (
+            <>
+              <Divider className="my-(--space-6)" />
+              <Stack direction="horizontal" gap="sm" nodeId="shop.cart-drawer.subtotal" className="justify-between mb-(--space-6)">
+                <Text variant="body">{subtotalLabel}</Text>
+                <Text variant="body" className="font-(--typography-weight-semibold)">
+                  {subtotal}
+                </Text>
+              </Stack>
+              <Button
+                nodeId="shop.cart-drawer.checkout"
+                variant="primary"
+                className="w-full"
+                disabled={checkoutDisabled}
+                onClick={onCheckout}
+              >
+                {checkoutLabel}
+              </Button>
+            </>
+          )}
         </Card>
       </Container>
     </section>

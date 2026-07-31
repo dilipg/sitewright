@@ -7,6 +7,7 @@
  * (pipeline 5.4): each names the offending value, file, and the rule.
  */
 
+import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { Project, SyntaxKind, ts } from "ts-morph";
@@ -44,6 +45,25 @@ export interface RunGatesOptions {
   ownershipMap?: OwnershipMap;
   /** Orchestrator-side write log per owner; boundary check is skipped without it. */
   writtenFiles?: Record<string, string[]>;
+  /**
+   * Runs the project's own `tsc --noEmit` as part of gate 1, which contract
+   * section 8 already defines as "All imports resolve; build passes" — the
+   * static import scan alone satisfies only the first half.
+   *
+   * Opt-in because it needs the project's installed typescript, which the
+   * tiny synthetic projects most gate tests use do not have. The generation
+   * pipeline turns it on; a type error caught here becomes a bounded retry
+   * with the compiler's own message injected, instead of surviving the whole
+   * run and aborting the export after all the spend (observed live: a section
+   * used `product.quickAddLabel` without declaring it on the interface, gates
+   * passed, all four page workers exited 0, and the export died at tsc).
+   *
+   * Combines with scopeRoute: typechecking is inherently whole-program, so
+   * during parallel fan-out a sibling worker's half-written route would
+   * otherwise fail this route's check. Diagnostics are filtered to the scoped
+   * route's own directory — the same containment gate 4 already applies.
+   */
+  typecheck?: boolean;
   /** Present only on regeneration runs; enables gate 7 (contract 5.3/8.7). */
   regen?: RegenGateContext;
   /** Restricts gate 4 to one route (build prompt 5.3 fan-out) — see gateNodeIdsRegistered's doc comment. */
@@ -99,6 +119,7 @@ export function runGates(projectDir: string, options: RunGatesOptions = {}): Gat
 
   const failures: GateFailure[] = [
     ...gateImportsResolve(root, sourceFiles),
+    ...(options.typecheck === true ? gateTypechecks(root, options.scopeRoute) : []),
     ...gateHrefsValid(root, sourceFiles),
     ...gateTokensOnly(root, styleScanFiles),
     ...gateNodeIdsRegistered(root, sourceFiles, options.scopeRoute, options.skipMissingCheck),
@@ -161,6 +182,68 @@ function gateRegenIdSurvival(
 }
 
 /** Gate 1: every relative import resolves to a file; bare imports appear in package.json. */
+/** `file(line,col): error TSxxxx: message` — tsc's default diagnostic format. */
+const TSC_DIAGNOSTIC = /^(.+?)\((\d+),(\d+)\): error (TS\d+): (.+)$/;
+
+/**
+ * Gate 1, second half: the project's own typecheck. Uses the project's
+ * installed tsc (not this package's) so the diagnostics match what its own
+ * `npm run build` would produce.
+ */
+function gateTypechecks(root: string, scopeRoute: string | undefined): GateFailure[] {
+  const tscPath = join(root, "node_modules", "typescript", "bin", "tsc");
+  if (!existsSync(tscPath)) {
+    return [
+      {
+        gate: 1,
+        reason: "typecheck-unavailable",
+        message:
+          `Typecheck requested but ${rel(root, tscPath)} is missing; run npm install in the project first. ` +
+          "Gate 1 covers \"build passes\" (contract section 8) and cannot be satisfied without it.",
+      },
+    ];
+  }
+
+  const result = spawnSync("node", [tscPath, "--noEmit"], {
+    cwd: root,
+    encoding: "utf8",
+    timeout: 180_000,
+  });
+  if (result.status === 0) return [];
+
+  const scopePrefix = scopeRoute === undefined ? undefined : `src/pages/${scopeRoute}/`;
+  const failures: GateFailure[] = [];
+  for (const line of `${result.stdout ?? ""}\n${result.stderr ?? ""}`.split(/\r?\n/)) {
+    const match = TSC_DIAGNOSTIC.exec(line.trim());
+    if (match === null) continue;
+    const file = match[1]!.replace(/\\/g, "/");
+    // Scoped runs ignore other routes: a concurrently-generating sibling's
+    // half-written page is not this section's failure to fix.
+    if (scopePrefix !== undefined && !file.startsWith(scopePrefix)) continue;
+    failures.push({
+      gate: 1,
+      reason: "typecheck-error",
+      file,
+      line: Number(match[2]),
+      message: `${match[4]}: ${match[5]} (${file}:${match[2]}:${match[3]})`,
+    });
+  }
+
+  // Nonzero exit with nothing attributable to this scope means the failure
+  // belongs to someone else's route (or is not a per-file diagnostic at all);
+  // reporting it here would fail an innocent section.
+  if (failures.length === 0 && scopePrefix === undefined) {
+    return [
+      {
+        gate: 1,
+        reason: "typecheck-error",
+        message: `Typecheck failed but produced no parsable diagnostics:\n${(result.stdout ?? "").slice(-2000)}`,
+      },
+    ];
+  }
+  return failures;
+}
+
 function gateImportsResolve(
   root: string,
   sourceFiles: import("ts-morph").SourceFile[],

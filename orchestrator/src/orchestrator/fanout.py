@@ -97,6 +97,10 @@ def run_fanout(run_id: str) -> dict:
             "scripts/gates.ts",
             str(project_dir),
             "--json",
+            # Unscoped by design (the whole-project check) and unscoped
+            # typecheck with it: every worker has finished, so nothing is
+            # in flight and a type error anywhere is genuinely the run's.
+            "--typecheck",
             "--write-log",
             str(write_log_file),
             "--ownership-map",

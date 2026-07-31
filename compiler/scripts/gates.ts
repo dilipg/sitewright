@@ -3,6 +3,7 @@
  * Usage: gates <projectDir> [--json] [--regen <context.json>]
  *                           [--write-log <file.json>] [--ownership-map <file.json>]
  *                           [--scope-route <slug>] [--skip-missing-check]
+ *                           [--typecheck]
  * --regen enables gate 7; the file holds { overriddenNodeIds, declaredOrphans }.
  * --write-log + --ownership-map enable gate 6's dynamic ownership-boundary
  * check (owner -> written files, owner -> allowed path prefixes) — the
@@ -57,6 +58,10 @@ const writeLogFile = readFlag("--write-log");
 const ownershipMapFile = readFlag("--ownership-map");
 const scopeRoute = readFlag("--scope-route");
 const skipMissingCheck = args.includes("--skip-missing-check");
+// --typecheck completes gate 1 ("imports resolve; build passes", contract
+// section 8) by running the project's own tsc. Needs the project's installed
+// typescript, so it is opt-in; the generation pipeline turns it on.
+const typecheck = args.includes("--typecheck");
 const options: RunGatesOptions = {
   ...(regen !== undefined ? { regen } : {}),
   ...(writeLogFile !== undefined ? { writtenFiles: JSON.parse(readFileSync(writeLogFile, "utf8")) } : {}),
@@ -65,6 +70,7 @@ const options: RunGatesOptions = {
     : {}),
   ...(scopeRoute !== undefined ? { scopeRoute } : {}),
   ...(skipMissingCheck ? { skipMissingCheck } : {}),
+  ...(typecheck ? { typecheck } : {}),
 };
 
 const report = runGates(resolve(dir), options);

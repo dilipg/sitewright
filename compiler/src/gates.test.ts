@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -614,4 +614,85 @@ describe("runGates: gate 2 parameterized routes (storefront product pages)", () 
     expect(failuresOf(report, 2).map((f) => f.reason)).toEqual(["dangling-href"]);
     rmSync(dir, { recursive: true, force: true });
   });
+});
+
+describe("runGates: gate 1 typecheck (contract section 8's \"build passes\")", () => {
+  // The static import scan satisfies only the first half of gate 1. Without
+  // the typecheck a section can use a field it never declared, pass every
+  // gate, and abort the export after the whole run's spend — observed live
+  // (docs/decisions.md 2026-07-30).
+  it("passes on the clean fixture", { timeout: 180_000 }, () => {
+    const report = runGates(cleanFixture, { typecheck: true });
+    expect(failuresOf(report, 1)).toEqual([]);
+  });
+
+  it("reports a real type error as a gate 1 failure with file and line", { timeout: 180_000 }, () => {
+    const dir = mkdtempSync(join(tmpdir(), "gate1-typecheck-"));
+    // Borrow the fixture wholesale (it has node_modules + tsconfig), then
+    // introduce the exact defect seen live: a field used but never declared.
+    cpSync(cleanFixture, dir, { recursive: true, filter: (src) => !src.includes("dist") });
+    const heroPath = join(dir, "src", "pages", "home", "sections", "Hero.tsx");
+    writeFileSync(
+      heroPath,
+      readFileSync(heroPath, "utf8").replace("{headline}", "{headline}{undeclaredField}"),
+    );
+
+    const report = runGates(dir, { typecheck: true });
+    const failures = failuresOf(report, 1);
+    expect(failures.length).toBeGreaterThan(0);
+    expect(failures[0]!.reason).toBe("typecheck-error");
+    expect(failures[0]!.file).toContain("Hero.tsx");
+    expect(failures[0]!.line).toBeGreaterThan(0);
+    expect(failures[0]!.message).toMatch(/TS\d+/);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("is off unless asked for, so the static gates stay fast", () => {
+    const report = runGates(cleanFixture);
+    expect(failuresOf(report, 1)).toEqual([]);
+    // no typescript needed: a bare synthetic project still passes gate 1
+    const dir = mkdtempSync(join(tmpdir(), "gate1-no-tsc-"));
+    mkdirSync(join(dir, "src", "shell"), { recursive: true });
+    writeFileSync(join(dir, "manifest.json"), JSON.stringify({ version: 1, nodes: {} }));
+    writeFileSync(join(dir, "src", "shell", "routes.ts"), "export const routes = [];\n");
+    expect(failuresOf(runGates(dir), 1)).toEqual([]);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("says so loudly when a typecheck is requested but typescript is absent", () => {
+    const dir = mkdtempSync(join(tmpdir(), "gate1-missing-tsc-"));
+    mkdirSync(join(dir, "src", "shell"), { recursive: true });
+    writeFileSync(join(dir, "manifest.json"), JSON.stringify({ version: 1, nodes: {} }));
+    writeFileSync(join(dir, "src", "shell", "routes.ts"), "export const routes = [];\n");
+    const failures = failuresOf(runGates(dir, { typecheck: true }), 1);
+    expect(failures[0]!.reason).toBe("typecheck-unavailable");
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it(
+    "scopeRoute confines diagnostics to that route, so a sibling's half-written page cannot fail it",
+    { timeout: 180_000 },
+    () => {
+      // This is what makes the typecheck safe under parallel fan-out:
+      // typechecking is whole-program, but a worker must only answer for its
+      // own route (the same containment gate 4 already applies).
+      const dir = mkdtempSync(join(tmpdir(), "gate1-scoped-typecheck-"));
+      cpSync(cleanFixture, dir, { recursive: true, filter: (src) => !src.includes("dist") });
+      const aboutPath = join(dir, "src", "pages", "about", "sections", "AboutIntro.tsx");
+      writeFileSync(
+        aboutPath,
+        readFileSync(aboutPath, "utf8").replace("export default function", "const broken: number = \"nope\";\nexport default function"),
+      );
+
+      // whole-project run sees it...
+      expect(failuresOf(runGates(dir, { typecheck: true }), 1).length).toBeGreaterThan(0);
+      // ...but the home worker is not blamed for the about route
+      expect(failuresOf(runGates(dir, { typecheck: true, scopeRoute: "home" }), 1)).toEqual([]);
+      // ...and the about worker still is
+      expect(
+        failuresOf(runGates(dir, { typecheck: true, scopeRoute: "about" }), 1).length,
+      ).toBeGreaterThan(0);
+      rmSync(dir, { recursive: true, force: true });
+    },
+  );
 });

@@ -264,9 +264,33 @@ export function renderHandover(data: HandoverData): string {
   lines.push("");
   lines.push(
     "Each section is a component plus a mock data file. Copy flows through props, " +
-      "so **text changes belong in the `.data.ts` file, never in the JSX**. Swapping " +
-      "mock data for a real source (CMS, API, database) means replacing the data " +
-      "file's export — the component's props interface is the contract.",
+      "so **static text changes belong in the `.data.ts` file, never in the JSX**.",
+  );
+  lines.push("");
+  lines.push(
+    "For anything **async or stateful** (fetching from an API, updating after a user " +
+      "action) a data file is not enough — it exports a module-level `const`, so it " +
+      "cannot hold a promise or react to a change. Put that logic in the **page " +
+      "container**, `src/pages/<route>/index.tsx`: own the state there with hooks, and " +
+      "pass it down as props. The section stays untouched. Its docblock says \"page " +
+      "assembly only, no styling decisions\" — that means keep *styling* out, not " +
+      "logic; the container is yours to edit after handover.",
+  );
+  lines.push("");
+  lines.push(
+    "Two consequences worth knowing before you start:",
+  );
+  lines.push("");
+  lines.push(
+    "- **Sections do no arithmetic.** A total or count is a display string you supply. " +
+      "Removing a list item does not recalculate it — recompute it in the container, or " +
+      "it will silently go stale.",
+  );
+  lines.push(
+    "- **Sections have no loading or error state.** An empty list renders the section's " +
+      "own empty-state copy, so a list that is still loading looks identical to one that " +
+      "is genuinely empty. Gate on your own loading flag in the container before " +
+      "rendering the section, or you will ship a flash of \"nothing here\" on every load.",
   );
   lines.push("");
 
@@ -306,8 +330,19 @@ export function renderHandover(data: HandoverData): string {
   } else {
     lines.push(
       `${String(data.integrations.length)} handler prop(s) are wired to no-op stubs. Each is a typed ` +
-        "seam: replace the stub in the mock data file (or pass your own handler where the " +
-        "section is rendered) and the component needs no changes.",
+        "seam, and the component needs no changes to use it. For a synchronous handler, " +
+        "replace the stub in the mock data file. For anything **async** — which is most " +
+        "real integrations — the stub cannot help you (it is a module-level `const`, with " +
+        "no access to React state); pass your own handler from the page container instead, " +
+        "as described in section 1.",
+    );
+    lines.push("");
+    lines.push(
+      "Before wiring one, read its section's props interface: a handler that can be " +
+        "triggered twice usually has a companion flag beside it (for example a " +
+        "`…Disabled?: boolean`) that exists precisely so you can block a double-submit " +
+        "while a request is in flight. It is optional, so mock data never sets it, and it " +
+        "is easy to miss.",
     );
     lines.push("");
     lines.push("| Route | Section | Handler | Signature | Stub location | Note |");
@@ -345,7 +380,44 @@ export function renderHandover(data: HandoverData): string {
     lines.push("");
   }
 
-  lines.push("## 4. Running it");
+  lines.push("## 4. Node ids, and why your data keys matter");
+  lines.push("");
+  lines.push(
+    "`data-node-id` attributes are canvas addressing metadata. They are inert at " +
+      "runtime, they make convenient stable test selectors, and they are safe to strip " +
+      "if you never plan to re-open this project in the editor.",
+  );
+  lines.push("");
+  lines.push(
+    "**If you do plan to re-open it, one rule matters.** A list item's node id is built " +
+      "from that item's own `key` field — `<section-id>.item-${item.key}` — so the keys " +
+      "your data source supplies become part of the id namespace. Keep them stable, " +
+      "human-meaningful slugs (`driftwood-shore`). Do **not** feed in database integers " +
+      "or array indices: ids like `…item-1` are positional, they change the moment the " +
+      "list reorders, and every canvas edit anchored to them is silently lost.",
+  );
+  lines.push("");
+
+  lines.push("## 5. What is yours to edit");
+  lines.push("");
+  lines.push("| Path | Who owns it |");
+  lines.push("| --- | --- |");
+  lines.push("| `src/pages/<route>/index.tsx` | **yours** — the page container, and where integration logic belongs |");
+  lines.push("| `src/pages/<route>/mock/*.data.ts` | **yours** — content and handler wiring |");
+  lines.push("| `src/lib/`, `src/pages/<route>/sections/*.tsx`, `src/primitives/`, `src/shell/`, `src/tokens/` | regenerated — safe to read, and safe to add NEW files to, but edits to existing files are overwritten if the project is regenerated |");
+  lines.push("| `HANDOVER.md` | regenerated on every export — put your own notes in a separate file |");
+  lines.push("");
+  lines.push(
+    "`src/tokens/tokens.css` is derived from `src/tokens/tokens.json` — edit the JSON, " +
+      "not the CSS. `src/shell/routes.ts` is the route table every internal link " +
+      "resolves against. `design-inventory.json` lists every primitive with its full " +
+      "prop signature (faster than reading the components). `manifest.json` is the " +
+      "editor's node registry: nothing imports it at runtime, and it is only needed if " +
+      "you re-import the project into the editor.",
+  );
+  lines.push("");
+
+  lines.push("## 6. Running it");
   lines.push("");
   lines.push("```sh");
   lines.push("npm install");
@@ -354,10 +426,23 @@ export function renderHandover(data: HandoverData): string {
   lines.push("```");
   lines.push("");
   lines.push(
-    "`src/tokens/tokens.css` is derived from `src/tokens/tokens.json` — edit the JSON, " +
-      "not the CSS. `src/shell/routes.ts` is the route table every internal link resolves " +
-      "against. `data-node-id` attributes are canvas addressing metadata; they are inert " +
-      "at runtime and safe to strip if you do not plan to re-import the project into the editor.",
+    "**Keep anything that writes to disk out of the project root.** The dev server " +
+      "watches the root, so a file your back-end or tooling writes there (a `db.json`, a " +
+      "sqlite file, a browser profile) triggers a full page reload that destroys React " +
+      "state mid-interaction — and a locked file can crash the dev server outright. " +
+      "Neither looks like a config problem: the reload silently re-fetches, so your DATA " +
+      "still looks correct and only state you hold locally (a confirmation message, a " +
+      "wizard step) vanishes. If you must keep the file in the root, exclude it: " +
+      "`server: { watch: { ignored: [\"**/db.json\"] } }` in `vite.config.ts`.",
+  );
+  lines.push("");
+  lines.push(
+    "Two smaller things worth knowing before you debug something that is not a bug: " +
+      "`main.tsx` renders under React `StrictMode`, so **every mount effect runs twice in " +
+      "development** — a `useEffect` fetch fires two requests, and an unguarded abort will " +
+      "surface as a spurious error on first load (guard it, or ignore `AbortError`). And " +
+      "`tsconfig.json` only includes `src`, so `npm run build` does not typecheck " +
+      "`vite.config.ts` itself.",
   );
   lines.push("");
 

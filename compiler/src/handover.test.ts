@@ -99,13 +99,57 @@ describe("collectHandoverData: off-scale overrides", () => {
 });
 
 describe("renderHandover", () => {
-  it("renders all four sections", () => {
+  it("renders every section", () => {
     const markdown = generateHandover(fixtureDir, fixtureManifest, []);
     expect(markdown).toContain("# Handover");
     expect(markdown).toContain("## 1. Where the content lives");
     expect(markdown).toContain("## 2. Integration TODOs");
     expect(markdown).toContain("## 3. Off-scale overrides");
-    expect(markdown).toContain("## 4. Running it");
+    expect(markdown).toContain("## 4. Node ids, and why your data keys matter");
+    expect(markdown).toContain("## 5. What is yours to edit");
+    expect(markdown).toContain("## 6. Running it");
+  });
+
+  // Each of these answers a specific friction point a real developer hit
+  // working only from this document (docs/reports/m6-handover-trial.md).
+  it("documents the async/stateful seam instead of promising a data-file swap", () => {
+    const markdown = generateHandover(fixtureDir, fixtureManifest, []);
+    // the old text claimed an API swap meant "replacing the data file's export",
+    // which is impossible: the file exports a module-level const
+    expect(markdown).toContain("page container");
+    expect(markdown).toContain("src/pages/<route>/index.tsx");
+    expect(markdown).toMatch(/cannot hold a promise/);
+  });
+
+  it("warns that sections do no arithmetic and have no loading state", () => {
+    const markdown = generateHandover(fixtureDir, fixtureManifest, []);
+    expect(markdown).toMatch(/no arithmetic/);
+    expect(markdown).toMatch(/no loading or error state/);
+  });
+
+  it("warns that a list item's data key becomes part of its node id", () => {
+    const markdown = generateHandover(fixtureDir, fixtureManifest, []);
+    expect(markdown).toMatch(/item-\$\{item\.key\}/);
+    expect(markdown).toMatch(/database integers or array indices/);
+  });
+
+  it("says which paths survive a regeneration, including itself", () => {
+    const markdown = generateHandover(fixtureDir, fixtureManifest, []);
+    expect(markdown).toContain("What is yours to edit");
+    expect(markdown).toMatch(/HANDOVER\.md` \| regenerated on every export/);
+    expect(markdown).toContain("src/lib/");
+  });
+
+  it("explains the two files nothing else documents", () => {
+    const markdown = generateHandover(fixtureDir, fixtureManifest, []);
+    expect(markdown).toContain("design-inventory.json");
+    expect(markdown).toContain("manifest.json");
+  });
+
+  it("warns about the dev-server watch trap a local back-end hits", () => {
+    const markdown = generateHandover(fixtureDir, fixtureManifest, []);
+    expect(markdown).toMatch(/watch: \{ ignored/);
+    expect(markdown).toMatch(/destroys React state/);
   });
 
   it("names every integration seam with its file and line", () => {

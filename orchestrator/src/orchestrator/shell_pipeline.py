@@ -12,7 +12,9 @@ AppShell.tsx/Nav.tsx/Footer.tsx, styled with tokens and primitives, importing
 hand-written shell, which serves as the canonical example.
 """
 
+import html
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -47,6 +49,8 @@ READ-ONLY; you import it, you never invent or omit a route.
 Rules (machine-checked):
 - Emit EXACTLY these 3 files: src/shell/AppShell.tsx, src/shell/Nav.tsx, src/shell/Footer.tsx.
 - Nav and Footer import `{{ routes }}` from "./routes" and map over it for every internal link. NEVER hardcode a route path, and NEVER link to a path absent from routes.
+- Internal links use react-router's `Link` (`import {{ Link }} from "react-router-dom"`, `to={{route.path}}`), NEVER a raw <a href>. The app is a client-side-routed SPA; a raw anchor triggers a full document reload, which throws away all React state (fatal for anything holding fetched data, e.g. a cart).
+- SKIP parameterized routes in nav: a path containing ":" (e.g. "/product/:id") is a template, not a destination, and linking to it ships a dead link to the literal URL. Filter them out (`routes.filter((route) => !route.path.includes(":"))`).
 - Style ONLY with Tailwind utilities over the token CSS variables in DESIGN CONTEXT. NEVER raw hex, NEVER raw px.
 - Compose ONLY the primitives listed in DESIGN CONTEXT, imported from ../primitives/<Name>.
 - Shell elements carry no data-node-id/nodeId — the shell is not canvas-editable in v1.
@@ -61,21 +65,25 @@ table):
 
 src/shell/Nav.tsx:
 ```tsx
+import {{ Link }} from "react-router-dom";
 import Container from "../primitives/Container";
 import {{ routes }} from "./routes";
+
+// A path with a ":" segment is a template, not a destination.
+const navRoutes = routes.filter((route) => !route.path.includes(":"));
 
 export default function Nav() {{
   return (
     <header className="border-b border-solid border-(--color-semantic-border) bg-(--color-semantic-surface)">
       <Container className="flex items-center justify-between py-(--space-4)">
-        <a href="/" className="font-(family-name:--typography-fontFamily-heading) text-(length:--typography-scale-lg) font-(--typography-weight-bold) text-(--color-semantic-text) no-underline">
+        <Link to="/" className="font-(family-name:--typography-fontFamily-heading) text-(length:--typography-scale-lg) font-(--typography-weight-bold) text-(--color-semantic-text) no-underline">
           {{brandName}}
-        </a>
+        </Link>
         <nav className="flex gap-(--space-6)">
-          {{routes.map((route) => (
-            <a key={{route.slug}} href={{route.path}} className="text-(length:--typography-scale-sm) text-(--color-semantic-textMuted) no-underline">
+          {{navRoutes.map((route) => (
+            <Link key={{route.slug}} to={{route.path}} className="text-(length:--typography-scale-sm) text-(--color-semantic-textMuted) no-underline">
               {{route.title}}
-            </a>
+            </Link>
           ))}}
         </nav>
       </Container>
@@ -83,7 +91,7 @@ export default function Nav() {{
   );
 }}
 ```
-(Footer follows the same route-mapping pattern; AppShell composes Nav + main + Footer.)
+(Footer follows the same route-mapping pattern -- same `Link`, same parameterized-route filter; AppShell composes Nav + main + Footer.)
 
 BRAND: {brand_name}
 '''
@@ -156,8 +164,56 @@ def generate_shell(
     return result["data"]
 
 
+def brand_slug(brand_name: str) -> str:
+    """npm-safe package name: lowercase, alphanumeric + single dashes."""
+    slug = re.sub(r"[^a-z0-9]+", "-", brand_name.lower()).strip("-")
+    return slug or "generated-site"
+
+
+def brand_scaffold(project_dir: str, brand_name: str) -> list[str]:
+    """Stamps the brand onto the two unowned scaffold files the fixture is
+    copied from, deterministically (no model involved -- same category as
+    routes.ts).
+
+    Without this every generated site ships the FIXTURE's identity: a browser
+    tab reading "Acme Analytics" and a package named "acme-landing-fixture",
+    on a site that is otherwise entirely about someone else's brand. A real
+    developer receiving the handover sees the wrong name before they see
+    anything else (found in the 6.4 handover trial). Returns the files it
+    changed."""
+    project = Path(project_dir)
+    changed: list[str] = []
+
+    index_html = project / "index.html"
+    if index_html.exists():
+        source = index_html.read_text(encoding="utf-8")
+        branded = re.sub(
+            r"<title>.*?</title>",
+            f"<title>{html.escape(brand_name)}</title>",
+            source,
+            count=1,
+            flags=re.DOTALL,
+        )
+        if branded != source:
+            index_html.write_text(branded, encoding="utf-8", newline="\n")
+            changed.append("index.html")
+
+    package_json = project / "package.json"
+    if package_json.exists():
+        data = json.loads(package_json.read_text(encoding="utf-8"))
+        slug = brand_slug(brand_name)
+        if data.get("name") != slug:
+            data["name"] = slug
+            package_json.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8", newline="\n")
+            changed.append("package.json")
+
+    return changed
+
+
 @checkpoint
-def write_shell(project_dir: str, routes_ts: str, shell_result: dict, attempt: int) -> dict:
+def write_shell(
+    project_dir: str, routes_ts: str, shell_result: dict, attempt: int, brand_name: str = ""
+) -> dict:
     project = Path(project_dir)
     shell_dir = project / "src" / "shell"
     if shell_dir.exists():
@@ -166,6 +222,9 @@ def write_shell(project_dir: str, routes_ts: str, shell_result: dict, attempt: i
     (shell_dir / "routes.ts").write_text(routes_ts, encoding="utf-8", newline="\n")
     for rel_path, content in shell_result["files"].items():
         (project / rel_path).write_text(content, encoding="utf-8", newline="\n")
+
+    if brand_name:
+        brand_scaffold(project_dir, brand_name)
 
     ensure_node_modules(project)
     tsc = subprocess.run(
@@ -223,6 +282,7 @@ def generate_shell_flow(run_id: str, brief_json: str, siteplan_json: str) -> dic
         else []
     )
     token_summary = build_design_context(tokens, signatures)
+    brand_name = json.loads(brief_json).get("brand", {}).get("name", "")
 
     failure_report = ""
     for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -231,7 +291,9 @@ def generate_shell_flow(run_id: str, brief_json: str, siteplan_json: str) -> dic
         )
         issues = validate_shell_output(shell_result.get("files", {}))
         if not issues:
-            written = materialize(write_shell(project_dir, routes_ts, shell_result, attempt))
+            written = materialize(
+                write_shell(project_dir, routes_ts, shell_result, attempt, brand_name)
+            )
             if written["ok"]:
                 return {"passed": True, "project_dir": project_dir, "attempts": attempt, "routes": routes}
             issues = written["issues"]

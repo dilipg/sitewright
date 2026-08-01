@@ -1,5 +1,5 @@
 ---
-version: 1.0.2
+version: 1.0.3
 archetype: product-detail
 ---
 [SYSTEM]
@@ -44,6 +44,8 @@ Structure: a 2-column Grid. Left: a main Image (the currently-selected gallery i
 
 Node id discipline: the buy-box fields (name, price, description, quantity stepper, add-to-cart button) are static, individually-authored elements — each carries a literal string nodeId in the full `<route-slug>.<section-slug>.<field>` pattern shown in the canonical example below (e.g. `product.product-detail.name` — substitute YOUR OWN route and section slugs, never drop the route-slug prefix even though "product" and "product-detail" look similar). ONLY the gallery thumbnails inside `images.map(...)` use a computed nodeId built from the image's own stable `key`. Never build a static (non-list) child's id from a template literal (`` nodeId={`${nodeId}.suffix`} ``) -- gate 4 cannot statically verify a computed id on a non-list element, so it reads as "never attached" and fails every retry identically. Every static child sets ONLY the `nodeId` prop, never a raw `data-node-id` attribute directly — the primitive itself renders `data-node-id` from `nodeId`; setting both causes a duplicate-id gate failure.
 
+Money is numeric: `price` is a number and `formatMoney` renders it — never a currency symbol in JSX or mock data.
+
 Quality bar: product name, price, and description must be specific and consistent with the brief's product line and (if a product-card-grid or similar section already ran on this page) with what it already established about pricing.
 
 Override-slot fields (contract 5.5): every item in the `ProductImage` array carries the four optional exporter-written fields (`className?`, `childClassNames?: Record<string,string>`, `hidden?`, `childHidden?: Record<string,boolean>`), never set in mock data, read back on the thumbnail's own root (it has no further children with their own node ids).
@@ -56,6 +58,7 @@ files["src/pages/product/sections/ProductDetail.tsx"]:
 ```tsx
 import { useState } from "react";
 import { cx } from "../../../lib/cx";
+import { formatMoney } from "../../../lib/format";
 import Container from "../../../primitives/Container";
 import Grid from "../../../primitives/Grid";
 import Stack from "../../../primitives/Stack";
@@ -78,7 +81,9 @@ export interface ProductImage {
 
 export interface ProductDetailProps {
   productName: string;
-  price: string;
+  // A number, formatted by lib/format at render time: the currency symbol
+  // must not be baked into data (contract 4.3, and see lib/format's own note).
+  price: number;
   description: string;
   images: ProductImage[];
   quantityDecrementLabel: string;
@@ -147,7 +152,7 @@ export default function ProductDetail({
               {productName}
             </Heading>
             <Text nodeId="product.product-detail.price" variant="body" className="text-(length:--typography-scale-2xl) font-(--typography-weight-semibold)">
-              {price}
+              {formatMoney(price)}
             </Text>
             <Text nodeId="product.product-detail.description" variant="body" className="text-(--color-semantic-textMuted)">
               {description}
@@ -178,7 +183,7 @@ import type { ProductDetailProps } from "../sections/ProductDetail";
 
 export const productDetailData: ProductDetailProps = {
   productName: "Amber Dusk Candle",
-  price: "$28",
+  price: 28,
   description: "A warm amber and sandalwood blend, hand-poured in small batches into a reusable matte jar. 45-hour burn time.",
   images: [
     { key: "front", src: "https://images.yourbrand.example/products/amber-dusk-front.jpg", alt: "Amber Dusk candle, front view" },

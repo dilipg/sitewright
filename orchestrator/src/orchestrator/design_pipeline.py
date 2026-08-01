@@ -1,5 +1,7 @@
 """Design System Agent (pipeline 2.3, build prompt 5.2): two checkpointed
-steps — tokens, then the fixed 15-primitive set (contract 4.1) generated
+steps — tokens, then the primitive set (contract 4.1 defines a MINIMUM set;
+4.2 reserves ADDING to it to this agent, so the set is closed per-run but not
+forever — `Notice` was added in 7.4) generated
 against static per-primitive specs (constrained fill-in, not open
 generation). Generated tokens flow through the M1 deriver; generated
 primitives must typecheck and pass gates, both with bounded retry. A
@@ -104,6 +106,13 @@ PRIMITIVE_SPECS: dict[str, str] = {
     "Stack": f'({{ nodeId?, direction?: "vertical" | "horizontal", gap?: "sm" | "md" | "lg", className?, children }}) — flex stack with token gaps. {_COMMON}',
     "Divider": f"({{ nodeId?, className? }}) — horizontal rule using the border semantic color. {_COMMON}",
     "Icon": f'({{ nodeId?, name: "check" | "arrow-right" | "star" | "chevron-down" | "plus" | "x", size?: "sm" | "md", className? }}) — inline SVG, stroke currentColor, no fill colors. {_COMMON}',
+    # Added in 7.4. Contract 4.1 specifies a MINIMUM set and 4.2 reserves
+    # adding primitives to this agent, so this is a sanctioned extension, not
+    # a contract change. It exists because a developer wiring a section to a
+    # real API must render loading/error/success somewhere and had nothing to
+    # render them with -- both 6.4 handover trials hand-composed status markup
+    # in a page container whose docblock disclaims styling decisions.
+    "Notice": f'({{ nodeId?, variant?: "info" | "error" | "success", className?, children }}) — runtime status surface (loading / error / success) for the INTEGRATION layer, not for section copy: bordered, tinted by variant via the semantic border/danger/success tokens, role="status". {_COMMON}',
 }
 
 EXPECTED_PRIMITIVE_FILES = {f"src/primitives/{name}.tsx" for name in PRIMITIVE_SPECS}
@@ -113,7 +122,10 @@ def validate_primitive_output(files: dict[str, str], inventory: list[str]) -> li
     issues: list[str] = []
     provided = set(files)
     for missing in sorted(EXPECTED_PRIMITIVE_FILES - provided):
-        issues.append(f"missing primitive file {missing} (the set is fixed: exactly the 15 contract primitives)")
+        issues.append(
+            f"missing primitive file {missing} (emit every one of the "
+            f"{len(PRIMITIVE_SPECS)} primitives in the spec list, no more and no fewer)"
+        )
     for stray in sorted(provided - EXPECTED_PRIMITIVE_FILES):
         issues.append(f"unexpected file {stray}: the Design System Agent writes only src/primitives/<Name>.tsx")
     if len(inventory) != len(PRIMITIVE_SPECS):
@@ -136,6 +148,7 @@ import Grid from "../../primitives/Grid";
 import Heading from "../../primitives/Heading";
 import Icon from "../../primitives/Icon";
 import Image from "../../primitives/Image";
+import Notice from "../../primitives/Notice";
 import Input from "../../primitives/Input";
 import Link from "../../primitives/Link";
 import Select from "../../primitives/Select";
@@ -174,6 +187,11 @@ export default function HomePage() {
           <Button variant="secondary">Secondary action</Button>
           <Button variant="ghost">Ghost action</Button>
           <Button variant="primary" href="/">Link button</Button>
+        </Stack>
+        <Stack direction="vertical" gap="sm">
+          <Notice variant="info">Loading…</Notice>
+          <Notice variant="error">Something went wrong.</Notice>
+          <Notice variant="success">Saved.</Notice>
         </Stack>
 
         <Stack direction="horizontal" gap="sm">
@@ -305,7 +323,7 @@ PRIMITIVES_TOOL = {
     "properties": {
         "files": {
             "type": "object",
-            "description": "src/primitives/<Name>.tsx -> complete file content, exactly 15 entries",
+            "description": f"src/primitives/<Name>.tsx -> complete file content, exactly {len(PRIMITIVE_SPECS)} entries",
             "properties": {f"src/primitives/{name}.tsx": {"type": "string"} for name in PRIMITIVE_SPECS},
             "required": [f"src/primitives/{name}.tsx" for name in PRIMITIVE_SPECS],
         },
@@ -373,7 +391,7 @@ def generate_primitives(
         user += f"\n\nPREVIOUS ATTEMPT FAILED VALIDATION. Fix every issue:\n{failure_report}"
     result = call_model_structured_impl(
         role="design-system",
-        system=PRIMITIVES_SYSTEM_TEMPLATE.format(specs=specs),
+        system=PRIMITIVES_SYSTEM_TEMPLATE.format(specs=specs, primitive_count=len(PRIMITIVE_SPECS)),
         user=user,
         tool_name="emit_primitives",
         tool_description="Emit the 15 primitive files and their inventory signatures.",

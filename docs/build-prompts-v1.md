@@ -460,6 +460,31 @@ the wall clock actually goes, and orders the optimisation levers by evidence.
 COMMIT: "docs(7.3): wall-clock diagnosis - the model was never the bottleneck"
 ```
 
+### 7.4 - Handover P0s from the 6.4 trials
+
+```
+Read docs/reports/m6-handover-trial.md's "Deferred to milestone 7" section.
+
+Four items, each independently reported by BOTH cold trials:
+- money/counts as pre-formatted strings relocate the currency symbol and the
+  separator into a page container with no override coverage, and there is no
+  currency or locale anywhere in the token set;
+- no status primitive, so a developer following the doc's own loading-gate
+  advice hand-composes status markup in a file that disclaims styling;
+- section props mark data and handlers REQUIRED, so a data file typed as the
+  full props keeps stale values that still read as authoritative;
+- no per-item pending seam.
+
+Note contract 4.1 says "Minimum v1 set" and 4.2 reserves ADDING primitives to
+the Design System Agent, so extending the set is sanctioned, not a contract
+change. Do not edit docs to match code.
+
+VERIFY: money renders through one shared helper with the separator and currency
+outside section JSX and outside mock data; the primitive-set test asserts the
+contract MINIMUM plus explicitly declared additions.
+COMMIT: "feat(7.4): handover P0s - money seam, status primitive, typing guidance"
+```
+
 ---
 
 ## Standing rules for every session

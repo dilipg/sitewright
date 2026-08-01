@@ -1,5 +1,5 @@
 ---
-version: 1.0.1
+version: 1.0.2
 archetype: product-card-grid
 ---
 [SYSTEM]
@@ -44,6 +44,8 @@ Structure: an optional intro (Heading level 2 variant "section") above a Grid (c
 
 Node id discipline: an intro heading, if present, is NOT a list item — literal string id. ONLY elements inside `products.map(...)` use a computed nodeId built from the product's own stable `key` (a slug from the product name or SKU, never array index). Never build a static (non-list) child's id from a template literal (`` nodeId={`${nodeId}.suffix`} ``) -- gate 4 cannot statically verify a computed id on a non-list element, so it reads as "never attached" and fails every retry identically.
 
+Money is numeric: `price` is a number and `formatMoney` renders it — never a currency symbol in JSX or mock data.
+
 Quality bar: product names and prices must be specific and plausible for the brief's product line (real-sounding product names, prices internally consistent with the brand's positioning — no candle at "$1,200"). 4-8 products.
 
 Override-slot fields (contract 5.5): every item in the `Product` array carries the four optional exporter-written fields (`className?`, `childClassNames?: Record<string,string>`, `hidden?`, `childHidden?: Record<string,boolean>`), never set in mock data, read back on the card's own root and on every child that carries its own node id (image, name, price, badge).
@@ -55,6 +57,7 @@ Canonical example — a previous gate-passing product-card-grid. Match its struc
 files["src/pages/shop/sections/ProductCardGrid.tsx"]:
 ```tsx
 import { cx } from "../../../lib/cx";
+import { formatMoney } from "../../../lib/format";
 import Container from "../../../primitives/Container";
 import Grid from "../../../primitives/Grid";
 import Link from "../../../primitives/Link";
@@ -67,7 +70,9 @@ import type { NodeProps } from "../../../lib/types";
 export interface Product {
   key: string;
   name: string;
-  price: string;
+  // A number, formatted by lib/format at render time — never a currency
+  // symbol baked into data (contract 4.3, and see lib/format's own note).
+  price: number;
   imageSrc: string;
   imageAlt: string;
   href: string;
@@ -128,7 +133,7 @@ export default function ProductCardGrid({ nodeId, heading, products }: ProductCa
                       variant="body"
                       className={cx("text-(--color-semantic-textMuted)", product.childClassNames?.price)}
                     >
-                      {product.price}
+                      {formatMoney(product.price)}
                     </Text>
                   )}
                 </Stack>
@@ -149,10 +154,10 @@ import type { ProductCardGridProps } from "../sections/ProductCardGrid";
 export const productCardGridData: ProductCardGridProps = {
   heading: "Best sellers",
   products: [
-    { key: "amber-dusk", name: "Amber Dusk Candle", price: "$28", imageSrc: "https://images.yourbrand.example/products/amber-dusk.jpg", imageAlt: "Amber Dusk candle in a matte jar", href: "/shop", badgeLabel: "New" },
-    { key: "cedar-fog", name: "Cedar Fog Candle", price: "$28", imageSrc: "https://images.yourbrand.example/products/cedar-fog.jpg", imageAlt: "Cedar Fog candle in a matte jar", href: "/shop" },
-    { key: "reed-diffuser", name: "Wildflower Reed Diffuser", price: "$36", imageSrc: "https://images.yourbrand.example/products/reed-diffuser.jpg", imageAlt: "Reed diffuser with rattan sticks", href: "/shop" },
-    { key: "gift-set", name: "Fireside Gift Set", price: "$64", imageSrc: "https://images.yourbrand.example/products/gift-set.jpg", imageAlt: "Boxed gift set of two candles", href: "/shop" },
+    { key: "amber-dusk", name: "Amber Dusk Candle", price: 28, imageSrc: "https://images.yourbrand.example/products/amber-dusk.jpg", imageAlt: "Amber Dusk candle in a matte jar", href: "/shop", badgeLabel: "New" },
+    { key: "cedar-fog", name: "Cedar Fog Candle", price: 28, imageSrc: "https://images.yourbrand.example/products/cedar-fog.jpg", imageAlt: "Cedar Fog candle in a matte jar", href: "/shop" },
+    { key: "reed-diffuser", name: "Wildflower Reed Diffuser", price: 36, imageSrc: "https://images.yourbrand.example/products/reed-diffuser.jpg", imageAlt: "Reed diffuser with rattan sticks", href: "/shop" },
+    { key: "gift-set", name: "Fireside Gift Set", price: 64, imageSrc: "https://images.yourbrand.example/products/gift-set.jpg", imageAlt: "Boxed gift set of two candles", href: "/shop" },
   ],
 };
 ```

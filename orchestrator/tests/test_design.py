@@ -85,13 +85,39 @@ def test_token_validator_names_missing_pieces() -> None:
     assert any("breakpoint" in issue for issue in validate_tokens_json(tokens))
 
 
-def test_primitive_specs_cover_the_contract_set() -> None:
-    assert set(PRIMITIVE_SPECS) == {
-        "Button", "Card", "Input", "Textarea", "Select", "Badge", "Heading", "Text",
-        "Link", "Image", "Container", "Grid", "Stack", "Divider", "Icon",
-    }
-    for spec in PRIMITIVE_SPECS.values():
-        assert "nodeId" in spec  # every spec restates the passthrough rule
+# Contract 4.1's wording is "Minimum v1 set" and 4.2 reserves ADDING primitives
+# to the Design System Agent -- so the contract set is a floor, not an equality.
+CONTRACT_MINIMUM_SET = {
+    "Button", "Card", "Input", "Textarea", "Select", "Badge", "Heading", "Text",
+    "Link", "Image", "Container", "Grid", "Stack", "Divider", "Icon",
+}
+
+# Every primitive beyond the contract minimum, with the reason it was added.
+# Listing them explicitly keeps the set from growing by accident.
+SANCTIONED_ADDITIONS = {
+    "Notice": "7.4: runtime status surface for the integration layer (6.4 handover trials)",
+}
+
+
+def test_primitive_specs_cover_the_contract_minimum() -> None:
+    missing = CONTRACT_MINIMUM_SET - set(PRIMITIVE_SPECS)
+    assert not missing, f"contract 4.1's minimum set is not covered: {sorted(missing)}"
+
+
+def test_every_primitive_beyond_the_contract_minimum_is_a_declared_addition() -> None:
+    """Guards against the set growing silently: a new primitive is a real
+    product decision (generation cost, handover surface), so it has to be
+    declared here with its reason, not just appear in the spec dict."""
+    extras = set(PRIMITIVE_SPECS) - CONTRACT_MINIMUM_SET
+    assert extras == set(SANCTIONED_ADDITIONS), (
+        f"undeclared primitive(s): {sorted(extras - set(SANCTIONED_ADDITIONS))}; "
+        f"declared but absent: {sorted(set(SANCTIONED_ADDITIONS) - extras)}"
+    )
+
+
+def test_every_primitive_spec_restates_the_nodeid_passthrough_rule() -> None:
+    for name, spec in PRIMITIVE_SPECS.items():
+        assert "nodeId" in spec, name
 
 
 def test_primitive_output_must_be_exactly_the_fifteen_files() -> None:

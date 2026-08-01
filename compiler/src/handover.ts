@@ -292,6 +292,30 @@ export function renderHandover(data: HandoverData): string {
       "is genuinely empty. Gate on your own loading flag in the container before " +
       "rendering the section, or you will ship a flash of \"nothing here\" on every load.",
   );
+  lines.push(
+    "- **Money and counts are numbers, not strings.** `src/lib/format.ts` owns the " +
+      "currency, the locale and every separator, and exposes `formatMoney`, " +
+      "`formatPriceLine` and `sumLineItems`. Change the currency in one place; do not " +
+      "reintroduce a `\"$\"` in your data.",
+  );
+  lines.push("");
+  lines.push(
+    "One typing wrinkle worth knowing up front. A section's props interface declares its " +
+      "data and handlers as **required**, so once the container supplies them the mock " +
+      "data file can no longer satisfy the full interface — and leaving stale values in " +
+      "it (a subtotal that no longer renders, a `console.log` stub that no longer runs) " +
+      "is how the next reader wastes an afternoon. Narrow the data file to just the copy " +
+      "it still owns, so anything stale becomes a compile error:",
+  );
+  lines.push("");
+  lines.push("```ts");
+  lines.push("// mock/CartContents.data.ts — copy only; the container supplies the rest");
+  lines.push("type CartContentsCopy = Omit<");
+  lines.push("  CartContentsProps,");
+  lines.push('  "items" | "subtotal" | "onRemoveItem" | "onCheckout"');
+  lines.push(">;");
+  lines.push("export const cartContentsData: CartContentsCopy = { /* headings, labels */ };");
+  lines.push("```");
   lines.push("");
 
   if (data.sections.length === 0) {
@@ -404,7 +428,8 @@ export function renderHandover(data: HandoverData): string {
   lines.push("| --- | --- |");
   lines.push("| `src/pages/<route>/index.tsx` | **yours** — the page container, and where integration logic belongs |");
   lines.push("| `src/pages/<route>/mock/*.data.ts` | **yours** — content and handler wiring |");
-  lines.push("| `src/lib/`, `src/pages/<route>/sections/*.tsx`, `src/primitives/`, `src/shell/`, `src/tokens/` | regenerated — safe to read, and safe to add NEW files to, but edits to existing files are overwritten if the project is regenerated |");
+  lines.push("| `src/lib/format.ts` | **yours** — currency, locale and separators live here |");
+  lines.push("| `src/lib/` (other files), `src/pages/<route>/sections/*.tsx`, `src/primitives/`, `src/shell/`, `src/tokens/` | regenerated — safe to read, and safe to add NEW files to, but edits to existing files are overwritten if the project is regenerated |");
   lines.push("| `HANDOVER.md` | regenerated on every export — put your own notes in a separate file |");
   lines.push("");
   lines.push(

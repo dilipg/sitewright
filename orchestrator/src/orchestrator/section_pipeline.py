@@ -30,6 +30,7 @@ from orchestrator.fixture_context import (
     fixture_tokens,
 )
 from orchestrator.model_call import call_model_structured_impl
+from orchestrator.placeholder_shield import shield, unshield
 from orchestrator.prompts import load_template, render_template
 from orchestrator.runlog import append_run_event, default_run_log_path
 
@@ -467,6 +468,12 @@ def generate_section(
     prompt_hash: str,
     section: str = "home.hero",
 ) -> dict:
+    # The prompts arrive shielded so Kitaru's replay-time env-var substitution
+    # cannot choke on the `${nodeId}` the contract requires in list-item ids
+    # (see placeholder_shield). Everything downstream -- the model call and the
+    # run log -- sees the real text.
+    system = unshield(system)
+    user = unshield(user)
     result = call_model_structured_impl(
         role="page",
         system=system,
@@ -769,8 +776,8 @@ def generate_section_flow(
         generated = generate_section(
             run_id=run_id,
             attempt=attempt,
-            system=rendered.system,
-            user=user,
+            system=shield(rendered.system),
+            user=shield(user),
             template_name=rendered.template_name,
             template_version=rendered.template_version,
             template_hash=rendered.template_hash,

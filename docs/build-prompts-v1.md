@@ -383,6 +383,48 @@ No fixed prompts. Read docs/canvas-editor-prd-v1.md section 7 P1 row and docs/bu
 Candidates in likely order: add-a-section (PRD 4.1), section reorder (PRD 3.3 sectionOrder override), image replace (PRD 3.5), responsive read-only preview, page-level regen.
 ```
 
+### Pull order (set 2026-07-30, by observed need)
+
+Correctness before features, per the milestone-7 instruction to pull by observed
+need rather than list order. Items 1-4 come from docs/reports/ and decisions.md;
+items 5-9 are the PRD P1 list itself.
+
+1. **7.1 Regen for list-based archetypes** - regen is the PRD's differentiating
+   loop and it could not run at all for 19 of 20 archetypes (6.4).
+2. **7.2 Cross-route gate scoping** - gates 2/3/5/6 still scan the whole project
+   during parallel fan-out; a sibling's in-flight files fail an innocent worker
+   and burn its retry budget (6.1; gate 1 was scoped in 6.4).
+3. **7.3 Wall clock** - 5.5 missed the 5-minute target on 0/3 runs; 6.3 added the
+   per-call latency data that makes it diagnosable, unexamined so far.
+4. **7.4 Handover P0s** - the four two-trial-evidenced items from 6.4.
+5. 7.5 Section reorder (PRD 3.3) - the rejected-gesture log exists precisely to
+   signal this.
+6. 7.6 Add-a-section (PRD 4.1).
+7. 7.7 Image replace (PRD 3.5).
+8. 7.8 Responsive read-only preview.
+9. 7.9 Page-level regen.
+
+### 7.1 - Regen for list-based archetypes
+
+```
+Read docs/reports/m6-handover-trial.md and the 2026-07-30 decisions rows on the
+Kitaru replay failure.
+
+Section regeneration dies before it starts for any section whose stored prompt
+contains `${identifier}`: Kitaru runs replayed values through zenml's
+substitute_env_variable_placeholders (pattern \$\{([a-zA-Z0-9_]+)\},
+raise_when_missing=True), and contract 5.2 REQUIRES `${nodeId}` in list-item
+ids. 19 of 20 archetype templates contain the pattern; `hero` is the only one
+that does not, and it is the only section M4's ID-survival suite and 5.5's regen
+check ever exercised.
+
+Fix it, and check the assumption that the exec being replayed is the right one.
+
+VERIFY: a live regen of a LIST-BASED section changes what the instruction asked
+for, every list-item id survives, and the template-literal id pattern is intact.
+COMMIT: "fix(7.1): section regeneration works for list-based archetypes"
+```
+
 ---
 
 ## Standing rules for every session

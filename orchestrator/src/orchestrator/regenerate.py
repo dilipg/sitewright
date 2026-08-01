@@ -12,16 +12,45 @@ Usage:
 import argparse
 import json
 
+from orchestrator.placeholder_shield import shield
 from orchestrator.runlog import default_run_log_path, read_run_events
 from orchestrator.section_pipeline import GENERATED_DIR, build_regen_block, generate_section_flow
 
 
-def recorded_exec_id(run_id: str) -> str:
-    """The original run's exec id, recovered from the run log's checkpoint refs."""
+def recorded_exec_id(run_id: str, section: str) -> str:
+    """The exec id of THIS SECTION's own recorded generation, recovered from the
+    run log's checkpoint refs.
+
+    Filtering by section is load-bearing. Every section of a run shares one
+    run_id and therefore one log, so taking the last `section.generated` event
+    outright (as this did until milestone 7.1) returns whichever section
+    happened to finish last — and the replay then regenerates THAT section
+    while the caller's regen block describes a different one. Harmless while a
+    run only ever held one section (M3/M4 soak and stress runs were all
+    home.hero); silently wrong from 5.3's multi-section fan-out onward.
+
+    Observed live: regenerating `shop.product-grid` replayed `home.cta-band`'s
+    execution instead, leaving shop untouched and writing a second home
+    component whose literal ids collided with the manifest's existing ones.
+    """
     events = read_run_events(default_run_log_path(run_id))
-    generated = [e for e in events if e["event_type"] == "section.generated"]
+    generated = [
+        e
+        for e in events
+        if e["event_type"] == "section.generated" and e.get("section") == section
+    ]
     if not generated:
-        raise SystemExit(f"no recorded generation for run '{run_id}'")
+        known = sorted(
+            {
+                e.get("section", "")
+                for e in events
+                if e["event_type"] == "section.generated" and e.get("section")
+            }
+        )
+        raise SystemExit(
+            f"no recorded generation for section '{section}' in run '{run_id}'"
+            + (f"; this run generated: {', '.join(known)}" if known else "")
+        )
     return generated[-1]["checkpoint_ref"].split("/")[0]
 
 
@@ -30,7 +59,7 @@ def regenerate_section(run_id: str, section: str, instruction: str) -> dict:
     CLI, the preview server's regen endpoint, and the 4.3 stress suite."""
     project_dir = GENERATED_DIR / run_id
     regen_block, overridden_ids = build_regen_block(project_dir, section, instruction)
-    exec_id = recorded_exec_id(run_id)
+    exec_id = recorded_exec_id(run_id, section)
     print(f"forking {exec_id} at generate_section; overridden ids: {overridden_ids}", flush=True)
 
     events_before = len(read_run_events(default_run_log_path(run_id)))
@@ -38,7 +67,11 @@ def regenerate_section(run_id: str, section: str, instruction: str) -> dict:
         exec_id,
         at="generate_section",
         flow_overrides={
-            "regen_block": regen_block,
+            # The regen block embeds the section's OWN existing source, which
+            # for any list-based archetype contains `${nodeId}` -- shielded so
+            # Kitaru's substitution pass cannot reject the replay outright
+            # (see placeholder_shield).
+            "regen_block": shield(regen_block),
             "regen_overridden_ids": overridden_ids,
         },
     )

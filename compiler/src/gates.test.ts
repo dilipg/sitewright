@@ -696,3 +696,113 @@ describe("runGates: gate 1 typecheck (contract section 8's \"build passes\")", (
     },
   );
 });
+
+describe("runGates: scopeRoute contains gates 1/2/3/5/6 (milestone 7.2)", () => {
+  // Until 7.2 only gate 4 (and 6.4's typecheck) honoured scopeRoute, so during
+  // parallel fan-out a page worker could fail on a SIBLING worker's
+  // half-written route and burn its retry budget on a problem it cannot fix.
+  // Each case below breaks the "about" route and asserts that a "home"-scoped
+  // run stays clean while an "about"-scoped run still catches it.
+  function twoRouteProject(aboutSection: string, aboutMock = ""): string {
+    const dir = mkdtempSync(join(tmpdir(), "gate-scope-"));
+    mkdirSync(join(dir, "src", "pages", "home", "sections"), { recursive: true });
+    mkdirSync(join(dir, "src", "pages", "about", "sections"), { recursive: true });
+    mkdirSync(join(dir, "src", "shell"), { recursive: true });
+    writeFileSync(join(dir, "manifest.json"), JSON.stringify({ version: 1, nodes: {} }));
+    writeFileSync(
+      join(dir, "src", "shell", "routes.ts"),
+      'export const routes = [{ slug: "home", path: "/", title: "Home" }];\n',
+    );
+    writeFileSync(
+      join(dir, "src", "pages", "home", "sections", "Hero.tsx"),
+      "export default function Hero({ headline }: { headline: string }) {\n" +
+        "  return <section>{headline}</section>;\n}\n",
+    );
+    writeFileSync(join(dir, "src", "pages", "about", "sections", "AboutIntro.tsx"), aboutSection);
+    if (aboutMock !== "") {
+      mkdirSync(join(dir, "src", "pages", "about", "mock"), { recursive: true });
+      writeFileSync(join(dir, "src", "pages", "about", "mock", "AboutIntro.data.ts"), aboutMock);
+    }
+    return dir;
+  }
+
+  function expectContained(dir: string, gate: number): void {
+    // unscoped (the final whole-project run) still sees it
+    expect(failuresOf(runGates(dir), gate).length).toBeGreaterThan(0);
+    // the innocent sibling is not blamed
+    expect(failuresOf(runGates(dir, { scopeRoute: "home" }), gate)).toEqual([]);
+    // the owning route still is
+    expect(failuresOf(runGates(dir, { scopeRoute: "about" }), gate).length).toBeGreaterThan(0);
+    rmSync(dir, { recursive: true, force: true });
+  }
+
+  it("gate 1: an unresolvable import on another route", () => {
+    expectContained(
+      twoRouteProject(
+        'import { missing } from "./nope";\nexport default function AboutIntro() {\n  return <section>{missing}</section>;\n}\n',
+      ),
+      1,
+    );
+  });
+
+  it("gate 2: a dangling href on another route", () => {
+    expectContained(
+      twoRouteProject(
+        'export default function AboutIntro() {\n  return <a href="/not-a-route">x</a>;\n}\n',
+      ),
+      2,
+    );
+  });
+
+  it("gate 3: a raw hex colour on another route", () => {
+    expectContained(
+      twoRouteProject(
+        'export default function AboutIntro() {\n  return <section style={{ color: "#ff0000" }} />;\n}\n',
+      ),
+      3,
+    );
+  });
+
+  it("gate 5: a hardcoded user-visible string on another route", () => {
+    expectContained(
+      twoRouteProject(
+        "export default function AboutIntro() {\n  return <section>Welcome to Acme</section>;\n}\n",
+      ),
+      5,
+    );
+  });
+
+  it("gate 6: a cross-page import on another route", () => {
+    expectContained(
+      twoRouteProject(
+        'import Hero from "../../home/sections/Hero";\nexport default function AboutIntro() {\n  return <Hero headline="x" />;\n}\n',
+      ),
+      6,
+    );
+  });
+
+  it("a scoped run still reports the scoped route's OWN problems across every gate", () => {
+    // containment must not become blindness: the owning worker sees everything
+    const dir = twoRouteProject(
+      'import { missing } from "./nope";\nexport default function AboutIntro() {\n' +
+        '  return <section style={{ color: "#ff0000" }}><a href="/not-a-route">Welcome to Acme</a>{missing}</section>;\n}\n',
+    );
+    const report = runGates(dir, { scopeRoute: "about" });
+    for (const gate of [1, 2, 3, 5]) {
+      expect(failuresOf(report, gate).length, `gate ${String(gate)}`).toBeGreaterThan(0);
+    }
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("shared files are outside every page's scope, so no page worker is blamed for them", () => {
+    // src/shell is the Shell Agent's, validated by its own step; a page
+    // worker must not fail because of it.
+    const dir = twoRouteProject("export default function AboutIntro() {\n  return <section />;\n}\n");
+    writeFileSync(join(dir, "src", "shell", "Nav.tsx"), 'export const c = "#ff0000";\n');
+    expect(failuresOf(runGates(dir, { scopeRoute: "home" }), 3)).toEqual([]);
+    expect(failuresOf(runGates(dir, { scopeRoute: "about" }), 3)).toEqual([]);
+    // ...but the whole-project run does catch it
+    expect(failuresOf(runGates(dir), 3).length).toBeGreaterThan(0);
+    rmSync(dir, { recursive: true, force: true });
+  });
+});

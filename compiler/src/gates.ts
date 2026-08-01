@@ -118,12 +118,12 @@ export function runGates(projectDir: string, options: RunGatesOptions = {}): Gat
   const sourceFiles = codeFiles.map((file) => project.addSourceFileAtPath(file));
 
   const failures: GateFailure[] = [
-    ...gateImportsResolve(root, sourceFiles),
+    ...gateImportsResolve(root, sourceFiles, options.scopeRoute),
     ...(options.typecheck === true ? gateTypechecks(root, options.scopeRoute) : []),
-    ...gateHrefsValid(root, sourceFiles),
-    ...gateTokensOnly(root, styleScanFiles),
+    ...gateHrefsValid(root, sourceFiles, options.scopeRoute),
+    ...gateTokensOnly(root, styleScanFiles, options.scopeRoute),
     ...gateNodeIdsRegistered(root, sourceFiles, options.scopeRoute, options.skipMissingCheck),
-    ...gateContentViaProps(root, sourceFiles),
+    ...gateContentViaProps(root, sourceFiles, options.scopeRoute),
     ...gateOwnership(root, sourceFiles, options),
     ...(options.regen !== undefined ? gateRegenIdSurvival(sourceFiles, options.regen) : []),
   ];
@@ -182,6 +182,26 @@ function gateRegenIdSurvival(
 }
 
 /** Gate 1: every relative import resolves to a file; bare imports appear in package.json. */
+/**
+ * Which files a SCOPED gate run is allowed to blame (build prompt 5.3
+ * fan-out, milestone 7.2). Typechecking aside, every gate used to scan the
+ * whole project even when scoped to one route, so a page worker could fail on
+ * a SIBLING worker's half-written page and burn its own retry budget on a
+ * problem it cannot fix. Gate 4 has been scoped since 5.3; 7.2 extends the
+ * same containment to gates 1, 2, 3, 5 and 6's static check.
+ *
+ * Shared files (src/lib, src/primitives, src/shell, src/tokens) are outside
+ * every page's scope on purpose: they belong to the Design System and Shell
+ * agents, are validated by their own steps, and are read-only to page agents.
+ * The final whole-project run (unscoped, after every worker exits) still sees
+ * everything.
+ */
+function scopeFilter(scopeRoute: string | undefined): (relPath: string) => boolean {
+  if (scopeRoute === undefined) return () => true;
+  const prefix = `src/pages/${scopeRoute}/`;
+  return (relPath) => relPath.startsWith(prefix);
+}
+
 /** `file(line,col): error TSxxxx: message` — tsc's default diagnostic format. */
 const TSC_DIAGNOSTIC = /^(.+?)\((\d+),(\d+)\): error (TS\d+): (.+)$/;
 
@@ -247,12 +267,15 @@ function gateTypechecks(root: string, scopeRoute: string | undefined): GateFailu
 function gateImportsResolve(
   root: string,
   sourceFiles: import("ts-morph").SourceFile[],
+  scopeRoute?: string,
 ): GateFailure[] {
   const failures: GateFailure[] = [];
   const dependencies = readDependencyNames(root);
+  const inScope = scopeFilter(scopeRoute);
 
   for (const sourceFile of sourceFiles) {
     const filePath = sourceFile.getFilePath();
+    if (!inScope(rel(root, filePath))) continue;
     const declarations = [
       ...sourceFile.getImportDeclarations(),
       ...sourceFile.getExportDeclarations(),
@@ -298,6 +321,7 @@ function gateImportsResolve(
 function gateHrefsValid(
   root: string,
   sourceFiles: import("ts-morph").SourceFile[],
+  scopeRoute?: string,
 ): GateFailure[] {
   const failures: GateFailure[] = [];
   const routesFile = sourceFiles.find((sf) => rel(root, sf.getFilePath()) === "src/shell/routes.ts");
@@ -335,7 +359,11 @@ function gateHrefsValid(
     });
   }
 
+  // routes.ts is read above regardless of scope (it is the ground truth);
+  // only the hrefs a scoped run REPORTS are confined to its own route.
+  const inScope = scopeFilter(scopeRoute);
   for (const { value, file, line } of collectHrefLiterals(sourceFiles)) {
+    if (!inScope(rel(root, file))) continue;
     if (EXTERNAL_HREF.test(value)) continue;
     if (knownRoutes.has(value)) continue;
     if (matchesParameterizedRoute(value)) continue;
@@ -351,11 +379,13 @@ function gateHrefsValid(
 }
 
 /** Gate 3: no raw hex colors or raw px values outside src/tokens/. */
-function gateTokensOnly(root: string, files: string[]): GateFailure[] {
+function gateTokensOnly(root: string, files: string[], scopeRoute?: string): GateFailure[] {
   const failures: GateFailure[] = [];
+  const inScope = scopeFilter(scopeRoute);
   for (const file of files) {
     const relPath = rel(root, file);
     if (relPath.startsWith("src/tokens/")) continue;
+    if (!inScope(relPath)) continue;
     const lines = readFileSync(file, "utf8").split(/\r?\n/);
     lines.forEach((rawLine, index) => {
       // Arbitrary-value utility classes (w-[480px]) are the compiled form of
@@ -587,13 +617,16 @@ function gateNodeIdsRegistered(
 function gateContentViaProps(
   root: string,
   sourceFiles: import("ts-morph").SourceFile[],
+  scopeRoute?: string,
 ): GateFailure[] {
   const failures: GateFailure[] = [];
   const sectionPattern = /^src\/pages\/[^/]+\/sections\/[^/]+\.tsx$/;
+  const inScope = scopeFilter(scopeRoute);
 
   for (const sourceFile of sourceFiles) {
     const relPath = rel(root, sourceFile.getFilePath());
     if (!sectionPattern.test(relPath)) continue;
+    if (!inScope(relPath)) continue;
 
     const report = (text: string, line: number): void => {
       const preview = text.length > 40 ? `${text.slice(0, 40)}…` : text;
@@ -631,11 +664,13 @@ function gateOwnership(
   options: RunGatesOptions,
 ): GateFailure[] {
   const failures: GateFailure[] = [];
+  const inScope = scopeFilter(options.scopeRoute);
 
   for (const sourceFile of sourceFiles) {
     const relPath = rel(root, sourceFile.getFilePath());
     const pageMatch = /^src\/pages\/([^/]+)\//.exec(relPath);
     if (pageMatch === null) continue;
+    if (!inScope(relPath)) continue;
     const ownPage = pageMatch[1]!;
 
     for (const declaration of [

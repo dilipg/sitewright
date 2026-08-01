@@ -425,6 +425,25 @@ for, every list-item id survives, and the template-literal id pattern is intact.
 COMMIT: "fix(7.1): section regeneration works for list-based archetypes"
 ```
 
+### 7.2 - Cross-route gate scoping
+
+```
+Read the 2026-07-30 decisions row on the cross-route gate-scoping gap, and
+gateNodeIdsRegistered's own doc comment in compiler/src/gates.ts.
+
+Only gate 4 (since 5.3) and gate 1's typecheck (6.4) honour scopeRoute. Gates
+1, 2, 3, 5 and 6's static check still scan the whole project even when scoped,
+so during parallel fan-out a page worker fails on a SIBLING's half-written
+route and burns its own retry budget on a problem it cannot fix.
+
+Extend the same containment to them. Containment must not become blindness:
+a scoped run must still catch every one of its OWN problems.
+
+VERIFY: per gate, breaking route B leaves an A-scoped run clean, still fails a
+B-scoped run, and still fails the unscoped whole-project run.
+COMMIT: "fix(7.2): scope gates 1/2/3/5/6 to the route under generation"
+```
+
 ---
 
 ## Standing rules for every session

@@ -44,8 +44,30 @@ export function clampZoom(zoom: number): number {
 export const FRAME_WIDTH = 1280;
 export const FRAME_GAP = 80;
 
-export function frameOffsetX(index: number): number {
-  return index * (FRAME_WIDTH + FRAME_GAP);
+/**
+ * Responsive read-only preview (PRD 7 P1). The canvas can render every frame
+ * at a narrower device width to check the generated layout holds up.
+ *
+ * READ-ONLY by design, not by omission: an override carries no breakpoint
+ * (contract 6.1), so an edit made while previewing at 390px would silently
+ * apply at every width. Rather than imply a responsive edit the override layer
+ * cannot express, narrow widths disable editing entirely — the same reasoning
+ * that makes layout edits no-reparenting in v1.
+ */
+export const PREVIEW_WIDTHS = {
+  desktop: FRAME_WIDTH,
+  tablet: 768,
+  mobile: 390,
+} as const;
+
+export type PreviewWidth = keyof typeof PREVIEW_WIDTHS;
+
+export function isEditableWidth(width: PreviewWidth): boolean {
+  return width === "desktop";
+}
+
+export function frameOffsetX(index: number, frameWidth: number = FRAME_WIDTH): number {
+  return index * (frameWidth + FRAME_GAP);
 }
 
 /** Zooms toward the cursor (screen coordinates), not the stage origin —

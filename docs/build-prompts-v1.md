@@ -485,6 +485,23 @@ contract MINIMUM plus explicitly declared additions.
 COMMIT: "feat(7.4): handover P0s - money seam, status primitive, typing guidance"
 ```
 
+### 7.8 - Responsive read-only preview
+
+```
+Read docs/canvas-editor-prd-v1.md section 7's P1 row.
+
+Let the canvas render every frame at tablet/mobile width to check the generated
+layout holds. READ-ONLY, and for a specific reason worth stating in the code:
+an override carries no breakpoint (contract 6.1), so an edit made while
+previewing at 390px would silently apply at every width. Rather than imply a
+responsive edit the override layer cannot express, disable editing entirely --
+the same reasoning that makes layout edits no-reparenting in v1.
+
+VERIFY: frames resize and re-lay-out without overlapping; a narrow width states
+it is read-only and selection genuinely does nothing; desktop restores editing.
+COMMIT: "feat(7.8): responsive read-only preview"
+```
+
 ---
 
 ## Standing rules for every session

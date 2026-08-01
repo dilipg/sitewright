@@ -13,12 +13,14 @@ import type { PlanBrief, PlanRoute } from "./components/PlanApproval";
 import PlanApproval from "./components/PlanApproval";
 import type { RegenPhase } from "./components/Regen";
 import { OrphanDialog, RegenControls } from "./components/Regen";
-import type { RouteInfo, Viewport } from "./lib/canvas";
+import type { PreviewWidth, RouteInfo, Viewport } from "./lib/canvas";
 import {
   clampZoom,
   FRAME_GAP,
   FRAME_WIDTH,
   frameOffsetX,
+  isEditableWidth,
+  PREVIEW_WIDTHS,
   isFrameNearViewport,
   routesFromManifest,
   splitOverridesByRoute,
@@ -138,6 +140,7 @@ export default function App() {
   );
   const [gestureToast, setGestureToast] = useState<string>();
   const [previewMode, setPreviewModeState] = useState<"edit" | "interact">("edit");
+  const [previewWidth, setPreviewWidth] = useState<PreviewWidth>("desktop");
   const [frameStatus, setFrameStatus] = useState<Record<string, ShimStatus>>({});
   const [viewport, setViewport] = useState<Viewport>({ x: 40, y: 40, zoom: 1 });
   const [stageSize, setStageSize] = useState({ width: 1200, height: 800 });
@@ -159,6 +162,7 @@ export default function App() {
   const editOverlayRef = useRef<HTMLDivElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
   const hydratedRef = useRef(false);
+  const widthEditableRef = useRef(true);
   // Bootstrap's own setHistory(persisted) is itself a `history` change, so
   // it would otherwise trigger the persistence effect below to immediately
   // write the just-loaded data straight back — a redundant "startup save"
@@ -170,6 +174,7 @@ export default function App() {
   // of trying to out-race it.
   const skipNextSaveRef = useRef(false);
   historyRef.current = history;
+  widthEditableRef.current = isEditableWidth(previewWidth);
 
   const map = history !== null ? currentSnapshot(history) : {};
   const routes = useMemo<RouteInfo[]>(() => (manifest === null ? [] : routesFromManifest(manifest)), [manifest]);
@@ -264,6 +269,9 @@ export default function App() {
           break;
         }
         case "node:hit": {
+          // Read-only at narrow widths (PRD 7 P1): selecting would offer edits
+          // that cannot be expressed per-breakpoint, so nothing is selectable.
+          if (!widthEditableRef.current) break;
           const resolved = selectableId(data.nodeId, manifestRef.current);
           if (data.kind === "click") {
             if (resolved !== undefined) setSelectedId(resolved);
@@ -736,6 +744,10 @@ export default function App() {
       : {};
   const selectedHidden = selectedId !== undefined && map[selectedId]?.visibility === true;
   const anyVersionMismatch = Object.values(frameStatus).some((status) => status === "version-mismatch");
+  const frameWidth = PREVIEW_WIDTHS[previewWidth];
+  // Narrow widths are read-only (PRD 7 P1): an override carries no
+  // breakpoint, so an edit made at 390px would silently apply everywhere.
+  const widthEditable = isEditableWidth(previewWidth);
 
   if (pendingPlan !== null) {
     return (
@@ -781,6 +793,20 @@ export default function App() {
           })}
         </nav>
         <div className="header-actions">
+          <div className="mode-toggle" data-testid="width-toggle" role="group" aria-label="Preview width">
+            {(Object.keys(PREVIEW_WIDTHS) as PreviewWidth[]).map((width) => (
+              <button
+                key={width}
+                type="button"
+                data-testid={`width-${width}`}
+                className={previewWidth === width ? "mode-btn active" : "mode-btn"}
+                aria-pressed={previewWidth === width}
+                onClick={() => setPreviewWidth(width)}
+              >
+                {width === "desktop" ? "Desktop" : width === "tablet" ? "Tablet" : "Mobile"}
+              </button>
+            ))}
+          </div>
           <div className="mode-toggle" data-testid="mode-toggle" role="group" aria-label="Preview mode">
             <button
               type="button"
@@ -835,6 +861,11 @@ export default function App() {
             {saveStatus}
           </span>
         </div>
+        {!widthEditable && (
+          <span data-testid="readonly-banner" className="version-warning">
+            Read-only at this width — overrides carry no breakpoint, so edits apply at every width.
+          </span>
+        )}
         {anyVersionMismatch && (
           <span data-testid="version-warning" className="version-warning">
             Preview shim protocol mismatch — rebuild the preview.
@@ -857,14 +888,14 @@ export default function App() {
             style={{ transform: `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.zoom})` }}
           >
             {routes.map((route, index) => {
-              const offsetX = frameOffsetX(index);
-              const near = isFrameNearViewport(offsetX, FRAME_WIDTH, viewport, stageSize.width);
+              const offsetX = frameOffsetX(index, frameWidth);
+              const near = isFrameNearViewport(offsetX, frameWidth, viewport, stageSize.width);
               return (
                 <div
                   key={route.slug}
                   className="frame-wrap"
                   data-testid={`frame-${route.slug}`}
-                  style={{ left: offsetX, width: FRAME_WIDTH, height: FRAME_HEIGHT }}
+                  style={{ left: offsetX, width: frameWidth, height: FRAME_HEIGHT }}
                 >
                   <span className="frame-label">{route.path === "/" ? route.slug : route.path}</span>
                   {near ? (

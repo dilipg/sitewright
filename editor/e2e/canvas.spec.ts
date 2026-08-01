@@ -118,3 +118,39 @@ test("route override files round-trip through the __overrides API by slug", asyn
   const body = await response.json();
   expect(body.route).toBe("/about");
 });
+
+test.describe("responsive read-only preview (PRD 7 P1)", () => {
+  test.use({ viewport: { width: 1700, height: 900 } });
+
+  test("switching to a narrow width resizes the frames and turns editing off", async ({ page }) => {
+    await openEditor(page);
+    const home = page.getByTestId("frame-home");
+    const desktopWidth = (await home.boundingBox())!.width;
+
+    await page.getByTestId("width-mobile").click();
+    const mobileWidth = (await home.boundingBox())!.width;
+    expect(mobileWidth).toBeLessThan(desktopWidth);
+    expect(Math.round(mobileWidth)).toBe(390);
+
+    // read-only is stated, not just implied
+    await expect(page.getByTestId("readonly-banner")).toBeVisible();
+
+    // and selection is genuinely off: clicking a node selects nothing
+    await page
+      .frameLocator('iframe[title="preview-home"]')
+      .locator('[data-node-id="home.hero.headline"]')
+      .click();
+    await expect(page.locator(".inspector-id")).toHaveCount(0);
+  });
+
+  test("returning to desktop restores editing", async ({ page }) => {
+    await openEditor(page);
+    await page.getByTestId("width-tablet").click();
+    await expect(page.getByTestId("readonly-banner")).toBeVisible();
+
+    await page.getByTestId("width-desktop").click();
+    await expect(page.getByTestId("readonly-banner")).toHaveCount(0);
+    await selectNode(page, "home.hero.headline");
+    await expect(page.locator(".inspector-id")).toHaveText("home.hero.headline");
+  });
+});

@@ -5,9 +5,11 @@ import {
   FRAME_GAP,
   FRAME_WIDTH,
   frameOffsetX,
+  isEditableWidth,
   isFrameNearViewport,
   MAX_ZOOM,
   MIN_ZOOM,
+  PREVIEW_WIDTHS,
   routesFromManifest,
   splitOverridesByRoute,
   zoomAt,
@@ -129,5 +131,28 @@ describe("splitOverridesByRoute", () => {
   it("drops overrides for node ids whose route slug isn't in the known route list", () => {
     const result = splitOverridesByRoute({ "gone.old": { text: "x" } }, routes);
     expect(result).toEqual({ home: {}, shop: {} });
+  });
+});
+
+describe("responsive read-only preview (PRD 7 P1)", () => {
+  it("offers desktop, tablet and mobile widths", () => {
+    expect(PREVIEW_WIDTHS).toEqual({ desktop: 1280, tablet: 768, mobile: 390 });
+  });
+
+  it("only desktop is editable", () => {
+    // An override carries no breakpoint (contract 6.1), so an edit made at
+    // 390px would silently apply at every width. Narrow widths are read-only
+    // rather than implying a responsive edit the override layer cannot express.
+    expect(isEditableWidth("desktop")).toBe(true);
+    expect(isEditableWidth("tablet")).toBe(false);
+    expect(isEditableWidth("mobile")).toBe(false);
+  });
+
+  it("frames re-lay-out at the selected width so they never overlap", () => {
+    expect(frameOffsetX(0, PREVIEW_WIDTHS.mobile)).toBe(0);
+    expect(frameOffsetX(1, PREVIEW_WIDTHS.mobile)).toBe(390 + FRAME_GAP);
+    expect(frameOffsetX(2, PREVIEW_WIDTHS.tablet)).toBe(2 * (768 + FRAME_GAP));
+    // and the default stays desktop, so existing callers are unaffected
+    expect(frameOffsetX(1)).toBe(FRAME_WIDTH + FRAME_GAP);
   });
 });

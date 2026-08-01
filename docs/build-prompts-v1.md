@@ -502,6 +502,90 @@ it is read-only and selection genuinely does nothing; desktop restores editing.
 COMMIT: "feat(7.8): responsive read-only preview"
 ```
 
+### 7.7 - Image replace
+
+```
+Read docs/canvas-editor-prd-v1.md 3.5 and docs/codegen-contract-v1.md 7.1.
+
+PRD 3.5 is specific and saves inventing anything: image replace is NOT a new
+channel. It is the existing `text` channel with key `src` -- "content, not
+style" -- so the override entry targets an Image node's `src` field and the
+exporter's existing mock-data rewrite does the compilation. Upload or URL;
+an uploaded asset is stored in the project. No cropping or filters in v1.
+
+The work is therefore: let a text override name WHICH field it rewrites
+(today it rewrites the node's single content field), an inspector affordance
+on Image nodes, and asset storage for the upload case.
+
+VERIFY: invariant-suite case -- replace an image, export, and the exported page
+renders the new src with the preview matching pixel-for-pixel.
+COMMIT: "feat(7.7): image replace via the text channel's src key"
+```
+
+### 7.5 - Section reorder
+
+```
+Read docs/canvas-editor-prd-v1.md 3.3's last sentence and docs/codegen-contract-v1.md 6.1.
+
+Reordering sections is explicitly NOT a DOM operation: it is "an index.tsx-level
+override (`sectionOrder` array in the route's override file)". So this is a
+new PAGE-level override kind, unlike every existing channel which targets a
+node id -- expect the override file schema, the shim's apply path, and the
+exporter (which must reorder the JSX children of the page's index.tsx) each to
+need a case for it.
+
+Note the rejected-gesture log (App.tsx, PRD risk 3.3) exists precisely to
+signal demand for this: a drag beyond the threshold is currently refused with
+"Regenerate the section to change its structure". Once reorder exists, a
+vertical drag past a sibling boundary should become the gesture that triggers
+it rather than a rejection.
+
+VERIFY: reorder in the editor, export, and the exported index.tsx renders the
+sections in the new order with every override still attached to its own node.
+COMMIT: "feat(7.5): section reorder via a page-level sectionOrder override"
+```
+
+### 7.9 - Page-level regeneration
+
+```
+Read docs/canvas-editor-prd-v1.md section 4's last paragraph.
+
+"Page-level regeneration ('redo this whole page') is P1 and reuses the same
+flow at page granularity." Build it on 7.1's now-working section regen rather
+than a parallel path: the same replay-with-overrides fork, the same gate 7 ID
+survival, the same orphan dialog, one route's sections at a time.
+
+Two things 7.1 established that this must respect: recorded_exec_id is
+per-section (a page regen forks N executions, not one), and the regen block
+must stay shielded (placeholder_shield) or replay dies on `${nodeId}`.
+
+VERIFY: regenerate a whole route; every section's surviving overrides re-apply,
+orphans surface once for the page rather than once per section, and revert
+restores the whole route in one step.
+COMMIT: "feat(7.9): page-level regeneration"
+```
+
+### 7.6 - Add-a-section
+
+```
+Read docs/canvas-editor-prd-v1.md 4.1.
+
+"+" between sections opens the archetype catalog with previews plus an
+instruction box, and runs "as a regen-style single-section generation appended
+to the site plan". Sequenced last of the P1s deliberately: it is the only one
+that both spends model budget per use AND mutates the site plan, so it wants
+7.5 (ordering) and 7.9 (page-granularity regen) already in place -- a new
+section has to land at a chosen position, which is a sectionOrder concern.
+
+Watch the manifest: a new section's ids must be proposed through the manifest
+service like any generated section, and its position recorded without
+renumbering anything (ids are semantic, never positional -- contract 5.2).
+
+VERIFY: add a section between two existing ones; it generates, lands in the
+right position, passes gates, and neighbours' overrides are untouched.
+COMMIT: "feat(7.6): add-a-section from the archetype catalog"
+```
+
 ---
 
 ## Standing rules for every session

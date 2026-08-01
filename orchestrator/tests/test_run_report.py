@@ -339,3 +339,35 @@ def test_the_header_reports_measured_model_time_when_available() -> None:
     events = [generated("home.hero", 1, at="2026-07-30T00:01:00+00:00", duration_s=42.0)]
     html_text = render_html("new-run", build_dag(events))
     assert "42s in model calls" in html_text
+
+
+# ---------- session-aware duration (milestone 7.3) ----------
+
+
+def test_a_later_regeneration_does_not_inflate_the_runs_wall_clock() -> None:
+    """The log is append-only and keyed by run_id, so regenerating a section
+    hours later appends to the same log. Spanning first-to-last event reported
+    44 HOURS for a run that generated in 291 seconds (observed live)."""
+    events = [
+        stage_event("intake.complete", at="2026-07-30T00:00:00+00:00"),
+        generated("home.hero", 1, at="2026-07-30T00:04:00+00:00", duration_s=12.0),
+        validated("home.hero", 1, at="2026-07-30T00:04:05+00:00", passed=True),
+        # ...a regeneration the next day
+        generated("home.hero", 1, at="2026-07-31T09:00:00+00:00", duration_s=13.0),
+        validated("home.hero", 1, at="2026-07-31T09:00:05+00:00", passed=True),
+    ]
+    dag = build_dag(events)
+    assert dag["duration_s"] == 245.0  # the original generation, not 33 hours
+    assert dag["later_sessions"] == 1
+    assert "+1 later session(s)" in render_html("run", dag)
+
+
+def test_a_single_session_run_reports_no_later_sessions() -> None:
+    events = [
+        stage_event("intake.complete", at="2026-07-30T00:00:00+00:00"),
+        generated("home.hero", 1, at="2026-07-30T00:02:00+00:00", duration_s=10.0),
+        validated("home.hero", 1, at="2026-07-30T00:02:05+00:00", passed=True),
+    ]
+    dag = build_dag(events)
+    assert dag["later_sessions"] == 0
+    assert "later session" not in render_html("run", dag)

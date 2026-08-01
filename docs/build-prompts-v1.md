@@ -444,6 +444,22 @@ B-scoped run, and still fails the unscoped whole-project run.
 COMMIT: "fix(7.2): scope gates 1/2/3/5/6 to the route under generation"
 ```
 
+### 7.3 - Wall clock: look at the data
+
+```
+Read docs/reports/m5-acceptance.md's wall-clock section.
+
+5.5 measured wall clock as the failing metric and attributed it to per-section
+model latency running 1.6-2.4x the docs' ~55s/section assumption -- an
+inference, because completion-only timestamps cannot separate model time from
+per-section overhead. 6.3 added duration_s specifically so the claim could be
+checked. Check it before optimising anything.
+
+VERIFY: docs/reports/m7-wall-clock.md states measured per-section latency, where
+the wall clock actually goes, and orders the optimisation levers by evidence.
+COMMIT: "docs(7.3): wall-clock diagnosis - the model was never the bottleneck"
+```
+
 ---
 
 ## Standing rules for every session

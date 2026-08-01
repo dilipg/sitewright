@@ -173,7 +173,7 @@ def build_dag(events: list[dict]) -> dict:
 
     return {
         "stages": [_finalize_stage(stages[name]) for name in STAGE_ORDER if name in stages],
-        **_run_totals(stages),
+        **_run_totals(stages, events),
     }
 
 
@@ -279,21 +279,48 @@ def _rollup(statuses: list[str]) -> str:
     return "unknown"
 
 
-def _run_totals(stages: dict) -> dict:
+# A run log is append-only and keyed by run_id, so a later REGENERATION of a
+# section appends to the same log hours or days after the original generation.
+# Spanning first-to-last event then reports the wall clock as the gap between
+# them -- observed live at 44 hours for a run that generated in 291 seconds.
+# Events are therefore grouped into sessions separated by a long idle gap, and
+# the run's duration is its FIRST session: the original generation.
+SESSION_GAP_S = 15 * 60
+
+
+def _sessions(stamps: list[str]) -> list[tuple[str, str]]:
+    """Contiguous (start, end) spans, split wherever the log goes quiet for
+    longer than SESSION_GAP_S."""
+    parsed = sorted((s for s in stamps if s), key=str)
+    if not parsed:
+        return []
+    spans: list[tuple[str, str]] = []
+    start = previous = parsed[0]
+    for stamp in parsed[1:]:
+        gap_from = _parse_time(previous)
+        gap_to = _parse_time(stamp)
+        if gap_from and gap_to and (gap_to - gap_from).total_seconds() > SESSION_GAP_S:
+            spans.append((start, previous))
+            start = stamp
+        previous = stamp
+    spans.append((start, previous))
+    return spans
+
+
+def _run_totals(stages: dict, events: list[dict]) -> dict:
     all_nodes = [
         node
         for stage in stages.values()
         for group in stage["groups"].values()
         for node in group["nodes"].values()
     ]
-    stamps = [node["started_at"] for node in all_nodes if node["started_at"]]
-    ends = [node["ended_at"] for node in all_nodes if node["ended_at"]]
-    started = min(stamps) if stamps else None
-    ended = max(ends) if ends else None
+    spans = _sessions([event.get("timestamp", "") for event in events])
+    started, ended = spans[0] if spans else (None, None)
     start_dt, end_dt = _parse_time(started), _parse_time(ended)
     return {
         "started_at": started,
         "ended_at": ended,
+        "later_sessions": max(0, len(spans) - 1),
         "duration_s": round((end_dt - start_dt).total_seconds(), 1)
         if start_dt and end_dt
         else None,
@@ -516,6 +543,18 @@ def render_html(run_id: str, dag: dict) -> str:
         else ""
     )
     duration = dag.get("duration_s")
+    # Rendered only when there ARE later sessions: an empty span with an
+    # explanatory tooltip is noise on the overwhelmingly common single-run log.
+    later = dag.get("later_sessions") or 0
+    later_sessions_note = (
+        ""
+        if later == 0
+        else (
+            '<span class="meta" title="this log also contains later sessions, e.g. '
+            "regenerations; their events appear in the DAG but not in the wall-clock "
+            f'figure">+{later} later session(s)</span>'
+        )
+    )
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -528,7 +567,8 @@ def render_html(run_id: str, dag: dict) -> str:
   <h1>Run {html.escape(run_id)}</h1>
   <span class="badge {dag["status"]}">{dag["status"]}</span>
   <span class="meta">{dag["node_count"]} nodes</span>
-  <span class="meta" title="wall clock from first call start to last call end">{"—" if duration is None else f"{duration}s wall"}</span>
+  <span class="meta" title="wall clock of the original generation session">{"—" if duration is None else f"{duration}s wall"}</span>
+  {later_sessions_note}
   <span class="meta" title="sum of measured model-call latency across all nodes; blank for runs logged before 6.3">{"" if not dag.get("measured_s") else f"{dag['measured_s']:.0f}s in model calls"}</span>
   <span class="meta">{dag["total_tokens"]:,} tokens</span>
   <span class="meta">${dag["total_cost_usd"]:.4f}{html.escape(unpriced_note)}</span>

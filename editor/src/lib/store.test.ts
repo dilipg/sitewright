@@ -8,6 +8,7 @@ import {
   fromOverrideFile,
   initHistory,
   moveSection,
+  placeSectionAfter,
   pushHistory,
   redo,
   removeNodeOverrides,
@@ -232,5 +233,40 @@ describe("sectionOrderOf", () => {
       "home.hero",
       "home.new",
     ]);
+  });
+});
+
+describe("placeSectionAfter (PRD 4.1 — where a new section lands)", () => {
+  const sections = ["home.hero", "home.features", "home.pricing"];
+
+  it("puts the new section immediately after the clicked one", () => {
+    const withNew = [...sections, "home.stats-band"]; // appended in source
+    const order = placeSectionAfter({}, "home", withNew, "home.stats-band", "home.hero")
+      .home!.sectionOrder as string[];
+    expect(order).toEqual(["home.hero", "home.stats-band", "home.features", "home.pricing"]);
+  });
+
+  it("treats no `after` as the top of the page", () => {
+    const withNew = [...sections, "home.stats-band"];
+    const order = placeSectionAfter({}, "home", withNew, "home.stats-band", undefined)
+      .home!.sectionOrder as string[];
+    expect(order[0]).toBe("home.stats-band");
+  });
+
+  it("places relative to an existing reorder, not to the source order", () => {
+    // the user already moved pricing to the top; "after pricing" must mean
+    // after it where it NOW is, not where the source puts it
+    const map = { home: { sectionOrder: ["home.pricing", "home.hero", "home.features"] } };
+    const withNew = [...sections, "home.stats-band"];
+    const order = placeSectionAfter(map, "home", withNew, "home.stats-band", "home.pricing")
+      .home!.sectionOrder as string[];
+    expect(order).toEqual(["home.pricing", "home.stats-band", "home.hero", "home.features"]);
+  });
+
+  it("writes the route's full order, so the export never sees a partial list", () => {
+    const withNew = [...sections, "home.stats-band"];
+    const order = placeSectionAfter({}, "home", withNew, "home.stats-band", "home.features")
+      .home!.sectionOrder as string[];
+    expect([...order].sort()).toEqual([...withNew].sort());
   });
 });

@@ -49,3 +49,23 @@ PAGE_ARCHETYPES: dict[str, dict] = {
         "prior": "feature-led sections with integration-grid/comparison-table where relevant",
     },
 }
+
+
+def main() -> None:
+    """Dumps the catalog as JSON so the editor's add-a-section picker (PRD 4.1)
+    can list archetypes without a second copy of this table in TypeScript. A
+    duplicate would offer the user a section the generator cannot build the
+    moment the two drift, since this table is what decides which archetypes
+    have prompt templates.
+
+    A module entry point rather than `python -c`: the preview server spawns
+    through a shell, which does not quote arguments on Windows, so a `-c`
+    expression containing spaces and a semicolon gets split into pieces.
+    """
+    import json
+
+    print(json.dumps(ARCHETYPE_CATALOG))
+
+
+if __name__ == "__main__":
+    main()

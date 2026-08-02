@@ -5,6 +5,9 @@
  *                                                     tombstoned, failureReport, canRevert }
  *   POST /__regen-page   { route, instruction }   -> same, plus { sections, perSection }
  *   POST /__regen-revert { section | route }      -> { ok }
+ *   GET  /__archetypes                            -> { archetypes: [{name, description}] }
+ *   POST /__add-section  { route, archetype, instruction }
+ *                                                 -> { passed, sectionId, failureReport }
  *
  * Before every regen the section's page directory + manifest are snapshotted;
  * revert restores the snapshot — the one-step "revert regeneration" (PRD 4.4).
@@ -70,6 +73,36 @@ export function regenApiPlugin(projectRoot: string): Plugin {
                 process.env.WG_REGEN_MOCK === "1"
                   ? await mockRegenPage(root, route, instruction)
                   : await realRegenPage(root, route, instruction);
+              server.moduleGraph.invalidateAll();
+              respondJson(res, 200, { ...result, canRevert: true });
+            } catch (error) {
+              respondJson(res, 500, { error: String(error) });
+            }
+          });
+          return;
+        }
+        if (req.method === "GET" && url === "/__archetypes") {
+          void archetypeCatalog(root)
+            .then((archetypes) => respondJson(res, 200, { archetypes }))
+            .catch((error) => respondJson(res, 500, { error: String(error) }));
+          return;
+        }
+        if (req.method === "POST" && url === "/__add-section") {
+          void readBody(req).then(async (body) => {
+            try {
+              const { route, archetype, instruction } = body as {
+                route: string;
+                archetype: string;
+                instruction: string;
+              };
+              // Same route-wide snapshot as a regen, so an added section is
+              // revertable by the same one step — adding one is as much a
+              // change to the page as regenerating it (PRD 4.4).
+              snapshotRoute(root, route);
+              const result =
+                process.env.WG_REGEN_MOCK === "1"
+                  ? await mockAddSection(root, route, archetype, instruction)
+                  : await realAddSection(root, route, archetype, instruction);
               server.moduleGraph.invalidateAll();
               respondJson(res, 200, { ...result, canRevert: true });
             } catch (error) {
@@ -150,12 +183,25 @@ function realRegenPage(root: string, route: string, instruction: string): Promis
 }
 
 function runRegenCli(root: string, scopeArgs: string[], instruction: string): Promise<RegenOutcome> {
+  return runCli<RegenOutcome>(root, ["orchestrator.regenerate", ...scopeArgs], instruction, "REGEN_RESULT ");
+}
+
+/** Spawns an orchestrator CLI and reads its single machine-readable result
+ *  line. `moduleAndArgs` starts with the module name; --run-id (the project
+ *  directory's own name) and --instruction are added here. */
+function runCli<T>(
+  root: string,
+  moduleAndArgs: string[],
+  instruction: string,
+  marker: string,
+): Promise<T> {
   const orchestratorDir = resolve(root, "..", "..", "orchestrator");
   const runId = basename(root);
+  const [moduleName, ...args] = moduleAndArgs;
   return new Promise((resolvePromise, rejectPromise) => {
     const child = spawn(
       "uv",
-      ["run", "python", "-m", "orchestrator.regenerate", "--run-id", runId, ...scopeArgs, "--instruction", instruction],
+      ["run", "python", "-m", moduleName!, "--run-id", runId, ...args, "--instruction", instruction],
       { cwd: orchestratorDir, shell: true },
     );
     let stdout = "";
@@ -163,12 +209,69 @@ function runRegenCli(root: string, scopeArgs: string[], instruction: string): Pr
     child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
     child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
     child.on("close", () => {
-      const marker = stdout.split("\n").find((line) => line.startsWith("REGEN_RESULT "));
-      if (marker === undefined) {
-        rejectPromise(new Error(`regenerate CLI produced no result:\n${stderr.slice(-2000)}`));
+      const resultLine = stdout.split("\n").find((line) => line.startsWith(marker));
+      if (resultLine === undefined) {
+        rejectPromise(new Error(`${moduleName!} produced no result:\n${stderr.slice(-2000)}`));
         return;
       }
-      resolvePromise(JSON.parse(marker.slice("REGEN_RESULT ".length)) as RegenOutcome);
+      resolvePromise(JSON.parse(resultLine.slice(marker.length)) as T);
+    });
+  });
+}
+
+interface AddSectionOutcome {
+  passed: boolean;
+  sectionId: string;
+  failureReport: string;
+}
+
+function realAddSection(
+  root: string,
+  route: string,
+  archetype: string,
+  instruction: string,
+): Promise<AddSectionOutcome> {
+  return runCli<AddSectionOutcome>(
+    root,
+    ["orchestrator.add_section", "--route", route, "--archetype", archetype],
+    instruction,
+    "ADD_SECTION_RESULT ",
+  );
+}
+
+/**
+ * The archetype catalog for the "+" picker (PRD 4.1), read from the
+ * orchestrator's own `ARCHETYPE_CATALOG`.
+ *
+ * Deliberately NOT duplicated in TypeScript. The catalog decides which
+ * archetypes actually have prompt templates, so a copy here would drift the
+ * moment one is added and would offer the user a section the generator cannot
+ * build. Cached after the first read — it cannot change while the server runs.
+ */
+let catalogCache: Array<{ name: string; description: string }> | undefined;
+
+async function archetypeCatalog(root: string): Promise<Array<{ name: string; description: string }>> {
+  if (catalogCache !== undefined) return catalogCache;
+  const raw = await runPython(root, ["-m", "orchestrator.catalog"]);
+  const parsed = JSON.parse(raw) as Record<string, string>;
+  catalogCache = Object.entries(parsed).map(([name, description]) => ({ name, description }));
+  return catalogCache;
+}
+
+function runPython(root: string, args: string[]): Promise<string> {
+  const orchestratorDir = resolve(root, "..", "..", "orchestrator");
+  return new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn("uv", ["run", "python", ...args], { cwd: orchestratorDir, shell: true });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
+    child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
+    child.on("close", () => {
+      // Kitaru prints a Windows daemon notice on import, so the payload is the
+      // last non-empty line rather than the whole of stdout.
+      const line = stdout.trim().split("\n").at(-1)?.trim() ?? "";
+      if (line.startsWith("{")) resolvePromise(line);
+      else rejectPromise(new Error(`python produced no JSON:\n${stderr.slice(-2000)}`));
     });
   });
 }
@@ -294,6 +397,118 @@ async function mockRegenPage(
     tombstoned: [...tombstoned].sort(),
     failureReport: failures.join("\n"),
   };
+}
+
+/**
+ * Mock add-a-section: writes a real (if plain) section component, its mock
+ * data, its manifest entries and its render line, so the editor's "+" flow is
+ * e2e-testable without model spend.
+ *
+ * It deliberately produces a section that is genuinely selectable and
+ * editable — a stub that rendered nothing would let the UX test pass while
+ * proving nothing about what the user ends up with. The component is written
+ * to satisfy the same contract rules the real templates do: primitives are
+ * default imports (contract 4.1), the root carries `data-node-id={nodeId}`,
+ * and nodeId comes from a separate NodeProps intersection (contract 5.6).
+ */
+async function mockAddSection(
+  root: string,
+  route: string,
+  archetype: string,
+  instruction: string,
+): Promise<AddSectionOutcome> {
+  await new Promise((resolveDelay) => setTimeout(resolveDelay, MOCK_DELAY_MS));
+
+  const manifestPath = join(root, "manifest.json");
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
+    nodes: Record<string, unknown>;
+  };
+  const taken = new Set(
+    Object.keys(manifest.nodes)
+      .filter((nodeId) => nodeId.startsWith(`${route}.`) && nodeId.split(".").length === 2)
+      .map((nodeId) => nodeId.split(".")[1]!),
+  );
+  let slug = archetype;
+  for (let n = 2; taken.has(slug); n += 1) slug = `${archetype}-${n}`;
+
+  const component = slug
+    .split("-")
+    .map((part) => part[0]!.toUpperCase() + part.slice(1))
+    .join("");
+  const sectionId = `${route}.${slug}`;
+  const pageDir = join(root, "src", "pages", route);
+  const file = `src/pages/${route}/sections/${component}.tsx`;
+
+  writeFileSync(
+    join(pageDir, "sections", `${component}.tsx`),
+    `import Container from "../../../primitives/Container";
+import Heading from "../../../primitives/Heading";
+import Text from "../../../primitives/Text";
+import type { NodeProps } from "../../../lib/types";
+
+export interface ${component}Props {
+  heading: string;
+  body: string;
+}
+
+export default function ${component}({ nodeId, heading, body }: ${component}Props & NodeProps) {
+  return (
+    <section data-node-id={nodeId} className="bg-(--color-semantic-surface) py-(--space-16)">
+      <Container>
+        <Heading nodeId="${sectionId}.heading" level={2} variant="section">
+          {heading}
+        </Heading>
+        <Text nodeId="${sectionId}.body" variant="body">
+          {body}
+        </Text>
+      </Container>
+    </section>
+  );
+}
+`,
+  );
+  const dataVar = component[0]!.toLowerCase() + component.slice(1) + "Data";
+  writeFileSync(
+    join(pageDir, "mock", `${component}.data.ts`),
+    `import type { ${component}Props } from "../sections/${component}";
+
+export const ${dataVar}: ${component}Props = {
+  heading: "Added: ${archetype}",
+  body: ${JSON.stringify(instruction.slice(0, 160))},
+};
+`,
+  );
+
+  // mock-only direct manifest edit (the product path goes through the service)
+  const entry = (element: string, editable: string[]) => ({
+    route: route === "home" ? "/" : `/${route}`,
+    file,
+    component,
+    element,
+    editable,
+    status: "active",
+  });
+  manifest.nodes[sectionId] = entry("section", ["style", "layout", "visibility"]);
+  manifest.nodes[`${sectionId}.heading`] = entry("Heading", ["text", "style", "layout", "visibility"]);
+  manifest.nodes[`${sectionId}.body`] = entry("Text", ["text", "style", "layout", "visibility"]);
+  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+
+  const indexPath = join(pageDir, "index.tsx");
+  const source = readFileSync(indexPath, "utf8");
+  const importLines = source.split("\n").filter((line) => line.startsWith("import "));
+  const withImports = source.replace(
+    importLines.at(-1)!,
+    `${importLines.at(-1)!}\nimport { ${dataVar} } from "./mock/${component}.data";\nimport ${component} from "./sections/${component}";`,
+  );
+  writeFileSync(
+    indexPath,
+    withImports.replace(
+      "\n    </>",
+      `\n      <${component} nodeId="${sectionId}" {...${dataVar}} />\n    </>`,
+    ),
+  );
+
+  return { passed: true, sectionId, failureReport: "" };
 }
 
 /* ---------- plumbing ---------- */

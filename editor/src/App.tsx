@@ -11,6 +11,8 @@ import ExportPanel from "./components/ExportPanel";
 import Inspector from "./components/Inspector";
 import type { PlanBrief, PlanRoute } from "./components/PlanApproval";
 import PlanApproval from "./components/PlanApproval";
+import type { AddSectionState, Archetype } from "./components/AddSection";
+import { AddSectionPanel } from "./components/AddSection";
 import type { RegenPhase } from "./components/Regen";
 import { OrphanDialog, RegenControls } from "./components/Regen";
 import type { PreviewWidth, RouteInfo, Viewport } from "./lib/canvas";
@@ -40,6 +42,7 @@ import {
   fromOverrideFile,
   initHistory,
   moveSection,
+  placeSectionAfter,
   pushHistory,
   redo,
   removeNodeOverrides,
@@ -161,6 +164,8 @@ export default function App() {
   const [pendingPlan, setPendingPlan] = useState<{ brief: PlanBrief; routes: PlanRoute[] } | null>(
     null,
   );
+  const [addSection, setAddSection] = useState<AddSectionState | null>(null);
+  const [archetypes, setArchetypes] = useState<Archetype[]>([]);
   const [exportState, setExportState] = useState<"idle" | "running">("idle");
   const [exportOutcome, setExportOutcome] = useState<ExportOutcome | null>(null);
 
@@ -659,12 +664,17 @@ export default function App() {
 
   /* ---------- regeneration (PRD section 4) ---------- */
 
-  async function refreshManifest() {
+  /** Returns the reloaded manifest as well as storing it: `manifest` is state,
+   *  so a caller that needs the new nodes in the SAME tick (add-a-section, which
+   *  must position a node the manifest only just gained) cannot read them from
+   *  the closure it was called in. */
+  async function refreshManifest(): Promise<Manifest> {
     const loaded = (await fetch(`${PREVIEW_URL}/manifest.json`, { cache: "no-store" }).then((r) =>
       r.json(),
     )) as Manifest;
     manifestRef.current = loaded;
     setManifest(loaded);
+    return loaded;
   }
 
   /** Deterministic frame reload after regen/revert — HMR is not a reliable
@@ -675,6 +685,92 @@ export default function App() {
     const routePath = routes.find((route) => route.slug === slug)?.path ?? "/";
     if (frame !== null && frame !== undefined) {
       frame.src = `${PREVIEW_URL}${routePath}?regen=${Date.now()}`;
+    }
+  }
+
+  /* ---------- add-a-section (PRD 4.1) ---------- */
+
+  /** Every insertion point on a route: one above the first section, one below
+   *  each. Derived from live geometry so the strips follow the sections when a
+   *  reorder moves them, rather than from the manifest, which records that a
+   *  section exists but never where it sits. */
+  function addSectionSlots(route: string): Array<{ afterSection: string | undefined; y: number }> {
+    if (manifest === null || previewMode !== "edit") return [];
+    const sections = renderedSections(geometryByRoute[route] ?? {}, manifest, route);
+    if (sections.length === 0) return [];
+    const boxes = sections.map((nodeId) => geometryByRoute[route]![nodeId]!);
+    return [
+      { afterSection: undefined, y: boxes[0]!.rect.y },
+      ...sections.map((nodeId, index) => ({
+        afterSection: nodeId,
+        y: boxes[index]!.rect.y + boxes[index]!.rect.height,
+      })),
+    ];
+  }
+
+  function openAddSection(route: string, afterSection: string | undefined) {
+    setAddSection({ phase: "picking", route, afterSection, instruction: "" });
+    if (archetypes.length === 0) {
+      void fetch(`${PREVIEW_URL}/__archetypes`)
+        .then((response) => response.json() as Promise<{ archetypes?: Archetype[] }>)
+        .then((body) => setArchetypes(body.archetypes ?? []))
+        .catch(() => setArchetypes([]));
+    }
+  }
+
+  async function confirmAddSection() {
+    if (addSection?.phase !== "picking" || addSection.archetype === undefined) return;
+    const { route, afterSection, archetype, instruction } = addSection;
+    setAddSection({ phase: "running", route });
+    try {
+      const response = await fetch(`${PREVIEW_URL}/__add-section`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ route, archetype, instruction }),
+      });
+      const outcome = (await response.json()) as {
+        passed?: boolean;
+        sectionId?: string;
+        failureReport?: string;
+        error?: string;
+      };
+      if (outcome.error !== undefined) throw new Error(outcome.error);
+      if (outcome.passed !== true || outcome.sectionId === undefined) {
+        setAddSection({
+          phase: "failed",
+          route,
+          report: outcome.failureReport ?? "unknown failure",
+        });
+        return;
+      }
+      // The new section is APPENDED to the page's source (ids are semantic, not
+      // positional — contract 5.2), so the position the user clicked is
+      // expressed as a sectionOrder override, exactly as a reorder is.
+      const fresh = await refreshManifest();
+      const sections = renderedSections(geometryByRoute[route] ?? {}, fresh, route);
+      const withNew = sections.includes(outcome.sectionId)
+        ? sections
+        : [...sections, outcome.sectionId];
+      setHistory((h) =>
+        h === null
+          ? h
+          : pushHistory(
+              h,
+              placeSectionAfter(
+                currentSnapshot(h),
+                route,
+                withNew,
+                outcome.sectionId!,
+                afterSection,
+              ),
+            ),
+      );
+      setRevertSection(route);
+      setAddSection(null);
+      setSelectedId(outcome.sectionId);
+      reloadPreview(route);
+    } catch (error) {
+      setAddSection({ phase: "failed", route, report: String(error) });
     }
   }
 
@@ -1004,6 +1100,28 @@ export default function App() {
                     </div>
                   )}
                   <div className="overlay">
+                    {/* PRD 4.1: "+" BETWEEN sections. One strip above the
+                        first section and one below each, so every insertion
+                        point on the page is reachable — including the top,
+                        which a "+" only ever placed after a section could not
+                        express. Positioned from live geometry, so the strips
+                        follow the sections when a reorder moves them. */}
+                    {addSectionSlots(route.slug).map((slot) => (
+                      <button
+                        type="button"
+                        key={slot.afterSection ?? "top"}
+                        data-testid={`add-section-slot-${slot.afterSection ?? "top"}`}
+                        className="add-section-slot"
+                        style={{ top: slot.y }}
+                        title="Add a section here"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          openAddSection(route.slug, slot.afterSection);
+                        }}
+                      >
+                        <span>+</span>
+                      </button>
+                    ))}
                     {hoverGeom !== undefined && hoverId !== undefined && routeOf(hoverId) === route.slug && (
                       <div
                         data-testid="hover-outline"
@@ -1143,6 +1261,24 @@ export default function App() {
         </div>
 
         <aside className="inspector" data-testid="inspector">
+          {addSection !== null && (
+            <AddSectionPanel
+              state={addSection}
+              archetypes={archetypes}
+              onPick={(archetype) =>
+                setAddSection((current) =>
+                  current?.phase === "picking" ? { ...current, archetype } : current,
+                )
+              }
+              onEdit={(instruction) =>
+                setAddSection((current) =>
+                  current?.phase === "picking" ? { ...current, instruction } : current,
+                )
+              }
+              onConfirm={() => void confirmAddSection()}
+              onCancel={() => setAddSection(null)}
+            />
+          )}
           <RegenControls
             regen={regen}
             sectionSelected={sectionSelected}

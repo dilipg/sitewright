@@ -111,6 +111,28 @@ export function moveSection(
   return { ...map, [route]: { ...map[route], sectionOrder: next } };
 }
 
+/**
+ * Places a section immediately after another (PRD 4.1's "+" between sections).
+ *
+ * A newly added section is APPENDED to the page's source — node ids are
+ * semantic, never positional (contract 5.2), so nothing about the new section's
+ * id or its neighbours' encodes where it sits. Its requested position is
+ * therefore expressed the same way any reorder is: a `sectionOrder` override.
+ * `afterNodeId` of undefined means "first on the page".
+ */
+export function placeSectionAfter(
+  map: OverridesMap,
+  route: string,
+  sections: string[],
+  nodeId: string,
+  afterNodeId: string | undefined,
+): OverridesMap {
+  const order = sectionOrderOf(map, route, sections).filter((id) => id !== nodeId);
+  const at = afterNodeId === undefined ? 0 : order.indexOf(afterNodeId) + 1;
+  order.splice(at, 0, nodeId);
+  return { ...map, [route]: { ...map[route], sectionOrder: order } };
+}
+
 /** The route's section order as the user currently sees it: the override if one exists, else the rendered order. */
 export function sectionOrderOf(map: OverridesMap, route: string, sections: string[]): string[] {
   const current = map[route]?.sectionOrder as string[] | undefined;

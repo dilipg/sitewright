@@ -153,3 +153,70 @@ test("page regen: every section regenerated, all overrides re-applied, one rever
   await expect.poll(() => color(headline), { timeout: 10_000 }).toBe(ACCENT_RGB);
   await expect.poll(() => color(faqHeading), { timeout: 10_000 }).toBe(ACCENT_RGB);
 });
+
+/* ---------- add-a-section (7.6, PRD 4.1) ---------- */
+
+test("add-a-section: pick an archetype, generate, and it lands at the clicked position", async ({
+  page,
+}) => {
+  // An override on a NEIGHBOUR of the insertion point: adding a section must
+  // not disturb the sections already on the page.
+  await styleOverrideHeadline(page);
+  const headline = previewFrameLocator(page).locator('[data-node-id="home.hero.headline"]');
+  await expect
+    .poll(() => headline.evaluate((el) => getComputedStyle(el).color))
+    .toBe(ACCENT_RGB);
+
+  // "+" strips sit at every boundary; this one inserts directly after the hero
+  await page.getByTestId("add-section-slot-home.hero").click({ force: true });
+  await expect(page.getByTestId("add-section-panel")).toBeVisible();
+
+  // the catalog comes from the orchestrator's own ARCHETYPE_CATALOG
+  await expect(page.getByTestId("archetype-stats-band")).toBeVisible();
+  // an archetype is required before anything can run
+  await expect(page.getByTestId("add-section-confirm")).toBeDisabled();
+  await page.getByTestId("archetype-stats-band").click();
+  await page.getByTestId("add-section-instruction").fill("Three headline metrics with labels.");
+  await expect(page.getByTestId("add-section-cost")).toContainText("30k");
+  await page.getByTestId("add-section-confirm").click();
+
+  await expect(page.getByTestId("add-section-running")).toBeVisible();
+  await expect(page.getByTestId("add-section-running")).toBeHidden({ timeout: 60_000 });
+
+  // it rendered, and it is a real selectable node rather than a stub
+  const added = previewFrameLocator(page).locator('[data-node-id="home.stats-band"]');
+  await expect(added).toBeVisible({ timeout: 20_000 });
+  await expect(page.locator(".inspector-id")).toHaveText("home.stats-band");
+
+  // It landed where the user clicked: appended in source, positioned by a
+  // sectionOrder override (PRD 3.3), so it renders between hero and the next
+  // section rather than at the bottom of the page.
+  await expect
+    .poll(async () => {
+      const order = await previewFrameLocator(page)
+        .locator("[data-node-id]")
+        .evaluateAll((nodes) =>
+          nodes
+            .map((node) => node.getAttribute("data-node-id"))
+            .filter((id) => id !== null && id.split(".").length === 2),
+        );
+      return order.slice(0, 2);
+    }, { timeout: 15_000 })
+    .toEqual(["home.hero", "home.stats-band"]);
+
+  // the neighbour's override is untouched
+  await expect
+    .poll(() => headline.evaluate((el) => getComputedStyle(el).color), { timeout: 10_000 })
+    .toBe(ACCENT_RGB);
+
+  // ...and it passes the gates. Export runs typecheck + all seven gates
+  // (contract section 8), so a successful export is the assertion that the
+  // added section is real code — and specifically that the sectionOrder
+  // override placing it compiles, which is where 7.5 and 7.6 meet: the
+  // exporter rejects an order that omits a section, so a newly added one that
+  // never reached the manifest, or an order that never learned about it, both
+  // fail loudly here rather than shipping a page missing a section.
+  await waitForSaved(page);
+  await page.getByTestId("export-button").click();
+  await expect(page.getByTestId("export-success-title")).toBeVisible({ timeout: 120_000 });
+});

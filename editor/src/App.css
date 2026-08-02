@@ -520,6 +520,12 @@ body {
   z-index: 4;
 }
 
+/* Page scope is deliberately the second, quieter button: it costs N sections
+   of real spend per use, so it should not be the one clicked by reflex. */
+.regen-open-row .regen-open:last-child {
+  background: #3a3a46;
+}
+
 .regen-open {
   width: 100%;
   margin-bottom: 12px;

@@ -99,3 +99,57 @@ test("failed regen surfaces the report with a try-again affordance", async ({ pa
   await page.getByTestId("regen-try-again").click();
   await expect(page.getByTestId("regen-instruction")).toBeVisible();
 });
+
+/* ---------- page-level regeneration (7.9, PRD section 4) ---------- */
+
+test("page regen: every section regenerated, all overrides re-applied, one revert undoes the page", async ({
+  page,
+}) => {
+  // Overrides on nodes in TWO different sections: the point of page scope is
+  // that every section's surviving overrides re-apply, not just the one the
+  // user happened to have selected.
+  await styleOverrideHeadline(page);
+  await selectNode(page, "home.faq.heading");
+  await page.getByTestId("swatch-color-color.semantic.accent").click();
+  await waitForSaved(page);
+
+  const headline = previewFrameLocator(page).locator('[data-node-id="home.hero.headline"]');
+  const faqHeading = previewFrameLocator(page).locator('[data-node-id="home.faq.heading"]');
+  const color = (locator: typeof headline) =>
+    locator.evaluate((el) => getComputedStyle(el).color);
+  await expect.poll(() => color(faqHeading)).toBe(ACCENT_RGB);
+
+  // Captured rather than assumed: earlier tests in this file regenerate the
+  // same fixture project and do not restore it, so "back to the original copy"
+  // is not a thing this test can assert. What revert has to guarantee is a
+  // return to the state that existed immediately before THIS regeneration.
+  const copyBeforeRegen = (await headline.textContent()) ?? "";
+
+  await selectNode(page, "home.hero");
+  await page.getByTestId("regen-page-button").click();
+  // The cost estimate must scale with the page, because that is the whole
+  // reason to show it before confirming — home has 6 sections.
+  await expect(page.getByTestId("regen-cost")).toContainText("180k");
+  await expect(page.getByTestId("regen-cost")).toContainText("6 sections");
+  await page.getByTestId("regen-confirm").click();
+
+  // Progress covers the page area, not one section's box (PRD 4.2).
+  await expect(page.getByTestId("regen-progress")).toBeVisible();
+  await expect(page.getByTestId("regen-progress")).toBeHidden({ timeout: 120_000 });
+
+  // The hero's copy changed (the mock's stand-in for new output), and BOTH
+  // sections' overrides re-applied with no user action.
+  await expect(headline).not.toHaveText(copyBeforeRegen, { timeout: 15_000 });
+  await expect(headline).toContainText("Regenerated:", { timeout: 15_000 });
+  await expect.poll(() => color(headline), { timeout: 10_000 }).toBe(ACCENT_RGB);
+  await expect.poll(() => color(faqHeading), { timeout: 10_000 }).toBe(ACCENT_RGB);
+
+  // ONE revert restores the whole route — the snapshot was always route-wide,
+  // and the page path must take it once up front rather than per section (a
+  // per-section snapshot would hold the previous section's new output, so this
+  // assertion is what catches that).
+  await page.getByTestId("revert-regen-button").click();
+  await expect(headline).toHaveText(copyBeforeRegen, { timeout: 15_000 });
+  await expect.poll(() => color(headline), { timeout: 10_000 }).toBe(ACCENT_RGB);
+  await expect.poll(() => color(faqHeading), { timeout: 10_000 }).toBe(ACCENT_RGB);
+});

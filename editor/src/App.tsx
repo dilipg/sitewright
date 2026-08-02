@@ -678,16 +678,25 @@ export default function App() {
     }
   }
 
+  /** One handler for both scopes (PRD section 4: page regen "reuses the same
+   *  flow at page granularity"). Only the endpoint and the request key differ;
+   *  the response shape, the orphan handling and revert are identical, and for
+   *  page scope `section` holds the route slug. */
   async function confirmRegen() {
     if (regen.phase !== "prompt") return;
-    const { section, instruction } = regen;
-    setRegen({ phase: "running", section });
+    const { section, instruction, scope } = regen;
+    setRegen({ phase: "running", section, scope });
     try {
-      const response = await fetch(`${PREVIEW_URL}/__regen`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ section, instruction }),
-      });
+      const response = await fetch(
+        `${PREVIEW_URL}${scope === "page" ? "/__regen-page" : "/__regen"}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(
+            scope === "page" ? { route: section, instruction } : { section, instruction },
+          ),
+        },
+      );
       const outcome = (await response.json()) as {
         passed?: boolean;
         orphanedOverrides?: string[];
@@ -697,7 +706,13 @@ export default function App() {
       if (outcome.error !== undefined) throw new Error(outcome.error);
       await refreshManifest();
       if (outcome.passed !== true) {
-        setRegen({ phase: "failed", section, report: outcome.failureReport ?? "unknown failure", instruction });
+        setRegen({
+          phase: "failed",
+          section,
+          scope,
+          report: outcome.failureReport ?? "unknown failure",
+          instruction,
+        });
         return;
       }
       setRevertSection(section);
@@ -705,7 +720,7 @@ export default function App() {
       setRegen({ phase: "idle" });
       reloadPreview(section);
     } catch (error) {
-      setRegen({ phase: "failed", section, report: String(error), instruction });
+      setRegen({ phase: "failed", section, scope, report: String(error), instruction });
     }
   }
 
@@ -791,7 +806,26 @@ export default function App() {
     return order.includes(sectionSelected) ? order : undefined;
   })();
 
-  const regenGeom = regen.phase === "running" ? geometry[regen.section] : undefined;
+  /** Where to draw the in-place progress overlay (PRD 4.2).
+   *
+   *  A section regen sits on that section's own box. A page regen has no node
+   *  to sit on — its target is a route slug — so it covers the union of the
+   *  route's section boxes, which is the page area being replaced. Without
+   *  this a page regen would show no in-canvas progress at all, and the only
+   *  feedback for a multi-minute operation would be the side panel. */
+  const regenGeom = ((): NodeGeometry | undefined => {
+    if (regen.phase !== "running") return undefined;
+    if (regen.scope === "section") return geometry[regen.section];
+    const boxes = renderedSections(geometryByRoute[regen.section] ?? {}, manifest!, regen.section)
+      .map((nodeId) => geometry[nodeId])
+      .filter((entry): entry is NodeGeometry => entry !== undefined);
+    if (boxes.length === 0) return undefined;
+    const top = Math.min(...boxes.map((box) => box.rect.y));
+    const bottom = Math.max(...boxes.map((box) => box.rect.y + box.rect.height));
+    const left = Math.min(...boxes.map((box) => box.rect.x));
+    const right = Math.max(...boxes.map((box) => box.rect.x + box.rect.width));
+    return { ...boxes[0]!, rect: { x: left, y: top, width: right - left, height: bottom - top } };
+  })();
   const hoverGeom = hoverId !== undefined && hoverId !== selectedId ? geometry[hoverId] : undefined;
   const selectedStyle =
     selectedId !== undefined
@@ -1112,8 +1146,17 @@ export default function App() {
           <RegenControls
             regen={regen}
             sectionSelected={sectionSelected}
-            onOpen={(section) =>
-              setRegen({ phase: "prompt", section, instruction: CANNED_SECTION_BRIEF })
+            pageSectionCount={
+              sectionSelected === undefined || manifest === null
+                ? 0
+                : renderedSections(
+                    geometryByRoute[routeOf(sectionSelected)] ?? {},
+                    manifest,
+                    routeOf(sectionSelected),
+                  ).length
+            }
+            onOpen={(target, scope) =>
+              setRegen({ phase: "prompt", section: target, scope, instruction: CANNED_SECTION_BRIEF })
             }
             onEdit={(instruction) =>
               setRegen((current) =>
@@ -1125,7 +1168,12 @@ export default function App() {
             onTryAgain={() =>
               setRegen((current) =>
                 current.phase === "failed"
-                  ? { phase: "prompt", section: current.section, instruction: current.instruction }
+                  ? {
+                      phase: "prompt",
+                      section: current.section,
+                      scope: current.scope,
+                      instruction: current.instruction,
+                    }
                   : current,
               )
             }

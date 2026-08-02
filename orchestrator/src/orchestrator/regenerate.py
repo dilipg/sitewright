@@ -1,16 +1,23 @@
-"""Section regeneration CLI (build prompt 4.1, pipeline 5.5): forks the
-recorded generation run at the generate_section checkpoint via Kitaru
+"""Regeneration CLI (build prompt 4.1, pipeline 5.5; page scope added in 7.9):
+forks the recorded generation run at the generate_section checkpoint via Kitaru
 replay-with-overrides, with the REGEN BLOCK (old source, manifest entries,
 overridden node IDs, user instruction) injected through flow overrides.
-Cost of a regen ≈ cost of one section.
+Cost of a section regen ≈ cost of one section; a page regen ≈ that times the
+number of sections on the route.
 
 Usage:
+  # one section
   uv run python -m orchestrator.regenerate --run-id soak-01-ledgerly \
-      --instruction "change the headline tone to playful"
+      --section home.hero --instruction "change the headline tone to playful"
+
+  # every section on a route ("redo this whole page", PRD section 4)
+  uv run python -m orchestrator.regenerate --run-id soak-01-ledgerly \
+      --route home --instruction "warmer, less corporate tone throughout"
 """
 
 import argparse
 import json
+from pathlib import Path
 
 from orchestrator.placeholder_shield import shield
 from orchestrator.runlog import default_run_log_path, read_run_events
@@ -110,14 +117,93 @@ def regenerate_section(run_id: str, section: str, instruction: str) -> dict:
     }
 
 
+def route_sections(project_dir: Path, route: str) -> list[str]:
+    """The route's ACTIVE section roots, in manifest registration order.
+
+    Registration order is the order the page worker generated them, which is
+    the order they were assembled into index.tsx -- so regenerating in this
+    order walks the page top to bottom. A tombstoned section is skipped: it no
+    longer exists in the source, so there is nothing to replay for it.
+    """
+    manifest = json.loads((project_dir / "manifest.json").read_text(encoding="utf-8"))
+    return [
+        node_id
+        for node_id, node in manifest["nodes"].items()
+        if node_id.startswith(f"{route}.")
+        and node_id.count(".") == 1
+        and node["status"] == "active"
+    ]
+
+
+def regenerate_page(run_id: str, route: str, instruction: str) -> dict:
+    """Page-level regeneration (PRD section 4, last paragraph): "reuses the same
+    flow at page granularity".
+
+    Literally the same flow -- this loops `regenerate_section`, so a page regen
+    inherits the replay-with-overrides fork, gate 7 ID survival and the orphan
+    declaration unchanged, and there is no second code path that could drift
+    from the section one.
+
+    SEQUENTIAL, not a fan-out. Every section on a route writes into the same
+    page directory and the same manifest, and contract section 2 gives that
+    directory exactly one writer; the manifest service's cross-process lock
+    would serialize the writes anyway, but only after two forks had already
+    raced to produce them. Sequential also means a mid-page failure leaves a
+    coherent prefix rather than an arbitrary subset.
+
+    Per 7.1: each section forks its OWN recorded execution (there is no single
+    page-level exec id to replay), and each regen block goes through the
+    placeholder shield.
+    """
+    sections = route_sections(GENERATED_DIR / run_id, route)
+    if not sections:
+        raise SystemExit(f"no active sections on route '{route}' in run '{run_id}'")
+
+    print(f"regenerating {len(sections)} sections on '{route}': {', '.join(sections)}", flush=True)
+    per_section: dict[str, dict] = {}
+    for section in sections:
+        per_section[section] = regenerate_section(run_id, section, instruction)
+
+    # Aggregated so the editor surfaces ONE outcome for the page: orphans
+    # appear once for the route rather than once per section (PRD 4.3's dialog
+    # is a decision point, and asking the same question N times per page turns
+    # a decision into a wall of prompts).
+    def merged(key: str) -> list[str]:
+        return sorted({value for result in per_section.values() for value in result[key]})
+
+    failures = [
+        f"{section}: {result['failureReport']}"
+        for section, result in per_section.items()
+        if not result["passed"]
+    ]
+    return {
+        "passed": all(result["passed"] for result in per_section.values()),
+        "route": route,
+        "sections": sections,
+        "attempts": sum(result["attempts"] for result in per_section.values()),
+        "orphanedOverrides": merged("orphanedOverrides"),
+        "overriddenIds": merged("overriddenIds"),
+        "tombstoned": merged("tombstoned"),
+        "gate7Retries": sum(result["gate7Retries"] for result in per_section.values()),
+        "failureReport": "\n".join(failures),
+        "perSection": {section: result["passed"] for section, result in per_section.items()},
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="orchestrator.regenerate")
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--instruction", required=True)
-    parser.add_argument("--section", default="home.hero")
+    scope = parser.add_mutually_exclusive_group()
+    scope.add_argument("--section", help="regenerate one section (default: home.hero)")
+    scope.add_argument("--route", help="regenerate every active section on a route")
     args = parser.parse_args()
 
-    summary = regenerate_section(args.run_id, args.section, args.instruction)
+    summary = (
+        regenerate_page(args.run_id, args.route, args.instruction)
+        if args.route is not None
+        else regenerate_section(args.run_id, args.section or "home.hero", args.instruction)
+    )
     print(json.dumps(summary, indent=2))
     # machine-readable single line for the preview server's regen endpoint
     print(f"REGEN_RESULT {json.dumps(summary)}")

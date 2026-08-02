@@ -25,6 +25,19 @@ ARCHETYPE_CATALOG: dict[str, str] = {
     "comparison-table": "us-vs-them or plan comparison table",
     "changelog-list": "dated list of product updates",
     "docs-toc-page": "documentation table-of-contents page body",
+    # app set: the SCREENS of a product, not pages about one. Spec 4.2 calls
+    # growing this catalog "the main ongoing content work of the product".
+    # Every one of these is still a presentational section with typed props and
+    # handler seams (contract 5.x) -- an app screen here means the UI layer of
+    # a builder or a data table, not a working one.
+    "app-shell": "application chrome: top bar with an inline-editable title, save-status, segmented view tabs and a primary action",
+    "element-palette": "searchable, grouped library of draggable element cards for a builder's left rail",
+    "builder-canvas": "a builder's centre work area: ordered field cards with selected/hover affordances, a drop indicator and an empty state",
+    "properties-inspector": "context panel of tabbed settings for the selected element: labels, an option list manager, and validation toggles",
+    "form-renderer": "a public, fillable form: header, optional progress, typed field list with per-field validation states, and a submit footer",
+    "data-toolbar": "a data view's control bar: breadcrumb, date-range and search filters, and an export menu",
+    "data-grid": "dense sortable/filterable submission table with row selection, read/unread rows, truncated cells and pagination",
+    "detail-drawer": "side-peek panel showing one record as key/value rows with media thumbnails and footer actions",
 }
 
 # `custom` is the twentieth: allowed but budgeted (max 1 per page), logged as
@@ -47,6 +60,21 @@ PAGE_ARCHETYPES: dict[str, dict] = {
     },
     "saas-product": {
         "prior": "feature-led sections with integration-grid/comparison-table where relevant",
+    },
+    # Spec 4.3: "A page archetype is just a Planner-side prior ... It adds no
+    # prompt blocks of its own." This one exists so the planner can lay out a
+    # screen INSIDE a product rather than a page marketing one -- without it,
+    # every app brief is forced onto a marketing archetype and comes back as a
+    # landing page about the app.
+    "app-screen": {
+        "min_sections": 2,
+        "max_sections": 5,
+        "first": "app-shell",
+        "prior": (
+            "app-shell first (the screen's own chrome), then the panes of the screen "
+            "left-to-right or top-to-bottom; 2-5 sections; NO hero and NO cta-band -- "
+            "this is a signed-in working surface, not a marketing page"
+        ),
     },
 }
 

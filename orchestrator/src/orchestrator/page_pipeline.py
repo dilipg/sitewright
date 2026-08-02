@@ -48,6 +48,15 @@ DEDICATED_TEMPLATES = {
     "comparison-table",
     "changelog-list",
     "docs-toc-page",
+    # app set — the screens of a product rather than pages about one
+    "app-shell",
+    "element-palette",
+    "builder-canvas",
+    "properties-inspector",
+    "form-renderer",
+    "data-toolbar",
+    "data-grid",
+    "detail-drawer",
 }
 
 

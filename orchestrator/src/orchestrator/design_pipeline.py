@@ -87,7 +87,18 @@ def validate_tokens_json(tokens: dict) -> list[str]:
 
 _COMMON = (
     "nodeId?: string spread as data-node-id on the root element; "
-    "className?: string merged LAST via cx(); children typed ReactNode where noted"
+    "className?: string merged LAST via cx(); children typed ReactNode where noted; "
+    # Passthrough is a DELIBERATELY BOUNDED list, not `...rest`. Sections must be
+    # able to make a primitive accessible or draggable without the primitive
+    # growing a bespoke prop for every case -- but a blanket
+    # ComponentPropsWithoutRef<"input"> would collide with the value-shaped
+    # onChange signatures above (DOM onChange takes an event, ours takes a
+    # string), which is a type error the section author cannot fix.
+    "and it ALSO accepts these passthrough props, forwarded verbatim to the root "
+    "element: aria-* (declared as `'aria-label'?: string` etc. or via "
+    "`AriaAttributes`), role, title, tabIndex, draggable, and the handlers "
+    "onClick/onDragStart/onDragOver/onDrop/onFocus/onBlur. Never widen this into "
+    "a full DOM props spread"
 )
 
 PRIMITIVE_SPECS: dict[str, str] = {
@@ -97,6 +108,17 @@ PRIMITIVE_SPECS: dict[str, str] = {
     "Textarea": f'({{ nodeId?, placeholder?, defaultValue?, rows?, onChange?: (value: string) => void, className? }}) — multi-line input. {_COMMON}',
     "Select": f'({{ nodeId?, options: Array<{{ label: string; value: string }}>, defaultValue?, onChange?: (value: string) => void, className? }}). {_COMMON}',
     "Badge": f'({{ nodeId?, variant?: "neutral" | "accent" | "success" | "danger", className?, children }}) — small pill label. {_COMMON}',
+    # Form controls (added for the app-screen archetype set). Contract 4.1's
+    # list is a MINIMUM and 4.2 reserves additions to the Design System Agent;
+    # these are here because a form product cannot be built without them and
+    # every archetype that needs one needs the SAME one -- a checkbox
+    # hand-rolled per section is exactly the inconsistency primitives exist to
+    # prevent. Each is controlled-optional (checked + onChange) so a section
+    # stays presentational and the container owns the state.
+    "Checkbox": f'({{ nodeId?, label?: string, checked?: boolean, defaultChecked?: boolean, disabled?: boolean, onChange?: (checked: boolean) => void, className? }}) — native <input type="checkbox"> plus its <label>; label is optional so it can also be used bare in a table row. {_COMMON}',
+    "Radio": f'({{ nodeId?, name: string, value: string, label?: string, checked?: boolean, defaultChecked?: boolean, disabled?: boolean, onChange?: (value: string) => void, className? }}) — native <input type="radio">; `name` groups the set, and onChange receives the VALUE, not the event. {_COMMON}',
+    "Switch": f'({{ nodeId?, label?: string, checked?: boolean, defaultChecked?: boolean, disabled?: boolean, onChange?: (checked: boolean) => void, className? }}) — a toggle rendered as <button role="switch" aria-checked>, NOT a checkbox: it is for settings that apply immediately, which is what a properties inspector is made of. {_COMMON}',
+    "Progress": f'({{ nodeId?, value: number, max?: number, label?: string, variant?: "bar" | "steps", className? }}) — determinate progress; "bar" is a filled track, "steps" is a discrete step tracker. Renders role="progressbar" with aria-valuenow/valuemax. {_COMMON}',
     "Heading": f'({{ nodeId?, level?: 1 | 2 | 3, variant?: "display" | "section" | "subsection", className?, children }}) — level picks h1/h2/h3; variant picks the type scale. {_COMMON}',
     "Text": f'({{ nodeId?, variant?: "body" | "lead" | "eyebrow" | "caption", className?, children }}) — renders <p>; eyebrow is small uppercase accent. {_COMMON}',
     "Link": f'({{ nodeId?, href, external?, className?, children }}) — inline text link; external adds target/rel. {_COMMON}',
@@ -105,7 +127,7 @@ PRIMITIVE_SPECS: dict[str, str] = {
     "Grid": f'({{ nodeId?, columns?: 2 | 3 | 4, className?, children }}) — responsive grid (1 column on small screens) with token gap. {_COMMON}',
     "Stack": f'({{ nodeId?, direction?: "vertical" | "horizontal", gap?: "sm" | "md" | "lg", className?, children }}) — flex stack with token gaps. {_COMMON}',
     "Divider": f"({{ nodeId?, className? }}) — horizontal rule using the border semantic color. {_COMMON}",
-    "Icon": f'({{ nodeId?, name: "check" | "arrow-right" | "star" | "chevron-down" | "plus" | "x", size?: "sm" | "md", className? }}) — inline SVG, stroke currentColor, no fill colors. {_COMMON}',
+    "Icon": f'({{ nodeId?, name: "check" | "arrow-right" | "star" | "chevron-down" | "plus" | "x" | "text" | "paragraph" | "circle" | "square" | "mail" | "upload" | "calendar" | "clock" | "pen" | "grip" | "paperclip" | "search" | "trash" | "copy" | "settings", size?: "sm" | "md", className? }}) — inline SVG, stroke currentColor, no fill colors. The union is CLOSED: a section may only ask for a name in this list, so every name here must render something. {_COMMON}',
     # Added in 7.4. Contract 4.1 specifies a MINIMUM set and 4.2 reserves
     # adding primitives to this agent, so this is a sanctioned extension, not
     # a contract change. It exists because a developer wiring a section to a
@@ -142,6 +164,7 @@ def build_gallery_source() -> str:
     return '''import Badge from "../../primitives/Badge";
 import Button from "../../primitives/Button";
 import Card from "../../primitives/Card";
+import Checkbox from "../../primitives/Checkbox";
 import Container from "../../primitives/Container";
 import Divider from "../../primitives/Divider";
 import Grid from "../../primitives/Grid";
@@ -149,10 +172,13 @@ import Heading from "../../primitives/Heading";
 import Icon from "../../primitives/Icon";
 import Image from "../../primitives/Image";
 import Notice from "../../primitives/Notice";
+import Progress from "../../primitives/Progress";
+import Radio from "../../primitives/Radio";
 import Input from "../../primitives/Input";
 import Link from "../../primitives/Link";
 import Select from "../../primitives/Select";
 import Stack from "../../primitives/Stack";
+import Switch from "../../primitives/Switch";
 import Text from "../../primitives/Text";
 import Textarea from "../../primitives/Textarea";
 
@@ -192,6 +218,21 @@ export default function HomePage() {
           <Notice variant="info">Loading…</Notice>
           <Notice variant="error">Something went wrong.</Notice>
           <Notice variant="success">Saved.</Notice>
+        </Stack>
+
+        <Stack direction="vertical" gap="sm">
+          <Checkbox label="Checkbox, unchecked" />
+          <Checkbox label="Checkbox, checked" defaultChecked />
+          <Checkbox label="Checkbox, disabled" disabled />
+          <Radio name="gallery-choice" value="a" label="Radio A" defaultChecked />
+          <Radio name="gallery-choice" value="b" label="Radio B" />
+          <Switch label="Switch, off" />
+          <Switch label="Switch, on" defaultChecked />
+        </Stack>
+
+        <Stack direction="vertical" gap="sm">
+          <Progress value={40} label="Bar progress" variant="bar" />
+          <Progress value={2} max={4} label="Step progress" variant="steps" />
         </Stack>
 
         <Stack direction="horizontal" gap="sm">

@@ -41,10 +41,18 @@ def landing_plan() -> dict:
 
 
 def test_catalog_shape() -> None:
-    assert len(ARCHETYPE_CATALOG) == 19  # + "custom" = twenty total (pipeline 4.2)
+    # 19 at v1 (pipeline 4.2's twenty, counting "custom"), plus the 8-archetype
+    # app set; 4.2 states that growing this catalog is ongoing product work.
+    assert len(ARCHETYPE_CATALOG) == 27
     assert "hero" in ARCHETYPE_CATALOG
     assert "product-detail" in ARCHETYPE_CATALOG
-    assert set(PAGE_ARCHETYPES) == {"landing", "marketing-page", "storefront", "saas-product"}
+    assert set(PAGE_ARCHETYPES) == {
+        "landing",
+        "marketing-page",
+        "storefront",
+        "saas-product",
+        "app-screen",
+    }
 
 
 def test_valid_plan_passes() -> None:

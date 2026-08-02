@@ -1,10 +1,13 @@
 """Template engine: block assembly per pipeline 4.1, versioning, hashing."""
 
+import re
+
 import pytest
 
 from orchestrator.design_context import build_design_context
 from orchestrator.fixture_context import fixture_primitive_signatures, fixture_tokens
-from orchestrator.prompts import load_template, render_template
+from orchestrator.page_pipeline import DEDICATED_TEMPLATES
+from orchestrator.prompts import PROMPTS_DIR, load_template, render_template
 
 
 def fixture_render_context() -> dict[str, str]:
@@ -85,10 +88,12 @@ def test_no_unresolved_placeholders_survive_rendering() -> None:
     assert "{{" not in rendered.user
 
 
-NEW_5_4_ARCHETYPES = ["feature-grid", "cta-band", "pricing-tiers", "faq-accordion", "social-proof"]
-
-
-@pytest.mark.parametrize("archetype", NEW_5_4_ARCHETYPES)
+# EVERY dedicated template, not a hand-kept subset. This started as the five
+# archetypes 5.4 added, which meant the 6.1 additions went uncovered -- and the
+# bug that cost the most time in 6.1 (a Jinja placeholder leaking into an
+# instructional example, so the model was taught an incomplete node-id pattern)
+# was exactly the kind this test catches.
+@pytest.mark.parametrize("archetype", sorted(DEDICATED_TEMPLATES))
 def test_new_archetype_templates_load_and_render_cleanly(archetype: str) -> None:
     template = load_template(archetype)
     assert template.archetype == archetype
@@ -101,3 +106,29 @@ def test_new_archetype_templates_load_and_render_cleanly(archetype: str) -> None
     # canonical example must be present (few-shot quality bar, pipeline 4.1)
     assert "Canonical example" in rendered.user
     assert "manifestProposals for that example" in rendered.user
+
+
+@pytest.mark.parametrize("archetype", sorted(DEDICATED_TEMPLATES))
+def test_no_jinja_placeholder_survives_inside_an_archetypes_teaching_block(archetype: str) -> None:
+    """The 6.1 bug, guarded at source.
+
+    `contact-form` shipped with `nodeId="{{section_slug}}.name-field"` inside an
+    instructional example. The renderer substituted it, so the model was shown a
+    node id with the route prefix already missing and produced ids that gate 4
+    rejected -- identically, on every retry, for every run. It presented as "this
+    archetype just cannot pass", and was only found by reading the RENDERED
+    prompt rather than the template.
+
+    Placeholders belong in the context blocks the renderer fills. Inside
+    [ARCHETYPE] -- prose the model reads as an example to copy -- a slug must be
+    written out concretely (`builder.app-shell.title`), never templated.
+    """
+    source = (PROMPTS_DIR / f"{archetype}.md").read_text(encoding="utf-8")
+    block = source[source.index("[ARCHETYPE]") : source.index("[SECTION BRIEF]")]
+    leaked = re.findall(r"\{\{\s*\w+\s*\}\}", block)
+    assert leaked == [], (
+        f"{archetype}.md: {sorted(set(leaked))} inside its [ARCHETYPE] block. "
+        "The renderer substitutes these, so the model is taught whatever the "
+        "current run happens to be called instead of the pattern. Write the "
+        "example slug out concretely."
+    )

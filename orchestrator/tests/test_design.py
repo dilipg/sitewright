@@ -96,6 +96,10 @@ CONTRACT_MINIMUM_SET = {
 # Listing them explicitly keeps the set from growing by accident.
 SANCTIONED_ADDITIONS = {
     "Notice": "7.4: runtime status surface for the integration layer (6.4 handover trials)",
+    "Checkbox": "app-screen set: choice fields, row selection, and inspector options",
+    "Radio": "app-screen set: single-choice form fields",
+    "Switch": "app-screen set: immediate-effect settings toggles (properties inspector)",
+    "Progress": "app-screen set: multi-page form progress and upload progress",
 }
 
 

@@ -38,6 +38,18 @@ REPO_ROOT = ORCHESTRATOR_ROOT.parent
 COMPILER_DIR = REPO_ROOT / "compiler"
 GENERATED_DIR = REPO_ROOT / "generated"
 
+# A section's structured output is the component, its mock data, one manifest
+# proposal per node, AND its sectionMeta -- and the proposals come LAST, so a
+# truncated response loses exactly the parts validation requires. The default
+# 8192 was enough for a marketing section and is not enough for a dense app one:
+# a data-grid emitted a 7.5 KB component, spent the whole budget on files, and
+# came back with `manifestProposals` and `sectionMeta` missing. That is
+# unrecoverable by retry -- three attempts failed identically, never reaching a
+# gate, and the page shipped a FailedSectionPlaceholder while the run reported
+# success. Output tokens are billed as emitted, so headroom costs nothing on the
+# small sections that never approach it.
+SECTION_MAX_TOKENS = 16000
+
 MAX_ATTEMPTS = 3  # 1 generation + max 2 bounded retries (pipeline 5.4)
 
 SECTION_TOOL_SCHEMA = {
@@ -494,6 +506,7 @@ def generate_section(
         tool_name="emit_section",
         tool_description="Emit the generated section: files, manifest proposals, section metadata.",
         tool_schema=SECTION_TOOL_SCHEMA,
+        max_tokens=SECTION_MAX_TOKENS,
     )
     append_run_event(
         default_run_log_path(run_id),

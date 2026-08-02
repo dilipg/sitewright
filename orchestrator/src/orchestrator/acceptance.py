@@ -73,6 +73,28 @@ def approve_plan(run_id: str) -> None:
     )
 
 
+def degraded_sections(project_dir: Path) -> list[str]:
+    """Sections the plan asked for that no manifest node was ever registered
+    for — i.e. the ones that exhausted their retries and became placeholders."""
+    plan_path = project_dir / "plan" / "siteplan.json"
+    manifest_path = project_dir / "manifest.json"
+    if not plan_path.exists() or not manifest_path.exists():
+        return []
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    built = {
+        node_id
+        for node_id, node in manifest["nodes"].items()
+        if node["status"] == "active" and node_id.count(".") == 1
+    }
+    return [
+        f"{route['slug']}.{section['slug']}"
+        for route in plan.get("routes", [])
+        for section in route.get("sections", [])
+        if f"{route['slug']}.{section['slug']}" not in built
+    ]
+
+
 def generate_site(brief: str, run_id: str | None = None) -> dict:
     """Chain plan -> approve -> design -> shell -> fan-out -> export for one
     brief, in-process. Raises StageError on the first stage that fails or
@@ -155,6 +177,13 @@ def generate_site(brief: str, run_id: str | None = None) -> dict:
         "project_dir": str(project_dir),
         "export_dir": str(export_dir),
         "routes": fanout_result["routes"],
+        # Loud on purpose. A section that exhausts its retries becomes a
+        # FailedSectionPlaceholder and the site continues (pipeline 5.4) -- that
+        # is the design, and the run genuinely did succeed. But a summary that
+        # reports only success hides a page shipping without the section that
+        # was the point of it, which is how a run gets called green while a
+        # data grid is missing. Planned-minus-built, named.
+        "degraded_sections": degraded_sections(project_dir),
         "timings_s": {k: round(v, 2) for k, v in timings.items()},
         "cost": cost_for_run(run_id),
     }

@@ -959,6 +959,44 @@
         "visibility"
       ],
       "status": "active"
+    },
+    "about.values": {
+      "route": "/about",
+      "file": "src/pages/about/sections/AboutValues.tsx",
+      "component": "AboutValues",
+      "element": "section",
+      "editable": [
+        "style",
+        "layout",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "about.values.heading": {
+      "route": "/about",
+      "file": "src/pages/about/sections/AboutValues.tsx",
+      "component": "AboutValues",
+      "element": "Heading",
+      "editable": [
+        "text",
+        "style",
+        "layout",
+        "visibility"
+      ],
+      "status": "active"
+    },
+    "about.values.body": {
+      "route": "/about",
+      "file": "src/pages/about/sections/AboutValues.tsx",
+      "component": "AboutValues",
+      "element": "Text",
+      "editable": [
+        "text",
+        "style",
+        "layout",
+        "visibility"
+      ],
+      "status": "active"
     }
   }
 }

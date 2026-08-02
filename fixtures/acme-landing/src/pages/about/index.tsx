@@ -1,6 +1,8 @@
 import FailedSectionPlaceholder from "../../lib/FailedSectionPlaceholder";
 import { aboutIntroData } from "./mock/AboutIntro.data";
+import { aboutValuesData } from "./mock/AboutValues.data";
 import AboutIntro from "./sections/AboutIntro";
+import AboutValues from "./sections/AboutValues";
 
 /** Page assembly only, no styling decisions (contract section 2).
  *
@@ -16,6 +18,7 @@ export default function AboutPage() {
     <>
       <AboutIntro nodeId="about.intro" {...aboutIntroData} />
       <FailedSectionPlaceholder />
+      <AboutValues nodeId="about.values" {...aboutValuesData} />
     </>
   );
 }

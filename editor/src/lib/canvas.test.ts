@@ -11,6 +11,7 @@ import {
   MIN_ZOOM,
   PREVIEW_WIDTHS,
   routesFromManifest,
+  renderedSections,
   splitOverridesByRoute,
   zoomAt,
 } from "./canvas";
@@ -156,3 +157,51 @@ describe("responsive read-only preview (PRD 7 P1)", () => {
     expect(frameOffsetX(1)).toBe(FRAME_WIDTH + FRAME_GAP);
   });
 });
+
+describe("renderedSections", () => {
+  const manifest = {
+    version: 1 as const,
+    nodes: {
+      "home.hero": node("active"),
+      "home.faq": node("active"),
+      "home.dropped": node("tombstoned"),
+      "home.hero.cta": node("active"),
+      "shop.grid": node("active"),
+    },
+  };
+
+  it("orders by rendered vertical position, not by manifest key order", () => {
+    const geometry = {
+      "home.faq": at(900),
+      "home.hero": at(0),
+      "home.hero.cta": at(120),
+    };
+    expect(renderedSections(geometry, manifest, "home")).toEqual(["home.hero", "home.faq"]);
+  });
+
+  it("excludes child nodes, other routes, and tombstoned sections", () => {
+    const geometry = {
+      "home.hero": at(0),
+      "home.hero.cta": at(50),
+      "home.dropped": at(400),
+      "shop.grid": at(10),
+    };
+    expect(renderedSections(geometry, manifest, "home")).toEqual(["home.hero"]);
+  });
+});
+
+function node(status: "active" | "tombstoned") {
+  return {
+    route: "/",
+    file: "src/pages/home/index.tsx",
+    component: "Home",
+    element: "Section",
+    editable: ["style"],
+    status,
+    createdAt: "2026-08-02T00:00:00Z",
+  } as never;
+}
+
+function at(y: number) {
+  return { rect: { y } };
+}

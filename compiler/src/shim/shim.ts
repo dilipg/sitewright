@@ -115,6 +115,8 @@ function applyOverrides(overrides: ShimOverride[]): void {
   lastOverrides = overrides;
   applyTextOverrides(overrides);
 
+  applySectionOrder(overrides);
+
   const rules: string[] = [];
   for (const override of overrides) {
     const selector = `[data-node-id="${override.nodeId}"]`;
@@ -141,6 +143,63 @@ function applyOverrides(overrides: ShimOverride[]): void {
   // re-append so the sheet stays after any styles Vite/Tailwind add later
   document.head.appendChild(overrideSheet);
   scheduleGeometryReport();
+}
+
+/**
+ * Section reorder in the live preview (PRD 3.3).
+ *
+ * This moves real DOM nodes, and deliberately does NOT use flex `order`, which
+ * would be the tidier trick. `order` only applies to flex/grid items, so
+ * faking the order means making the page container a flex column — and that
+ * changes the formatting context, most visibly by turning off the vertical
+ * margin collapsing a block container does. The export reorders JSX and stays
+ * a block container, so preview and handover would then lay the same sections
+ * out differently, and the pixel suite would not catch it: it frames each node
+ * by its own box, so a shifted position hides while the box looks identical.
+ *
+ * Moving nodes means React can restore its own order on the next render. That
+ * is the same fight `applyTextOverrides` already has, and it is resolved the
+ * same way: the mutation observer re-runs this, and it re-applies. It only
+ * writes when the order is actually wrong, so re-applying settles instead of
+ * feeding itself.
+ *
+ * Order is assigned by slot, exactly as the exporter assigns it: a child with
+ * no node id (a FailedSectionPlaceholder) holds its position rather than being
+ * shuffled to one end.
+ */
+function applySectionOrder(overrides: ShimOverride[]): void {
+  for (const override of overrides) {
+    if (override.channel !== "sectionOrder") continue;
+    const order = (Array.isArray(override.value) ? override.value : []).filter(
+      (id): id is string => typeof id === "string",
+    );
+    if (order.length === 0) continue;
+
+    const parent = document.querySelector(`[data-node-id="${order[0]}"]`)?.parentElement ?? null;
+    if (parent === null) continue;
+
+    const wanted = new Set(order);
+    const children = [...parent.children].filter(
+      (child): child is HTMLElement => child instanceof HTMLElement,
+    );
+
+    let next = 0;
+    const sequence: HTMLElement[] = [];
+    for (const child of children) {
+      const id = child.getAttribute("data-node-id");
+      if (id === null || !wanted.has(id)) {
+        sequence.push(child);
+        continue;
+      }
+      const target = parent.querySelector(`:scope > [data-node-id="${order[next]}"]`);
+      next += 1;
+      sequence.push(target instanceof HTMLElement ? target : child);
+    }
+
+    // The guard that makes re-application terminate.
+    if (sequence.every((element, index) => element === children[index])) continue;
+    for (const element of sequence) parent.appendChild(element);
+  }
 }
 
 function applyTextOverrides(overrides: ShimOverride[]): void {

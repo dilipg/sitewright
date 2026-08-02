@@ -437,6 +437,33 @@ body {
   gap: 6px;
 }
 
+.reorder-row {
+  display: flex;
+  gap: 6px;
+}
+
+.reorder-row button {
+  flex: 1;
+  background: #3a3a46;
+  border: none;
+  color: #e8e8ee;
+  border-radius: 4px;
+  padding: 5px 8px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.reorder-row button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.inspector-note {
+  margin: 6px 0 0;
+  font-size: 11px;
+  color: #9a9aa8;
+}
+
 .variant-btn {
   background: #3a3a46;
   border: none;

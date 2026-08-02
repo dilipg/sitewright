@@ -4,7 +4,7 @@
  * one entry per node+channel with later edits replacing earlier ones.
  */
 
-export type Channel = "text" | "style" | "layout" | "visibility";
+export type Channel = "text" | "style" | "layout" | "visibility" | "sectionOrder";
 
 export type OverridesMap = Record<string, Partial<Record<Channel, unknown>>>;
 
@@ -76,6 +76,49 @@ export function applyLayoutProperty(
 export function applyVisibility(map: OverridesMap, nodeId: string, hidden: boolean): OverridesMap {
   const nodeChannels = map[nodeId] ?? {};
   return { ...map, [nodeId]: { ...nodeChannels, visibility: hidden } };
+}
+
+/**
+ * Section reorder (PRD 3.3), the one PAGE-level channel: it is "an index.tsx
+ * -level override … NOT a DOM operation", so it is keyed by the ROUTE SLUG
+ * rather than a node id, and its value is the route's full section order.
+ *
+ * `sections` is the route's sections in their current rendered order. The
+ * exporter rejects a partial list — an omitted section would silently vanish
+ * from the export — so the whole order is always written, never a delta.
+ */
+export function moveSection(
+  map: OverridesMap,
+  route: string,
+  sections: string[],
+  nodeId: string,
+  direction: -1 | 1,
+): OverridesMap {
+  const current = (map[route]?.sectionOrder as string[] | undefined) ?? sections;
+  // Only ids still on the route, plus any the override has not seen yet: a
+  // regenerated route can add or retire a section under a stale override.
+  const order = [
+    ...current.filter((id) => sections.includes(id)),
+    ...sections.filter((id) => !current.includes(id)),
+  ];
+
+  const from = order.indexOf(nodeId);
+  const to = from + direction;
+  if (from === -1 || to < 0 || to >= order.length) return map;
+
+  const next = [...order];
+  [next[from], next[to]] = [next[to]!, next[from]!];
+  return { ...map, [route]: { ...map[route], sectionOrder: next } };
+}
+
+/** The route's section order as the user currently sees it: the override if one exists, else the rendered order. */
+export function sectionOrderOf(map: OverridesMap, route: string, sections: string[]): string[] {
+  const current = map[route]?.sectionOrder as string[] | undefined;
+  if (current === undefined) return sections;
+  return [
+    ...current.filter((id) => sections.includes(id)),
+    ...sections.filter((id) => !current.includes(id)),
+  ];
 }
 
 /** Drops every channel for a node — used when the user discards an orphaned override. */

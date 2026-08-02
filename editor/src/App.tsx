@@ -22,6 +22,7 @@ import {
   isEditableWidth,
   PREVIEW_WIDTHS,
   isFrameNearViewport,
+  renderedSections,
   routesFromManifest,
   splitOverridesByRoute,
   zoomAt,
@@ -38,9 +39,11 @@ import {
   currentSnapshot,
   fromOverrideFile,
   initHistory,
+  moveSection,
   pushHistory,
   redo,
   removeNodeOverrides,
+  sectionOrderOf,
   toOverrideFile,
   undo,
 } from "./lib/store";
@@ -423,6 +426,20 @@ export default function App() {
     });
   }
 
+  /** PRD 3.3: a reorder is a page-level override keyed by the route, so it
+   *  writes the whole section order rather than touching the moved node. */
+  function commitSectionMove(nodeId: string, direction: -1 | 1) {
+    const route = nodeId.split(".")[0]!;
+    if (manifest === null) return;
+    const rendered = renderedSections(geometryByRoute[route] ?? {}, manifest, route);
+    setHistory((h) => {
+      if (h === null) return h;
+      const previous = currentSnapshot(h);
+      const next = moveSection(previous, route, rendered, nodeId, direction);
+      return next === previous ? h : pushHistory(h, next);
+    });
+  }
+
   function toggleVisibility() {
     if (selectedId === undefined) return;
     setHistory((h) => {
@@ -553,6 +570,22 @@ export default function App() {
       const rawDx = (upEvent.clientX - startX) / zoom;
       const rawDy = (upEvent.clientY - startY) / zoom;
       if (Math.abs(rawDx) > REJECT_THRESHOLD_PX || Math.abs(rawDy) > REJECT_THRESHOLD_PX) {
+        // A big vertical drag of a SECTION used to be rejected as implied
+        // reordering that v1 could not express (PRD risk 3). Now it can, so
+        // the gesture becomes the reorder it always looked like — one step
+        // per gesture, and only when the drag is clearly vertical, so a
+        // diagonal fling is still a rejection rather than a surprise move.
+        const direction: -1 | 1 = rawDy < 0 ? -1 : 1;
+        if (
+          kind === "move" &&
+          Math.abs(rawDy) > Math.abs(rawDx) &&
+          selectedSectionOrder !== undefined &&
+          selectedSectionOrder.includes(nodeId) &&
+          selectedSectionOrder[selectedSectionOrder.indexOf(nodeId) + direction] !== undefined
+        ) {
+          commitSectionMove(nodeId, direction);
+          return;
+        }
         showGestureRejectedHint(nodeId, kind, rawDx, rawDy);
         return;
       }
@@ -747,6 +780,17 @@ export default function App() {
   const editingMultiline = editingId !== undefined && manifest?.nodes[editingId]?.element === "Text";
   const sectionSelected =
     selectedId !== undefined && selectedId.split(".").length === 2 ? selectedId : undefined;
+  /** The order the reorder control acts on — only meaningful with a section
+   *  selected on a route that has more than one section to swap it with. */
+  const selectedSectionOrder = ((): string[] | undefined => {
+    if (sectionSelected === undefined || manifest === null) return undefined;
+    const route = sectionSelected.split(".")[0]!;
+    const rendered = renderedSections(geometryByRoute[route] ?? {}, manifest, route);
+    if (rendered.length < 2) return undefined;
+    const order = sectionOrderOf(map, route, rendered);
+    return order.includes(sectionSelected) ? order : undefined;
+  })();
+
   const regenGeom = regen.phase === "running" ? geometry[regen.section] : undefined;
   const hoverGeom = hoverId !== undefined && hoverId !== selectedId ? geometry[hoverId] : undefined;
   const selectedStyle =
@@ -1102,6 +1146,15 @@ export default function App() {
               }
               onCommitImageSrc={commitImageSrc}
               onToggleVisibility={toggleVisibility}
+              reorder={
+                selectedSectionOrder === undefined
+                  ? undefined
+                  : {
+                      position: selectedSectionOrder.indexOf(selectedId),
+                      total: selectedSectionOrder.length,
+                      onMove: (direction) => commitSectionMove(selectedId, direction),
+                    }
+              }
             />
           ) : (
             <p className="inspector-empty">Click an element in the preview to select it.</p>

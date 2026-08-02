@@ -18,6 +18,12 @@ export interface InvariantCase {
    * gone), so there is nothing to pixel-diff — the invariant to check is
    * that the node is absent from export, not that it renders identically. */
   expectRemovedFromExport?: boolean;
+  /** Reorder cases: the channel changes position, never appearance, so the
+   * per-node pixel diff measures nothing and only picks up rasterization
+   * noise. invariant.spec.ts's section-order test is the real assertion.
+   * See the reorder case for the full reasoning — do NOT set this to quiet a
+   * diff on any channel that changes how a node renders. */
+  skipPixelDiff?: boolean;
 }
 
 /** Selects via a corner click, not the default center click: a section root
@@ -280,9 +286,9 @@ export const INVARIANT_CASES: InvariantCase[] = [
     // a sub-pixel screenshot-boundary rounding artifact between the two
     // separate page renders, not a real difference. The answer sits inset
     // from that edge (below the heading), so its crop never touches it. The
-    // visibility case below hides a DIFFERENT faq item's answer
-    // (item-cancel-anytime, not item-trial-length), so this item's own
-    // content never shrinks between preview and export either.
+    // visibility case below hides an answer inside the LAST item
+    // (item-data-export, not item-trial-length), so this item's own content
+    // never shrinks between preview and export, and nothing above it moves.
     name: "style: background swatch on a faq item",
     screenshotNode: "home.faq.item-trial-length.answer",
     apply: applyStyleSwatch("home.faq.item-trial-length"),
@@ -294,16 +300,28 @@ export const INVARIANT_CASES: InvariantCase[] = [
   },
   {
     name: "layout: a faq item moved via margin",
-    screenshotNode: "home.faq.item-data-export",
-    apply: applyLayoutMove("home.faq.item-data-export", 0, 16),
+    screenshotNode: "home.faq.item-cancel-anytime",
+    apply: applyLayoutMove("home.faq.item-cancel-anytime", 0, 16),
   },
   {
-    // A different item than the style case above (item-cancel-anytime, not
-    // item-trial-length) so hiding this answer doesn't shrink the item the
-    // style case screenshots in full.
+    // The LAST item's answer (items run trial-length, cancel-anytime,
+    // data-export), which matters more than just being "a different item"
+    // from the cases above.
+    //
+    // A ghosted node keeps its layout space in preview (PRD 3.4) and is gone
+    // from the export entirely (contract 6.2), so every sibling BELOW it sits
+    // higher in export than in preview — a real, intended difference that
+    // this suite must not mistake for a fidelity bug. While the shift is a
+    // whole number of pixels it is invisible to a per-node screenshot; land
+    // it on a fractional boundary and identical text rasterizes to different
+    // sub-pixels (1.27% of pixels, found when the reorder case first changed
+    // the section's absolute Y). Hiding inside the last item leaves nothing
+    // below it to shift, so the fragility does not exist rather than being
+    // tolerated. The visibility channel is asserted exactly as before, by
+    // absence from the export.
     name: "visibility: a faq answer ghosted",
-    screenshotNode: "home.faq.item-cancel-anytime.answer",
-    apply: applyVisibilityToggle("home.faq.item-cancel-anytime.answer"),
+    screenshotNode: "home.faq.item-data-export.answer",
+    apply: applyVisibilityToggle("home.faq.item-data-export.answer"),
     expectRemovedFromExport: true,
   },
 
@@ -369,6 +387,54 @@ export const INVARIANT_CASES: InvariantCase[] = [
     },
   },
 
+  // ---------- section reorder (PRD 3.3) ----------
+  {
+    // On "about", not "home", although home is the route with six sections.
+    //
+    // Every home section also carries a visibility case, and a ghosted node
+    // keeps its layout space in preview (PRD 3.4) while the export compiles it
+    // out entirely (contract 6.2). So on home, every node below a ghost
+    // already sits at a different absolute Y in preview than in export — a
+    // real and intended difference, invisible to a per-node screenshot only
+    // while the offset stays a whole number of pixels. Moving a section
+    // changes those offsets, and reordering home was measured flipping two
+    // unrelated cases onto different pixel boundaries (a 1.27% text
+    // rasterization diff, then a 1px crop difference) — noise that says
+    // nothing about reorder.
+    //
+    // "about" carries no visibility case, so both its sections render at
+    // identical positions on both sides and a reorder perturbs nothing. It
+    // also has the page's FailedSectionPlaceholder sitting between the two
+    // reorderable sections, making this the only end-to-end coverage of the
+    // rule that a child with NO node id holds its slot rather than being
+    // shuffled to an end or dropped (the exporter and the shim implement that
+    // rule separately, so agreeing here is worth asserting).
+    name: "sectionOrder: about values moved above the intro",
+    screenshotNode: "about.values.heading",
+    skipPixelDiff: true,
+    apply: async (page) => {
+      await panUntilFrameMounted(page, "about");
+      await selectViaCorner(page, "about.values");
+      await expect(page.getByTestId("reorder-position")).toHaveText("Section 2 of 2");
+      await page.getByTestId("reorder-up").click();
+      await expect(page.getByTestId("reorder-position")).toHaveText("Section 1 of 2");
+    },
+  },
+  // Why this case is exempt from the pixel diff, and why that costs nothing:
+  //
+  // Reorder is the only channel that changes NOTHING about how a node renders
+  // — only where it sits. A per-node screenshot frames the node's own box, so
+  // it cannot see position at all. What needs proving is that preview and
+  // export agree on ORDER, and invariant.spec.ts's section-order test asserts
+  // that directly, against an explicitly expected sequence so it cannot pass
+  // vacuously.
+  //
+  // That test is also sufficient, because the shim reorders the real DOM
+  // rather than faking it with flex `order`: order-dependent CSS
+  // (:first-child, nth-child, sibling combinators) therefore resolves against
+  // the same DOM order on both sides. A visual-only reorder would have made
+  // this exemption unsafe.
+
   {
     // Screenshots the heading, not "support.contact-form" itself: this
     // suite's visibility case below hides the submit button — still
@@ -406,4 +472,5 @@ export const INVARIANT_CASES: InvariantCase[] = [
     apply: applyVisibilityToggle("support.contact-form.message-field"),
     expectRemovedFromExport: true,
   },
+
 ];

@@ -573,16 +573,20 @@ describe("exportProject: section reorder (PRD 3.3, milestone 7.5)", () => {
   });
 
   it("keeps a failed-section placeholder in place — it carries no id to reorder by", () => {
-    // about/index.tsx renders AboutIntro + <FailedSectionPlaceholder />; the
-    // placeholder deliberately has no nodeId (pipeline 5.4), so a reorder must
-    // neither drop it nor try to position it.
+    // about/index.tsx renders AboutIntro, then <FailedSectionPlaceholder />,
+    // then AboutValues. The placeholder deliberately has no nodeId (pipeline
+    // 5.4), so a reorder must neither drop it nor try to position it: swapping
+    // the two real sections has to move them AROUND it, leaving it in the
+    // middle slot it already occupied.
     const dir = fixtureCopyWithOverrides([]);
     writeFileSync(
       join(dir, "overrides", "about.overrides.json"),
       JSON.stringify({
         version: 1,
         route: "/about",
-        overrides: [{ nodeId: "about", channel: "sectionOrder", value: ["about.intro"] }],
+        overrides: [
+          { nodeId: "about", channel: "sectionOrder", value: ["about.values", "about.intro"] },
+        ],
       }),
     );
     const outDir = join(tempDir("export-reorder-placeholder-"), "export");
@@ -590,6 +594,11 @@ describe("exportProject: section reorder (PRD 3.3, milestone 7.5)", () => {
 
     const index = readOut(outDir, "src/pages/about/index.tsx");
     expect(index).toContain("<FailedSectionPlaceholder />");
-    expect(index).toContain('nodeId="about.intro"');
+    const values = index.indexOf('nodeId="about.values"');
+    const placeholder = index.indexOf("<FailedSectionPlaceholder />");
+    const intro = index.indexOf('nodeId="about.intro"');
+    expect(values, "about.values is missing from the reordered page").toBeGreaterThan(-1);
+    expect(placeholder, "the placeholder moved up with the section that swapped past it").toBeGreaterThan(values);
+    expect(intro, "the placeholder did not stay in its own slot").toBeGreaterThan(placeholder);
   });
 });

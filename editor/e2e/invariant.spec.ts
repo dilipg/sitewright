@@ -146,11 +146,53 @@ test("apply all invariant-case edits in the editor and capture preview nodes", a
     for (const invariantCase of cases) {
       const locator = previewPage.locator(`[data-node-id="${invariantCase.screenshotNode}"]`);
       await locator.scrollIntoViewIfNeeded();
+      if (invariantCase.skipPixelDiff === true) continue;
       previewShots.set(invariantCase.name, await locator.screenshot());
     }
+    previewOrder.set(slug, (await previewPage.evaluate(SECTION_ORDER_SCRIPT)) as string[]);
     await previewPage.close();
   }
 });
+
+/**
+ * A document's section roots in DOM order.
+ *
+ * Reorder is the one channel whose whole effect is POSITION, so a per-node
+ * pixel diff cannot see it: each section's own box renders identically no
+ * matter where on the page it sits. This is the assertion that actually holds
+ * preview = handover for it.
+ */
+const SECTION_ORDER_SCRIPT = `[...document.querySelectorAll("[data-node-id]")]
+  .map((element) => element.getAttribute("data-node-id"))
+  .filter((id) => id !== null && id.split(".").length === 2)`;
+
+const previewOrder = new Map<string, string[]>();
+const exportOrder = new Map<string, string[]>();
+
+/**
+ * The order each route MUST end up in once every case has been applied.
+ *
+ * Spelled out rather than derived: comparing preview to export alone would
+ * pass just as happily if both ignored the reorder override entirely, which is
+ * the exact failure this test exists to catch. "home" is the authored fixture
+ * order with faq moved above testimonials by the reorder case.
+ */
+const EXPECTED_ORDER: Record<string, string[]> = {
+  // home: the authored fixture order, untouched — no reorder case runs here.
+  home: [
+    "home.hero",
+    "home.capabilities",
+    "home.pricing",
+    "home.testimonials",
+    "home.faq",
+    "home.cta-band",
+  ],
+  // about: authored intro-then-values, swapped by the reorder case. The
+  // FailedSectionPlaceholder between them has no node id and so never appears
+  // here — that it stays in the middle instead of moving is the point.
+  about: ["about.values", "about.intro"],
+  support: ["support.contact-form"],
+};
 
 test("export builds and the same nodes render in the served export", async ({ page }) => {
   test.setTimeout(240_000);
@@ -186,8 +228,10 @@ test("export builds and the same nodes render in the served export", async ({ pa
           continue;
         }
         await expect(locator).toBeVisible();
+        if (invariantCase.skipPixelDiff === true) continue;
         exportShots.set(invariantCase.name, await locator.screenshot());
       }
+      exportOrder.set(slug, (await exportPage.evaluate(SECTION_ORDER_SCRIPT)) as string[]);
       await exportPage.close();
     }
   } finally {
@@ -195,7 +239,20 @@ test("export builds and the same nodes render in the served export", async ({ pa
   }
 });
 
+for (const slug of casesByRoute().keys()) {
+  test(`section-order: ${slug} renders in the same order in preview and export`, () => {
+    const preview = previewOrder.get(slug);
+    const exported = exportOrder.get(slug);
+    expect(preview, "preview order missing (earlier step failed)").toBeDefined();
+    expect(exported, "export order missing (earlier step failed)").toBeDefined();
+    expect(preview!.length, "no sections captured — the selector stopped matching").toBeGreaterThan(0);
+    expect(exported).toEqual(preview);
+    expect(preview, "preview is not in the order the cases asked for").toEqual(EXPECTED_ORDER[slug]);
+  });
+}
+
 for (const invariantCase of INVARIANT_CASES) {
+  if (invariantCase.skipPixelDiff === true) continue;
   if (invariantCase.expectRemovedFromExport === true) {
     test(`removed-from-export: ${invariantCase.name}`, () => {
       // The absence assertion already ran in the "export builds..." step

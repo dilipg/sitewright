@@ -17,6 +17,8 @@ export interface InspectorProps {
   /** Current src override on an Image node, when one is set (PRD 3.5). */
   imageSrc?: string;
   onCommitImageSrc: (src: string) => void;
+  /** Present only on a section root, the one node a reorder can address (PRD 3.3). */
+  reorder?: { position: number; total: number; onMove: (direction: -1 | 1) => void };
 }
 
 export default function Inspector({
@@ -30,6 +32,7 @@ export default function Inspector({
   onToggleVisibility,
   imageSrc,
   onCommitImageSrc,
+  reorder,
 }: InspectorProps) {
   const styleEditable = node.editable.includes("style");
   const visibilityEditable = node.editable.includes("visibility");
@@ -68,6 +71,33 @@ export default function Inspector({
               if (event.key === "Enter") onCommitImageSrc(event.currentTarget.value);
             }}
           />
+        </section>
+      )}
+
+      {reorder !== undefined && (
+        <section className="control-section">
+          <h3 className="inspector-subheading">Position on page</h3>
+          <div className="reorder-row">
+            <button
+              type="button"
+              data-testid="reorder-up"
+              disabled={reorder.position === 0}
+              onClick={() => reorder.onMove(-1)}
+            >
+              ↑ Move up
+            </button>
+            <button
+              type="button"
+              data-testid="reorder-down"
+              disabled={reorder.position === reorder.total - 1}
+              onClick={() => reorder.onMove(1)}
+            >
+              ↓ Move down
+            </button>
+          </div>
+          <p className="inspector-note" data-testid="reorder-position">
+            Section {reorder.position + 1} of {reorder.total}
+          </p>
         </section>
       )}
 

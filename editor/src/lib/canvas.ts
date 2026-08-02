@@ -99,6 +99,31 @@ export function splitOverridesByRoute(map: OverridesMap, routes: RouteInfo[]): R
   return result;
 }
 
+/**
+ * A route's section roots in the order they actually appear on the page,
+ * top to bottom.
+ *
+ * The manifest is a map, not a sequence — it records that a section exists,
+ * never where on the page it sits — so the order is read from the live
+ * geometry the shim already reports. That also makes it self-correcting once
+ * a reorder is applied: `order` moves the rendered box, so the next report
+ * comes back in the new order rather than the authored one.
+ */
+export function renderedSections(
+  geometry: Record<string, { rect: { y: number } }>,
+  manifest: Manifest,
+  route: string,
+): string[] {
+  return Object.keys(geometry)
+    .filter(
+      (nodeId) =>
+        nodeId.split(".").length === 2 &&
+        nodeId.startsWith(`${route}.`) &&
+        manifest.nodes[nodeId]?.status === "active",
+    )
+    .sort((a, b) => geometry[a]!.rect.y - geometry[b]!.rect.y);
+}
+
 export function isFrameNearViewport(
   frameX: number,
   frameWidth: number,

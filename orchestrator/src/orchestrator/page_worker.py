@@ -106,7 +106,11 @@ def run_route(run_id: str, route_slug: str, crash_after_section: int | None = No
         save_progress(project_dir, route_slug, progress)
 
     assembled = assemble_page_flow.run(
-        run_id=run_id, project_dir=str(project_dir), route_slug=route_slug, sections=sections_meta
+        run_id=run_id,
+        project_dir=str(project_dir),
+        route_slug=route_slug,
+        sections=sections_meta,
+        page_archetype=route.get("pageArchetype", ""),
     ).wait()
     return {"route_slug": route_slug, "sections": sections_meta, "assembled": assembled}
 

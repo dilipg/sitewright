@@ -748,12 +748,37 @@ function applySectionOrder(
     throw new ExportError(`Cannot reorder route "${routeSlug}": ${indexPath} not found.`);
   }
 
-  const fragment = indexFile.getFirstDescendantByKind(SyntaxKind.JsxFragment);
-  if (fragment === undefined) {
+  // The sections' actual PARENT, not "the fragment". A marketing page returns a
+  // bare fragment, but a page archetype may wrap its sections in a layout
+  // element — an app screen puts them in a flex row so its panes sit side by
+  // side instead of stacking. Both are lists of sections; only the container
+  // differs. Locating the parent by looking for a section rather than assuming
+  // the shape also matches what the shim does at runtime (it takes the
+  // parentElement of the first section), so preview and export agree on which
+  // element they are reordering.
+  // Anchor on the ATTRIBUTE, not on "a node whose text contains the id":
+  // getDescendants() is document order, so every ancestor's text contains the
+  // id too and the outermost element matches first.
+  const attribute = indexFile
+    .getDescendantsOfKind(SyntaxKind.JsxAttribute)
+    .find(
+      (attr) =>
+        attr.getNameNode().getText() === "nodeId" &&
+        attr.getInitializer()?.getText() === `"${order[0]!}"`,
+    );
+  const sectionElement =
+    attribute?.getFirstAncestorByKind(SyntaxKind.JsxSelfClosingElement) ??
+    attribute?.getFirstAncestorByKind(SyntaxKind.JsxElement);
+  const container = sectionElement?.getParent();
+  if (
+    container === undefined ||
+    (container.getKind() !== SyntaxKind.JsxFragment && container.getKind() !== SyntaxKind.JsxElement)
+  ) {
     throw new ExportError(
       `Cannot reorder route "${routeSlug}": its page renders a single element, not a list of sections.`,
     );
   }
+  const fragment = container as unknown as { getJsxChildren: () => Node[]; replaceWithText: (t: string) => void };
 
   const children = fragment
     .getJsxChildren()
@@ -780,7 +805,21 @@ function applySectionOrder(
     return replacement;
   });
 
-  fragment.replaceWithText(`<>\n      ${rewritten.map((text) => text.trim()).join("\n      ")}\n    </>`);
+  // Rebuild the container with its OWN opening and closing tags preserved: a
+  // page archetype's layout wrapper carries the classNames that arrange the
+  // sections, so emitting a bare fragment here would reorder them correctly and
+  // silently strip the layout that positions them.
+  const containerText = container.getText();
+  const openTag =
+    container.getKind() === SyntaxKind.JsxFragment
+      ? "<>"
+      : containerText.slice(0, containerText.indexOf(">") + 1);
+  const closeTag =
+    container.getKind() === SyntaxKind.JsxFragment
+      ? "</>"
+      : containerText.slice(containerText.lastIndexOf("</"));
+  const inner = rewritten.map((text) => text.trim()).join("\n      ");
+  fragment.replaceWithText(`${openTag}\n      ${inner}\n    ${closeTag}`);
   changed.add(indexFile);
 }
 

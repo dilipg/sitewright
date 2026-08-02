@@ -255,7 +255,27 @@ def write_section_files(
     return sorted(written)
 
 
-def assemble_page_index_source(*, route_slug: str, sections: list[dict]) -> str:
+# How a page arranges its sections. A marketing page stacks them down the
+# screen, which a bare fragment already does. An APP SCREEN does not: its chrome
+# sits on top and its panes sit SIDE BY SIDE, and the pane sections say so in
+# their own classNames (`w-[18rem] shrink-0`, `flex-1`) -- which mean nothing
+# unless something puts them in a row.
+#
+# `flex-wrap` rather than a nested row, deliberately: it arranges the panes while
+# keeping every section a DIRECT SIBLING of every other. Nesting the panes one
+# level deeper would arrange them just as well and would break BOTH reorder
+# implementations, which each operate on the section elements' common parent --
+# the exporter rewrites that parent's children, the shim moves real DOM nodes
+# within it. A full-width chrome section takes a whole flex line to itself, so
+# the panes fall onto the next line together with no extra markup.
+PAGE_LAYOUTS: dict[str, str] = {
+    "app-screen": "flex min-h-screen flex-wrap items-stretch content-start",
+}
+
+
+def assemble_page_index_source(
+    *, route_slug: str, sections: list[dict], page_archetype: str = ""
+) -> str:
     """Deterministic multi-section page assembly (pipeline 2.5's per-page
     assembly step). Each section dict is either {"slug","component"} (a
     generated section, imported normally) or {"slug","failed": True} (bounded
@@ -287,15 +307,22 @@ def assemble_page_index_source(*, route_slug: str, sections: list[dict]) -> str:
         imports.insert(0, 'import FailedSectionPlaceholder from "../../lib/FailedSectionPlaceholder";')
 
     imports_source = "\n".join(imports)
-    renders_source = "\n".join(renders)
+    layout = PAGE_LAYOUTS.get(page_archetype)
+    if layout is None:
+        body = "    <>\n" + "\n".join(renders) + "\n    </>"
+    else:
+        # one extra indent level for the wrapped children
+        body = (
+            f'    <div className="{layout}">\n'
+            + "\n".join(f"  {line}" for line in renders)
+            + "\n    </div>"
+        )
     return (
         f"{imports_source}\n\n"
         "/** Page assembly only, no styling decisions (contract section 2). */\n"
         f"export default function {page_component_name(route_slug)}Page() {{\n"
         "  return (\n"
-        "    <>\n"
-        f"{renders_source}\n"
-        "    </>\n"
+        f"{body}\n"
         "  );\n"
         "}\n"
     )

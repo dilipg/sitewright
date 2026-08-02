@@ -75,7 +75,13 @@ def route_table_source(routes: list[dict]) -> str:
 
 
 @checkpoint
-def assemble_page(run_id: str, project_dir: str, route_slug: str, sections: list[dict]) -> dict:
+def assemble_page(
+    run_id: str,
+    project_dir: str,
+    route_slug: str,
+    sections: list[dict],
+    page_archetype: str = "",
+) -> dict:
     """Deterministic index.tsx assembly + a gate check SCOPED to this route
     (gate 4; build prompt 5.3). Runs once per route, after every section has
     completed or exhausted retries — but sibling routes may still be mid-
@@ -84,7 +90,9 @@ def assemble_page(run_id: str, project_dir: str, route_slug: str, sections: list
     run_gates_step's scope_route). The true whole-project check, including
     gate 6 with the real cross-process write log, runs once at the very end
     in fanout.py after every worker has finished."""
-    index_source = assemble_page_index_source(route_slug=route_slug, sections=sections)
+    index_source = assemble_page_index_source(
+        route_slug=route_slug, sections=sections, page_archetype=page_archetype
+    )
     page_dir = Path(project_dir) / "src" / "pages" / route_slug
     page_dir.mkdir(parents=True, exist_ok=True)
     (page_dir / "index.tsx").write_text(index_source, encoding="utf-8", newline="\n")
@@ -97,6 +105,12 @@ def assemble_page(run_id: str, project_dir: str, route_slug: str, sections: list
 
 
 @flow
-def assemble_page_flow(run_id: str, project_dir: str, route_slug: str, sections: list[dict]) -> dict:
+def assemble_page_flow(
+    run_id: str,
+    project_dir: str,
+    route_slug: str,
+    sections: list[dict],
+    page_archetype: str = "",
+) -> dict:
     print(f"exec_id: {kitaru.current_execution_id()}", flush=True)
-    return assemble_page(run_id, project_dir, route_slug, sections)
+    return assemble_page(run_id, project_dir, route_slug, sections, page_archetype)

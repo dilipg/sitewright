@@ -1,5 +1,5 @@
 ---
-version: 1.0.0
+version: 1.0.1
 archetype: app-shell
 ---
 [SYSTEM]
@@ -51,7 +51,7 @@ change how you write it:
   handling logic, or a fetch. The container that renders this section owns all
   of that; your job is the surface it drives.
 
-Structure: a `<header>` root, `sticky top-0 z-10` with a bottom border, laid out as three groups on one row (left: title + status, centre: segmented tabs, right: secondary action + primary Button). Left group: the title rendered as an `Input` (this is an INLINE EDITOR — the user renames the record here), plus a status `Text variant="caption"` whose copy comes from a `statusLabel` prop (never compute "Saving…" yourself; the container passes it). Centre: a `tabs` array mapped to `Button variant="ghost"`, with the active one distinguished via `className` and `aria-current="page"`. Right: an optional secondary `Button variant="secondary"` (e.g. a preview toggle) and the primary `Button variant="primary"`.
+Structure: a `<header>` root that MUST carry `w-full`, plus `sticky top-0 z-10` and a bottom border. `w-full` is not cosmetic: an app screen's page wrapper is a flex row that arranges the panes beside each other, and the chrome has to claim a whole line to itself or it sits in the row alongside them. The root is laid out laid out as three groups on one row (left: title + status, centre: segmented tabs, right: secondary action + primary Button). Left group: the title rendered as an `Input` (this is an INLINE EDITOR — the user renames the record here), plus a status `Text variant="caption"` whose copy comes from a `statusLabel` prop (never compute "Saving…" yourself; the container passes it). Centre: a `tabs` array mapped to `Button variant="ghost"`, with the active one distinguished via `className` and `aria-current="page"`. Right: an optional secondary `Button variant="secondary"` (e.g. a preview toggle) and the primary `Button variant="primary"`.
 
 Wrap the whole row in `Container` only if the screen is centred; an app shell usually spans full width, so prefer a plain `div` with `px-(--space-6)` and `flex items-center justify-between gap-(--space-4)`.
 
@@ -61,7 +61,7 @@ Quality bar: the tab labels must be the real modes of THIS screen from the brief
 
 Override-slot fields (contract 5.5): the tab cells are rendered by one `.map()` body and so have no JSX of their own — every item in the `Tab` array carries `className?: string`, `childClassNames?: Record<string, string>`, `hidden?: boolean`, `childHidden?: Record<string, boolean>`. Never set these in mock data; the component must read them back on the tab's own root.
 
-Failure modes that fail gates or reviews — avoid: hand-writing a fixed set of tabs instead of mapping `tabs`; putting the title in a `Heading` instead of an `Input` (it is an editor, not a label); computing the status string in the component; hardcoded strings in JSX; hex/px values.
+Failure modes that fail gates or reviews — avoid: omitting `w-full` from the root (the chrome then shares a line with the panes instead of sitting above them); hand-writing a fixed set of tabs instead of mapping `tabs`; putting the title in a `Heading` instead of an `Input` (it is an editor, not a label); computing the status string in the component; hardcoded strings in JSX; hex/px values.
 
 Canonical example — a previous gate-passing app-shell. Match its structure and file shapes exactly; do NOT reuse its copy or slugs unless they match your section:
 
@@ -112,7 +112,7 @@ export default function AppShell({
   return (
     <header
       data-node-id={nodeId}
-      className="sticky top-0 z-10 flex items-center justify-between gap-(--space-4) border-b border-(--color-semantic-border) bg-(--color-semantic-surface) px-(--space-6) py-(--space-3)"
+      className="w-full sticky top-0 z-10 flex items-center justify-between gap-(--space-4) border-b border-(--color-semantic-border) bg-(--color-semantic-surface) px-(--space-6) py-(--space-3)"
     >
       <div className="flex min-w-0 items-center gap-(--space-3)">
         <Input

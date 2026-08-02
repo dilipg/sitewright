@@ -572,6 +572,44 @@ describe("exportProject: section reorder (PRD 3.3, milestone 7.5)", () => {
     expect(existsSync(outDir)).toBe(false);
   });
 
+  it("reorders inside a page-archetype layout wrapper without stripping it", () => {
+    // A marketing page returns a bare fragment; an app screen wraps its
+    // sections in a flex row so its panes sit side by side instead of stacking.
+    // Reorder has to find the sections' real parent either way, and rebuild it
+    // with its OWN tags — emitting a bare fragment would reorder correctly and
+    // silently delete the layout that positions them.
+    const dir = fixtureCopyWithOverrides([]);
+    const indexPath = join(dir, "src", "pages", "about", "index.tsx");
+    const wrapped = readFileSync(indexPath, "utf8")
+      .replace("    <>", '    <div className="flex min-h-screen flex-wrap">')
+      .replace("    </>", "    </div>");
+    writeFileSync(indexPath, wrapped);
+    writeFileSync(
+      join(dir, "overrides", "about.overrides.json"),
+      JSON.stringify({
+        version: 1,
+        route: "/about",
+        overrides: [
+          { nodeId: "about", channel: "sectionOrder", value: ["about.values", "about.intro"] },
+        ],
+      }),
+    );
+    const outDir = join(tempDir("export-reorder-layout-"), "export");
+    exportProject(dir, { outDir, skipBuild: true });
+
+    const index = readOut(outDir, "src/pages/about/index.tsx");
+    expect(index, "the layout wrapper must survive the rewrite").toContain(
+      'className="flex min-h-screen flex-wrap"',
+    );
+    expect(index).not.toContain("<>");
+    const values = index.indexOf('nodeId="about.values"');
+    const placeholder = index.indexOf("<FailedSectionPlaceholder />");
+    const intro = index.indexOf('nodeId="about.intro"');
+    expect(values).toBeGreaterThan(-1);
+    expect(placeholder).toBeGreaterThan(values);
+    expect(intro).toBeGreaterThan(placeholder);
+  });
+
   it("keeps a failed-section placeholder in place — it carries no id to reorder by", () => {
     // about/index.tsx renders AboutIntro, then <FailedSectionPlaceholder />,
     // then AboutValues. The placeholder deliberately has no nodeId (pipeline

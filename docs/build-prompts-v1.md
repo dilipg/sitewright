@@ -277,7 +277,7 @@ COMMIT: "feat(5.1): intake + planner + plan approval"
 ```
 Read docs/agent-pipeline-spec-v1.md section 2.3, docs/codegen-contract-v1.md sections 3 and 4.1.
 
-Implement the two-step Design System Agent (tokens, then the full 15-primitive set) with per-step checkpoints. Primitive generation runs against static internal per-primitive specs (write these: props shape, variant unions, nodeId/className rules). Generated tokens flow through the milestone-1 deriver; generated primitives must pass gates and typecheck.
+Implement the two-step Design System Agent (tokens, then contract 4.1's full minimum primitive set: 15 at the time of this step; a 16th, `Notice`, was added in 7.4) with per-step checkpoints. Primitive generation runs against static internal per-primitive specs (write these: props shape, variant unions, nodeId/className rules). Generated tokens flow through the milestone-1 deriver; generated primitives must pass gates and typecheck.
 
 Then re-point the pipeline: generated tokens/primitives replace fixture context in page-agent prompts (fixture remains the compiler test bed, per build-plan stub table).
 

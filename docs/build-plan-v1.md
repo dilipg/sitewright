@@ -66,7 +66,7 @@ Exit criteria: ≥ 90% of overrides on conceptually-surviving elements reattach 
 
 ## Milestone 5: Full pipeline, narrow catalog (weeks 5 to 6)
 
-- Intake Agent, Site Planner (with user plan-approval UI), Design System Agent (replacing fixture tokens/primitives; full 15-primitive set), Shell Agent.
+- Intake Agent, Site Planner (with user plan-approval UI), Design System Agent (replacing fixture tokens/primitives; contract 4.1's full minimum primitive set — 15 at M5, plus `Notice` added in 7.4), Shell Agent.
 - Page fan-out with parallel workers, per-page sequential sections, crash-resume from checkpoints (kill -9 a worker mid-run as a test).
 - Archetype catalog cut for the skeleton phase: `hero`, `feature-grid`, `cta-band`, `pricing-tiers`, `faq-accordion`, `social-proof` (6 of 20). Landing + marketing page archetypes only.
 - Editor: infinite canvas with multiple frames, frame virtualization, remaining P0 edit channels (text, layout, visibility).

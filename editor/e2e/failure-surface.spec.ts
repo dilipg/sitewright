@@ -36,8 +36,12 @@ test("the rest of the page still renders around the failed section", async ({ pa
   // the sibling section is present and fully addressable — one section's
   // exhausted retries do not take the page (or the route) down with it
   await expect(about.locator('[data-node-id="about.intro"]')).toBeVisible();
-  await selectNode(page, "about.intro");
-  await expect(page.locator(".inspector-id")).toHaveText("about.intro");
+  // A leaf, not the section root: a root's centre is occupied by whichever
+  // child happens to sit there, so a plain centre-click selects the child
+  // (the reason invariant-cases.ts has selectViaCorner). What this test
+  // actually cares about is that the surviving section is addressable.
+  await selectNode(page, "about.intro.heading");
+  await expect(page.locator(".inspector-id")).toHaveText("about.intro.heading");
 });
 
 test("the placeholder carries no node id, so the editor offers no edits for it", async ({ page }) => {

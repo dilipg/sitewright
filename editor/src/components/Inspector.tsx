@@ -14,6 +14,9 @@ export interface InspectorProps {
   onCommit: (property: string, value: string) => void;
   hidden: boolean;
   onToggleVisibility: () => void;
+  /** Current src override on an Image node, when one is set (PRD 3.5). */
+  imageSrc?: string;
+  onCommitImageSrc: (src: string) => void;
 }
 
 export default function Inspector({
@@ -25,6 +28,8 @@ export default function Inspector({
   onCommit,
   hidden,
   onToggleVisibility,
+  imageSrc,
+  onCommitImageSrc,
 }: InspectorProps) {
   const styleEditable = node.editable.includes("style");
   const visibilityEditable = node.editable.includes("visibility");
@@ -46,6 +51,25 @@ export default function Inspector({
           </span>
         ))}
       </div>
+
+      {node.element === "Image" && (
+        <section className="control-section">
+          <h3 className="inspector-subheading">Image</h3>
+          {/* PRD 3.5: replacing a source is CONTENT, so it rides the text
+              channel with key "src" rather than a channel of its own. */}
+          <input
+            data-testid="image-src-input"
+            className="custom-input"
+            type="text"
+            defaultValue={imageSrc ?? ""}
+            placeholder="Image URL"
+            key={nodeId + ":" + (imageSrc ?? "")}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") onCommitImageSrc(event.currentTarget.value);
+            }}
+          />
+        </section>
+      )}
 
       {visibilityEditable && (
         <section className="control-section">

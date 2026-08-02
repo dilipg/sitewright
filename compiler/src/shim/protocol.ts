@@ -42,6 +42,10 @@ export interface NodeGeometry {
 export interface ShimOverride {
   nodeId: string;
   channel: "text" | "style" | "layout" | "visibility";
+  /** Text-channel only: which prop to rewrite. Absent means the node's
+   * text content; "src" is image replace (PRD 3.5), which is this channel
+   * rather than a new one because a source swap is content, not style. */
+  key?: string;
   value: unknown;
 }
 

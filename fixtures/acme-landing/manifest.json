@@ -946,6 +946,19 @@
         "visibility"
       ],
       "status": "active"
+    },
+    "about.intro.portrait": {
+      "route": "/about",
+      "file": "src/pages/about/sections/AboutIntro.tsx",
+      "component": "AboutIntro",
+      "element": "Image",
+      "editable": [
+        "text",
+        "style",
+        "layout",
+        "visibility"
+      ],
+      "status": "active"
     }
   }
 }

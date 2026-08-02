@@ -44,6 +44,19 @@ export interface OverrideEntry {
   nodeId: string;
   channel: "text" | "style" | "layout" | "visibility";
   value: unknown;
+  /**
+   * Which prop of the node the text override rewrites. Absent means the
+   * node's single text-bearing child (`<Heading>{headline}</Heading>`), which
+   * is every ordinary copy edit.
+   *
+   * Image replace (PRD 3.5) is deliberately NOT a new channel: it is this
+   * channel with `key: "src"` — "content, not style" — so an image swap
+   * compiles through the same mock-data rewrite as any other content edit,
+   * and needs no new compilation path, no new gate, and no new override kind.
+   * An Image is self-closing and has no text child, so the key is what tells
+   * the exporter to resolve the field from the `src` ATTRIBUTE instead.
+   */
+  key?: string;
   updatedAt?: string;
 }
 
@@ -642,6 +655,24 @@ function applyListItemTextOverride(
   changed.add(mockFile);
 }
 
+/**
+ * The expression bound to a named JSX attribute, e.g. `src={product.imageSrc}`
+ * -> the `product.imageSrc` node. Used by keyed text overrides (image replace,
+ * PRD 3.5) to find which mock-data field feeds an attribute.
+ */
+function attributeExpression(
+  element: JsxOpeningElement | JsxSelfClosingElement,
+  name: string,
+): import("ts-morph").Node | undefined {
+  for (const attribute of element.getAttributes()) {
+    const jsxAttribute = attribute.asKind(SyntaxKind.JsxAttribute);
+    if (jsxAttribute === undefined) continue;
+    if (jsxAttribute.getNameNode().getText() !== name) continue;
+    return jsxAttribute.getInitializer()?.asKind(SyntaxKind.JsxExpression)?.getExpression();
+  }
+  return undefined;
+}
+
 function applyTextOverride(
   project: Project,
   outDir: string,
@@ -659,22 +690,36 @@ function applyTextOverride(
     throw new ExportError(`No element carries data-node-id "${override.nodeId}"; cannot apply text override.`);
   }
 
-  const container = attached.isKind(SyntaxKind.JsxOpeningElement)
-    ? attached.getFirstAncestorByKind(SyntaxKind.JsxElement)
-    : undefined;
-  if (container === undefined) {
-    throw new ExportError(`Node "${override.nodeId}" has no JSX children; text overrides need a text-bearing child.`);
-  }
-
-  const expressions = container
-    .getJsxChildren()
-    .filter((child) => child.isKind(SyntaxKind.JsxExpression));
-  if (expressions.length !== 1) {
+  const keyedExpression =
+    override.key === undefined ? undefined : attributeExpression(attached, override.key);
+  if (override.key !== undefined && keyedExpression === undefined) {
     throw new ExportError(
-      `Node "${override.nodeId}" has ${expressions.length} child expressions; expected exactly one text-bearing prop (contract 7.1).`,
+      `Node "${override.nodeId}" has no "${override.key}" attribute bound to a prop; ` +
+        `a keyed text override rewrites the mock-data field feeding that attribute (PRD 3.5).`,
     );
   }
-  const inner = expressions[0]!.asKindOrThrow(SyntaxKind.JsxExpression).getExpression();
+
+  let inner: import("ts-morph").Node | undefined;
+  if (keyedExpression !== undefined) {
+    inner = keyedExpression;
+  } else {
+    const container = attached.isKind(SyntaxKind.JsxOpeningElement)
+      ? attached.getFirstAncestorByKind(SyntaxKind.JsxElement)
+      : undefined;
+    if (container === undefined) {
+      throw new ExportError(`Node "${override.nodeId}" has no JSX children; text overrides need a text-bearing child.`);
+    }
+
+    const expressions = container
+      .getJsxChildren()
+      .filter((child) => child.isKind(SyntaxKind.JsxExpression));
+    if (expressions.length !== 1) {
+      throw new ExportError(
+        `Node "${override.nodeId}" has ${expressions.length} child expressions; expected exactly one text-bearing prop (contract 7.1).`,
+      );
+    }
+    inner = expressions[0]!.asKindOrThrow(SyntaxKind.JsxExpression).getExpression();
+  }
   const propPath = expressionToPath(inner?.getText() ?? "");
   if (propPath === undefined) {
     throw new ExportError(

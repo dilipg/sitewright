@@ -33,6 +33,7 @@ import {
   applyLayoutProperty,
   applyStyleProperty,
   applyTextValue,
+  isKeyedTextValue,
   applyVisibility,
   currentSnapshot,
   fromOverrideFile,
@@ -97,6 +98,10 @@ function expandForShim(map: OverridesMap, manifest: Manifest | null): ShimOverri
           channel,
           value: expandStyleValue(value as Record<string, unknown>, element),
         });
+      } else if (channel === "text" && isKeyedTextValue(value)) {
+        // image replace (PRD 3.5): the key tells the shim to set that
+        // attribute rather than the node's text content
+        overrides.push({ nodeId, channel: "text", key: value.key, value: value.value });
       } else {
         overrides.push({ nodeId, channel: channel as ShimOverride["channel"], value });
       }
@@ -703,6 +708,12 @@ export default function App() {
     });
   }
 
+  /** Image replace (PRD 3.5): a text override keyed to the src attribute. */
+  function commitImageSrc(src: string) {
+    if (selectedId === undefined) return;
+    setHistory((h) => (h === null ? h : pushHistory(h, applyTextValue(currentSnapshot(h), selectedId, src, "src"))));
+  }
+
   async function approvePlan() {
     await fetch(`${PREVIEW_URL}/__plan/approve`, { method: "POST" });
     setPendingPlan(null);
@@ -1084,6 +1095,12 @@ export default function App() {
               styleValue={selectedStyle}
               onCommit={commitStyle}
               hidden={selectedHidden}
+              imageSrc={
+                isKeyedTextValue(map[selectedId]?.text)
+                  ? (map[selectedId]!.text as { key: string; value: string }).value
+                  : undefined
+              }
+              onCommitImageSrc={commitImageSrc}
               onToggleVisibility={toggleVisibility}
             />
           ) : (

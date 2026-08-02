@@ -44,8 +44,30 @@ const exportShots = new Map<string, Buffer>();
 // screenshot a child instead of the styled section root) is guaranteed to
 // land in the shim's injected stylesheet once overrides have actually
 // applied, so waiting for that substring is a real condition, not a guess.
-const ROUTE_PATHS: Record<string, string> = { home: "/", support: "/support" };
-const ROUTE_READY_MARKER: Record<string, string> = { home: "home.hero", support: "support.contact-form" };
+const ROUTE_PATHS: Record<string, string> = { home: "/", about: "/about", support: "/support" };
+/**
+ * How to know a route's overrides have actually applied before screenshotting.
+ *
+ * A style/layout override lands in the shim's injected stylesheet, so waiting
+ * for the node id to appear there is a real condition. A route whose only
+ * override is TEXT-channel injects no stylesheet at all — "about" carries just
+ * the image-replace case (PRD 3.5: image replace IS the text channel) — so it
+ * waits on the DOM effect itself instead.
+ */
+type ReadyCheck =
+  | { kind: "stylesheet"; marker: string }
+  | { kind: "attribute"; selector: string; attribute: string; startsWith: string };
+
+const ROUTE_READY: Record<string, ReadyCheck> = {
+  home: { kind: "stylesheet", marker: "home.hero" },
+  about: {
+    kind: "attribute",
+    selector: '[data-node-id="about.intro.portrait"]',
+    attribute: "src",
+    startsWith: "data:image/svg+xml",
+  },
+  support: { kind: "stylesheet", marker: "support.contact-form" },
+};
 
 function routeSlugOf(nodeId: string): string {
   return nodeId.split(".")[0]!;
@@ -93,8 +115,8 @@ test("apply all invariant-case edits in the editor and capture preview nodes", a
   for (const [slug, cases] of casesByRoute()) {
     const routePath = ROUTE_PATHS[slug];
     if (routePath === undefined) throw new Error(`invariant-cases.ts: no ROUTE_PATHS entry for route "${slug}"`);
-    const readyMarker = ROUTE_READY_MARKER[slug];
-    if (readyMarker === undefined) throw new Error(`invariant-cases.ts: no ROUTE_READY_MARKER entry for route "${slug}"`);
+    const readyCheck = ROUTE_READY[slug];
+    if (readyCheck === undefined) throw new Error(`invariant-cases.ts: no ROUTE_READY entry for route "${slug}"`);
 
     const overrideFile = JSON.parse(
       readFileSync(join(projectDir, "overrides", `${slug}.overrides.json`), "utf8"),
@@ -111,8 +133,14 @@ test("apply all invariant-case edits in the editor and capture preview nodes", a
       window.postMessage({ type: "overrides:apply", protocolVersion: 1, overrides }, "*");
     }, overrideFile.overrides);
     await previewPage.waitForFunction(
-      (marker) => document.querySelector("style[data-wg-shim]")?.textContent?.includes(marker),
-      readyMarker,
+      (check) =>
+        check.kind === "stylesheet"
+          ? document.querySelector("style[data-wg-shim]")?.textContent?.includes(check.marker) === true
+          : document
+              .querySelector(check.selector)
+              ?.getAttribute(check.attribute)
+              ?.startsWith(check.startsWith) === true,
+      readyCheck,
     );
 
     for (const invariantCase of cases) {

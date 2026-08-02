@@ -429,3 +429,74 @@ describe("export CLI argument handling", () => {
     expect(result.stderr).toContain("Usage:");
   });
 });
+
+describe("exportProject: image replace (PRD 3.5, milestone 7.7)", () => {
+  it("rewrites the mock-data field feeding the src attribute, not the JSX", () => {
+    const source = fixtureCopyWithOverrides([]);
+    writeFileSync(
+      join(source, "overrides", "about.overrides.json"),
+      JSON.stringify({
+        version: 1,
+        route: "/about",
+        overrides: [
+          {
+            nodeId: "about.intro.portrait",
+            channel: "text",
+            key: "src",
+            value: "https://cdn.example.com/new-portrait.jpg",
+          },
+        ],
+      }),
+    );
+    const outDir = join(tempDir("export-image-"), "export");
+    exportProject(source, { outDir, skipBuild: true });
+
+    // the swap lands in mock data — the props seam is preserved
+    const mock = readOut(outDir, "src/pages/about/mock/AboutIntro.data.ts");
+    expect(mock).toContain("https://cdn.example.com/new-portrait.jpg");
+    expect(mock).not.toContain("images.acme.example/team/founders.jpg");
+
+    // ...and the component still reads it through the prop, untouched
+    const section = readOut(outDir, "src/pages/about/sections/AboutIntro.tsx");
+    expect(section).toContain("src={portraitSrc}");
+    expect(section).not.toContain("cdn.example.com");
+  });
+
+  it("leaves the node's text alone — a keyed override is not a copy edit", () => {
+    const source = fixtureCopyWithOverrides([]);
+    writeFileSync(
+      join(source, "overrides", "about.overrides.json"),
+      JSON.stringify({
+        version: 1,
+        route: "/about",
+        overrides: [
+          { nodeId: "about.intro.portrait", channel: "text", key: "alt", value: "A new caption" },
+        ],
+      }),
+    );
+    const outDir = join(tempDir("export-image-alt-"), "export");
+    exportProject(source, { outDir, skipBuild: true });
+
+    const mock = readOut(outDir, "src/pages/about/mock/AboutIntro.data.ts");
+    expect(mock).toContain('portraitAlt: "A new caption"');
+    // the sibling src field is untouched
+    expect(mock).toContain("images.acme.example/team/founders.jpg");
+  });
+
+  it("fails loudly when the named attribute is not bound to a prop", () => {
+    const source = fixtureCopyWithOverrides([]);
+    writeFileSync(
+      join(source, "overrides", "about.overrides.json"),
+      JSON.stringify({
+        version: 1,
+        route: "/about",
+        overrides: [
+          { nodeId: "about.intro.portrait", channel: "text", key: "nope", value: "x" },
+        ],
+      }),
+    );
+    const outDir = join(tempDir("export-image-bad-"), "export");
+    expect(() => exportProject(source, { outDir, skipBuild: true })).toThrow(/no "nope" attribute/);
+    expect(existsSync(outDir)).toBe(false);
+  });
+});

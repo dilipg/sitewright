@@ -146,7 +146,19 @@ function applyOverrides(overrides: ShimOverride[]): void {
 function applyTextOverrides(overrides: ShimOverride[]): void {
   const textByNode = new Map<string, string>();
   for (const override of overrides) {
-    if (override.channel === "text") textByNode.set(override.nodeId, String(override.value));
+    if (override.channel !== "text") continue;
+    if (override.key !== undefined) {
+      // Keyed text override = image replace (PRD 3.5): rewrite the named
+      // attribute instead of the node's text. Kept out of textByNode so the
+      // restore pass below never clobbers this element's textContent.
+      const target = document.querySelector(`[data-node-id="${override.nodeId}"]`);
+      if (target !== null) {
+        const next = String(override.value);
+        if (target.getAttribute(override.key) !== next) target.setAttribute(override.key, next);
+      }
+      continue;
+    }
+    textByNode.set(override.nodeId, String(override.value));
   }
   for (const [element, original] of originalTexts) {
     const nodeId = element.getAttribute("data-node-id");

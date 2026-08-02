@@ -11,6 +11,8 @@ export type OverridesMap = Record<string, Partial<Record<Channel, unknown>>>;
 export interface OverrideFileEntry {
   nodeId: string;
   channel: Channel;
+  /** Text channel only: which prop to rewrite (PRD 3.5 image replace). */
+  key?: string;
   value: unknown;
   updatedAt: string;
 }
@@ -32,9 +34,31 @@ export function applyStyleProperty(
   return { ...map, [nodeId]: { ...nodeChannels, style } };
 }
 
-export function applyTextValue(map: OverridesMap, nodeId: string, value: string): OverridesMap {
+/**
+ * A keyed text value: image replace (PRD 3.5) is the TEXT channel with
+ * `key: "src"` — "content, not style" — so it rides the same channel rather
+ * than inventing one. Stored as an object so the key survives persistence
+ * and reaches the exporter, which uses it to rewrite the mock-data field
+ * feeding that attribute instead of the node's text content.
+ */
+export interface KeyedTextValue {
+  key: string;
+  value: string;
+}
+
+export function isKeyedTextValue(value: unknown): value is KeyedTextValue {
+  return typeof value === "object" && value !== null && "key" in value && "value" in value;
+}
+
+export function applyTextValue(
+  map: OverridesMap,
+  nodeId: string,
+  value: string,
+  key?: string,
+): OverridesMap {
   const nodeChannels = map[nodeId] ?? {};
-  return { ...map, [nodeId]: { ...nodeChannels, text: value } };
+  const next = key === undefined ? value : ({ key, value } satisfies KeyedTextValue);
+  return { ...map, [nodeId]: { ...nodeChannels, text: next } };
 }
 
 /** Size/position deltas from drag/resize gestures (contract 6.1) — same shape as style, distinct channel key. */
@@ -67,9 +91,12 @@ export function toOverrideFile(map: OverridesMap, route: string): OverrideFileJs
   const overrides: OverrideFileEntry[] = [];
   for (const [nodeId, channels] of Object.entries(map)) {
     for (const [channel, value] of Object.entries(channels)) {
-      if (value !== undefined) {
-        overrides.push({ nodeId, channel: channel as Channel, value, updatedAt });
+      if (value === undefined) continue;
+      if (channel === "text" && isKeyedTextValue(value)) {
+        overrides.push({ nodeId, channel: "text", key: value.key, value: value.value, updatedAt });
+        continue;
       }
+      overrides.push({ nodeId, channel: channel as Channel, value, updatedAt });
     }
   }
   return { version: 1, route, overrides };
@@ -78,7 +105,11 @@ export function toOverrideFile(map: OverridesMap, route: string): OverrideFileJs
 export function fromOverrideFile(file: OverrideFileJson): OverridesMap {
   const map: OverridesMap = {};
   for (const entry of file.overrides) {
-    map[entry.nodeId] = { ...map[entry.nodeId], [entry.channel]: entry.value };
+    const value =
+      entry.channel === "text" && entry.key !== undefined
+        ? ({ key: entry.key, value: String(entry.value) } satisfies KeyedTextValue)
+        : entry.value;
+    map[entry.nodeId] = { ...map[entry.nodeId], [entry.channel]: value };
   }
   return map;
 }

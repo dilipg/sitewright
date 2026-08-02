@@ -72,6 +72,11 @@ function applyVisibilityToggle(nodeId: string) {
   };
 }
 
+/** A tiny inline SVG: no network, deterministic bytes, and it renders at a
+ * fixed size so the pixel-diff compares like for like. */
+const REPLACEMENT_IMAGE =
+  "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='200' height='200'><rect width='200' height='200' fill='%234f46e5'/></svg>";
+
 /** Style channel: background swatch — same control regardless of archetype. */
 function applyStyleSwatch(nodeId: string) {
   return async (page: Page) => {
@@ -80,7 +85,15 @@ function applyStyleSwatch(nodeId: string) {
   };
 }
 
-/** Canvas virtualization (PRD risk 2): a route frame renders a placeholder,
+/** Pans right until the named route's frame leaves virtualization and mounts.
+ *
+ * Target-seeking rather than a fixed delta: cases run in one continuous
+ * session and several of them pan the stage as a side effect (layout drags do
+ * it invisibly; the image case pans deliberately), so any fixed offset is
+ * correct only for whichever case happens to run first. Overshooting is as
+ * fatal as undershooting — the frame leaves range on the other side.
+ *
+ * Canvas virtualization (PRD risk 2): a route frame renders a placeholder,
  * not a live iframe, until it's within a render-ahead margin of the
  * viewport (canvas.spec.ts's "narrow viewport" test exercises this same
  * mechanism directly) — this suite's home/about routes always start near
@@ -101,9 +114,18 @@ function applyStyleSwatch(nodeId: string) {
  * cross-origin iframe afterward, which silently swallows the wheel event
  * (it doesn't bubble to the stage) rather than erroring — the gap position
  * is immune to this because no frame ever occupies that column, at any Y. */
-async function panStageLeft(page: Page, deltaX: number): Promise<void> {
-  await page.mouse.move(1360, 400);
-  await page.mouse.wheel(deltaX, 0);
+async function panUntilFrameMounted(page: Page, slug: string): Promise<void> {
+  const frame = page.locator(`iframe[title="preview-${slug}"]`);
+  for (let step = 0; step < 12; step += 1) {
+    if ((await frame.count()) > 0) return;
+    // Dispatched straight at the stage rather than via mouse position:
+    // hit-testing is unreliable here because earlier cases move frames
+    // around, so any fixed screen point can end up inside a live
+    // cross-origin iframe, which swallows the wheel without erroring.
+    await page.getByTestId("canvas-stage").dispatchEvent("wheel", { deltaX: 400, deltaY: 0 });
+    await page.waitForTimeout(60);
+  }
+  throw new Error(`frame "${slug}" never entered virtualization range`);
 }
 
 export const INVARIANT_CASES: InvariantCase[] = [
@@ -331,6 +353,22 @@ export const INVARIANT_CASES: InvariantCase[] = [
   // archetype in this suite — Input/Textarea primitives, a typed onSubmit
   // handler prop, and a real <form> wrapper none of the original 6
   // archetypes exercise) ----------
+  // ---------- image replace (7.7, PRD 3.5) ----------
+  {
+    // The image swap is a TEXT override with key "src" (PRD 3.5: content, not
+    // style), so this case also proves the keyed variant of the text channel
+    // survives compilation. Screenshots the image itself: its rendered box is
+    // exactly what an image swap must keep identical between preview and export.
+    name: "text(src): image replace on an Image node",
+    screenshotNode: "about.intro.portrait",
+    apply: async (page) => {
+      await panUntilFrameMounted(page, "about");
+      await selectViaCorner(page, "about.intro.portrait");
+      await page.getByTestId("image-src-input").fill(REPLACEMENT_IMAGE);
+      await page.getByTestId("image-src-input").press("Enter");
+    },
+  },
+
   {
     // Screenshots the heading, not "support.contact-form" itself: this
     // suite's visibility case below hides the submit button — still
@@ -344,7 +382,7 @@ export const INVARIANT_CASES: InvariantCase[] = [
     name: "style: background swatch on the contact-form section root",
     screenshotNode: "support.contact-form.heading",
     apply: async (page) => {
-      await panStageLeft(page, 1500);
+      await panUntilFrameMounted(page, "support");
       await applyStyleSwatch("support.contact-form")(page);
     },
   },

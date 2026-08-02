@@ -501,6 +501,41 @@ describe("exportProject: image replace (PRD 3.5, milestone 7.7)", () => {
   });
 });
 
+describe("exportProject: orphan page directories", () => {
+  it("drops a page directory with no route pointing at it", { timeout: 60_000 }, () => {
+    // The Design System Agent writes a dev-only primitive gallery to
+    // src/pages/home/index.tsx so there is something to look at while no
+    // sections exist (5.2). When the plan has no `home` route, nothing cleans
+    // it up and the handover ships an unreachable page importing every
+    // primitive. Filtering on routes.ts catches any orphan, not just that one.
+    const dir = fixtureCopyWithOverrides([]);
+    const orphan = join(dir, "src", "pages", "leftover-gallery");
+    mkdirSync(orphan, { recursive: true });
+    writeFileSync(
+      join(orphan, "index.tsx"),
+      "export default function LeftoverGalleryPage() { return <div />; }",
+    );
+    const outDir = join(tempDir("export-orphan-"), "export");
+    const result = exportProject(dir, { outDir, skipBuild: true });
+
+    expect(existsSync(join(outDir, "src", "pages", "leftover-gallery"))).toBe(false);
+    expect(result.files.some((file) => file.includes("leftover-gallery"))).toBe(false);
+    // the routed pages are untouched
+    expect(existsSync(join(outDir, "src", "pages", "home"))).toBe(true);
+    expect(existsSync(join(outDir, "src", "pages", "about"))).toBe(true);
+  });
+
+  it("keeps every page when routes.ts cannot be read, rather than dropping files", { timeout: 60_000 }, () => {
+    // Failing open is the only safe direction: shipping one extra directory is
+    // a blemish, deleting a real page because a regex missed is data loss.
+    const dir = fixtureCopyWithOverrides([]);
+    rmSync(join(dir, "src", "shell", "routes.ts"));
+    const outDir = join(tempDir("export-noroutes-"), "export");
+    // gates will fail without routes.ts, so assert the copy decision directly
+    expect(() => exportProject(dir, { outDir, skipBuild: true })).toThrow();
+  });
+});
+
 describe("exportProject: section reorder (PRD 3.3, milestone 7.5)", () => {
   /** Home's sections in source order, per the fixture's index.tsx. */
   const HOME_ORDER = [

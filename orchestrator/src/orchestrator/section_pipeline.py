@@ -189,8 +189,18 @@ def prepare_workspace_dir(project_dir: str, routes: list[dict] | None = None) ->
     (target / "manifest.json").write_text(
         json.dumps({"version": 1, "nodes": {}}, indent=2) + "\n", encoding="utf-8"
     )
+    # Wiped wholesale, for the same reason src/pages/ is: the fixture ships
+    # override files for ITS routes (about, support), and only adding the
+    # planned ones left those behind — stale files naming routes that do not
+    # exist in this site, which then shipped into the export. The docstring
+    # above already promised no caller inherits a stray fixture page; overrides
+    # were simply missed.
+    overrides_dir = target / "overrides"
+    if overrides_dir.exists():
+        shutil.rmtree(overrides_dir)
+    overrides_dir.mkdir(parents=True, exist_ok=True)
     for route in resolved_routes:
-        (target / "overrides" / f"{route['slug']}.overrides.json").write_text(
+        (overrides_dir / f"{route['slug']}.overrides.json").write_text(
             json.dumps({"version": 1, "route": route["path"], "overrides": []}, indent=2) + "\n",
             encoding="utf-8",
         )

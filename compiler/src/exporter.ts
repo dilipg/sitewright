@@ -184,12 +184,14 @@ export function exportProject(projectDir: string, options: ExportOptions): Expor
   validateOverrides(overrides, manifest);
 
   mkdirSync(dirname(outDir), { recursive: true });
+  const routedSlugs = routeSlugsOf(projectRoot);
   cpSync(projectRoot, outDir, {
     recursive: true,
     filter: (src) => {
       const rel = relative(projectRoot, src);
       if (rel === "") return true;
-      return !COPY_SKIP.has(rel.split(sep)[0]!);
+      if (COPY_SKIP.has(rel.split(sep)[0]!)) return false;
+      return !isOrphanPage(rel, routedSlugs);
     },
   });
 
@@ -280,6 +282,38 @@ function archiveOverrides(projectRoot: string, outDir: string): void {
 }
 
 /** Every file that goes into the handover package, repo-relative, forward slashes, sorted. */
+/**
+ * Route slugs from the project's own routes.ts — the ground-truth route table
+ * (contract section 2). Returns undefined if it cannot be read, which means
+ * "do not filter": dropping files on a parse failure would be far worse than
+ * shipping one extra directory.
+ */
+function routeSlugsOf(projectRoot: string): Set<string> | undefined {
+  const routesPath = join(projectRoot, "src", "shell", "routes.ts");
+  if (!existsSync(routesPath)) return undefined;
+  const source = readFileSync(routesPath, "utf8");
+  const slugs = new Set([...source.matchAll(/slug:\s*"([^"]+)"/g)].map((match) => match[1]!));
+  return slugs.size > 0 ? slugs : undefined;
+}
+
+/**
+ * A page directory with no route pointing at it — unreachable code in a
+ * deliverable.
+ *
+ * The case that surfaced this: the Design System Agent writes a dev-only
+ * primitive gallery to src/pages/home/index.tsx so there is something to look
+ * at while no sections exist yet (5.2). When the plan turns out to have no
+ * `home` route, nothing ever cleans it up, and the handover zip ships an
+ * unreachable page importing every primitive. Filtering on routes.ts rather
+ * than special-casing the gallery catches any orphan, whatever produced it.
+ */
+function isOrphanPage(rel: string, routedSlugs: Set<string> | undefined): boolean {
+  if (routedSlugs === undefined) return false;
+  const parts = rel.split(sep);
+  if (parts.length < 3 || parts[0] !== "src" || parts[1] !== "pages") return false;
+  return !routedSlugs.has(parts[2]!);
+}
+
 function packagedFiles(outDir: string): string[] {
   const found: string[] = [];
   const walk = (dir: string, prefix: string): void => {

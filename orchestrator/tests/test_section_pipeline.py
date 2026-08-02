@@ -368,3 +368,27 @@ def test_both_page_assemblers_emit_a_parseable_component_name(route_slug: str) -
         # the actual defect: a hyphen anywhere in the identifier
         declaration = next(l for l in source.splitlines() if l.startswith("export default function"))
         assert "-" not in declaration, declaration
+
+
+def test_workspace_prep_drops_fixture_override_files_for_unplanned_routes(tmp_path: Path) -> None:
+    """src/pages/ is wiped wholesale so no caller inherits a stray fixture page.
+    overrides/ was only ADDED to, so the fixture's own override files (about,
+    support) survived into every generated project — stale files naming routes
+    that do not exist in that site, which then shipped in the export."""
+    project = tmp_path / "run"
+    prepare_workspace_dir(str(project), [{"slug": "builder", "path": "/"}])
+
+    present = {p.name for p in (project / "overrides").iterdir()}
+    assert present == {"builder.overrides.json"}, (
+        f"fixture override files leaked into the workspace: {sorted(present)}"
+    )
+
+
+def test_workspace_prep_scaffolds_an_empty_override_file_per_planned_route(tmp_path: Path) -> None:
+    project = tmp_path / "run"
+    prepare_workspace_dir(
+        str(project), [{"slug": "builder", "path": "/"}, {"slug": "submissions", "path": "/s"}]
+    )
+    for slug, path in (("builder", "/"), ("submissions", "/s")):
+        data = json.loads((project / "overrides" / f"{slug}.overrides.json").read_text(encoding="utf-8"))
+        assert data == {"version": 1, "route": path, "overrides": []}

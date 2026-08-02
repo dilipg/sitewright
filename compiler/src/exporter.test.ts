@@ -500,3 +500,96 @@ describe("exportProject: image replace (PRD 3.5, milestone 7.7)", () => {
     expect(existsSync(outDir)).toBe(false);
   });
 });
+
+describe("exportProject: section reorder (PRD 3.3, milestone 7.5)", () => {
+  /** Home's sections in source order, per the fixture's index.tsx. */
+  const HOME_ORDER = [
+    "home.hero",
+    "home.capabilities",
+    "home.pricing",
+    "home.testimonials",
+    "home.faq",
+    "home.cta-band",
+  ];
+
+  function withSectionOrder(order: string[]): string {
+    const dir = fixtureCopyWithOverrides([]);
+    writeFileSync(
+      join(dir, "overrides", "home.overrides.json"),
+      JSON.stringify({
+        version: 1,
+        route: "/",
+        overrides: [{ nodeId: "home", channel: "sectionOrder", value: order }],
+      }),
+    );
+    return dir;
+  }
+
+  function renderedOrder(indexSource: string): string[] {
+    return [...indexSource.matchAll(/nodeId="([^"]+)"/g)].map((match) => match[1]!);
+  }
+
+  it("reorders the page's JSX children, not the DOM", () => {
+    const moved = [HOME_ORDER[5]!, ...HOME_ORDER.slice(0, 5)]; // cta-band to the top
+    const outDir = join(tempDir("export-reorder-"), "export");
+    exportProject(withSectionOrder(moved), { outDir, skipBuild: true });
+
+    const index = readOut(outDir, "src/pages/home/index.tsx");
+    expect(renderedOrder(index)).toEqual(moved);
+    // every section still renders exactly once, with its data spread intact
+    for (const id of HOME_ORDER) expect(index).toContain(`nodeId="${id}"`);
+    expect(index).toContain("{...heroData}");
+  });
+
+  it("is a no-op when the order matches the source", () => {
+    const outDir = join(tempDir("export-reorder-noop-"), "export");
+    exportProject(withSectionOrder(HOME_ORDER), { outDir, skipBuild: true });
+    expect(renderedOrder(readOut(outDir, "src/pages/home/index.tsx"))).toEqual(HOME_ORDER);
+  });
+
+  it("refuses an order that omits a section rather than dropping it", () => {
+    // Silent content loss is the failure mode this project exists to prevent.
+    const outDir = join(tempDir("export-reorder-partial-"), "export");
+    expect(() => exportProject(withSectionOrder(HOME_ORDER.slice(0, 3)), { outDir, skipBuild: true })).toThrow(
+      /omits .*a reorder must list every section/s,
+    );
+    expect(existsSync(outDir)).toBe(false);
+  });
+
+  it("refuses an unknown section id", () => {
+    const outDir = join(tempDir("export-reorder-unknown-"), "export");
+    expect(() =>
+      exportProject(withSectionOrder([...HOME_ORDER, "home.does-not-exist"]), { outDir, skipBuild: true }),
+    ).toThrow(/not an active section/);
+    expect(existsSync(outDir)).toBe(false);
+  });
+
+  it("refuses a duplicated section id", () => {
+    const outDir = join(tempDir("export-reorder-dupe-"), "export");
+    expect(() =>
+      exportProject(withSectionOrder([HOME_ORDER[0]!, ...HOME_ORDER]), { outDir, skipBuild: true }),
+    ).toThrow(/more than once/);
+    expect(existsSync(outDir)).toBe(false);
+  });
+
+  it("keeps a failed-section placeholder in place — it carries no id to reorder by", () => {
+    // about/index.tsx renders AboutIntro + <FailedSectionPlaceholder />; the
+    // placeholder deliberately has no nodeId (pipeline 5.4), so a reorder must
+    // neither drop it nor try to position it.
+    const dir = fixtureCopyWithOverrides([]);
+    writeFileSync(
+      join(dir, "overrides", "about.overrides.json"),
+      JSON.stringify({
+        version: 1,
+        route: "/about",
+        overrides: [{ nodeId: "about", channel: "sectionOrder", value: ["about.intro"] }],
+      }),
+    );
+    const outDir = join(tempDir("export-reorder-placeholder-"), "export");
+    exportProject(dir, { outDir, skipBuild: true });
+
+    const index = readOut(outDir, "src/pages/about/index.tsx");
+    expect(index).toContain("<FailedSectionPlaceholder />");
+    expect(index).toContain('nodeId="about.intro"');
+  });
+});

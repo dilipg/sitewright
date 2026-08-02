@@ -42,7 +42,7 @@ import { createZip } from "./zip.ts";
 
 export interface OverrideEntry {
   nodeId: string;
-  channel: "text" | "style" | "layout" | "visibility";
+  channel: "text" | "style" | "layout" | "visibility" | "sectionOrder";
   value: unknown;
   /**
    * Which prop of the node the text override rewrites. Absent means the
@@ -314,8 +314,54 @@ function readManifest(projectRoot: string): Manifest {
   return JSON.parse(readFileSync(manifestPath, "utf8")) as Manifest;
 }
 
+/**
+ * A page-level reorder (PRD 3.3). Deliberately strict: a partial or unknown
+ * list would silently drop a section from the exported page, which is the
+ * kind of silent content loss this project's whole override design exists to
+ * prevent — so it names exactly what is wrong instead.
+ */
+function validateSectionOrder(override: OverrideEntry, manifest: Manifest): void {
+  const route = override.nodeId;
+  if (!Array.isArray(override.value) || override.value.some((id) => typeof id !== "string")) {
+    throw new ExportError(`sectionOrder for route "${route}" must be an array of section ids.`);
+  }
+  const order = override.value as string[];
+
+  const sectionsOnRoute = new Set(
+    Object.entries(manifest.nodes)
+      .filter(([id, node]) => node.status === "active" && id.split(".").length === 2 && id.startsWith(`${route}.`))
+      .map(([id]) => id),
+  );
+
+  const unknown = order.filter((id) => !sectionsOnRoute.has(id));
+  if (unknown.length > 0) {
+    throw new ExportError(
+      `sectionOrder for route "${route}" names ${unknown.map((id) => `"${id}"`).join(", ")}, ` +
+        `which ${unknown.length === 1 ? "is not an active section" : "are not active sections"} on that route.`,
+    );
+  }
+  if (new Set(order).size !== order.length) {
+    throw new ExportError(`sectionOrder for route "${route}" lists the same section more than once.`);
+  }
+  const missing = [...sectionsOnRoute].filter((id) => !order.includes(id)).sort();
+  if (missing.length > 0) {
+    throw new ExportError(
+      `sectionOrder for route "${route}" omits ${missing.map((id) => `"${id}"`).join(", ")}; ` +
+        "a reorder must list every section on the route, or the omitted ones would vanish from the export.",
+    );
+  }
+}
+
 function validateOverrides(overrides: OverrideEntry[], manifest: Manifest): void {
   for (const override of overrides) {
+    // sectionOrder is the one PAGE-level override (PRD 3.3): it reorders a
+    // route's sections in its index.tsx, so its "nodeId" is a route slug and
+    // there is deliberately no manifest node to look up. Its value is a list
+    // of section-root ids, each of which IS a node and is checked as such.
+    if (override.channel === "sectionOrder") {
+      validateSectionOrder(override, manifest);
+      continue;
+    }
     const node = manifest.nodes[override.nodeId];
     if (node === undefined || node.status !== "active") {
       throw new ExportError(
@@ -359,6 +405,11 @@ function applyOverrides(outDir: string, overrides: OverrideEntry[], manifest: Ma
     if (override.value === false) continue;
     const removedFromSource = removeElement(project, outDir, override.nodeId, manifest.nodes[override.nodeId]!, changed);
     if (removedFromSource) tombstoned.push(override.nodeId);
+  }
+  // Last: reordering rewrites the page's index.tsx wholesale, so it must run
+  // after any visibility removal has already taken its section out.
+  for (const override of byChannel("sectionOrder")) {
+    applySectionOrder(project, outDir, override.nodeId, override.value as string[], changed);
   }
 
   for (const sourceFile of changed) sourceFile.saveSync();
@@ -671,6 +722,66 @@ function attributeExpression(
     return jsxAttribute.getInitializer()?.asKind(SyntaxKind.JsxExpression)?.getExpression();
   }
   return undefined;
+}
+
+/**
+ * Page-level reorder (PRD 3.3): "Reordering sections within a page is P1 and
+ * is expressed as an index.tsx-level override (`sectionOrder` array in the
+ * route's override file), NOT a DOM operation."
+ *
+ * So this reorders the JSX children of the page's returned fragment, matching
+ * each child to a section id by its literal `nodeId` attribute. Anything
+ * without one — a FailedSectionPlaceholder, which deliberately carries no id
+ * (pipeline 5.4) — keeps its position relative to the sections around it
+ * rather than being dropped or shuffled to an end.
+ */
+function applySectionOrder(
+  project: Project,
+  outDir: string,
+  routeSlug: string,
+  order: string[],
+  changed: Set<SourceFile>,
+): void {
+  const indexPath = join(outDir, "src", "pages", routeSlug, "index.tsx").replace(/\\/g, "/");
+  const indexFile = project.getSourceFile(indexPath);
+  if (indexFile === undefined) {
+    throw new ExportError(`Cannot reorder route "${routeSlug}": ${indexPath} not found.`);
+  }
+
+  const fragment = indexFile.getFirstDescendantByKind(SyntaxKind.JsxFragment);
+  if (fragment === undefined) {
+    throw new ExportError(
+      `Cannot reorder route "${routeSlug}": its page renders a single element, not a list of sections.`,
+    );
+  }
+
+  const children = fragment
+    .getJsxChildren()
+    .filter((child) => child.getText().trim() !== "");
+  const idOf = (text: string): string | undefined =>
+    /nodeId="([^"]+)"/.exec(text)?.[1];
+
+  const sectionChildren = children.filter((child) => idOf(child.getText()) !== undefined);
+  const byId = new Map(sectionChildren.map((child) => [idOf(child.getText())!, child.getText()]));
+
+  // Walk the original slots, replacing each section slot with the next id in
+  // the requested order and leaving id-less children (placeholders) untouched.
+  let next = 0;
+  const rewritten = children.map((child) => {
+    if (idOf(child.getText()) === undefined) return child.getText();
+    const id = order[next];
+    next += 1;
+    const replacement = id === undefined ? undefined : byId.get(id);
+    if (replacement === undefined) {
+      throw new ExportError(
+        `Cannot reorder route "${routeSlug}": no rendered section carries nodeId "${String(id)}".`,
+      );
+    }
+    return replacement;
+  });
+
+  fragment.replaceWithText(`<>\n      ${rewritten.map((text) => text.trim()).join("\n      ")}\n    </>`);
+  changed.add(indexFile);
 }
 
 function applyTextOverride(

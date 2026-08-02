@@ -385,6 +385,12 @@ Candidates in likely order: add-a-section (PRD 4.1), section reorder (PRD 3.3 se
 
 ### Pull order (set 2026-07-30, by observed need)
 
+**Numbers are identifiers, not sequence.** They were assigned when each item
+was pulled; the prompts below are appended in the order they were actually
+EXECUTED (7.1-7.4, then 7.8, 7.7, 7.5, 7.9, 7.6), because this file is the
+sequence of record and commit messages reference the numbers. Correctness work
+went first, then the P1 features cheapest-blast-radius first.
+
 Correctness before features, per the milestone-7 instruction to pull by observed
 need rather than list order. Items 1-4 come from docs/reports/ and decisions.md;
 items 5-9 are the PRD P1 list itself.

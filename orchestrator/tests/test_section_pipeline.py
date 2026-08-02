@@ -4,6 +4,8 @@ index assembly, failure-report formatting, retry-prompt construction."""
 import json
 from pathlib import Path
 
+import pytest
+
 from orchestrator.section_pipeline import (
     assemble_page_index_source,
     build_index_source,
@@ -333,3 +335,36 @@ def test_validate_section_meta_fails_when_slug_or_component_is_missing() -> None
     model_result = {"data": {"sectionMeta": {"summary": "x"}}}
     failure = validate_section_meta(model_result)
     assert failure != ""
+
+
+def test_a_two_word_route_slug_yields_a_valid_component_identifier() -> None:
+    """`"public-form".capitalize()` is `"Public-form"`, so page assembly emitted
+    `export default function Public-formPage()` — a syntax error, not a naming
+    wart. It survived every milestone because every route ever planned happened
+    to be one word (home, shop, product, about, support); the first acceptance
+    run to plan a two-word route died at gate 1 with all three page workers
+    reporting exit 0. Route slugs are kebab-case by contract, so a hyphen is the
+    general case."""
+    from orchestrator.section_pipeline import page_component_name
+
+    assert page_component_name("home") == "Home"
+    assert page_component_name("public-form") == "PublicForm"
+    assert page_component_name("submission-detail-view") == "SubmissionDetailView"
+
+
+@pytest.mark.parametrize("route_slug", ["home", "public-form", "submission-detail-view"])
+def test_both_page_assemblers_emit_a_parseable_component_name(route_slug: str) -> None:
+    """Covers BOTH assemblers: the multi-section one used by fan-out and the
+    single-section one used by the M3 skeleton path. Only the first was hit by
+    the failing run, and a fix to one and not the other would have left the bug
+    live on the other path."""
+    expected = "".join(part.capitalize() for part in route_slug.split("-"))
+    multi = assemble_page_index_source(
+        route_slug=route_slug, sections=[{"slug": "intro", "component": "Intro"}]
+    )
+    single = build_index_source(route_slug=route_slug, section_slug="intro", component="Intro")
+    for source in (multi, single):
+        assert f"export default function {expected}Page() {{" in source
+        # the actual defect: a hyphen anywhere in the identifier
+        declaration = next(l for l in source.splitlines() if l.startswith("export default function"))
+        assert "-" not in declaration, declaration

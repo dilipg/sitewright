@@ -92,6 +92,19 @@ def materialize(value):
 DEFAULT_ROUTES = [{"slug": "home", "path": "/"}]
 
 
+def page_component_name(route_slug: str) -> str:
+    """A route slug as a valid React component identifier.
+
+    `"public-form".capitalize()` is `"Public-form"`, which produces
+    `export default function Public-formPage()` -- a syntax error, not a naming
+    wart. It went unnoticed until an acceptance run first planned a two-word
+    route: every route in every earlier run (home, shop, product, about,
+    support) happened to be a single word. Route slugs are kebab-case by
+    contract, so this is the general case, not an edge one.
+    """
+    return "".join(part.capitalize() for part in route_slug.split("-") if part)
+
+
 def _humanize_slug(slug: str) -> str:
     return " ".join(word.capitalize() for word in slug.split("-"))
 
@@ -186,7 +199,7 @@ def build_index_source(*, route_slug: str, section_slug: str, component: str) ->
         f'import {component} from "./sections/{component}";\n'
         "\n"
         "/** Page assembly only, no styling decisions (contract section 2). */\n"
-        f"export default function {route_slug.capitalize()}Page() {{\n"
+        f"export default function {page_component_name(route_slug)}Page() {{\n"
         f'  return <{component} nodeId="{route_slug}.{section_slug}" {{...{data_var}}} />;\n'
         "}\n"
     )
@@ -266,7 +279,7 @@ def assemble_page_index_source(*, route_slug: str, sections: list[dict]) -> str:
     return (
         f"{imports_source}\n\n"
         "/** Page assembly only, no styling decisions (contract section 2). */\n"
-        f"export default function {route_slug.capitalize()}Page() {{\n"
+        f"export default function {page_component_name(route_slug)}Page() {{\n"
         "  return (\n"
         "    <>\n"
         f"{renders_source}\n"

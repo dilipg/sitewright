@@ -127,6 +127,19 @@ def main() -> None:
     print(json.dumps(result, indent=2, default=str))
     print(f"PAGE_WORKER_RESULT {json.dumps(result, default=str)}")
 
+    # A worker that assembled a page failing its OWN route-scoped gates must
+    # not report success. assemble_page has always run those gates and returned
+    # the verdict; nothing read it, so a broken page surfaced only later as an
+    # anonymous project-wide gate failure with every worker claiming exit 0 —
+    # observed exactly that way when a two-word route slug produced an invalid
+    # component identifier. Exiting non-zero makes the failure attributable to
+    # the route that caused it, which is the whole point of scoping gates to a
+    # route (7.2). Note this does NOT fight the bounded-retry design: a section
+    # that exhausts its retries assembles a FailedSectionPlaceholder, which is
+    # valid code and passes gates, so the page still ships degraded (5.4).
+    if result["assembled"]["passed"] is not True:
+        raise SystemExit(1)
+
 
 if __name__ == "__main__":
     main()

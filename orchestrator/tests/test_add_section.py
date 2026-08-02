@@ -160,3 +160,75 @@ def test_an_unknown_route_in_the_plan_fails_loudly(tmp_path: Path) -> None:
     )
     with pytest.raises(SystemExit, match="not in the site plan"):
         append_to_siteplan(project, "shop", {"slug": "x"})
+
+
+def test_the_section_flow_is_invoked_through_run_and_wait(tmp_path, monkeypatch) -> None:
+    """Kitaru rejects a direct flow call with KitaruUsageError: calling the
+    function bypasses the execution that gives it checkpoints — the very
+    checkpoints regeneration later replays.
+
+    add_section shipped calling it directly. Nothing caught it, because the
+    mock-mode e2e never reaches this function and the other tests here cover
+    only the pure helpers around it. The first live run died on it. This stub
+    reproduces Kitaru's actual contract, so a direct call fails the test rather
+    than a paid run.
+    """
+    from orchestrator import add_section as module
+
+    calls: dict = {}
+
+    class Handle:
+        def wait(self) -> dict:
+            calls["waited"] = True
+            return {"passed": True, "attempts": 1}
+
+    class Flow:
+        def __call__(self, *args, **kwargs):
+            raise AssertionError(
+                "flow invoked directly; Kitaru requires .run(...).wait() so the "
+                "execution is checkpointed and replayable"
+            )
+
+        def run(self, **kwargs):
+            calls["kwargs"] = kwargs
+            return Handle()
+
+    project = tmp_path / "run"
+    (project / "src" / "pages" / "home").mkdir(parents=True)
+    (project / "src" / "pages" / "home" / "index.tsx").write_text(ASSEMBLED_INDEX, encoding="utf-8")
+    (project / "manifest.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "nodes": {
+                    "home.hero": {
+                        "route": "/",
+                        "file": "f",
+                        "component": "Hero",
+                        "element": "section",
+                        "editable": ["style"],
+                        "status": "active",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(module, "generate_section_flow", Flow())
+    monkeypatch.setattr(module, "GENERATED_DIR", project.parent)
+    # the flow reports success, so add_section reads the component back from the
+    # manifest — register what the "generation" would have added
+    original = module.manifest_component
+    monkeypatch.setattr(module, "manifest_component", lambda project_dir, section_id: "CtaBand")
+
+    result = module.add_section("run", "home", "cta-band", "A closing call to action.")
+
+    assert calls["waited"] is True, "must block on the handle, not fire and forget"
+    assert calls["kwargs"]["assemble_index"] is False, (
+        "assembling here would overwrite index.tsx with a one-section page"
+    )
+    assert calls["kwargs"]["reuse_workspace"] is True, "must build into the existing project"
+    assert result["passed"] is True
+    assert result["sectionId"] == "home.cta-band"
+    assert original is not None

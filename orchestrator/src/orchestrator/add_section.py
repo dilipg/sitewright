@@ -149,7 +149,13 @@ def add_section(run_id: str, route: str, archetype: str, instruction: str) -> di
     # assemble_index=False: this flow's own single-section assembly would
     # OVERWRITE index.tsx with a one-section page, deleting every section
     # already on the route. The append below is the assembly step.
-    result = generate_section_flow(
+    # .run(...).wait(), never a direct call: Kitaru rejects a direct flow
+    # invocation outright (KitaruUsageError), because calling the function
+    # bypasses the execution that gives it its checkpoints — the same
+    # checkpoints regeneration later replays. Every other call site in the
+    # orchestrator does it this way; this one did not, and only a live run
+    # could find it, since mock mode never reaches this function.
+    result = generate_section_flow.run(
         run_id=run_id,
         page_brief=f"The {route} page of an existing site.",
         section_brief=instruction,
@@ -159,7 +165,7 @@ def add_section(run_id: str, route: str, archetype: str, instruction: str) -> di
         section_slug=section_slug,
         archetype=archetype,
         assemble_index=False,
-    )
+    ).wait()
 
     if not result.get("passed", False):
         # The section flow already rolled its manifest proposals back on

@@ -8,6 +8,8 @@
  *   GET  /__archetypes                            -> { archetypes: [{name, description}] }
  *   POST /__add-section  { route, archetype, instruction }
  *                                                 -> { passed, sectionId, failureReport }
+ *   POST /__edit-prompt  { route, instruction, selection? }
+ *                                                 -> { operations, clarify, structural, notes }
  *
  * Before every regen the section's page directory + manifest are snapshotted;
  * revert restores the snapshot — the one-step "revert regeneration" (PRD 4.4).
@@ -32,6 +34,8 @@ import { cpSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { basename, join, resolve } from "node:path";
 import type { Plugin } from "vite";
+import type { EditAgentResult } from "./edit-protocol.ts";
+import { mockEditOperations } from "./edit-mock.ts";
 
 const MOCK_DELAY_MS = 1500; // keeps the in-place progress state observable in e2e
 
@@ -105,6 +109,28 @@ export function regenApiPlugin(projectRoot: string): Plugin {
                   : await realAddSection(root, route, archetype, instruction);
               server.moduleGraph.invalidateAll();
               respondJson(res, 200, { ...result, canRevert: true });
+            } catch (error) {
+              respondJson(res, 500, { error: String(error) });
+            }
+          });
+          return;
+        }
+        if (req.method === "POST" && url === "/__edit-prompt") {
+          void readBody(req).then(async (body) => {
+            try {
+              const { route, instruction, selection } = body as {
+                route: string;
+                instruction: string;
+                selection?: string;
+              };
+              // No snapshot here, unlike regen: this endpoint changes nothing on
+              // disk. It returns operations; the editor applies them as ordinary
+              // overrides, which the existing undo stack already covers.
+              const result =
+                process.env.WG_REGEN_MOCK === "1"
+                  ? mockEditOperations(instruction, route)
+                  : await realEditPrompt(root, route, instruction, selection);
+              respondJson(res, 200, result);
             } catch (error) {
               respondJson(res, 500, { error: String(error) });
             }
@@ -237,6 +263,17 @@ function realAddSection(
     instruction,
     "ADD_SECTION_RESULT ",
   );
+}
+
+function realEditPrompt(
+  root: string,
+  route: string,
+  instruction: string,
+  selection: string | undefined,
+): Promise<EditAgentResult> {
+  const scope = ["orchestrator.edit_agent", "--route", route];
+  if (selection !== undefined) scope.push("--selection", selection);
+  return runCli<EditAgentResult>(root, scope, instruction, "EDIT_RESULT ");
 }
 
 /**

@@ -10,9 +10,13 @@ describe("mockEditOperations", () => {
   });
 
   it("returns a style operation on the cta-band heading for the accent-colour-change instruction, not the hero headline the general colour branch targets", () => {
+    // accentContrast, not accent: the cta-band section's own background is
+    // already the accent token elsewhere in the invariant suite, so recolouring
+    // this heading's TEXT to the same token would make it blend into its own
+    // background instead of demonstrating the override visually.
     const result = mockEditOperations("make the accent colour change", "home");
     expect(result.operations).toEqual([
-      { op: "style", nodeId: "home.cta-band.heading", property: "color", token: "color.semantic.accent" },
+      { op: "style", nodeId: "home.cta-band.heading", property: "color", token: "color.semantic.accentContrast" },
     ]);
   });
 

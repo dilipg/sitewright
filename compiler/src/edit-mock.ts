@@ -35,10 +35,23 @@ export function mockEditOperations(instruction: string, route: string): EditAgen
   // suite's proof that an agent-authored style override survives export
   // exactly as a canvas-authored one does, on a node the general branch
   // does not touch.
+  //
+  // Token is accentContrast, not accent: the invariant suite's earlier
+  // cta-band cases already set the SECTION's own background to the accent
+  // token, and this heading has no background of its own, so recolouring
+  // its TEXT to that same accent token would make it blend invisibly into
+  // its own background by the time every case's edits have accumulated
+  // (found by a real invariant-suite failure — the pixel diff still passed,
+  // because both sides rendered the identical invisible block, but the
+  // heading's own typography stopped being compared by anything). accentContrast
+  // is the token the design system already pairs with accent for exactly
+  // this reason (see Button's "primary" variant), so the heading stays
+  // legible and the override is still visibly distinguishable from the
+  // Heading primitive's own default text colour.
   if (text.includes("accent colour change")) {
     return {
       operations: [
-        { op: "style", nodeId: `${route}.cta-band.heading`, property: "color", token: "color.semantic.accent" },
+        { op: "style", nodeId: `${route}.cta-band.heading`, property: "color", token: "color.semantic.accentContrast" },
       ],
       notes: "mock: recoloured the cta-band heading",
     };

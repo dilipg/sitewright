@@ -1147,13 +1147,30 @@ function conflictsWith(existing: string, incoming: string): boolean {
   return utilityCategory(existing) === utilityCategory(incoming);
 }
 
-/** Category key for conflict detection: utility root, with text- split into size/color/keyword. */
+/** Category key for conflict detection: utility root, with text- split into size/color/keyword.
+ *
+ * Strips a trailing "!" (Tailwind's important modifier, appended by
+ * applyClassOverride/applyListItemClassOverride) before deriving the root:
+ * the bracket/paren-anchored form (`/^(.*?)-[([]/`) does not care either way,
+ * since it only matches up to the FIRST "(" or "[", but the keyword fallback
+ * (`-[a-z0-9]+$`) anchors on the END of the string, and an un-stripped "!"
+ * sits after that anchor and defeats the match entirely — so a keyword
+ * utility (alignSelf/justifySelf/textAlign; every other PROPERTY_UTILITIES
+ * entry compiles to a `-(` or `-[` form the bracket-anchored branch already
+ * handles) would return itself, whole, as a category no other class can ever
+ * equal, and mergeClassName would stop detecting it as a conflict — leaving
+ * an old and a new same-category utility sitting side by side in export
+ * source, e.g. `text-center text-left!`. Rendering still resolves correctly
+ * (the "!" wins), so this was invisible to the pixel-diff invariant suite;
+ * it only costs handover source cleanliness, which is why it's worth fixing
+ * rather than leaving as a rendering-harmless wart. */
 function utilityCategory(cls: string): string {
-  const rootMatch = /^(.*?)-[([]/.exec(cls);
-  const root = rootMatch !== null ? rootMatch[1]! : cls.replace(/-[a-z0-9]+$/, "");
+  const bare = cls.endsWith("!") ? cls.slice(0, -1) : cls;
+  const rootMatch = /^(.*?)-[([]/.exec(bare);
+  const root = rootMatch !== null ? rootMatch[1]! : bare.replace(/-[a-z0-9]+$/, "");
   if (root === "text") {
-    if (/^text-\((?:length:)/.test(cls) || /^text-\[\d/.test(cls)) return "text:size";
-    if (/^text-(?:\(|\[)/.test(cls)) return "text:color";
+    if (/^text-\((?:length:)/.test(bare) || /^text-\[\d/.test(bare)) return "text:size";
+    if (/^text-(?:\(|\[)/.test(bare)) return "text:color";
     return "text:keyword";
   }
   return root;

@@ -122,8 +122,12 @@ describe("exportProject: style channel", () => {
     expect(section).toContain("bg-(--color-semantic-accent)");
     expect(section).not.toContain("bg-(--color-semantic-bg) py-(--space-24) bg-");
     expect(section).toContain("py-(--space-24)");
-    // headline primitive gains a className, merged last through the cx() seam
-    expect(section).toMatch(/nodeId="home\.hero\.headline"[^>]*className="mt-\(--space-8\)"/s);
+    // headline primitive gains a className, merged last through the cx() seam.
+    // Forced important ("!"): Heading's own base classes (a shared primitive,
+    // not this instance's className) always set a default color, so without a
+    // forced tiebreaker Tailwind's stylesheet order -- not source order --
+    // would decide the winner (same reasoning as the list-item path below).
+    expect(section).toMatch(/nodeId="home\.hero\.headline"[^>]*className="mt-\(--space-8\)!"/s);
   });
 
   it("fails loudly on token-shaped refs that resolve to no token", { timeout: 60_000 }, () => {
@@ -145,7 +149,7 @@ describe("exportProject: layout channel", () => {
     exportProject(source, { outDir, skipBuild: true });
 
     const section = readOut(outDir, "src/pages/home/sections/Hero.tsx");
-    expect(section).toMatch(/nodeId="home\.hero\.cta-secondary"[^>]*className="w-\[480px\] self-center"/s);
+    expect(section).toMatch(/nodeId="home\.hero\.cta-secondary"[^>]*className="w-\[480px\]! self-center!"/s);
   });
 });
 

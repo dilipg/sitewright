@@ -29,6 +29,20 @@ export function mockEditOperations(instruction: string, route: string): EditAgen
   if (text.includes("button")) {
     return { operations: [], clarify: "Which button — the primary or the secondary one?", notes: "mock: ambiguous" };
   }
+  // A specific colour instruction targeting the cta-band heading, checked
+  // before the general accent/colour/color branch below (which shares its
+  // keywords) so it cannot be shadowed by it — this is the invariant
+  // suite's proof that an agent-authored style override survives export
+  // exactly as a canvas-authored one does, on a node the general branch
+  // does not touch.
+  if (text.includes("accent colour change")) {
+    return {
+      operations: [
+        { op: "style", nodeId: `${route}.cta-band.heading`, property: "color", token: "color.semantic.accent" },
+      ],
+      notes: "mock: recoloured the cta-band heading",
+    };
+  }
   if (text.includes("accent") || text.includes("colour") || text.includes("color")) {
     return {
       operations: [

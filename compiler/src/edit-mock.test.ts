@@ -9,6 +9,13 @@ describe("mockEditOperations", () => {
     ]);
   });
 
+  it("returns a style operation on the cta-band heading for the accent-colour-change instruction, not the hero headline the general colour branch targets", () => {
+    const result = mockEditOperations("make the accent colour change", "home");
+    expect(result.operations).toEqual([
+      { op: "style", nodeId: "home.cta-band.heading", property: "color", token: "color.semantic.accent" },
+    ]);
+  });
+
   it("returns a clarify for an ambiguous instruction", () => {
     expect(mockEditOperations("make the button green", "home").clarify).toMatch(/which/i);
   });

@@ -1060,7 +1060,24 @@ function applyClassOverride(
   }
 
   for (const [property, rawValue] of Object.entries(override.value as Record<string, unknown>)) {
-    const compiled = compileUtilityClass(override.nodeId, property, String(rawValue), tokenVars);
+    // Trailing "!" (Tailwind v4's important modifier), matching
+    // applyListItemClassOverride below and the live shim's !important-injected
+    // override stylesheet. mergeClassName removes any same-category utility
+    // sitting in THIS element's own className string, which is sufficient
+    // when the competing class was authored there too (e.g. a page template's
+    // own default background on a section root) -- but a primitive component
+    // (Heading, Button, Input, ...) can ALSO hardcode a same-category utility
+    // in its own shared base classes, invisible to and unreachable by that
+    // string surgery since it lives in a different file, applies to every
+    // usage, and only ever appears once compiled. Without a forced-important
+    // tiebreaker there, Tailwind's stylesheet order -- not source order --
+    // decides the winner, which found a real preview/export mismatch on a
+    // Heading's default text color (contract's preview = handover invariant):
+    // the live shim always forces its override important, so preview showed
+    // the override; the built export's generated CSS happened to place the
+    // Heading's own default color rule after the override's, so the export
+    // silently kept the default color instead.
+    const compiled = `${compileUtilityClass(override.nodeId, property, String(rawValue), tokenVars)}!`;
     mergeClassName(target, compiled);
   }
   changed.add(target.getSourceFile());

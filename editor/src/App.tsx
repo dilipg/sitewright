@@ -31,7 +31,8 @@ import {
   splitOverridesByRoute,
   zoomAt,
 } from "./lib/canvas";
-import { applyEditOperations, validateEditOperations } from "./lib/edit-ops";
+import { applyEditOperations, interpretEditResult, validateEditOperations } from "./lib/edit-ops";
+import type { EditPromptResponse } from "./lib/edit-ops";
 import { expandStyleValue } from "./lib/inventory";
 import { breadcrumbFor, humanizeSegment, parentNodeId } from "./lib/labels";
 import type { History, OverridesMap } from "./lib/store";
@@ -454,7 +455,11 @@ export default function App() {
    *  validates, so a compound instruction never half-lands. */
   async function submitEditPrompt() {
     const route = selectedId === undefined ? routes[0]?.slug : routeOf(selectedId);
-    if (route === undefined || manifest === null || tokens === null) return;
+    // `history` is guarded with the rest: during the bootstrap window it is
+    // still null, and setHistory's own null check would then silently drop the
+    // batch while this function went on to report phase "done" — success
+    // reported, nothing applied.
+    if (route === undefined || manifest === null || tokens === null || history === null) return;
     const instruction = editDraft;
     setEditPrompt({ phase: "running" });
     try {
@@ -463,34 +468,27 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ route, instruction, selection: selectedId }),
       });
-      const result = (await response.json()) as {
-        operations?: Parameters<typeof validateEditOperations>[0];
-        clarify?: string;
-        structural?: { kind: string; reason: string };
-        notes?: string;
-        error?: string;
-      };
-      if (result.error !== undefined) throw new Error(result.error);
-      if (result.structural !== undefined) {
-        setEditPrompt({ phase: "structural", kind: result.structural.kind, reason: result.structural.reason });
+      const outcome = interpretEditResult((await response.json()) as EditPromptResponse);
+      if (outcome.kind === "error") throw new Error(outcome.message);
+      if (outcome.kind === "structural") {
+        setEditPrompt({ phase: "structural", kind: outcome.structuralKind, reason: outcome.reason });
         return;
       }
-      if (result.clarify !== undefined) {
-        setEditPrompt({ phase: "clarify", question: result.clarify });
+      if (outcome.kind === "clarify") {
+        setEditPrompt({ phase: "clarify", question: outcome.question });
         return;
       }
-      const ops = result.operations ?? [];
+      const ops = outcome.operations;
       const errors = validateEditOperations(ops, manifest, tokenPathSet(tokens), route);
       if (errors.length > 0 || ops.length === 0) {
         setEditPrompt({ phase: "rejected", errors: errors.length > 0 ? errors : ["Nothing to change."] });
         return;
       }
-      const sections = renderedSections(geometryByRoute[route] ?? {}, manifest, route);
-      setHistory((h) => (h === null ? h : pushHistory(h, applyEditOperations(currentSnapshot(h), ops, sections))));
+      setHistory((h) => (h === null ? h : pushHistory(h, applyEditOperations(currentSnapshot(h), ops))));
       setEditDraft("");
       setEditPrompt({
         phase: "done",
-        notes: result.notes ?? "",
+        notes: outcome.notes,
         applied: ops.map((op) => `${op.op} ${op.nodeId ?? op.route ?? ""}`),
       });
     } catch (error) {

@@ -212,10 +212,45 @@ function runRegenCli(root: string, scopeArgs: string[], instruction: string): Pr
   return runCli<RegenOutcome>(root, ["orchestrator.regenerate", ...scopeArgs], instruction, "REGEN_RESULT ");
 }
 
+/**
+ * Spawns a child process and buffers its output. One place, because every
+ * endpoint here spawns the same way.
+ *
+ * Deliberately WITHOUT `shell: true`. A shell means Node hands the OS one
+ * command STRING, built by concatenating argv with spaces and no quoting
+ * (Node's own DEP0190 warns about exactly this), so an argument containing a
+ * space arrives as several arguments and one containing a quote arrives
+ * mangled. Every argument list here ends in `--instruction <free-form user
+ * text>`, so with a shell argparse saw five arguments for "make the headline
+ * shorter", exited 2, and no endpoint could ever produce a result line. It was
+ * also a shell-injection surface fed straight from a text box.
+ *
+ * Shell-free spawning resolves `uv` on Windows too: libuv searches PATH and
+ * PATHEXT, so the bare name finds `uv.exe` (verified on this platform — and
+ * the argv-preservation test below is the standing proof).
+ */
+export function runProcess(
+  command: string,
+  args: string[],
+  cwd: string,
+): Promise<{ stdout: string; stderr: string; code: number | null }> {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn(command, args, { cwd });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
+    child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
+    // Without this the promise never settles when the executable is missing:
+    // "close" does not fire if the process never started.
+    child.on("error", (error) => rejectPromise(error));
+    child.on("close", (code) => resolvePromise({ stdout, stderr, code }));
+  });
+}
+
 /** Spawns an orchestrator CLI and reads its single machine-readable result
  *  line. `moduleAndArgs` starts with the module name; --run-id (the project
  *  directory's own name) and --instruction are added here. */
-function runCli<T>(
+async function runCli<T>(
   root: string,
   moduleAndArgs: string[],
   instruction: string,
@@ -224,25 +259,16 @@ function runCli<T>(
   const orchestratorDir = resolve(root, "..", "..", "orchestrator");
   const runId = basename(root);
   const [moduleName, ...args] = moduleAndArgs;
-  return new Promise((resolvePromise, rejectPromise) => {
-    const child = spawn(
-      "uv",
-      ["run", "python", "-m", moduleName!, "--run-id", runId, ...args, "--instruction", instruction],
-      { cwd: orchestratorDir, shell: true },
-    );
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
-    child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
-    child.on("close", () => {
-      const resultLine = stdout.split("\n").find((line) => line.startsWith(marker));
-      if (resultLine === undefined) {
-        rejectPromise(new Error(`${moduleName!} produced no result:\n${stderr.slice(-2000)}`));
-        return;
-      }
-      resolvePromise(JSON.parse(resultLine.slice(marker.length)) as T);
-    });
-  });
+  const { stdout, stderr } = await runProcess(
+    "uv",
+    ["run", "python", "-m", moduleName!, "--run-id", runId, ...args, "--instruction", instruction],
+    orchestratorDir,
+  );
+  const resultLine = stdout.split("\n").find((line) => line.startsWith(marker));
+  if (resultLine === undefined) {
+    throw new Error(`${moduleName!} produced no result:\n${stderr.slice(-2000)}`);
+  }
+  return JSON.parse(resultLine.slice(marker.length)) as T;
 }
 
 interface AddSectionOutcome {
@@ -295,22 +321,14 @@ async function archetypeCatalog(root: string): Promise<Array<{ name: string; des
   return catalogCache;
 }
 
-function runPython(root: string, args: string[]): Promise<string> {
+async function runPython(root: string, args: string[]): Promise<string> {
   const orchestratorDir = resolve(root, "..", "..", "orchestrator");
-  return new Promise((resolvePromise, rejectPromise) => {
-    const child = spawn("uv", ["run", "python", ...args], { cwd: orchestratorDir, shell: true });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
-    child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
-    child.on("close", () => {
-      // Kitaru prints a Windows daemon notice on import, so the payload is the
-      // last non-empty line rather than the whole of stdout.
-      const line = stdout.trim().split("\n").at(-1)?.trim() ?? "";
-      if (line.startsWith("{")) resolvePromise(line);
-      else rejectPromise(new Error(`python produced no JSON:\n${stderr.slice(-2000)}`));
-    });
-  });
+  const { stdout, stderr } = await runProcess("uv", ["run", "python", ...args], orchestratorDir);
+  // Kitaru prints a Windows daemon notice on import, so the payload is the
+  // last non-empty line rather than the whole of stdout.
+  const line = stdout.trim().split("\n").at(-1)?.trim() ?? "";
+  if (!line.startsWith("{")) throw new Error(`python produced no JSON:\n${stderr.slice(-2000)}`);
+  return line;
 }
 
 /* ---------- mock mode: deterministic transformations for UX e2e ---------- */

@@ -11,6 +11,9 @@ export type { DeriveTokensResult, TailwindTheme } from "./derive-tokens";
 export { ExportError, exportProject } from "./exporter";
 export type { ExportOptions, ExportResult, OverrideEntry } from "./exporter";
 
+export { PROPERTY_UTILITIES, STYLE_PROPERTIES, isSupportedStyleProperty } from "./style-properties";
+export type { UtilitySpec } from "./style-properties";
+
 export { runGates } from "./gates";
 export type { GateFailure, GateReport, GateResult, RegenGateContext, RunGatesOptions } from "./gates";
 

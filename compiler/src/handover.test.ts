@@ -121,6 +121,16 @@ describe("renderHandover", () => {
     expect(markdown).toMatch(/cannot hold a promise/);
   });
 
+  it("explains the trailing `!` on compiled override classes", () => {
+    // Without this, the `!` the exporter appends to every compiled override
+    // reads as a mistake to the developer receiving the code — and "tidying" it
+    // away silently reintroduces the preview/export mismatch it exists to fix.
+    const markdown = generateHandover(fixtureDir, fixtureManifest, []);
+    expect(markdown).toMatch(/end in `!`/);
+    expect(markdown).toMatch(/important modifier/);
+    expect(markdown).toMatch(/your rule needs `!`/);
+  });
+
   it("warns that sections do no arithmetic and have no loading state", () => {
     const markdown = generateHandover(fixtureDir, fixtureManifest, []);
     expect(markdown).toMatch(/no arithmetic/);

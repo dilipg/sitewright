@@ -49,7 +49,7 @@ test("one prompt is one undo entry, even for a compound instruction touching two
   await expect(page.getByTestId("undo-button")).toBeDisabled();
 });
 
-test("Enter is guarded like the submit button: a rapid double press still yields one undo entry", async ({
+test("Enter is guarded like the submit button: a rapid double press sends one request", async ({
   page,
 }) => {
   // Regression for the keyboard path bypassing the running/empty guard that
@@ -57,16 +57,40 @@ test("Enter is guarded like the submit button: a rapid double press still yields
   // (or OS key-repeat from holding it) calls submitEditPrompt() twice
   // concurrently, and each call reaches its own pushHistory — one prompt
   // would then produce two undo entries.
+  //
+  // The response is HELD until both presses have happened, and the request
+  // count is asserted. Neither is optional: the mock endpoint answers in
+  // milliseconds and the draft clears on success, so if the first request
+  // finished between the presses, the second press would be stopped by the
+  // EMPTY-value guard instead — and the test would pass with the running
+  // guard deleted, which is the only thing it is here to check.
+  let requests = 0;
+  let release = () => {};
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await page.route("**/__edit-prompt", async (route) => {
+    requests += 1;
+    await held;
+    await route.continue();
+  });
+
   const headline = previewFrameLocator(page).locator('[data-node-id="home.hero.headline"]');
   const before = (await headline.textContent()) ?? "";
   const input = page.getByTestId("edit-prompt-input");
 
   await input.fill("make the headline shorter");
   await input.press("Enter");
+  // in flight and visibly so: the guard the second press must hit
+  await expect(page.getByTestId("edit-prompt-submit")).toHaveText("Working…");
   await input.press("Enter");
+  expect(requests, "the second Enter must not reach the server").toBe(1);
 
+  release();
   await expect(headline).toHaveText("A shorter headline", { timeout: 20_000 });
   await expect(page.getByTestId("undo-button")).toBeEnabled();
+  // and still exactly one request, now that the first has completed
+  expect(requests).toBe(1);
 
   await page.getByTestId("edit-prompt-undo").click();
   await expect(headline).toHaveText(before, { timeout: 15_000 });

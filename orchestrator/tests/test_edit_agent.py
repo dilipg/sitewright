@@ -4,9 +4,8 @@ is the schema we ask for, how a response is interpreted, and when we escalate.""
 import json
 from pathlib import Path
 
-import pytest
-
 from orchestrator import edit_agent
+from orchestrator.config import ORCHESTRATOR_ROOT
 
 
 def project(tmp_path: Path) -> Path:
@@ -127,3 +126,37 @@ def test_the_tool_schema_constrains_style_to_the_projects_own_tokens(tmp_path) -
         if variant["properties"]["op"]["const"] == "style"
     )
     assert style["properties"]["token"]["enum"] == ["color.semantic.accent", "color.semantic.bg"]
+
+
+def _variant(schema: dict, op: str) -> dict:
+    return next(
+        variant for variant in schema["properties"]["operations"]["items"]["anyOf"]
+        if variant["properties"]["op"]["const"] == op
+    )
+
+
+def test_the_tool_schema_constrains_property_to_what_the_exporter_can_compile() -> None:
+    """`property` was an open string, so `fontFamily` was askable, validated,
+    rendered in the preview — and then killed the export. The enum makes the
+    unexportable unrepresentable, one layer earlier than validation."""
+    schema = edit_agent.build_tool_schema(["color.semantic.accent"])
+    for op in ("style", "styleExact", "layout"):
+        enum = _variant(schema, op)["properties"]["property"]["enum"]
+        assert "color" in enum, op
+        assert "padding" in enum, op
+        assert "fontFamily" not in enum, op
+        assert "opacity" not in enum, op
+        assert "borderColor" not in enum, op
+
+
+def test_the_property_enum_IS_the_compilers_list_not_a_copy_of_it() -> None:
+    """Three modules have to agree about what is representable (the exporter's
+    utility table, the editor's validation, this schema). They agree by reading
+    one file; this test is what keeps that true."""
+    shared = json.loads(
+        (ORCHESTRATOR_ROOT.parent / "compiler" / "src" / "style-properties.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    schema = edit_agent.build_tool_schema(["color.semantic.accent"])
+    assert _variant(schema, "style")["properties"]["property"]["enum"] == list(shared)

@@ -13,6 +13,8 @@ import json
 import re
 from pathlib import Path
 
+from orchestrator.config import ORCHESTRATOR_ROOT
+
 TEXT_LIMIT = 80
 
 # `headline: "..."` in a mock data file. Deliberately a regex and not an AST
@@ -62,6 +64,21 @@ def build_route_projection(
             }
         )
     return projection
+
+
+def style_properties() -> list[str]:
+    """Every property a style/layout operation may name.
+
+    Read from the COMPILER's own list rather than restated here. The exporter
+    compiles each property to a Tailwind utility and throws on anything it has
+    no mapping for, while the preview shim applies any CSS property at all — so
+    a property this list does not contain renders in the preview, persists, and
+    then kills the export. That is the preview-≠-handover failure the whole
+    architecture exists to prevent, which is why the list is data both
+    languages read (compiler/src/style-properties.json) and not a copy.
+    """
+    path = ORCHESTRATOR_ROOT.parent / "compiler" / "src" / "style-properties.json"
+    return list(json.loads(path.read_text(encoding="utf-8")).keys())
 
 
 def token_vocabulary(project_dir: Path) -> list[str]:

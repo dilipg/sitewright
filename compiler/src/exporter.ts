@@ -37,6 +37,7 @@ import { runGates } from "./gates.ts";
 import { collectHandoverData, renderHandover } from "./handover.ts";
 import type { Manifest, ManifestNode } from "./manifest.ts";
 import { tombstone as tombstoneNodes } from "./manifest.ts";
+import { PROPERTY_UTILITIES } from "./style-properties.ts";
 import { isTokenReference } from "./style-value.ts";
 import { createZip } from "./zip.ts";
 
@@ -133,39 +134,6 @@ const PACKAGE_SKIP = new Set(["node_modules", "dist"]);
  * fully editable and re-exportable (PRD 5).
  */
 const OVERRIDE_ARCHIVE_DIR = "overrides-archive";
-
-/** style/layout property -> utility compilation spec. Unknown properties fail loudly. */
-const PROPERTY_UTILITIES: Record<string, { prefix: string; hint?: string; keyword?: boolean }> = {
-  background: { prefix: "bg" },
-  backgroundColor: { prefix: "bg" },
-  color: { prefix: "text" },
-  fontSize: { prefix: "text", hint: "length" },
-  fontWeight: { prefix: "font" },
-  lineHeight: { prefix: "leading" },
-  letterSpacing: { prefix: "tracking" },
-  margin: { prefix: "m" },
-  marginTop: { prefix: "mt" },
-  marginRight: { prefix: "mr" },
-  marginBottom: { prefix: "mb" },
-  marginLeft: { prefix: "ml" },
-  padding: { prefix: "p" },
-  paddingTop: { prefix: "pt" },
-  paddingRight: { prefix: "pr" },
-  paddingBottom: { prefix: "pb" },
-  paddingLeft: { prefix: "pl" },
-  gap: { prefix: "gap" },
-  width: { prefix: "w" },
-  height: { prefix: "h" },
-  maxWidth: { prefix: "max-w" },
-  minWidth: { prefix: "min-w" },
-  maxHeight: { prefix: "max-h" },
-  minHeight: { prefix: "min-h" },
-  borderRadius: { prefix: "rounded" },
-  boxShadow: { prefix: "shadow" },
-  alignSelf: { prefix: "self", keyword: true },
-  justifySelf: { prefix: "justify-self", keyword: true },
-  textAlign: { prefix: "text", keyword: true },
-};
 
 
 export function exportProject(projectDir: string, options: ExportOptions): ExportResult {

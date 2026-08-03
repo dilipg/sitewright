@@ -18,9 +18,8 @@ Usage:
 
 import argparse
 import json
-from pathlib import Path
 
-from orchestrator.edit_context import build_route_projection, token_vocabulary
+from orchestrator.edit_context import build_route_projection, style_properties, token_vocabulary
 from orchestrator.model_call import call_model_structured_impl
 from orchestrator.section_pipeline import GENERATED_DIR
 
@@ -29,15 +28,26 @@ MAX_TOKENS = 2000
 _STRUCTURAL_KINDS = ["add-section", "regenerate-section", "regenerate-page"]
 
 
-def build_tool_schema(tokens: list[str]) -> dict:
+def build_tool_schema(tokens: list[str], properties: list[str] | None = None) -> dict:
     """The operation set, with `style` restricted to THIS project's tokens.
 
     The enum is the fidelity guarantee: a raw colour is not merely discouraged,
     it is unrepresentable. `styleExact` exists so an explicit "exactly 37px" is
     still possible, and the exporter counts it as off-scale exactly as it counts
     a canvas edit of the same kind.
+
+    `property` is enumerated for the same reason, from the compiler's own list
+    (see `style_properties`): it was an open string, so the model could ask for
+    `fontFamily` or `opacity`, which validated, rendered in the preview, and
+    then hard-failed the export — the one failure mode the architecture exists
+    to prevent. Unrepresentable beats rejected-afterwards.
     """
     node = {"type": "string", "description": "a nodeId from the projection"}
+    prop = {
+        "type": "string",
+        "enum": style_properties() if properties is None else properties,
+        "description": "a css property the exporter can compile",
+    }
     return {
         "type": "object",
         "properties": {
@@ -60,7 +70,7 @@ def build_tool_schema(tokens: list[str]) -> dict:
                             "properties": {
                                 "op": {"const": "style"},
                                 "nodeId": node,
-                                "property": {"type": "string"},
+                                "property": prop,
                                 "token": {"type": "string", "enum": tokens},
                             },
                             "required": ["op", "nodeId", "property", "token"],
@@ -70,7 +80,7 @@ def build_tool_schema(tokens: list[str]) -> dict:
                             "properties": {
                                 "op": {"const": "styleExact"},
                                 "nodeId": node,
-                                "property": {"type": "string"},
+                                "property": prop,
                                 "value": {"type": "string"},
                             },
                             "required": ["op", "nodeId", "property", "value"],
@@ -80,7 +90,7 @@ def build_tool_schema(tokens: list[str]) -> dict:
                             "properties": {
                                 "op": {"const": "layout"},
                                 "nodeId": node,
-                                "property": {"type": "string"},
+                                "property": prop,
                                 "value": {"type": "string"},
                             },
                             "required": ["op", "nodeId", "property", "value"],

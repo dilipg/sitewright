@@ -36,6 +36,12 @@ export default function EditPrompt({ state, value, onChange, onSubmit, onUndo }:
           event.stopPropagation();
           if (event.key === "Enter" && !event.shiftKey) {
             event.preventDefault();
+            // Same guard as the submit button's `disabled`: without it, Enter
+            // fires unconditionally, so a double-press (or OS key-repeat from
+            // holding it) submits twice concurrently. Each call reaches its
+            // own pushHistory, so one user submission would produce more than
+            // one undo entry — the task's primary constraint.
+            if (state.phase === "running" || value.trim() === "") return;
             onSubmit();
           }
         }}

@@ -25,14 +25,61 @@ test("a prompt applies overrides and summarises what changed", async ({ page }) 
   await waitForSaved(page);
 });
 
-test("one prompt is one undo entry", async ({ page }) => {
+test("one prompt is one undo entry, even for a compound instruction touching two nodes", async ({ page }) => {
+  // Every other mock branch returns at most one operation, which can't tell
+  // "pushHistory once per prompt" apart from "once per operation" (1 op
+  // either way = 1 push either way). This instruction returns two operations
+  // on two distinct nodes, so a single undo reverting BOTH is the only way
+  // to prove the whole prompt landed as one history entry.
+  const eyebrow = previewFrameLocator(page).locator('[data-node-id="home.hero.eyebrow"]');
+  const subheadline = previewFrameLocator(page).locator('[data-node-id="home.hero.subheadline"]');
+  const eyebrowBefore = (await eyebrow.textContent()) ?? "";
+  const subheadlineBefore = (await subheadline.textContent()) ?? "";
+
+  await prompt(page, "update the eyebrow and the subhead");
+  await expect(eyebrow).toHaveText("New eyebrow copy", { timeout: 20_000 });
+  await expect(subheadline).toHaveText("New subheadline copy", { timeout: 15_000 });
+  await expect(page.getByTestId("undo-button")).toBeEnabled();
+
+  await page.getByTestId("edit-prompt-undo").click();
+  await expect(eyebrow).toHaveText(eyebrowBefore, { timeout: 15_000 });
+  await expect(subheadline).toHaveText(subheadlineBefore, { timeout: 15_000 });
+  // history.index is back to 0 (undo-button disabled) after exactly ONE
+  // undo — proof there was exactly one entry to undo, not two.
+  await expect(page.getByTestId("undo-button")).toBeDisabled();
+});
+
+test("Enter is guarded like the submit button: a rapid double press still yields one undo entry", async ({
+  page,
+}) => {
+  // Regression for the keyboard path bypassing the running/empty guard that
+  // the submit button already has: without the guard, a fast double-Enter
+  // (or OS key-repeat from holding it) calls submitEditPrompt() twice
+  // concurrently, and each call reaches its own pushHistory — one prompt
+  // would then produce two undo entries.
   const headline = previewFrameLocator(page).locator('[data-node-id="home.hero.headline"]');
   const before = (await headline.textContent()) ?? "";
-  await prompt(page, "make the headline shorter");
+  const input = page.getByTestId("edit-prompt-input");
+
+  await input.fill("make the headline shorter");
+  await input.press("Enter");
+  await input.press("Enter");
+
   await expect(headline).toHaveText("A shorter headline", { timeout: 20_000 });
+  await expect(page.getByTestId("undo-button")).toBeEnabled();
 
   await page.getByTestId("edit-prompt-undo").click();
   await expect(headline).toHaveText(before, { timeout: 15_000 });
+  await expect(page.getByTestId("undo-button")).toBeDisabled();
+});
+
+test("an instruction that matches nothing applies no operations and says so", async ({ page }) => {
+  const headline = previewFrameLocator(page).locator('[data-node-id="home.hero.headline"]');
+  const before = (await headline.textContent()) ?? "";
+
+  await prompt(page, "do something the mock has never heard of");
+  await expect(page.getByTestId("edit-prompt-errors")).toContainText(/nothing to change/i, { timeout: 20_000 });
+  await expect(headline).toHaveText(before);
 });
 
 test("an invalid operation applies nothing and says why", async ({ page }) => {

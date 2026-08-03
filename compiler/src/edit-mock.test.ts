@@ -24,4 +24,22 @@ describe("mockEditOperations", () => {
     const result = mockEditOperations("INVALID", "home");
     expect(result.operations[0]!.nodeId).toBe("home.does-not-exist");
   });
+
+  it("returns two operations on two distinct nodes for a compound instruction", () => {
+    // Every other branch returns at most one operation, which can't tell
+    // "pushHistory once per prompt" apart from "once per operation" — this
+    // is the branch the editor's compound-instruction undo test relies on.
+    const result = mockEditOperations("update the eyebrow and the subhead", "home");
+    expect(result.operations).toEqual([
+      { op: "text", nodeId: "home.hero.eyebrow", value: "New eyebrow copy" },
+      { op: "text", nodeId: "home.hero.subheadline", value: "New subheadline copy" },
+    ]);
+  });
+
+  it("returns no operations for an instruction that matches nothing", () => {
+    const result = mockEditOperations("do something the mock has never heard of", "home");
+    expect(result.operations).toEqual([]);
+    expect(result.clarify).toBeUndefined();
+    expect(result.structural).toBeUndefined();
+  });
 });

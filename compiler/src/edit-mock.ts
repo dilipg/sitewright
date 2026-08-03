@@ -43,5 +43,19 @@ export function mockEditOperations(instruction: string, route: string): EditAgen
       notes: "mock: shortened the headline",
     };
   }
+  // A compound instruction touching two distinct nodes in one batch — every
+  // other branch above returns at most one operation, which cannot tell
+  // "pushHistory once per prompt" apart from "pushHistory once per
+  // operation" (1 op either way = 1 push either way). This is the only
+  // branch that can prove the editor treats a whole prompt as one entry.
+  if (text.includes("eyebrow") && text.includes("subhead")) {
+    return {
+      operations: [
+        { op: "text", nodeId: `${route}.hero.eyebrow`, value: "New eyebrow copy" },
+        { op: "text", nodeId: `${route}.hero.subheadline`, value: "New subheadline copy" },
+      ],
+      notes: "mock: a compound edit touching two nodes",
+    };
+  }
   return { operations: [], notes: "mock: no match" };
 }

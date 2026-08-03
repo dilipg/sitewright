@@ -27,7 +27,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
-import type { CallExpression, JsxOpeningElement, JsxSelfClosingElement, ObjectLiteralExpression, SourceFile } from "ts-morph";
+import type { CallExpression, Expression, JsxOpeningElement, JsxSelfClosingElement, ObjectLiteralExpression, PropertyAccessExpression, SourceFile, VariableDeclaration } from "ts-morph";
 import { Node, Project, SyntaxKind, ts } from "ts-morph";
 // Runtime imports carry explicit .ts extensions: scripts/ run this module
 // through Node's native type-stripping, which resolves ESM paths literally.
@@ -314,6 +314,54 @@ function isOrphanPage(rel: string, routedSlugs: Set<string> | undefined): boolea
   return !routedSlugs.has(parts[2]!);
 }
 
+/**
+ * The MOCK-DATA array behind whatever a section maps over.
+ *
+ * `items.map(...)` names the prop directly, but a section may derive the list
+ * first — `const visibleFields = fields.filter((f) => f.hidden !== true)` and
+ * then `visibleFields.map(...)`. That is behaviourally identical to the
+ * `if (item.hidden) return null` form the templates teach, and it is what a
+ * model reasonably writes; but it left the compiler looking for a
+ * `visibleFields` array in mock data that only exports `fields`, so ANY
+ * list-item override on such a section failed the export outright.
+ *
+ * So: follow the derivation to its source. Through a chained call
+ * (`fields.filter(...)`, `.slice(...)`) take the receiver; through a local
+ * `const` take its initializer; stop at the first identifier that is not a
+ * local const, which is the destructured prop backing the mock data. Bounded
+ * hop count so a circular or pathological chain terminates rather than hangs,
+ * and `undefined` on anything unrecognised — the caller then skips this node
+ * rather than guessing at an array name.
+ */
+function resolveDataArrayName(expression: Node): string | undefined {
+  let current: Node | undefined = expression;
+  for (let hops = 0; current !== undefined && hops < 8; hops += 1) {
+    if (Node.isCallExpression(current)) {
+      const access: PropertyAccessExpression | undefined = current
+        .getExpression()
+        .asKind(SyntaxKind.PropertyAccessExpression);
+      if (access === undefined) return undefined;
+      current = access.getExpression();
+      continue;
+    }
+    if (Node.isIdentifier(current)) {
+      const name: string = current.getText();
+      // A local `const x = ...` in the same component; a destructured prop has
+      // no VariableDeclaration and so ends the walk here, which is the answer.
+      const declaration: VariableDeclaration | undefined = current
+        .getFirstAncestor((ancestor: Node): boolean => Node.isFunctionDeclaration(ancestor) || Node.isArrowFunction(ancestor))
+        ?.getDescendantsOfKind(SyntaxKind.VariableDeclaration)
+        .find((variable) => variable.getName() === name);
+      const initializer: Expression | undefined = declaration?.getInitializer();
+      if (initializer === undefined) return name;
+      current = initializer;
+      continue;
+    }
+    return undefined;
+  }
+  return undefined;
+}
+
 function packagedFiles(outDir: string): string[] {
   const found: string[] = [];
   const walk = (dir: string, prefix: string): void => {
@@ -570,7 +618,8 @@ function resolveListItemContext(project: Project, nodeId: string): ListItemConte
       const mapCall = findEnclosingMapCall(declaration);
       if (mapCall === undefined) continue;
       const callee = mapCall.getExpression().asKind(SyntaxKind.PropertyAccessExpression);
-      const arrayPropName = callee?.getExpression().getText();
+      const mapped = callee?.getExpression();
+      const arrayPropName = mapped === undefined ? undefined : resolveDataArrayName(mapped);
       if (arrayPropName === undefined) continue;
 
       const prefixPattern = templateToPrefixPattern(template);

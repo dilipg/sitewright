@@ -218,6 +218,40 @@ describe("exportProject: list-item overrides", () => {
     expect(mock).toMatch(/key:\s*"growth"[\s\S]*?className:\s*"bg-\(--color-semantic-accent\)!"/);
   });
 
+  it("resolves a DERIVED list back to its mock-data prop", { timeout: 60_000 }, () => {
+    // A section may filter before mapping — `const visible = items.filter(...)`
+    // then `visible.map(...)` — which is behaviourally identical to the
+    // `if (item.hidden) return null` form the templates teach, and is what a
+    // model reasonably writes. The compiler resolved the MAPPED identifier, so
+    // it went looking for a `visible` array in mock data that only exports
+    // `items`, and every list-item override on such a section failed the export.
+    // Observed live on a generated BuilderCanvas (`visibleFields`).
+    const source = fixtureCopyWithOverrides([
+      { nodeId: "home.capabilities.feature-realtime-sync.title", channel: "layout", value: { width: "480px" } },
+    ]);
+    const sectionPath = join(source, "src", "pages", "home", "sections", "Capabilities.tsx");
+    const derived = readFileSync(sectionPath, "utf8").replace(
+      "{features.map((feature) => {",
+      "{visibleFeatures.map((feature) => {",
+    );
+    expect(derived, "fixture no longer maps `features` directly; update this test").toContain(
+      "visibleFeatures.map",
+    );
+    writeFileSync(
+      sectionPath,
+      derived.replace(
+        "  return (",
+        "  const visibleFeatures = features.filter((feature) => feature.hidden !== true); return (",
+      ),
+    );
+
+    const outDir = join(tempDir("export-derived-"), "export");
+    exportProject(source, { outDir, skipBuild: true });
+
+    const mock = readOut(outDir, "src/pages/home/mock/Capabilities.data.ts");
+    expect(mock).toMatch(/key:\s*"realtime-sync"[\s\S]*?childClassNames:\s*\{\s*"title":\s*"w-\[480px\]!"/);
+  });
+
   it("layout on a list item's child: merges a compiled utility class into childClassNames keyed by suffix", { timeout: 60_000 }, () => {
     const source = fixtureCopyWithOverrides([
       { nodeId: "home.capabilities.feature-realtime-sync.title", channel: "layout", value: { width: "480px" } },

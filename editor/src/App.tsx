@@ -13,6 +13,8 @@ import type { PlanBrief, PlanRoute } from "./components/PlanApproval";
 import PlanApproval from "./components/PlanApproval";
 import type { AddSectionState, Archetype } from "./components/AddSection";
 import { AddSectionPanel } from "./components/AddSection";
+import type { EditPromptState } from "./components/EditPrompt";
+import EditPrompt from "./components/EditPrompt";
 import type { RegenPhase } from "./components/Regen";
 import { OrphanDialog, RegenControls } from "./components/Regen";
 import type { PreviewWidth, RouteInfo, Viewport } from "./lib/canvas";
@@ -29,6 +31,7 @@ import {
   splitOverridesByRoute,
   zoomAt,
 } from "./lib/canvas";
+import { applyEditOperations, validateEditOperations } from "./lib/edit-ops";
 import { expandStyleValue } from "./lib/inventory";
 import { breadcrumbFor, humanizeSegment, parentNodeId } from "./lib/labels";
 import type { History, OverridesMap } from "./lib/store";
@@ -168,6 +171,8 @@ export default function App() {
   const [archetypes, setArchetypes] = useState<Archetype[]>([]);
   const [exportState, setExportState] = useState<"idle" | "running">("idle");
   const [exportOutcome, setExportOutcome] = useState<ExportOutcome | null>(null);
+  const [editPrompt, setEditPrompt] = useState<EditPromptState>({ phase: "idle" });
+  const [editDraft, setEditDraft] = useState("");
 
   const manifestRef = useRef<Manifest | null>(null);
   const historyRef = useRef<History | null>(null);
@@ -443,6 +448,54 @@ export default function App() {
       const next = moveSection(previous, route, rendered, nodeId, direction);
       return next === previous ? h : pushHistory(h, next);
     });
+  }
+
+  /** One prompt = one history entry. Nothing is applied unless every operation
+   *  validates, so a compound instruction never half-lands. */
+  async function submitEditPrompt() {
+    const route = selectedId === undefined ? routes[0]?.slug : routeOf(selectedId);
+    if (route === undefined || manifest === null || tokens === null) return;
+    const instruction = editDraft;
+    setEditPrompt({ phase: "running" });
+    try {
+      const response = await fetch(`${PREVIEW_URL}/__edit-prompt`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ route, instruction, selection: selectedId }),
+      });
+      const result = (await response.json()) as {
+        operations?: Parameters<typeof validateEditOperations>[0];
+        clarify?: string;
+        structural?: { kind: string; reason: string };
+        notes?: string;
+        error?: string;
+      };
+      if (result.error !== undefined) throw new Error(result.error);
+      if (result.structural !== undefined) {
+        setEditPrompt({ phase: "structural", kind: result.structural.kind, reason: result.structural.reason });
+        return;
+      }
+      if (result.clarify !== undefined) {
+        setEditPrompt({ phase: "clarify", question: result.clarify });
+        return;
+      }
+      const ops = result.operations ?? [];
+      const errors = validateEditOperations(ops, manifest, tokenPathSet(tokens), route);
+      if (errors.length > 0 || ops.length === 0) {
+        setEditPrompt({ phase: "rejected", errors: errors.length > 0 ? errors : ["Nothing to change."] });
+        return;
+      }
+      const sections = renderedSections(geometryByRoute[route] ?? {}, manifest, route);
+      setHistory((h) => (h === null ? h : pushHistory(h, applyEditOperations(currentSnapshot(h), ops, sections))));
+      setEditDraft("");
+      setEditPrompt({
+        phase: "done",
+        notes: result.notes ?? "",
+        applied: ops.map((op) => `${op.op} ${op.nodeId ?? op.route ?? ""}`),
+      });
+    } catch (error) {
+      setEditPrompt({ phase: "rejected", errors: [String(error)] });
+    }
   }
 
   function toggleVisibility() {
@@ -1279,6 +1332,16 @@ export default function App() {
               onCancel={() => setAddSection(null)}
             />
           )}
+          <EditPrompt
+            state={editPrompt}
+            value={editDraft}
+            onChange={setEditDraft}
+            onSubmit={() => void submitEditPrompt()}
+            onUndo={() => {
+              setHistory((h) => (h === null ? h : undo(h)));
+              setEditPrompt({ phase: "idle" });
+            }}
+          />
           <RegenControls
             regen={regen}
             sectionSelected={sectionSelected}

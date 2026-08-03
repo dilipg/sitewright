@@ -47,10 +47,16 @@ describe("mockEditOperations", () => {
     ]);
   });
 
-  it("returns no operations for an instruction that matches nothing", () => {
+  it("returns no operations for an instruction that matches nothing, with clarify/structural explicitly null", () => {
+    // Not `toBeUndefined()`: that pinned the mock's OLD, wrong shape (omitted
+    // keys). The real agent (`edit_agent.py`'s `_normalize`) always emits an
+    // explicit `null` for an absent field rather than omitting the key, and
+    // every automated test ran against the mock — so the omitted-key shape
+    // hid a bug that failed 100% of real prompts while this suite stayed
+    // green. The mock must mirror the real wire shape, not invent its own.
     const result = mockEditOperations("do something the mock has never heard of", "home");
     expect(result.operations).toEqual([]);
-    expect(result.clarify).toBeUndefined();
-    expect(result.structural).toBeUndefined();
+    expect(result.clarify).toBeNull();
+    expect(result.structural).toBeNull();
   });
 });

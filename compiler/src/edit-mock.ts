@@ -10,24 +10,53 @@
  */
 import type { EditAgentResult } from "./edit-protocol.ts";
 
-export function mockEditOperations(instruction: string, route: string): EditAgentResult {
+/**
+ * The mock's actual return shape — `EditAgentResult` widened to require
+ * `clarify`/`structural` explicitly, as `null` rather than absent.
+ *
+ * `edit-protocol.ts`'s `EditAgentResult` predates this convention (it types
+ * both fields as merely optional) and is a known, deliberately deferred stale
+ * spot — left alone here. But the REAL agent, `orchestrator/.../edit_agent.py`'s
+ * `_normalize` and its other two return sites, always emits an explicit
+ * `None`/JSON `null` for an absent field, never omits the key. The mock used
+ * to omit the same keys instead, which is a different wire shape — and since
+ * every automated test only ever ran in mock mode, that shape difference hid
+ * a Critical bug: a `!== undefined` check downstream passed every mock
+ * response and failed 100% of real ones, while CI stayed green throughout.
+ * Matching the real shape here is what makes the editor's test suite
+ * actually exercise the shape production sends.
+ */
+type MockEditResult = Omit<EditAgentResult, "clarify" | "structural"> & {
+  clarify: string | null;
+  structural: NonNullable<EditAgentResult["structural"]> | null;
+};
+
+export function mockEditOperations(instruction: string, route: string): MockEditResult {
   const text = instruction.toLowerCase();
 
   if (instruction.includes("INVALID")) {
     return {
       operations: [{ op: "visibility", nodeId: `${route}.does-not-exist`, hidden: true }],
+      clarify: null,
+      structural: null,
       notes: "mock: an operation naming an unknown node",
     };
   }
   if (text.includes("add ") && text.includes("section")) {
     return {
       operations: [],
+      clarify: null,
       structural: { kind: "add-section", route, archetype: "social-proof", reason: "adding a section requires generation" },
       notes: "mock: structural request",
     };
   }
   if (text.includes("button")) {
-    return { operations: [], clarify: "Which button — the primary or the secondary one?", notes: "mock: ambiguous" };
+    return {
+      operations: [],
+      clarify: "Which button — the primary or the secondary one?",
+      structural: null,
+      notes: "mock: ambiguous",
+    };
   }
   // A specific colour instruction targeting the cta-band heading, checked
   // before the general accent/colour/color branch below (which shares its
@@ -53,6 +82,8 @@ export function mockEditOperations(instruction: string, route: string): EditAgen
       operations: [
         { op: "style", nodeId: `${route}.cta-band.heading`, property: "color", token: "color.semantic.accentContrast" },
       ],
+      clarify: null,
+      structural: null,
       notes: "mock: recoloured the cta-band heading",
     };
   }
@@ -61,12 +92,16 @@ export function mockEditOperations(instruction: string, route: string): EditAgen
       operations: [
         { op: "style", nodeId: `${route}.hero.headline`, property: "color", token: "color.semantic.accent" },
       ],
+      clarify: null,
+      structural: null,
       notes: "mock: recoloured the headline",
     };
   }
   if (text.includes("shorter") || text.includes("headline")) {
     return {
       operations: [{ op: "text", nodeId: `${route}.hero.headline`, value: "A shorter headline" }],
+      clarify: null,
+      structural: null,
       notes: "mock: shortened the headline",
     };
   }
@@ -81,8 +116,10 @@ export function mockEditOperations(instruction: string, route: string): EditAgen
         { op: "text", nodeId: `${route}.hero.eyebrow`, value: "New eyebrow copy" },
         { op: "text", nodeId: `${route}.hero.subheadline`, value: "New subheadline copy" },
       ],
+      clarify: null,
+      structural: null,
       notes: "mock: a compound edit touching two nodes",
     };
   }
-  return { operations: [], notes: "mock: no match" };
+  return { operations: [], clarify: null, structural: null, notes: "mock: no match" };
 }

@@ -153,9 +153,25 @@ export function validateEditOperations(
 
     if (op.op === "sectionOrder") {
       const order = op.order!;
+      // Mirrors compiler/src/exporter.ts's validateSectionOrder exactly, so a
+      // hallucinated or tombstoned id, or a duplicate, fails HERE instead of
+      // at export — where it used to persist as an override the user cannot
+      // see, then hard-fail the export with no path back to its cause.
+      const unknownSections = order.filter((id) => !activeSections.includes(id));
+      const duplicateSections = [...new Set(order.filter((id, index) => order.indexOf(id) !== index))];
       const missingSections = activeSections.filter((id) => !order.includes(id));
-      if (op.route !== route) errors.push(`reorder names route "${op.route}" but this page is "${route}"`);
-      else if (missingSections.length > 0) errors.push(`reorder omits ${missingSections.join(", ")}`);
+      if (op.route !== route) {
+        errors.push(`reorder names route "${op.route}" but this page is "${route}"`);
+      } else if (unknownSections.length > 0) {
+        errors.push(
+          `reorder names ${unknownSections.map((id) => `"${id}"`).join(", ")}, which ` +
+            `${unknownSections.length === 1 ? "is not an active section" : "are not active sections"} on this page`,
+        );
+      } else if (duplicateSections.length > 0) {
+        errors.push(`reorder lists ${duplicateSections.map((id) => `"${id}"`).join(", ")} more than once`);
+      } else if (missingSections.length > 0) {
+        errors.push(`reorder omits ${missingSections.join(", ")}`);
+      }
       continue;
     }
 

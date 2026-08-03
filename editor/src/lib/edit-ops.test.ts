@@ -134,6 +134,32 @@ describe("validateEditOperations", () => {
     ).toEqual([]);
   });
 
+  it("rejects a sectionOrder naming an id that is not an active section", () => {
+    // Mirrors the exporter's validateSectionOrder (compiler/src/exporter.ts),
+    // which hard-fails an export on the same case: a hallucinated or
+    // tombstoned id in the order used to pass validation here and only ever
+    // surface at export time, far from the override that caused it.
+    // home.hero.gone is tombstoned in this manifest, so it can never be a
+    // valid member of an order.
+    const errors = validateEditOperations(
+      [{ op: "sectionOrder", route: "home", order: ["home.hero", "home.faq", "home.hero.gone"] }],
+      MANIFEST, TOKENS, "home",
+    );
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatch(/home\.hero\.gone/);
+  });
+
+  it("rejects a sectionOrder that lists the same section more than once", () => {
+    // Same mirrored rule: the exporter also rejects a duplicate id, since a
+    // duplicate implies at least one other section is silently missing.
+    const errors = validateEditOperations(
+      [{ op: "sectionOrder", route: "home", order: ["home.hero", "home.faq", "home.hero"] }],
+      MANIFEST, TOKENS, "home",
+    );
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatch(/home\.hero/);
+  });
+
   it("rejects a style property the exporter has no utility mapping for", () => {
     // fontFamily is the shape of the whole class: the tool schema let the agent
     // ask for it, the shim applies ANY css property so the preview showed it,

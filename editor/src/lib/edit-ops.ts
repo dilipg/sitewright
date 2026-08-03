@@ -6,7 +6,7 @@
  * a token. The requirement is that any of those changes NOTHING — validation is
  * all-or-nothing per prompt, so a compound instruction never half-lands.
  */
-import type { Manifest } from "@website-generator/compiler/src/manifest.ts";
+import type { EditableChannel, Manifest } from "@website-generator/compiler/src/manifest.ts";
 import type { EditOperation } from "@website-generator/compiler/src/edit-protocol.ts";
 import type { OverridesMap } from "./store";
 import {
@@ -16,13 +16,12 @@ import {
   applyVisibility,
 } from "./store";
 
-const CHANNEL_OF: Record<EditOperation["op"], string> = {
+const CHANNEL_OF: Record<Exclude<EditOperation["op"], "sectionOrder">, EditableChannel> = {
   text: "text",
   style: "style",
   styleExact: "style",
   layout: "layout",
   visibility: "visibility",
-  sectionOrder: "sectionOrder",
 };
 
 /** Rejection reasons; empty means the batch may be applied. */
@@ -57,7 +56,7 @@ export function validateEditOperations(
       continue;
     }
     const channel = CHANNEL_OF[op.op];
-    if (!(node.editable as string[]).includes(channel)) {
+    if (!node.editable.includes(channel)) {
       errors.push(`"${nodeId}" cannot be edited through ${channel}`);
       continue;
     }

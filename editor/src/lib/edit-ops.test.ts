@@ -14,6 +14,7 @@ const MANIFEST = {
     "home.hero.headline": { route: "/", file: "f", component: "Hero", element: "Heading", editable: ["text", "style"], status: "active" },
     "home.faq": { route: "/", file: "f", component: "Faq", element: "section", editable: ["style"], status: "active" },
     "home.hero.gone": { route: "/", file: "f", component: "Hero", element: "Text", editable: ["text"], status: "tombstoned" },
+    "shop.grid": { route: "/shop", file: "f", component: "Grid", element: "section", editable: ["style"], status: "active" },
   },
 } as unknown as Manifest;
 

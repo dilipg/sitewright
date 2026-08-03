@@ -36,6 +36,14 @@ ROLE_TIERS: dict[str, str] = {
     "shell": "mid",
     "page": "top",
     "export-cleanup": "small",
+    # Prompt-driven editing. Resolving an instruction to {node, channel, token}
+    # is lookup and mapping, not authoring — the design system supplies the
+    # values — so it runs on the mid tier. `edit-escalated` is the single retry
+    # on the top tier when the mid tier returns nothing usable. Two roles rather
+    # than one so record_usage attributes their cost separately and the
+    # escalation rate is visible in the run log.
+    "edit": "mid",
+    "edit-escalated": "top",
 }
 
 

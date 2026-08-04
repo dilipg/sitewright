@@ -1,8 +1,8 @@
 # Slices 2–4 (accounts, BYOK, tenancy) — decisions so far
 
-**Status:** brainstorming in progress, via the grilling skill. **Not a spec yet.**
-Six decisions are settled; the remaining ones are listed at the end with
-recommendations awaiting a yes/no.
+**Status: SUPERSEDED** by `2026-08-04-accounts-byok-tenancy-design.md`, which
+carries every decision here plus the ones settled afterwards. Kept only as the
+record of how the decisions were reached; the design doc is authoritative.
 
 Covers slices 2, 3 and 4 of
 `docs/superpowers/specs/2026-08-03-prompt-driven-editing-design.md`'s

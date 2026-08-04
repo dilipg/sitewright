@@ -12,7 +12,7 @@ import { createServer } from "node:http";
 import { authRoutes } from "../src/auth-routes.ts";
 import { openDatabase } from "../src/db.ts";
 import { keyRoutes } from "../src/key-routes.ts";
-import { loadMasterKey } from "../src/master-key.ts";
+import { loadMasterKey, MASTER_KEY_ENV_VAR } from "../src/master-key.ts";
 import { createRequestListener } from "../src/router.ts";
 import { deleteExpiredSessions } from "../src/sessions.ts";
 // Reuses the flag() already fixed twice (server/src/user-cli.ts, applied to
@@ -60,6 +60,18 @@ const secureCookies = process.env.INSECURE_COOKIES !== "1";
 // Before anything else that could fail for a mundane reason: an operator who
 // forgot the master key should learn it immediately, not after a port bind.
 const masterKey = loadMasterKey();
+// The Buffer above is now the single in-memory copy of the master key for
+// this process — leaving WEBGEN_MASTER_KEY in process.env would hand it to
+// every child process this server spawns WITHOUT an explicit `env` override.
+// Today that is the generated project's own `npm run build`
+// (compiler/src/exporter.ts), its `tsc --noEmit` (compiler/src/gates.ts), and
+// the orchestrator's regeneration subprocess (compiler/src/regen-api.ts) —
+// none of them opt into a scrubbed copy the way buildAgentEnv's own copy
+// does; they inherit process.env verbatim. Export runs the generated
+// project's own config and plugin chain, which is model-generated from a
+// free-text brief, i.e. untrusted input. One process.env read there would
+// decrypt every user's stored key.
+delete process.env[MASTER_KEY_ENV_VAR];
 
 const db = openDatabase(dbPath);
 const pruned = deleteExpiredSessions(db);

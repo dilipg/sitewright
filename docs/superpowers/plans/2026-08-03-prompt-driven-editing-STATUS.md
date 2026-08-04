@@ -1,7 +1,7 @@
 # Prompt-driven editing — status and restart guide
 
-**Written:** 2026-08-03, at a deliberate pause point.
-**Branch:** `feat/prompt-driven-editing` — 15 commits, **not merged**.
+**Written:** 2026-08-03. **Updated:** 2026-08-04 — merged, and the live gap closed.
+**Branch:** `feat/prompt-driven-editing` — **merged to `main` as `1d6467a`**, branch deleted.
 **HEAD:** `e50c94d`
 **Tree:** clean. `npm run check` green: 170 compiler · 108 editor · 246 orchestrator · 13 + 99 e2e = **636 tests**.
 
@@ -55,7 +55,7 @@ e50c94d fix(edit): the wire-contract type now admits null, as the agent actually
 
 ## NEXT STEP
 
-**Merge.** Nothing is outstanding on the code.
+**Nothing.** This slice is merged, green, and live-verified.
 
 The SDD workspace `.superpowers/sdd/2026-08-03-prompt-driven-editing/` has been
 deleted: it existed to hold the per-task ledger and the parked findings, all of
@@ -91,25 +91,26 @@ immediately earned itself by catching an unguarded `result.operations[0]!` in
 
 ## Honest gaps, recorded not buried
 
-- **Cost is $0.0038 measured, not the $0.001 the design claims.** 3,361 input +
-  89 output tokens, Haiku 4.5, no escalation. The estimate assumed a **cached**
-  prefix; this call was uncached, so it landed near the design's own ~$0.003
-  uncached figure. **Prompt caching remains unproven** — one call cannot
-  demonstrate a cache hit. A regeneration is ~$0.13, so the ~100× argument for
-  compiling to overrides still holds comfortably.
-- **`cost_for_run(run_id)` cannot see edit-agent spend.** The agent writes the
-  global `usage.jsonl`; that function reads the per-run log. Per-run cost
-  reports understate spend once editing is used. Recorded in `decisions.md`,
-  not fixed.
-- **No live end-to-end model call.** Both halves of the real path are proven
-  separately — the payload shape as a unit test against `_normalize`'s three
-  return sites, and the CLI argv empirically (shell-free, with a quote and an
-  ampersand). Never together. Commit `1968761` closed half this gap by making
-  the mock emit `clarify: null` / `structural: null`, so all 99 editor e2e
-  tests now flow the **real** wire shape through `App.tsx`'s actual wiring.
-  What remains unproven is one real `/__edit-prompt` round trip — notably
-  whether a live model honours the new 29-member `property` enum. Every
-  unproven step fails loudly (a 500, or a loud export error), not silently.
+- **Cost, measured live and with the cache visible.** Three real calls:
+
+  | call | input | output | cache write | cache read | cost |
+  |---|---|---|---|---|---|
+  | uncached | 3,361 | 89 | — | — | $0.003806 |
+  | cache write | 429 | 92 | 4,752 | — | $0.006829 |
+  | **cache read** | 426 | 79 | — | **4,752** | **$0.001296** |
+
+  A cached edit costs **$0.0013**, essentially the design's ~$0.001 estimate.
+  The first prompt of a session pays a one-off write premium; every one after
+  is ~$0.0013. Against ~$0.13 for a regeneration that is ~100× cheaper, as the
+  design argued. **Prompt caching is proven, not assumed.**
+- **RESOLVED: the live end-to-end gap.** Two real prompts against a real
+  generated project both resolved correctly on Haiku with no escalation,
+  returning real node ids from that project's manifest and honouring the
+  29-member `property` enum — the specific thing that had been untested.
+- **`cost_for_run(run_id)` still cannot see edit-agent spend.** The agent
+  writes the global `usage.jsonl`; that function reads the per-run log, so
+  per-run cost reports understate spend once editing is used. Open, recorded
+  in `decisions.md`, not fixed.
 
 ## Two bugs worth remembering
 

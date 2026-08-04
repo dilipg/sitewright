@@ -48,7 +48,17 @@ async function call(routes: Route[], cookie?: string) {
   });
   await createRequestListener(routes)(req as never, res as never);
   const text = chunks.join("");
-  return { status, json: text === "" ? undefined : JSON.parse(text) };
+  if (text === "") return { status, json: undefined };
+  // A malformed body — e.g. two response writes concatenated because a
+  // handler ran when it should not have — must not make the harness itself
+  // throw before the caller's own assertions get to run. Fall back to the
+  // raw text rather than letting JSON.parse's exception pre-empt whatever
+  // the test is actually trying to check.
+  try {
+    return { status, json: JSON.parse(text) };
+  } catch {
+    return { status, json: text };
+  }
 }
 
 describe("requireSession", () => {
@@ -78,8 +88,19 @@ describe("requireSession", () => {
       path: "/api/whoami",
       handler: requireSession(db, (_req, res) => { ran = true; res.writeHead(200); res.end("{}"); }),
     }];
-    expect((await call(routes)).status).toBe(401);
+    let result: { status: number; json: unknown } | undefined;
+    let threw: unknown;
+    try {
+      result = await call(routes);
+    } catch (e) {
+      threw = e;
+    }
+    // Asserted first and in isolation: neither a corrupted response body nor
+    // an overwritten status code can pre-empt the one assertion that encodes
+    // the actual security property under test — the handler must not run.
     expect(ran).toBe(false);
+    expect(threw).toBeUndefined();
+    expect(result?.status).toBe(401);
   });
 
   it("401s for a forged session id", async () => {

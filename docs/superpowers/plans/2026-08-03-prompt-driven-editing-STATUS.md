@@ -2,7 +2,7 @@
 
 **Written:** 2026-08-03, at a deliberate pause point.
 **Branch:** `feat/prompt-driven-editing` — 12 commits, **not merged**.
-**HEAD:** `1968761`
+**HEAD:** `e50c94d`
 **Tree:** clean. `npm run check` green: 170 compiler · 108 editor · 246 orchestrator · 13 + 99 e2e = **636 tests**.
 
 ## State in one line
@@ -50,27 +50,28 @@ b8cf443 fix(edit): make the real agent path work — null-vs-undefined, shell-fr
 1968761 fix(edit): reject invalid sectionOrder ids; mock mirrors the agent's null shape
 ```
 
-## NEXT STEP — restart here
+## NEXT STEP
 
-1. **Decide the one deferred item** (below), fix or accept it.
-2. **Merge**, via `superpowers:finishing-a-development-branch`.
-3. **Then** delete the SDD workspace `.superpowers/sdd/2026-08-03-prompt-driven-editing/` — it is
-   deliberately kept for now because its `progress.md` is the record of the
-   parked findings. Deleting it before they are acted on destroys that record.
+**Merge.** Nothing is outstanding on the code.
 
-## The one deferred item
+The SDD workspace `.superpowers/sdd/2026-08-03-prompt-driven-editing/` has been
+deleted: it existed to hold the per-task ledger and the parked findings, all of
+which are now resolved and recorded here and in `docs/decisions.md`. Git history
+is the record.
 
-**`compiler/src/edit-protocol.ts` still declares the falsehood that caused the
-Critical bug.** The file whose own header calls it "the wire contract between
-the edit agent, the preview server and the editor" declares
-`clarify?: string` and `structural?: {...}` with **no `| null`** — but the
-Python agent emits explicit `null` for both. The honest type now lives in
-`editor/src/lib/edit-ops.ts` (`EditPromptResponse`).
+## Resolved: the last deferred item
 
-No runtime impact: the preview server only passes the object through. The risk
-is a human one — the next reader who trusts the canonical-looking file
-reintroduces the bug that failed 100% of real prompts. Fix is adding `| null`
-to two fields.
+`compiler/src/edit-protocol.ts` — the file whose own header calls it "the wire
+contract" — declared `clarify` and `structural` as optional-only, while the
+Python agent emits explicit `null` for both. That was the exact falsehood behind
+the Critical bug: an editor check of `!== undefined` matched `null`, took the
+structural branch, and threw on every real prompt while the suite stayed green
+against a mock that omitted the keys instead.
+
+The runtime bug was already fixed; what remained was a type that would lead the
+next reader straight back into it. Fixed in `e50c94d`, and the stricter type
+immediately earned itself by catching an unguarded `result.operations[0]!` in
+`edit-mock.test.ts`.
 
 ## Two decisions that are not mine
 

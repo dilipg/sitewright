@@ -11,6 +11,8 @@
 import { createServer } from "node:http";
 import { authRoutes } from "../src/auth-routes.ts";
 import { openDatabase } from "../src/db.ts";
+import { keyRoutes } from "../src/key-routes.ts";
+import { loadMasterKey } from "../src/master-key.ts";
 import { createRequestListener } from "../src/router.ts";
 import { deleteExpiredSessions } from "../src/sessions.ts";
 // Reuses the flag() already fixed twice (server/src/user-cli.ts, applied to
@@ -55,11 +57,20 @@ if (!Number.isInteger(port) || port < 1 || port > 65535) {
 // this must be 1 — a session cookie without Secure can leak over plain HTTP.
 const secureCookies = process.env.INSECURE_COOKIES !== "1";
 
+// Before anything else that could fail for a mundane reason: an operator who
+// forgot the master key should learn it immediately, not after a port bind.
+const masterKey = loadMasterKey();
+
 const db = openDatabase(dbPath);
 const pruned = deleteExpiredSessions(db);
 if (pruned > 0) console.log(`pruned ${pruned} expired session(s)`);
 
-const server = createServer(createRequestListener(authRoutes({ db, secureCookies })));
+const server = createServer(
+  createRequestListener([
+    ...authRoutes({ db, secureCookies }),
+    ...keyRoutes({ db, masterKey }),
+  ]),
+);
 
 // A failure to bind (EADDRINUSE, EACCES on a privileged port) is a failed boot,
 // not a runtime hiccup: exit non-zero so a supervisor restarts and a deploy

@@ -6,13 +6,14 @@
  * testable and the process wrapper stays trivial.
  */
 import type { DatabaseSync } from "node:sqlite";
+import { deleteApiKey } from "./api-keys.ts";
 import { generatePassword, hashPassword } from "./passwords.ts";
 import { revokeAllSessionsForUser } from "./sessions.ts";
 import {
   createUser, findUserByEmail, listUsers, setDisabled, setPasswordHash, setSpendCap,
 } from "./users.ts";
 
-const COMMANDS = ["create", "disable", "enable", "reset-password", "set-cap", "list"] as const;
+const COMMANDS = ["create", "disable", "enable", "reset-password", "set-cap", "list", "clear-key"] as const;
 
 /**
  * Returns the token following `--name`, unless that token is itself another
@@ -99,6 +100,16 @@ export async function runUserCommand(db: DatabaseSync, argv: string[]): Promise<
     }
     setSpendCap(db, user.id, usd);
     return `set ${email} spend cap to $${usd} per rolling 24h`;
+  }
+
+  if (command === "clear-key") {
+    const email = requireEmail(argv);
+    const user = requireExisting(db, email);
+    // An operator needs this without the master key and without the user's
+    // session: if a key is suspected compromised, removing it must not require
+    // the person who pasted it to be available.
+    deleteApiKey(db, user.id);
+    return `cleared the stored API key for ${email}`;
   }
 
   if (command === "list") {

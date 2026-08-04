@@ -73,6 +73,29 @@ describe("createRequestListener", () => {
     expect(result.body).not.toContain("hunter2");
   });
 
+  it("400s a malformed Host header instead of throwing out of the listener", async () => {
+    // The actual guarantee: the listener's returned promise must RESOLVE, not
+    // reject. node:http has no handler for a rejected listener promise, so a
+    // reject here would (in the real server) escape uncaught and kill the
+    // process for every user, not just this request. `new URL(..., "http://a
+    // b")` throws TypeError: Invalid URL before this fix — the guard must
+    // catch it at construction, before the try/catch around the handler.
+    const listener = createRequestListener([ok]);
+    const chunks: string[] = [];
+    let status = 0;
+    const res = {
+      headersSent: false,
+      writeHead(code: number, _hdrs?: Record<string, string | string[]>) {
+        status = code; res.headersSent = true; return res;
+      },
+      setHeader() {},
+      end(chunk?: string) { if (chunk !== undefined) chunks.push(chunk); },
+    };
+    const req = { method: "GET", url: "/api/ok", headers: { host: "a b" } };
+    await expect(listener(req as never, res as never)).resolves.toBeUndefined();
+    expect(status).toBe(400);
+  });
+
   it("terminates the response exactly once when a handler throws after sending headers", async () => {
     // Once writeHead has run, a 500 can no longer be sent (writeHead cannot
     // be called twice) — but the connection must still be closed, or the

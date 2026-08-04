@@ -26,7 +26,21 @@ export interface Route {
 
 export function createRequestListener(routes: Route[]) {
   return async function listener(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+    // Constructing the URL can throw (a malformed Host header, e.g. "a b" or
+    // "a:99999999", makes `new URL` throw TypeError: Invalid URL). That must
+    // never escape this function: node:http has no default handler for a
+    // rejected request-listener promise, so an uncaught throw here takes down
+    // the whole process, not just this one request. A request with an
+    // unparseable Host is malformed — answer 400, never fall back to a
+    // default host, which would silently address the request somewhere the
+    // client never asked for.
+    let url: URL;
+    try {
+      url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+    } catch {
+      sendJson(res, 400, { error: "bad request" });
+      return;
+    }
     // Exact match, never prefix: prefix matching is how a guard on one path
     // accidentally covers — or fails to cover — a neighbouring one.
     const route = routes.find((r) => r.method === req.method && r.path === url.pathname);

@@ -14,6 +14,18 @@ import { openDatabase } from "../src/db.ts";
 import { createRequestListener } from "../src/router.ts";
 import { deleteExpiredSessions } from "../src/sessions.ts";
 
+// Defence in depth, not the fix itself (that is router.ts's URL-construction
+// guard): node:http installs no handler for a rejected request-listener
+// promise or an exception outside one, so without this, the *next* such bug
+// still takes the whole process down for every user until a human restarts
+// it. Log and keep serving rather than exit.
+process.on("unhandledRejection", (reason) => {
+  console.error("unhandled rejection (server continues):", reason);
+});
+process.on("uncaughtException", (error) => {
+  console.error("uncaught exception (server continues):", error);
+});
+
 const args = process.argv.slice(2);
 function flag(name: string, fallback: string): string {
   const index = args.indexOf(`--${name}`);

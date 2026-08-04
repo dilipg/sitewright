@@ -259,6 +259,18 @@ export function renderHandover(data: HandoverData): string {
       "seams you will actually touch.",
   );
   lines.push("");
+  lines.push(
+    "**Why some utility classes end in `!`.** Those are the compiled canvas edits, and " +
+      "the `!` (Tailwind's important modifier) is deliberate, not a leftover. A primitive " +
+      "such as `Heading` or `Button` carries its own base utilities in its own file, so a " +
+      "class added here for the same CSS property would otherwise be resolved by " +
+      "stylesheet order rather than by source order — and the loser was sometimes the " +
+      "edit, which made the built site differ from what the editor showed. Forcing it " +
+      "important is what makes the two match. If you want to change one of these values, " +
+      "edit the class in place; if you override it from elsewhere, your rule needs `!` " +
+      "too, or it will lose.",
+  );
+  lines.push("");
 
   lines.push("## 1. Where the content lives");
   lines.push("");

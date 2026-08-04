@@ -37,6 +37,7 @@ import { runGates } from "./gates.ts";
 import { collectHandoverData, renderHandover } from "./handover.ts";
 import type { Manifest, ManifestNode } from "./manifest.ts";
 import { tombstone as tombstoneNodes } from "./manifest.ts";
+import { PROPERTY_UTILITIES } from "./style-properties.ts";
 import { isTokenReference } from "./style-value.ts";
 import { createZip } from "./zip.ts";
 
@@ -133,39 +134,6 @@ const PACKAGE_SKIP = new Set(["node_modules", "dist"]);
  * fully editable and re-exportable (PRD 5).
  */
 const OVERRIDE_ARCHIVE_DIR = "overrides-archive";
-
-/** style/layout property -> utility compilation spec. Unknown properties fail loudly. */
-const PROPERTY_UTILITIES: Record<string, { prefix: string; hint?: string; keyword?: boolean }> = {
-  background: { prefix: "bg" },
-  backgroundColor: { prefix: "bg" },
-  color: { prefix: "text" },
-  fontSize: { prefix: "text", hint: "length" },
-  fontWeight: { prefix: "font" },
-  lineHeight: { prefix: "leading" },
-  letterSpacing: { prefix: "tracking" },
-  margin: { prefix: "m" },
-  marginTop: { prefix: "mt" },
-  marginRight: { prefix: "mr" },
-  marginBottom: { prefix: "mb" },
-  marginLeft: { prefix: "ml" },
-  padding: { prefix: "p" },
-  paddingTop: { prefix: "pt" },
-  paddingRight: { prefix: "pr" },
-  paddingBottom: { prefix: "pb" },
-  paddingLeft: { prefix: "pl" },
-  gap: { prefix: "gap" },
-  width: { prefix: "w" },
-  height: { prefix: "h" },
-  maxWidth: { prefix: "max-w" },
-  minWidth: { prefix: "min-w" },
-  maxHeight: { prefix: "max-h" },
-  minHeight: { prefix: "min-h" },
-  borderRadius: { prefix: "rounded" },
-  boxShadow: { prefix: "shadow" },
-  alignSelf: { prefix: "self", keyword: true },
-  justifySelf: { prefix: "justify-self", keyword: true },
-  textAlign: { prefix: "text", keyword: true },
-};
 
 
 export function exportProject(projectDir: string, options: ExportOptions): ExportResult {
@@ -1060,7 +1028,24 @@ function applyClassOverride(
   }
 
   for (const [property, rawValue] of Object.entries(override.value as Record<string, unknown>)) {
-    const compiled = compileUtilityClass(override.nodeId, property, String(rawValue), tokenVars);
+    // Trailing "!" (Tailwind v4's important modifier), matching
+    // applyListItemClassOverride below and the live shim's !important-injected
+    // override stylesheet. mergeClassName removes any same-category utility
+    // sitting in THIS element's own className string, which is sufficient
+    // when the competing class was authored there too (e.g. a page template's
+    // own default background on a section root) -- but a primitive component
+    // (Heading, Button, Input, ...) can ALSO hardcode a same-category utility
+    // in its own shared base classes, invisible to and unreachable by that
+    // string surgery since it lives in a different file, applies to every
+    // usage, and only ever appears once compiled. Without a forced-important
+    // tiebreaker there, Tailwind's stylesheet order -- not source order --
+    // decides the winner, which found a real preview/export mismatch on a
+    // Heading's default text color (contract's preview = handover invariant):
+    // the live shim always forces its override important, so preview showed
+    // the override; the built export's generated CSS happened to place the
+    // Heading's own default color rule after the override's, so the export
+    // silently kept the default color instead.
+    const compiled = `${compileUtilityClass(override.nodeId, property, String(rawValue), tokenVars)}!`;
     mergeClassName(target, compiled);
   }
   changed.add(target.getSourceFile());
@@ -1130,13 +1115,30 @@ function conflictsWith(existing: string, incoming: string): boolean {
   return utilityCategory(existing) === utilityCategory(incoming);
 }
 
-/** Category key for conflict detection: utility root, with text- split into size/color/keyword. */
+/** Category key for conflict detection: utility root, with text- split into size/color/keyword.
+ *
+ * Strips a trailing "!" (Tailwind's important modifier, appended by
+ * applyClassOverride/applyListItemClassOverride) before deriving the root:
+ * the bracket/paren-anchored form (`/^(.*?)-[([]/`) does not care either way,
+ * since it only matches up to the FIRST "(" or "[", but the keyword fallback
+ * (`-[a-z0-9]+$`) anchors on the END of the string, and an un-stripped "!"
+ * sits after that anchor and defeats the match entirely — so a keyword
+ * utility (alignSelf/justifySelf/textAlign; every other PROPERTY_UTILITIES
+ * entry compiles to a `-(` or `-[` form the bracket-anchored branch already
+ * handles) would return itself, whole, as a category no other class can ever
+ * equal, and mergeClassName would stop detecting it as a conflict — leaving
+ * an old and a new same-category utility sitting side by side in export
+ * source, e.g. `text-center text-left!`. Rendering still resolves correctly
+ * (the "!" wins), so this was invisible to the pixel-diff invariant suite;
+ * it only costs handover source cleanliness, which is why it's worth fixing
+ * rather than leaving as a rendering-harmless wart. */
 function utilityCategory(cls: string): string {
-  const rootMatch = /^(.*?)-[([]/.exec(cls);
-  const root = rootMatch !== null ? rootMatch[1]! : cls.replace(/-[a-z0-9]+$/, "");
+  const bare = cls.endsWith("!") ? cls.slice(0, -1) : cls;
+  const rootMatch = /^(.*?)-[([]/.exec(bare);
+  const root = rootMatch !== null ? rootMatch[1]! : bare.replace(/-[a-z0-9]+$/, "");
   if (root === "text") {
-    if (/^text-\((?:length:)/.test(cls) || /^text-\[\d/.test(cls)) return "text:size";
-    if (/^text-(?:\(|\[)/.test(cls)) return "text:color";
+    if (/^text-\((?:length:)/.test(bare) || /^text-\[\d/.test(bare)) return "text:size";
+    if (/^text-(?:\(|\[)/.test(bare)) return "text:color";
     return "text:keyword";
   }
   return root;

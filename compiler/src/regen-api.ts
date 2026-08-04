@@ -8,6 +8,8 @@
  *   GET  /__archetypes                            -> { archetypes: [{name, description}] }
  *   POST /__add-section  { route, archetype, instruction }
  *                                                 -> { passed, sectionId, failureReport }
+ *   POST /__edit-prompt  { route, instruction, selection? }
+ *                                                 -> { operations, clarify, structural, notes }
  *
  * Before every regen the section's page directory + manifest are snapshotted;
  * revert restores the snapshot — the one-step "revert regeneration" (PRD 4.4).
@@ -32,6 +34,8 @@ import { cpSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { basename, join, resolve } from "node:path";
 import type { Plugin } from "vite";
+import type { EditAgentResult } from "./edit-protocol.ts";
+import { mockEditOperations } from "./edit-mock.ts";
 
 const MOCK_DELAY_MS = 1500; // keeps the in-place progress state observable in e2e
 
@@ -105,6 +109,28 @@ export function regenApiPlugin(projectRoot: string): Plugin {
                   : await realAddSection(root, route, archetype, instruction);
               server.moduleGraph.invalidateAll();
               respondJson(res, 200, { ...result, canRevert: true });
+            } catch (error) {
+              respondJson(res, 500, { error: String(error) });
+            }
+          });
+          return;
+        }
+        if (req.method === "POST" && url === "/__edit-prompt") {
+          void readBody(req).then(async (body) => {
+            try {
+              const { route, instruction, selection } = body as {
+                route: string;
+                instruction: string;
+                selection?: string;
+              };
+              // No snapshot here, unlike regen: this endpoint changes nothing on
+              // disk. It returns operations; the editor applies them as ordinary
+              // overrides, which the existing undo stack already covers.
+              const result =
+                process.env.WG_REGEN_MOCK === "1"
+                  ? mockEditOperations(instruction, route)
+                  : await realEditPrompt(root, route, instruction, selection);
+              respondJson(res, 200, result);
             } catch (error) {
               respondJson(res, 500, { error: String(error) });
             }
@@ -186,10 +212,45 @@ function runRegenCli(root: string, scopeArgs: string[], instruction: string): Pr
   return runCli<RegenOutcome>(root, ["orchestrator.regenerate", ...scopeArgs], instruction, "REGEN_RESULT ");
 }
 
+/**
+ * Spawns a child process and buffers its output. One place, because every
+ * endpoint here spawns the same way.
+ *
+ * Deliberately WITHOUT `shell: true`. A shell means Node hands the OS one
+ * command STRING, built by concatenating argv with spaces and no quoting
+ * (Node's own DEP0190 warns about exactly this), so an argument containing a
+ * space arrives as several arguments and one containing a quote arrives
+ * mangled. Every argument list here ends in `--instruction <free-form user
+ * text>`, so with a shell argparse saw five arguments for "make the headline
+ * shorter", exited 2, and no endpoint could ever produce a result line. It was
+ * also a shell-injection surface fed straight from a text box.
+ *
+ * Shell-free spawning resolves `uv` on Windows too: libuv searches PATH and
+ * PATHEXT, so the bare name finds `uv.exe` (verified on this platform — and
+ * the argv-preservation test below is the standing proof).
+ */
+export function runProcess(
+  command: string,
+  args: string[],
+  cwd: string,
+): Promise<{ stdout: string; stderr: string; code: number | null }> {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn(command, args, { cwd });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
+    child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
+    // Without this the promise never settles when the executable is missing:
+    // "close" does not fire if the process never started.
+    child.on("error", (error) => rejectPromise(error));
+    child.on("close", (code) => resolvePromise({ stdout, stderr, code }));
+  });
+}
+
 /** Spawns an orchestrator CLI and reads its single machine-readable result
  *  line. `moduleAndArgs` starts with the module name; --run-id (the project
  *  directory's own name) and --instruction are added here. */
-function runCli<T>(
+async function runCli<T>(
   root: string,
   moduleAndArgs: string[],
   instruction: string,
@@ -198,25 +259,16 @@ function runCli<T>(
   const orchestratorDir = resolve(root, "..", "..", "orchestrator");
   const runId = basename(root);
   const [moduleName, ...args] = moduleAndArgs;
-  return new Promise((resolvePromise, rejectPromise) => {
-    const child = spawn(
-      "uv",
-      ["run", "python", "-m", moduleName!, "--run-id", runId, ...args, "--instruction", instruction],
-      { cwd: orchestratorDir, shell: true },
-    );
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
-    child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
-    child.on("close", () => {
-      const resultLine = stdout.split("\n").find((line) => line.startsWith(marker));
-      if (resultLine === undefined) {
-        rejectPromise(new Error(`${moduleName!} produced no result:\n${stderr.slice(-2000)}`));
-        return;
-      }
-      resolvePromise(JSON.parse(resultLine.slice(marker.length)) as T);
-    });
-  });
+  const { stdout, stderr } = await runProcess(
+    "uv",
+    ["run", "python", "-m", moduleName!, "--run-id", runId, ...args, "--instruction", instruction],
+    orchestratorDir,
+  );
+  const resultLine = stdout.split("\n").find((line) => line.startsWith(marker));
+  if (resultLine === undefined) {
+    throw new Error(`${moduleName!} produced no result:\n${stderr.slice(-2000)}`);
+  }
+  return JSON.parse(resultLine.slice(marker.length)) as T;
 }
 
 interface AddSectionOutcome {
@@ -239,6 +291,17 @@ function realAddSection(
   );
 }
 
+function realEditPrompt(
+  root: string,
+  route: string,
+  instruction: string,
+  selection: string | undefined,
+): Promise<EditAgentResult> {
+  const scope = ["orchestrator.edit_agent", "--route", route];
+  if (selection !== undefined) scope.push("--selection", selection);
+  return runCli<EditAgentResult>(root, scope, instruction, "EDIT_RESULT ");
+}
+
 /**
  * The archetype catalog for the "+" picker (PRD 4.1), read from the
  * orchestrator's own `ARCHETYPE_CATALOG`.
@@ -258,22 +321,14 @@ async function archetypeCatalog(root: string): Promise<Array<{ name: string; des
   return catalogCache;
 }
 
-function runPython(root: string, args: string[]): Promise<string> {
+async function runPython(root: string, args: string[]): Promise<string> {
   const orchestratorDir = resolve(root, "..", "..", "orchestrator");
-  return new Promise((resolvePromise, rejectPromise) => {
-    const child = spawn("uv", ["run", "python", ...args], { cwd: orchestratorDir, shell: true });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
-    child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
-    child.on("close", () => {
-      // Kitaru prints a Windows daemon notice on import, so the payload is the
-      // last non-empty line rather than the whole of stdout.
-      const line = stdout.trim().split("\n").at(-1)?.trim() ?? "";
-      if (line.startsWith("{")) resolvePromise(line);
-      else rejectPromise(new Error(`python produced no JSON:\n${stderr.slice(-2000)}`));
-    });
-  });
+  const { stdout, stderr } = await runProcess("uv", ["run", "python", ...args], orchestratorDir);
+  // Kitaru prints a Windows daemon notice on import, so the payload is the
+  // last non-empty line rather than the whole of stdout.
+  const line = stdout.trim().split("\n").at(-1)?.trim() ?? "";
+  if (!line.startsWith("{")) throw new Error(`python produced no JSON:\n${stderr.slice(-2000)}`);
+  return line;
 }
 
 /* ---------- mock mode: deterministic transformations for UX e2e ---------- */

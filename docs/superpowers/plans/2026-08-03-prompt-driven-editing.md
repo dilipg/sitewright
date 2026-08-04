@@ -31,7 +31,8 @@
 | `orchestrator/tests/test_edit_agent.py` | **Create.** Tests with the model call stubbed. |
 | `orchestrator/src/orchestrator/config.py` | **Modify.** Add `edit` and `edit-escalated` roles to `ROLE_TIERS`. |
 | `compiler/src/regen-api.ts` | **Modify.** Add `POST /__edit-prompt` (real + mock modes). |
-| `compiler/src/edit-mock.ts` | **Create.** Deterministic operation source for mock mode, unit-testable. |
+| `compiler/src/edit-protocol.ts` | **Create.** Shared `EditOperation` / `EditAgentResult` types. Production editor code must never import from a mock module, so the contract lives here. |
+| `compiler/src/edit-mock.ts` | **Create.** Deterministic operation source for mock mode, unit-testable. Imports its types from `edit-protocol.ts`. |
 | `compiler/src/edit-mock.test.ts` | **Create.** Tests for the above. |
 | `editor/src/lib/edit-ops.ts` | **Create.** Operation types, `validateEditOperations`, `applyEditOperations`. |
 | `editor/src/lib/edit-ops.test.ts` | **Create.** Every validation rejection rule. |
@@ -700,13 +701,14 @@ git commit -m "feat(edit): edit agent with token-constrained schema and one esca
 ### Task 3: `POST /__edit-prompt` on the preview server
 
 **Files:**
+- Create: `compiler/src/edit-protocol.ts`
 - Create: `compiler/src/edit-mock.ts`
 - Create: `compiler/src/edit-mock.test.ts`
 - Modify: `compiler/src/regen-api.ts`
 
 **Interfaces:**
 - Consumes: the CLI from Task 2 (`orchestrator.edit_agent`, marker `EDIT_RESULT `).
-- Produces: `POST /__edit-prompt { route, instruction, selection? }` → `{ operations, clarify, structural, notes }`; and `mockEditOperations(instruction: string, route: string): EditAgentResult` for e2e.
+- Produces: `POST /__edit-prompt { route, instruction, selection? }` → `{ operations, clarify, structural, notes }`; `mockEditOperations(instruction: string, route: string): EditAgentResult` for e2e; and the `EditOperation` / `EditAgentResult` types in `compiler/src/edit-protocol.ts`, which Task 4 imports.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -748,18 +750,13 @@ Expected: FAIL — cannot resolve `./edit-mock`
 
 - [ ] **Step 3: Write the mock source**
 
+First `compiler/src/edit-protocol.ts` — the shared contract. It lives in its
+own module because the editor imports these types, and production code must
+never depend on a mock:
+
 ```typescript
-// compiler/src/edit-mock.ts
-/**
- * Deterministic operations for mock mode (WG_REGEN_MOCK=1), so the editor's
- * prompt UX is e2e-testable without model spend.
- *
- * Keyword-matched on purpose: it is not a second implementation of the agent,
- * it is a fixed set of responses covering each branch the editor must handle —
- * edits, a clarify, a structural verdict, and an invalid batch. Anything it
- * cannot match returns an empty result, which the editor reports as
- * "could not resolve" exactly as a failed real call would.
- */
+// compiler/src/edit-protocol.ts
+/** The wire contract between the edit agent, the preview server and the editor. */
 
 export interface EditOperation {
   op: "text" | "style" | "styleExact" | "layout" | "visibility" | "sectionOrder";
@@ -779,6 +776,23 @@ export interface EditAgentResult {
   structural?: { kind: string; route: string; archetype?: string; reason: string };
   notes: string;
 }
+```
+
+Then `compiler/src/edit-mock.ts`:
+
+```typescript
+// compiler/src/edit-mock.ts
+/**
+ * Deterministic operations for mock mode (WG_REGEN_MOCK=1), so the editor's
+ * prompt UX is e2e-testable without model spend.
+ *
+ * Keyword-matched on purpose: it is not a second implementation of the agent,
+ * it is a fixed set of responses covering each branch the editor must handle —
+ * edits, a clarify, a structural verdict, and an invalid batch. Anything it
+ * cannot match returns an empty result, which the editor reports as
+ * "could not resolve" exactly as a failed real call would.
+ */
+import type { EditAgentResult } from "./edit-protocol.ts";
 
 export function mockEditOperations(instruction: string, route: string): EditAgentResult {
   const text = instruction.toLowerCase();
@@ -834,7 +848,7 @@ In `compiler/src/regen-api.ts`, extend the header comment's route list with:
 Add the import at the top:
 
 ```typescript
-import type { EditAgentResult } from "./edit-mock.ts";
+import type { EditAgentResult } from "./edit-protocol.ts";
 import { mockEditOperations } from "./edit-mock.ts";
 ```
 
@@ -888,7 +902,7 @@ Expected: PASS, no type errors
 - [ ] **Step 7: Commit**
 
 ```bash
-git add compiler/src/edit-mock.ts compiler/src/edit-mock.test.ts compiler/src/regen-api.ts
+git add compiler/src/edit-protocol.ts compiler/src/edit-mock.ts compiler/src/edit-mock.test.ts compiler/src/regen-api.ts
 git commit -m "feat(edit): /__edit-prompt endpoint with a deterministic mock mode"
 ```
 
@@ -1057,7 +1071,7 @@ Expected: FAIL — cannot resolve `./edit-ops`
  * all-or-nothing per prompt, so a compound instruction never half-lands.
  */
 import type { Manifest } from "@website-generator/compiler/src/manifest.ts";
-import type { EditOperation } from "@website-generator/compiler/src/edit-mock.ts";
+import type { EditOperation } from "@website-generator/compiler/src/edit-protocol.ts";
 import type { OverridesMap } from "./store";
 import {
   applyLayoutProperty,
@@ -1173,8 +1187,11 @@ git commit -m "feat(edit): validate and apply agent operations, all-or-nothing"
 **Files:**
 - Create: `editor/src/components/EditPrompt.tsx`
 - Modify: `editor/src/App.tsx`
-- Modify: `editor/src/App.css`
 - Test: `editor/e2e/edit-prompt.spec.ts`
+
+> `App.css` needs no change: `EditPrompt` reuses the existing `control-section`,
+> `inspector-subheading`, `regen-instruction`, `regen-actions` and
+> `inspector-note` classes. Do not add styles unless something renders visibly broken.
 
 **Interfaces:**
 - Consumes: `validateEditOperations`, `applyEditOperations` (Task 4); `POST /__edit-prompt` (Task 3).
@@ -1428,7 +1445,7 @@ Expected: PASS (5 tests)
 - [ ] **Step 6: Commit**
 
 ```bash
-git add editor/src/components/EditPrompt.tsx editor/src/App.tsx editor/src/App.css editor/e2e/edit-prompt.spec.ts
+git add editor/src/components/EditPrompt.tsx editor/src/App.tsx editor/e2e/edit-prompt.spec.ts
 git commit -m "feat(edit): prompt box, one history entry per prompt"
 ```
 
@@ -1522,4 +1539,4 @@ git commit -m "test(edit): invariant coverage for agent-authored overrides; meas
 
 **Type consistency.** `EditOperation` and `EditAgentResult` are defined once in `compiler/src/edit-mock.ts` (Task 3) and imported by `editor/src/lib/edit-ops.ts` (Task 4). `validateEditOperations(ops, manifest, tokenPaths, route)` and `applyEditOperations(map, ops, sections)` keep the same signatures in Tasks 4 and 5. The CLI marker `EDIT_RESULT ` matches between Task 2's `main()` and Task 3's `realEditPrompt`. Roles `edit` / `edit-escalated` match between Task 2's `config.py` change and its `resolve_edit` loop.
 
-**Ordering note.** Task 4 imports a type from `compiler/src/edit-mock.ts`, so Task 3 must land first. Tasks 1 → 2 → 3 → 4 → 5 → 6 in order.
+**Ordering note.** Task 4 imports a type from `compiler/src/edit-protocol.ts`, so Task 3 must land first. Tasks 1 → 2 → 3 → 4 → 5 → 6 in order.

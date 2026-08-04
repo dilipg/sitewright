@@ -120,18 +120,29 @@ function applyStyleSwatch(nodeId: string) {
  * cross-origin iframe afterward, which silently swallows the wheel event
  * (it doesn't bubble to the stage) rather than erroring — the gap position
  * is immune to this because no frame ever occupies that column, at any Y. */
-async function panUntilFrameMounted(page: Page, slug: string): Promise<void> {
+async function panUntilFrameMounted(page: Page, slug: string, deltaX = 400): Promise<void> {
   const frame = page.locator(`iframe[title="preview-${slug}"]`);
-  for (let step = 0; step < 12; step += 1) {
-    if ((await frame.count()) > 0) return;
+  // viewportWidth guards not just "mounted" (a live iframe exists once within
+  // the render-ahead margin) but "actually on screen": a frame can enter the
+  // DOM slightly before its bounding box overlaps the visible viewport, which
+  // is invisible for the original rightward callers (about/support, panned
+  // just far enough) but matters once this same helper is asked to pan back
+  // LEFT to "home" from far to the right — several groups' worth of prior
+  // panning means "mounted" and "on screen" are no longer the same moment.
+  const viewportWidth = page.viewportSize()?.width ?? 0;
+  for (let step = 0; step < 30; step += 1) {
+    if ((await frame.count()) > 0) {
+      const box = await frame.boundingBox();
+      if (box !== null && box.x < viewportWidth && box.x + box.width > 0) return;
+    }
     // Dispatched straight at the stage rather than via mouse position:
     // hit-testing is unreliable here because earlier cases move frames
     // around, so any fixed screen point can end up inside a live
     // cross-origin iframe, which swallows the wheel without erroring.
-    await page.getByTestId("canvas-stage").dispatchEvent("wheel", { deltaX: 400, deltaY: 0 });
+    await page.getByTestId("canvas-stage").dispatchEvent("wheel", { deltaX, deltaY: 0 });
     await page.waitForTimeout(60);
   }
-  throw new Error(`frame "${slug}" never entered virtualization range`);
+  throw new Error(`frame "${slug}" never entered the viewport`);
 }
 
 export const INVARIANT_CASES: InvariantCase[] = [
@@ -473,4 +484,31 @@ export const INVARIANT_CASES: InvariantCase[] = [
     expectRemovedFromExport: true,
   },
 
+  // ---------- prompt-driven editing ----------
+  {
+    // An override authored by the agent must survive export exactly as one
+    // authored by the canvas does. It compiles through the same channel and the
+    // same exporter path, so this SHOULD be redundant — which is precisely why
+    // it is worth asserting: if a prompt ever produced something the canvas
+    // could not, this is where it would show up as a pixel difference.
+    //
+    // The prompt endpoint resolves its target route from the CURRENTLY
+    // SELECTED node (App.tsx's submitEditPrompt: `selectedId === undefined ?
+    // routes[0] : routeOf(selectedId)`), not from whichever frame the stage
+    // happens to be panned to. By this point in the suite, selection and pan
+    // both sit on "support" (the last case group above), so submitting
+    // without first selecting a "home" node would send route: "support" and
+    // the mock's home-shaped nodeId would fail validation as unknown on that
+    // route. Pans back and selects explicitly so this case is self-contained
+    // rather than order-dependent on what the previous case left behind.
+    name: "prompt: agent-authored style override on the cta-band heading",
+    screenshotNode: "home.cta-band.heading",
+    apply: async (page) => {
+      await panUntilFrameMounted(page, "home", -400);
+      await selectNode(page, "home.cta-band.heading");
+      await page.getByTestId("edit-prompt-input").fill("make the accent colour change");
+      await page.getByTestId("edit-prompt-submit").click();
+      await expect(page.getByTestId("edit-prompt-summary")).toBeVisible({ timeout: 20_000 });
+    },
+  },
 ];

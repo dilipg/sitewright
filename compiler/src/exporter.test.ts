@@ -122,8 +122,12 @@ describe("exportProject: style channel", () => {
     expect(section).toContain("bg-(--color-semantic-accent)");
     expect(section).not.toContain("bg-(--color-semantic-bg) py-(--space-24) bg-");
     expect(section).toContain("py-(--space-24)");
-    // headline primitive gains a className, merged last through the cx() seam
-    expect(section).toMatch(/nodeId="home\.hero\.headline"[^>]*className="mt-\(--space-8\)"/s);
+    // headline primitive gains a className, merged last through the cx() seam.
+    // Forced important ("!"): Heading's own base classes (a shared primitive,
+    // not this instance's className) always set a default color, so without a
+    // forced tiebreaker Tailwind's stylesheet order -- not source order --
+    // would decide the winner (same reasoning as the list-item path below).
+    expect(section).toMatch(/nodeId="home\.hero\.headline"[^>]*className="mt-\(--space-8\)!"/s);
   });
 
   it("fails loudly on token-shaped refs that resolve to no token", { timeout: 60_000 }, () => {
@@ -145,7 +149,28 @@ describe("exportProject: layout channel", () => {
     exportProject(source, { outDir, skipBuild: true });
 
     const section = readOut(outDir, "src/pages/home/sections/Hero.tsx");
-    expect(section).toMatch(/nodeId="home\.hero\.cta-secondary"[^>]*className="w-\[480px\] self-center"/s);
+    expect(section).toMatch(/nodeId="home\.hero\.cta-secondary"[^>]*className="w-\[480px\]! self-center!"/s);
+  });
+
+  it("replaces a same-category KEYWORD utility (no ( or [), not just merges alongside it", { timeout: 60_000 }, () => {
+    // Regression: utilityCategory's keyword fallback (`cls.replace(/-[a-z0-9]+$/, "")`)
+    // anchors on the end of the string. Before this fix, the trailing "!" this
+    // channel always appends sat after that anchor and defeated the match, so
+    // conflictsWith("text-center", "text-left!") came back false -- the old
+    // utility was never removed, and export shipped BOTH "text-center" and
+    // "text-left!" on the same element. home.faq.heading is a literal node
+    // whose OWN className already carries a keyword utility ("text-center",
+    // set directly in Faq.tsx) rather than one hidden inside a primitive, so
+    // this exercises mergeClassName's string-level removal specifically.
+    const source = fixtureCopyWithOverrides([
+      { nodeId: "home.faq.heading", channel: "layout", value: { textAlign: "left" } },
+    ]);
+    const outDir = join(tempDir("export-out-"), "export");
+    exportProject(source, { outDir, skipBuild: true });
+
+    const section = readOut(outDir, "src/pages/home/sections/Faq.tsx");
+    expect(section).toMatch(/nodeId="home\.faq\.heading"[^>]*className="text-left!"/s);
+    expect(section).not.toContain("text-center");
   });
 });
 

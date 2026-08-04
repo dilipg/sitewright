@@ -13,6 +13,8 @@ def test_every_pipeline_role_has_a_tier() -> None:
         "shell",
         "page",
         "export-cleanup",
+        "edit",
+        "edit-escalated",
     }
 
 

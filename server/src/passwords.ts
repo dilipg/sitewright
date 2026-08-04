@@ -27,7 +27,8 @@ export async function verifyPassword(hashed: string, plain: string): Promise<boo
 
 /**
  * `randomInt` rather than `Math.random`: this is a credential.
- * Rejection-free because 64 divides the range evenly, so no modulo bias.
+ * `randomInt` is uniform for any range because it rejection-samples internally,
+ * ensuring no modulo bias regardless of alphabet size.
  */
 export function generatePassword(): string {
   let out = "";

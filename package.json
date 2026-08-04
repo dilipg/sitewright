@@ -4,10 +4,11 @@
   "version": "0.0.0",
   "workspaces": [
     "compiler",
-    "editor"
+    "editor",
+    "server"
   ],
   "scripts": {
-    "check": "npm run test -w compiler && npm run test -w editor && npm run check:orchestrator && npm run test:e2e -w compiler && npm run test:e2e -w editor",
+    "check": "npm run test -w compiler && npm run test -w editor && npm run test -w server && npm run check:orchestrator && npm run test:e2e -w compiler && npm run test:e2e -w editor",
     "check:orchestrator": "uv run --directory orchestrator pytest",
     "spine": "npm run derive:fixture -w compiler && npm run gates -w compiler -- ../fixtures/acme-landing && npm run export -w compiler -- ../fixtures/acme-landing ../generated/acme-landing-export --clean"
   },

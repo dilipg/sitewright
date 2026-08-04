@@ -1,0 +1,22 @@
+{
+  "name": "@website-generator/server",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "test": "tsc --noEmit && vitest run",
+    "serve": "node scripts/serve.ts",
+    "user": "node scripts/user.ts"
+  },
+  "dependencies": {
+    "@node-rs/argon2": "^2.0.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2",
+    "vitest": "^4.1.10"
+  }
+}

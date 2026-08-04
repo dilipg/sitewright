@@ -14,7 +14,9 @@ import type { DatabaseSync } from "node:sqlite";
 import { openDatabase } from "./db.ts";
 import { createUser, setDisabled } from "./users.ts";
 import { setApiKey } from "./api-keys.ts";
-import { buildAgentEnv, DisabledUserError, MissingApiKeyError, resolveApiKey } from "./agent-env.ts";
+import {
+  buildAgentEnv, DisabledUserError, MissingApiKeyError, resolveApiKey, UnknownUserError,
+} from "./agent-env.ts";
 
 const masterKey = randomBytes(32);
 const STORED = "sk-ant-api03-stored-key-value-goes-here-XY9z";
@@ -87,6 +89,17 @@ describe("resolveApiKey", () => {
     const { db, user } = fresh();
     setDisabled(db, user.id, true);
     expect(() => resolveApiKey(db, masterKey, user.id, PASTED)).toThrow(DisabledUserError);
+  });
+
+  it("distinguishes an unknown user from a disabled one", () => {
+    // Both fail closed, and that is the security property — but the messages
+    // must differ. Slice 4 resolves keys from a project's owner_id, so a bad
+    // id is a realistic bug, and telling the operator "this account is
+    // disabled" when there is no row at all sends them looking in the wrong
+    // place. Asserting NOT DisabledUserError is the load-bearing half.
+    const { db } = fresh();
+    expect(() => resolveApiKey(db, masterKey, "no-such-user-id")).toThrow(UnknownUserError);
+    expect(() => resolveApiKey(db, masterKey, "no-such-user-id")).not.toThrow(DisabledUserError);
   });
 
   it("still resolves normally for an enabled user", () => {

@@ -34,6 +34,19 @@ export class MissingApiKeyError extends Error {
  * suspected-compromised user's key must be refused here too, or `disable`
  * alone is not enough to stop it being spent.
  */
+/**
+ * Distinct from DisabledUserError on purpose. Both fail closed, but they mean
+ * different things to whoever is reading the error: "disabled" is a decision
+ * someone made, "unknown" is a bad id — and slice 4 resolves keys from a
+ * project's owner_id, which is exactly where a bad id shows up.
+ */
+export class UnknownUserError extends Error {
+  constructor() {
+    super("no such user: no key can be resolved");
+    this.name = "UnknownUserError";
+  }
+}
+
 export class DisabledUserError extends Error {
   constructor() {
     super("this account is disabled: no key can be resolved for it, pasted or stored");
@@ -55,7 +68,11 @@ export function resolveApiKey(
   pastedKey?: string,
 ): string {
   const user = findUserById(db, userId);
-  if (user === null || user.disabledAt !== null) throw new DisabledUserError();
+  // Two distinct failures, kept distinct: an operator debugging a bad
+  // owner_id in slice 4 must not be told "this account is disabled" when
+  // there is no row at all. Both fail closed; only the message differs.
+  if (user === null) throw new UnknownUserError();
+  if (user.disabledAt !== null) throw new DisabledUserError();
   if (pastedKey !== undefined && pastedKey !== "") return pastedKey;
   const stored = getApiKeyPlaintext(db, masterKey, userId);
   if (stored === null || stored === "") throw new MissingApiKeyError();

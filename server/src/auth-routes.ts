@@ -16,9 +16,9 @@ import { generatePassword, hashPassword, verifyPassword } from "./passwords.ts";
 import { createSession, revokeSession, SESSION_COOKIE, SESSION_TTL_MS } from "./sessions.ts";
 import { requireSession } from "./require-session.ts";
 
-// Re-exported so existing importers (require-session.test.ts, key-routes.ts,
-// key-routes.test.ts, and anything else that reaches for "the login
-// cookie's name") keep working unchanged. The canonical definition lives in
+// Re-exported so existing importers (require-session.test.ts,
+// key-routes.test.ts, and anything else that reaches for "the login cookie's
+// name") keep working unchanged. The canonical definition lives in
 // sessions.ts — see the comment there for why.
 export { SESSION_COOKIE };
 

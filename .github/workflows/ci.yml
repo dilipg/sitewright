@@ -11,9 +11,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 24 to match the development environment and the accounts plan's stated
+      # stack. server/ requires >=22.13 (see its engines field) because that is
+      # where node:sqlite — the whole identity store — was unflagged; pinning
+      # the major here keeps CI from drifting below that floor silently.
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
 
       # Installs uv; Python 3.12 is auto-fetched from orchestrator/.python-version

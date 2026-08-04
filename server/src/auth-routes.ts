@@ -58,6 +58,15 @@ export function authRoutes(deps: { db: DatabaseSync; secureCookies: boolean }): 
           sendJson(res, 400, BAD_REQUEST);
           return;
         }
+        // JSON.parse("null") and JSON.parse("[]") both succeed, so
+        // readJsonBody's own try/catch above does not catch either — `parsed`
+        // can be `null` or an array here. Without this guard, `body.email` on
+        // a null body throws and escapes to the router's catch as an
+        // unhandled 500; a hostile body must never produce one.
+        if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+          sendJson(res, 400, BAD_REQUEST);
+          return;
+        }
         const body = parsed as { email?: unknown; password?: unknown };
         if (typeof body.email !== "string" || typeof body.password !== "string") {
           sendJson(res, 400, BAD_REQUEST);

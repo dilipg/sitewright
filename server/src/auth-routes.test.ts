@@ -115,6 +115,28 @@ describe("POST /api/login", () => {
     expect((await call("POST", "/api/login", {})).status).toBe(400);
   });
 
+  // JSON.parse("null") succeeds, so readJsonBody's own try/catch never sees
+  // it as invalid JSON — the parsed value is `null`, and `body.email` on it
+  // throws unless there's a type guard. That throw would escape to the
+  // router's catch-all as an unhandled 500. This is the one body shape that
+  // slipped through the (typeof body.email !== "string") check alone,
+  // because the check never runs — accessing .email on null throws first.
+  it("rejects a null JSON body with 400, not 500", async () => {
+    const { call } = await harness();
+    const result = await call("POST", "/api/login", null);
+    expect(result.status).toBe(400);
+  });
+
+  // Guards against the fix being narrowed to `parsed !== null` (which arrays
+  // would still pass, since typeof [] === "object"). An array has no .email
+  // property so `body.email` is merely undefined rather than throwing, but it
+  // is not a legitimate request body and must still be rejected as malformed.
+  it("rejects a JSON array body with 400", async () => {
+    const { call } = await harness();
+    const result = await call("POST", "/api/login", []);
+    expect(result.status).toBe(400);
+  });
+
   // Gap the brief's own test name promised but didn't cover: well-formed JSON
   // with wrong types is not the only "malformed body". readJsonBody calls
   // JSON.parse, which throws on bytes that aren't JSON at all — and an

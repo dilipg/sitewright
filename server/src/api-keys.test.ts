@@ -61,13 +61,33 @@ describe("setApiKey / getApiKeyPlaintext", () => {
   });
 
   it("stores no plaintext anywhere in the row", () => {
-    // The whole point of the slice. Read the raw row and assert the key is not
-    // sitting in any column.
+    // The whole point of the slice. `node:sqlite` returns a plain Uint8Array
+    // for a BLOB column, and JSON.stringify on a typed array enumerates
+    // indices ({"0":115,"1":107,...}) rather than rendering it as text — so a
+    // JSON.stringify(row) check can never contain the key regardless of what
+    // bytes are actually stored. Decode the BLOB columns to text explicitly:
+    // latin1 maps every byte to one character, so no byte sequence is lost or
+    // mangled the way an invalid utf8 sequence would be.
     const { db, user } = fresh();
     setApiKey(db, masterKey, user.id, KEY);
-    const row = db.prepare("SELECT * FROM api_key WHERE user_id = ?").get(user.id);
-    expect(JSON.stringify(row)).not.toContain(KEY);
-    expect(JSON.stringify(row)).not.toContain("sk-ant");
+    const row = db.prepare("SELECT * FROM api_key WHERE user_id = ?").get(user.id) as {
+      ciphertext: Uint8Array;
+      nonce: Uint8Array;
+      fingerprint: string;
+      created_at: number;
+    };
+    const ciphertextText = Buffer.from(row.ciphertext).toString("latin1");
+    const nonceText = Buffer.from(row.nonce).toString("latin1");
+    expect(ciphertextText).not.toContain(KEY);
+    expect(ciphertextText).not.toContain("sk-ant");
+    expect(nonceText).not.toContain(KEY);
+    expect(nonceText).not.toContain("sk-ant");
+    // The fingerprint legitimately contains the last 4 characters of the key
+    // ("XY9z"), so this checks the full key and the "sk-ant" prefix only —
+    // never the fingerprint itself — across the whole row.
+    const rowText = JSON.stringify(row);
+    expect(rowText).not.toContain(KEY);
+    expect(rowText).not.toContain("sk-ant");
   });
 
   it("replaces an existing key rather than failing or adding a second", () => {

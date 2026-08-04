@@ -101,4 +101,23 @@ describe("seal / open", () => {
     const { seal } = await import("./secrets.ts");
     expect(() => seal(randomBytes(16), secret)).toThrow(/32/);
   });
+
+  it("open() also rejects a master key that is not 32 bytes", async () => {
+    // seal()'s guard is covered above; open() has the identical assertKey()
+    // call but nothing had ever exercised that copy of it.
+    const { seal, open } = await import("./secrets.ts");
+    const sealed = seal(key, secret);
+    expect(() => open(randomBytes(16), sealed)).toThrow(/32/);
+  });
+
+  it("round-trips an empty-string plaintext", async () => {
+    // Boundary case: an empty plaintext produces a ciphertext that is exactly
+    // TAG_BYTES long (the auth tag with no body). open()'s length guard is a
+    // strict `<`, so this must still succeed — a future "fix" to `<=` would
+    // reject it silently.
+    const { seal, open } = await import("./secrets.ts");
+    const sealed = seal(key, "");
+    expect(sealed.ciphertext).toHaveLength(16);
+    expect(open(key, sealed)).toBe("");
+  });
 });

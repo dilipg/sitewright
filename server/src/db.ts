@@ -47,6 +47,14 @@ export function openDatabase(path: string): DatabaseSync {
   // WAL: the server reads sessions on every request while writes happen
   // concurrently; the default rollback journal serialises them.
   db.exec("PRAGMA journal_mode = WAL");
+  // WAL permits many concurrent readers but still only one writer at a time.
+  // The CLI and the server are two separate processes on the same file, and
+  // the default busy_timeout is 0 — the loser of a write race throws
+  // ERR_SQLITE_ERROR: database is locked immediately instead of retrying.
+  // That surfaces as an emergency `disable` silently failing to apply, or a
+  // 500 on a correct login from inside createSession. 5s is comfortably
+  // longer than any single write transaction this schema ever holds open.
+  db.exec("PRAGMA busy_timeout = 5000");
   for (const migration of MIGRATIONS) db.exec(migration);
   return db;
 }

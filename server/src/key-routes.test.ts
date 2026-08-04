@@ -32,7 +32,11 @@ function harness() {
   const session = createSession(db, user.id);
   const listener = createRequestListener(keyRoutes({ db, masterKey }));
 
-  async function call(method: string, path: string, body?: unknown, cookie?: string) {
+  // `body` is JSON-stringified as usual. `raw`, when given, bypasses
+  // JSON.stringify entirely and is sent as-is — the only way to get non-JSON
+  // bytes (or an oversized body) onto the wire for a test. Same idiom as
+  // auth-routes.test.ts's call() helper.
+  async function call(method: string, path: string, body?: unknown, cookie?: string, raw?: Buffer) {
     const chunks: string[] = [];
     let status = 0;
     const res = {
@@ -41,7 +45,7 @@ function harness() {
       setHeader() {},
       end(chunk?: string) { if (chunk !== undefined) chunks.push(chunk); },
     };
-    const payload = body === undefined ? [] : [Buffer.from(JSON.stringify(body))];
+    const payload = raw !== undefined ? [raw] : body === undefined ? [] : [Buffer.from(JSON.stringify(body))];
     const req = Object.assign((async function* () { yield* payload; })(), {
       method,
       url: path,
@@ -67,9 +71,14 @@ describe("PUT /api/key", () => {
     const { call, cookie, db, user } = harness();
     const result = await call("PUT", "/api/key", { apiKey: KEY }, cookie);
     expect(result.status).toBe(200);
-    expect(result.json).toEqual({ fingerprint: "XY9z" });
-    // The response must not carry the key even incidentally.
+    // The response must not carry the key even incidentally. Asserted on the
+    // raw text FIRST and independently of the parsed-JSON check below: every
+    // response here comes from a single sendJson, so raw is always
+    // JSON.stringify(json), which means a strict toEqual on json would catch
+    // a leak before this line ever ran. If toEqual is ever loosened to
+    // toMatchObject/objectContaining, this is the assertion that still holds.
     expect(result.raw).not.toContain(KEY);
+    expect(result.json).toEqual({ fingerprint: "XY9z" });
     // ...but it really was stored.
     expect(getApiKeyPlaintext(db, masterKey, user.id)).toBe(KEY);
   });
@@ -97,6 +106,46 @@ describe("PUT /api/key", () => {
     const { call, cookie } = harness();
     const result = await call("PUT", "/api/key", { apiKey: "sk-ant-short" }, cookie);
     expect(result.raw).not.toContain("sk-ant-short");
+  });
+
+  // JSON.parse("null") succeeds, so readJsonBody's own try/catch never sees it
+  // as invalid JSON — the parsed value is `null`, and `(parsed as
+  // {apiKey?}).apiKey` on it would throw unless there's a type guard before
+  // that access. That throw would escape to the router's catch-all as an
+  // unhandled 500. Same pattern as auth-routes.test.ts's equivalent test,
+  // which exists because POST /api/login genuinely shipped a 500 here before
+  // this guard was added.
+  it("rejects a null JSON body with 400, not 500", async () => {
+    const { call, cookie } = harness();
+    const result = await call("PUT", "/api/key", null, cookie);
+    expect(result.status).toBe(400);
+  });
+
+  // Guards against the handler's guard being narrowed to `parsed !== null`
+  // (which an array would still pass, since typeof [] === "object"). An array
+  // has no .apiKey property, so accessing it is merely undefined rather than
+  // throwing — but an array is not a legitimate request body and must still
+  // be rejected as malformed, not accepted as if apiKey were missing.
+  it("rejects a JSON array body with 400", async () => {
+    const { call, cookie } = harness();
+    const result = await call("PUT", "/api/key", [], cookie);
+    expect(result.status).toBe(400);
+  });
+
+  // Well-formed JSON with wrong types is not the only "malformed body".
+  // readJsonBody calls JSON.parse, which throws on bytes that aren't JSON at
+  // all — an unguarded throw here would escape to createRequestListener's
+  // catch, which is a 500.
+  it("rejects a body that is not valid JSON with 400, not 500", async () => {
+    const { call, cookie } = harness();
+    const result = await call("PUT", "/api/key", undefined, cookie, Buffer.from("not json at all{{{"));
+    expect(result.status).toBe(400);
+  });
+
+  it("rejects an over-limit body with 400, not 500", async () => {
+    const { call, cookie } = harness();
+    const result = await call("PUT", "/api/key", undefined, cookie, Buffer.alloc(1_500_000, "a"));
+    expect(result.status).toBe(400);
   });
 
   it("replaces an existing key", async () => {
@@ -170,5 +219,16 @@ describe("tenancy", () => {
       .toEqual({ fingerprint: "BB22" });
     expect((await call("GET", "/api/key", undefined, firstCookie)).json)
       .toEqual({ fingerprint: "XY9z" });
+  });
+});
+
+describe("method table", () => {
+  it("404s a method never registered for /api/key, rather than 401 or 405", async () => {
+    // router.test.ts proves method-mismatch -> 404 generically; this pins it
+    // for the two methods this task just added to the union. The route table
+    // is an allowlist: an unregistered method has nowhere to go, not a
+    // recognized path with the wrong verb.
+    const { call, cookie } = harness();
+    expect((await call("POST", "/api/key", { apiKey: KEY }, cookie)).status).toBe(404);
   });
 });

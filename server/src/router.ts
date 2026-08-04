@@ -39,7 +39,15 @@ export function createRequestListener(routes: Route[]) {
     } catch {
       // Deliberately no detail: a stack trace in a response body leaks paths,
       // versions, and sometimes secrets.
-      if (!res.headersSent) sendJson(res, 500, { error: "internal error" });
+      if (!res.headersSent) {
+        sendJson(res, 500, { error: "internal error" });
+      } else {
+        // Headers are already on the wire, so no status or body can be sent
+        // at this point — but the connection must still be closed. Ending
+        // with no chunk is the honest signal: a truncated response, not a
+        // hang until the client's socket/idle timeout.
+        res.end();
+      }
     }
   };
 }

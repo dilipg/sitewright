@@ -14,19 +14,25 @@ async function call(routes: Route[], method: string, path: string) {
   const listener = createRequestListener(routes);
   const chunks: string[] = [];
   let status = 0;
+  let endCalls = 0;
   const headers: Record<string, string | string[]> = {};
   const res = {
+    // Stateful, matching real ServerResponse semantics: false until the
+    // first writeHead, then true — this is what lets the catch block's
+    // `!res.headersSent` branch actually be exercised by a test.
+    headersSent: false,
     writeHead(code: number, hdrs?: Record<string, string | string[]>) {
       status = code;
       Object.assign(headers, hdrs ?? {});
+      res.headersSent = true;
       return res;
     },
     setHeader(name: string, value: string | string[]) { headers[name.toLowerCase()] = value; },
-    end(chunk?: string) { if (chunk !== undefined) chunks.push(chunk); },
+    end(chunk?: string) { endCalls += 1; if (chunk !== undefined) chunks.push(chunk); },
   };
   const req = { method, url: path, headers: { host: "localhost" } };
   await listener(req as never, res as never);
-  return { status, headers, body: chunks.join("") };
+  return { status, headers, body: chunks.join(""), endCalls };
 }
 
 const ok: Route = {
@@ -64,6 +70,23 @@ describe("createRequestListener", () => {
     const boom: Route = { method: "GET", path: "/api/boom", handler: () => { throw new Error("db password is hunter2"); } };
     const result = await call([boom], "GET", "/api/boom");
     expect(result.status).toBe(500);
+    expect(result.body).not.toContain("hunter2");
+  });
+
+  it("terminates the response exactly once when a handler throws after sending headers", async () => {
+    // Once writeHead has run, a 500 can no longer be sent (writeHead cannot
+    // be called twice) — but the connection must still be closed, or the
+    // client hangs until a socket/idle timeout with no terminating chunk.
+    const leaky: Route = {
+      method: "GET",
+      path: "/api/leaky",
+      handler: (_req, res) => {
+        res.writeHead(200);
+        throw new Error("db password is hunter2");
+      },
+    };
+    const result = await call([leaky], "GET", "/api/leaky");
+    expect(result.endCalls).toBe(1);
     expect(result.body).not.toContain("hunter2");
   });
 });

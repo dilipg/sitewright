@@ -9,7 +9,7 @@ import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { afterAll, describe, expect, it } from "vitest";
 import { openDatabase } from "./db.ts";
-import { findUserByEmail } from "./users.ts";
+import { findUserByEmail, listUsers } from "./users.ts";
 import { verifyPassword } from "./passwords.ts";
 import { createSession, resolveSession } from "./sessions.ts";
 import { runUserCommand } from "./user-cli.ts";
@@ -61,6 +61,23 @@ describe("user create", () => {
 
   it("requires an email", async () => {
     await expect(runUserCommand(freshDb(), ["create"])).rejects.toThrow(/--email/);
+  });
+
+  it("does not let a missing --email value swallow the next flag's name", async () => {
+    // Without the flag() guard, argv[index+1] would be "--usd" and the CLI
+    // would silently create a user literally named "--usd", dropping the 50.
+    // Asserts the specific "is required" message (not just /--email/), so
+    // this test actually exercises the flag() guard rather than being
+    // incidentally satisfied by the separate email-format check below.
+    const db = freshDb();
+    await expect(runUserCommand(db, ["create", "--email", "--usd", "50"])).rejects.toThrow(/--email is required/);
+    expect(listUsers(db)).toHaveLength(0);
+  });
+
+  it("rejects a malformed email", async () => {
+    const db = freshDb();
+    await expect(runUserCommand(db, ["create", "--email", "not-an-email"])).rejects.toThrow(/email address/i);
+    expect(listUsers(db)).toHaveLength(0);
   });
 });
 

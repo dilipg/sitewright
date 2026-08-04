@@ -7,11 +7,12 @@
  *   node scripts/user.ts list
  */
 import { openDatabase } from "../src/db.ts";
-import { runUserCommand } from "../src/user-cli.ts";
+import { flag, runUserCommand } from "../src/user-cli.ts";
 
 const argv = process.argv.slice(2);
-const dbIndex = argv.indexOf("--db");
-const dbPath = dbIndex >= 0 && argv[dbIndex + 1] !== undefined ? argv[dbIndex + 1]! : "./data/identity.db";
+// Reuses user-cli's flag() so a swallowed flag name (e.g. `--db --email a@b.c`)
+// is treated as no value, not as the literal db path, same as every other flag.
+const dbPath = flag(argv, "db") ?? "./data/identity.db";
 
 try {
   console.log(await runUserCommand(openDatabase(dbPath), argv));

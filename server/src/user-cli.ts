@@ -14,9 +14,30 @@ import {
 
 const COMMANDS = ["create", "disable", "enable", "reset-password", "set-cap", "list"] as const;
 
-function flag(argv: string[], name: string): string | undefined {
+/**
+ * Returns the token following `--name`, unless that token is itself another
+ * flag (starts with `--`) — in which case there is no value, not a value
+ * that happens to look like a flag. Without this, a missing value silently
+ * swallows the next flag's name instead of failing (e.g. `--email --usd 50`
+ * would otherwise read "--usd" as the email and drop the 50 with no error).
+ */
+export function flag(argv: string[], name: string): string | undefined {
   const index = argv.indexOf(`--${name}`);
-  return index >= 0 ? argv[index + 1] : undefined;
+  if (index < 0) return undefined;
+  const value = argv[index + 1];
+  return value !== undefined && !value.startsWith("--") ? value : undefined;
+}
+
+/**
+ * Deliberately minimal: catches an operator typo (a swallowed flag, a bare
+ * word), not a policy call on what a real address may contain. Exactly one
+ * `@`, with non-empty, whitespace-free text on both sides.
+ */
+function looksLikeEmail(email: string): boolean {
+  const parts = email.split("@");
+  if (parts.length !== 2) return false;
+  const [local, domain] = parts as [string, string];
+  return local.length > 0 && domain.length > 0 && !/\s/.test(local) && !/\s/.test(domain);
 }
 
 function requireEmail(argv: string[]): string {
@@ -41,6 +62,7 @@ export async function runUserCommand(db: DatabaseSync, argv: string[]): Promise<
       throw new Error("passwords cannot be supplied; one is generated and printed once");
     }
     const email = requireEmail(argv);
+    if (!looksLikeEmail(email)) throw new Error(`--email ${email} does not look like an email address`);
     if (findUserByEmail(db, email) !== null) throw new Error(`a user with email ${email} already exists`);
     const password = generatePassword();
     createUser(db, email, await hashPassword(password));

@@ -24,6 +24,12 @@ playwright-report/
 .env
 *.env
 
+# Identity database (argon2 hashes, live session ids, and — from slice 3 —
+# encrypted API keys). Ignore the directory, not just the filename: WAL mode
+# also writes -wal and -shm siblings alongside identity.db, and those hold
+# recent committed data too.
+server/data/
+
 # Misc
 coverage/
 *.local

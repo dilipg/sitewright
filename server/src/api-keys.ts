@@ -19,6 +19,20 @@ interface Row {
 }
 
 /**
+ * Typed so a caller can map it to a legible 4xx instead of an opaque 500.
+ * Thrown when `open()` fails — almost always a rotated WEBGEN_MASTER_KEY, the
+ * one operationally realistic cause. Message names no key material and gives
+ * the user something actionable: the stored value is unrecoverable and must
+ * be replaced.
+ */
+export class UndecryptableApiKeyError extends Error {
+  constructor() {
+    super("the stored API key can no longer be read and must be re-entered");
+    this.name = "UndecryptableApiKeyError";
+  }
+}
+
+/**
  * Last four characters — enough for a user to confirm which key is stored,
  * useless to anyone who steals it (spec, BYOK requirement 3).
  */
@@ -66,11 +80,20 @@ export function getApiKeyPlaintext(
 ): string | null {
   const row = db.prepare("SELECT * FROM api_key WHERE user_id = ?").get(userId) as Row | undefined;
   if (row === undefined) return null;
-  // node:sqlite hands back a Uint8Array for a BLOB; the cipher needs a Buffer.
-  return open(masterKey, {
-    ciphertext: Buffer.from(row.ciphertext),
-    nonce: Buffer.from(row.nonce),
-  });
+  try {
+    // node:sqlite hands back a Uint8Array for a BLOB; the cipher needs a Buffer.
+    return open(masterKey, {
+      ciphertext: Buffer.from(row.ciphertext),
+      nonce: Buffer.from(row.nonce),
+    });
+  } catch {
+    // `open()` throws node's bare, untyped GCM message ("Unsupported state or
+    // unable to authenticate data") on a wrong key or tampered ciphertext.
+    // Rethrown as a typed error so a caller can map it to a 4xx — an
+    // untyped throw here reaches router.ts's catch-all as an opaque 500
+    // with no log line, indistinguishable from a genuine server bug.
+    throw new UndecryptableApiKeyError();
+  }
 }
 
 /** Silent when there is nothing to delete: revoking twice is not an error. */

@@ -13,6 +13,7 @@ import { openDatabase } from "./db.ts";
 import { createUser } from "./users.ts";
 import {
   deleteApiKey, fingerprintOf, getApiKeyFingerprint, getApiKeyPlaintext, setApiKey,
+  UndecryptableApiKeyError,
 } from "./api-keys.ts";
 
 const masterKey = randomBytes(32);
@@ -104,11 +105,28 @@ describe("setApiKey / getApiKeyPlaintext", () => {
     expect(getApiKeyFingerprint(db, user.id)).toBeNull();
   });
 
-  it("throws rather than returning nonsense when the master key has changed", () => {
-    // Operationally real: someone rotates WEBGEN_MASTER_KEY and restarts.
+  it("throws a typed UndecryptableApiKeyError rather than returning nonsense when the master key has changed", () => {
+    // Operationally real: someone rotates WEBGEN_MASTER_KEY and restarts. A
+    // bare `.toThrow()` with no matcher would also pass for node's untyped
+    // GCM error ("Unsupported state or unable to authenticate data"), which
+    // is exactly the shape that let this ship unnoticed: router.ts's
+    // catch-all turns anything untyped into an opaque 500 with no log line,
+    // and a caller further up has no typed error to map to a legible 4xx.
     const { db, user } = fresh();
     setApiKey(db, masterKey, user.id, KEY);
-    expect(() => getApiKeyPlaintext(db, randomBytes(32), user.id)).toThrow();
+    expect(() => getApiKeyPlaintext(db, randomBytes(32), user.id)).toThrow(UndecryptableApiKeyError);
+  });
+
+  it("does not put a key in the message when the master key has changed", () => {
+    const { db, user } = fresh();
+    setApiKey(db, masterKey, user.id, KEY);
+    try {
+      getApiKeyPlaintext(db, randomBytes(32), user.id);
+      throw new Error("expected a throw");
+    } catch (error) {
+      expect((error as Error).message).not.toContain(KEY);
+      expect((error as Error).message).not.toContain("sk-ant");
+    }
   });
 });
 

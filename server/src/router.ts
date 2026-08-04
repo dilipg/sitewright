@@ -19,7 +19,7 @@ export type Handler = (
 ) => Promise<void> | void;
 
 export interface Route {
-  method: "GET" | "POST";
+  method: "GET" | "POST" | "PUT" | "DELETE";
   path: string;
   handler: Handler;
 }

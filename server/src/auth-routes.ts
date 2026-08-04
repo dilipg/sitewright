@@ -7,6 +7,7 @@
  * operator CLI, so no amount of guessing at the HTTP surface produces an
  * account.
  */
+import type { IncomingMessage } from "node:http";
 import type { DatabaseSync } from "node:sqlite";
 import type { Route } from "./router.ts";
 import { parseCookies, readJsonBody, sendJson, serializeCookie } from "./router.ts";
@@ -40,6 +41,29 @@ function dummyHash(): Promise<string> {
   return dummyHashPromise;
 }
 
+/**
+ * `SameSite=Lax` protects requests that SEND the session cookie; login SETS
+ * one, which Lax does not cover. A cross-site HTML form can only submit
+ * `application/x-www-form-urlencoded`, `multipart/form-data`, or
+ * `text/plain` — never `application/json` — so requiring this content type
+ * closes the classic CSRF bypass: an attacker's page silently POSTs
+ * credentials into the victim's browser, logging it into the attacker's
+ * account. A cross-origin `fetch` that sets this content type also triggers
+ * a CORS preflight, which fails here since no CORS headers exist.
+ *
+ * Parsed properly rather than compared verbatim: `application/json;
+ * charset=utf-8` is a legitimate value a real client may send, and matching
+ * must be case-insensitive (`Content-Type` values are case-insensitive per
+ * RFC 9110).
+ */
+function hasJsonContentType(req: IncomingMessage): boolean {
+  const raw = req.headers["content-type"];
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  if (value === undefined) return false;
+  const mediaType = value.split(";")[0]?.trim().toLowerCase();
+  return mediaType === "application/json";
+}
+
 export function authRoutes(deps: { db: DatabaseSync; secureCookies: boolean }): Route[] {
   const { db, secureCookies } = deps;
 
@@ -48,6 +72,10 @@ export function authRoutes(deps: { db: DatabaseSync; secureCookies: boolean }): 
       method: "POST",
       path: "/api/login",
       handler: async (req, res) => {
+        if (!hasJsonContentType(req)) {
+          sendJson(res, 400, BAD_REQUEST);
+          return;
+        }
         let parsed: unknown;
         try {
           // readJsonBody throws both on invalid JSON and on a body over the

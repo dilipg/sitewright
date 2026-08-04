@@ -30,7 +30,21 @@ async function harness() {
   // `body` is JSON-stringified as usual. `raw`, when given, bypasses
   // JSON.stringify entirely and is sent as-is — the only way to get
   // non-JSON bytes (or an oversized body) onto the wire for a test.
-  async function call(method: string, path: string, body?: unknown, cookie?: string, raw?: Buffer) {
+  //
+  // `contentType` defaults to "application/json" — real JSON callers always
+  // send it, and login now requires it (CSRF: an HTML form can never send
+  // this content type). Every pre-existing test below relies on that default
+  // to keep meaning exactly what it meant before login started checking the
+  // header. Pass a string to test a specific value, or `null` to send no
+  // Content-Type header at all.
+  async function call(
+    method: string,
+    path: string,
+    body?: unknown,
+    cookie?: string,
+    raw?: Buffer,
+    contentType: string | null = "application/json",
+  ) {
     const chunks: string[] = [];
     let status = 0;
     const headers: Record<string, string | string[]> = {};
@@ -43,9 +57,12 @@ async function harness() {
       end(chunk?: string) { if (chunk !== undefined) chunks.push(chunk); },
     };
     const payload = raw !== undefined ? [raw] : body === undefined ? [] : [Buffer.from(JSON.stringify(body))];
+    const reqHeaders: Record<string, string> = { host: "localhost" };
+    if (contentType !== null) reqHeaders["content-type"] = contentType;
+    if (cookie !== undefined) reqHeaders.cookie = cookie;
     const req = Object.assign(
       (async function* () { yield* payload; })(),
-      { method, url: path, headers: { host: "localhost", ...(cookie ? { cookie } : {}) } },
+      { method, url: path, headers: reqHeaders },
     );
     await listener(req as never, res as never);
     const text = chunks.join("");
@@ -113,6 +130,55 @@ describe("POST /api/login", () => {
     const { call } = await harness();
     expect((await call("POST", "/api/login", { email: 42 })).status).toBe(400);
     expect((await call("POST", "/api/login", {})).status).toBe(400);
+  });
+
+  // The CSRF vector this closes: an HTML <form> submitting cross-site can
+  // only send one of three content types, and application/x-www-form-urlencoded
+  // is the classic one. SameSite=Lax does not stop this, because it only
+  // guards requests that SEND the cookie — login SETS one. Credentials here
+  // are well-formed and CORRECT; only the content type is wrong, isolating
+  // this check from the body-shape checks above.
+  it("rejects a form-encoded content type, even with an otherwise valid body", async () => {
+    const { call } = await harness();
+    const result = await call(
+      "POST",
+      "/api/login",
+      { email: "a@example.com", password: "s3cret-password" },
+      undefined,
+      undefined,
+      "application/x-www-form-urlencoded",
+    );
+    expect(result.status).toBe(400);
+    expect(result.headers["set-cookie"]).toBeUndefined();
+  });
+
+  it("rejects a request with no Content-Type header at all", async () => {
+    const { call } = await harness();
+    const result = await call(
+      "POST",
+      "/api/login",
+      { email: "a@example.com", password: "s3cret-password" },
+      undefined,
+      undefined,
+      null,
+    );
+    expect(result.status).toBe(400);
+  });
+
+  // A real JSON client commonly sends a charset parameter; it must not be
+  // treated as "not JSON". Matching is also case-insensitive per RFC 9110,
+  // covered by the mixed case here.
+  it("accepts application/json with a charset parameter, case-insensitively", async () => {
+    const { call } = await harness();
+    const result = await call(
+      "POST",
+      "/api/login",
+      { email: "a@example.com", password: "s3cret-password" },
+      undefined,
+      undefined,
+      "Application/JSON; charset=utf-8",
+    );
+    expect(result.status).toBe(200);
   });
 
   // JSON.parse("null") succeeds, so readJsonBody's own try/catch never sees

@@ -84,6 +84,20 @@ Hide any selectable node (eye toggle in inspector and context menu). Hidden node
 
 Replace an `Image` primitive's source: upload or URL, stored as an asset in the project, override channel `text` with key `src` (content, not style). No cropping/filters in v1.
 
+### 3.6 Prompt-driven editing (P1)
+
+A prompt box, alongside the direct-manipulation controls above and not replacing them: the user describes a change ("make the hero headline shorter and the primary button green") and an agent resolves it into operations on **these same five channels**. It is a second way to *author* an override, not a sixth channel and not a second kind of edit — everything downstream (persistence, undo/redo, the shim, the exporter, the invariant suite) is unchanged.
+
+Requirements:
+
+1. The agent resolves which nodes are meant from the route's manifest nodes; selection is supported and narrows both what it sees and what it may target, but is never required.
+2. One prompt is **one** undo entry, and validation is **all-or-nothing** — a compound instruction never half-lands.
+3. Colour, size and spacing come from a token path the project actually defines, so a raw hex is unrepresentable rather than merely rejected (the same guarantee gate 3 gives generated components). An explicit literal value is still possible and is recorded as an off-scale edit.
+4. A node is editable only through a channel its manifest entry declares.
+5. A request that needs new or rewritten content is **detected and deferred** to the regeneration flows in section 4, behind a cost confirmation. A prompt never silently spends.
+
+Design and rationale: `docs/superpowers/specs/2026-08-03-prompt-driven-editing-design.md`.
+
 ---
 
 ## 4. Regeneration UX (the differentiating loop)

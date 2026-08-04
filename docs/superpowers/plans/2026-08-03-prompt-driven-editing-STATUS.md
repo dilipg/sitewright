@@ -78,11 +78,11 @@ immediately earned itself by catching an unguarded `result.operations[0]!` in
 
 ## Two decisions that are not mine
 
-1. **The PRD has no prompt-editing section.** `docs/canvas-editor-prd-v1.md`
-   describes editing as a canvas interaction. Nothing here violates the
-   contract — the same override entries flow through the same channels — but
-   the PRD does not cover this surface. Flagged rather than silently edited,
-   per the standing rule. Someone should decide whether it gains a section.
+1. **RESOLVED:** the PRD now has section 3.6, "Prompt-driven editing (P1)",
+   describing only what was actually built and pointing at the design doc.
+   It was flagged twice and then closed on the instruction to complete
+   pending items. **Worth a human sanity-check of the wording** — it is spec
+   text, and I authored it rather than transcribing a decision.
 2. **Slices 2–5 are unstarted**: accounts, BYOK secrets, tenancy/isolation,
    web-triggered generation. Each needs its own spec → plan → implementation
    cycle. The agreed destination is a hosted multi-user app; this slice runs

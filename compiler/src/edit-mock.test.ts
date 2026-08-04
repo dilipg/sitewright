@@ -33,7 +33,12 @@ describe("mockEditOperations", () => {
   it("returns an invalid nodeId when asked to, so the editor's rejection path is testable", () => {
     // The e2e needs a way to exercise all-or-nothing rejection without a model.
     const result = mockEditOperations("INVALID", "home");
-    expect(result.operations[0]!.nodeId).toBe("home.does-not-exist");
+    // Asserted as a whole array rather than indexing: EditAgentResult.operations
+    // is optional-and-nullable (the agent may omit or null it), so indexing it
+    // needs a non-null assertion that would hide a genuinely absent list.
+    expect(result.operations).toEqual([
+      { op: "visibility", nodeId: "home.does-not-exist", hidden: true },
+    ]);
   });
 
   it("returns two operations on two distinct nodes for a compound instruction", () => {

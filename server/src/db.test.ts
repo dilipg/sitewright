@@ -69,4 +69,17 @@ describe("openDatabase", () => {
     expect(db.prepare("SELECT id FROM session").all()).toEqual([]);
     db.close(); // release the handle so afterAll can remove the temp dir on Windows
   });
+
+  it("defaults spend_cap_usd to 10 when the column is omitted", () => {
+    // The $10/24h cap is a documented product decision (see the brief). A
+    // future migration typo or copy-paste of the user DDL that drops or
+    // changes DEFAULT 10 must fail loudly here, not silently ship a
+    // different cap.
+    const db = openDatabase(tempDbPath());
+    db.prepare("INSERT INTO user (id, email, password_hash, created_at) VALUES (?, ?, ?, ?)")
+      .run("u1", "a@example.com", "h", 1);
+    const row = db.prepare("SELECT spend_cap_usd FROM user WHERE id = ?").get("u1");
+    expect(row).toEqual({ spend_cap_usd: 10 });
+    db.close(); // release the handle so afterAll can remove the temp dir on Windows
+  });
 });

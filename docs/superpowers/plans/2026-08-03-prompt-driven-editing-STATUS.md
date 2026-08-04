@@ -1,13 +1,13 @@
 # Prompt-driven editing — status and restart guide
 
 **Written:** 2026-08-03, at a deliberate pause point.
-**Branch:** `feat/prompt-driven-editing` — 12 commits, **not merged**.
+**Branch:** `feat/prompt-driven-editing` — 15 commits, **not merged**.
 **HEAD:** `e50c94d`
 **Tree:** clean. `npm run check` green: 170 compiler · 108 editor · 246 orchestrator · 13 + 99 e2e = **636 tests**.
 
 ## State in one line
 
-The feature is **implemented, reviewed, and ready to merge**, with **one** deliberately deferred item and **two** open decisions that belong to a human.
+The feature is **implemented, reviewed, and ready to merge**. Every review finding and every parked item is resolved. **Two** open decisions remain, and both belong to a human rather than to this work.
 
 ## What was built
 
@@ -48,6 +48,9 @@ f806047 test(edit): invariant coverage for agent-authored overrides; measured co
 82c361a fix(edit): keyword-utility conflict removal, and a legible invariant case
 b8cf443 fix(edit): make the real agent path work — null-vs-undefined, shell-free spawn
 1968761 fix(edit): reject invalid sectionOrder ids; mock mirrors the agent's null shape
+239cfc8 docs: status and restart guide for prompt-driven editing
+e50c94d fix(edit): the wire-contract type now admits null, as the agent actually sends
+1f3ea7e docs: all parked items resolved; branch ready to merge
 ```
 
 ## NEXT STEP

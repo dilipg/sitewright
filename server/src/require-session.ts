@@ -11,8 +11,7 @@ import type { DatabaseSync } from "node:sqlite";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { User } from "./users.ts";
 import { type Handler, parseCookies, sendJson } from "./router.ts";
-import { resolveSession } from "./sessions.ts";
-import { SESSION_COOKIE } from "./auth-routes.ts";
+import { resolveSession, SESSION_COOKIE } from "./sessions.ts";
 
 export type AuthedHandler = (
   req: IncomingMessage,

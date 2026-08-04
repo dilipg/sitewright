@@ -30,10 +30,20 @@ export function loadMasterKey(env: NodeJS.ProcessEnv = process.env): Buffer {
 
   // Buffer.from is famously lenient — it ignores characters outside the base64
   // alphabet rather than throwing — so a typo would otherwise silently produce
-  // a short key. Re-encoding and comparing is what actually rejects it.
+  // a short key. Re-encoding and comparing is what actually rejects it. Note
+  // this also rejects base64url and unpadded base64: both decode to the
+  // correct 32 bytes but re-encode to a *different* string (`+`/`/` instead
+  // of `-`/`_`, and restored `=` padding), so they fail this comparison too —
+  // correctly, since the check's job is to catch a typo, but the message
+  // below must say so, not blame "not valid base64" for a value that a typo
+  // never produced.
   const decoded = Buffer.from(raw, "base64");
   if (decoded.toString("base64") !== raw.trim()) {
-    throw new Error(`${MASTER_KEY_ENV_VAR} is not valid base64.`);
+    throw new Error(
+      `${MASTER_KEY_ENV_VAR} is not valid base64. It must be canonical, padded ` +
+        `base64 (RFC 4648 §4) — base64url and unpadded base64 are rejected even ` +
+        `when they decode to the correct 32 bytes.`,
+    );
   }
   if (decoded.length !== REQUIRED_BYTES) {
     throw new Error(

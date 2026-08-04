@@ -13,9 +13,14 @@ import type { Route } from "./router.ts";
 import { parseCookies, readJsonBody, sendJson, serializeCookie } from "./router.ts";
 import { findUserByEmail } from "./users.ts";
 import { generatePassword, hashPassword, verifyPassword } from "./passwords.ts";
-import { createSession, resolveSession, revokeSession, SESSION_TTL_MS } from "./sessions.ts";
+import { createSession, revokeSession, SESSION_COOKIE, SESSION_TTL_MS } from "./sessions.ts";
+import { requireSession } from "./require-session.ts";
 
-export const SESSION_COOKIE = "sid";
+// Re-exported so existing importers (require-session.test.ts, key-routes.ts,
+// key-routes.test.ts, and anything else that reaches for "the login
+// cookie's name") keep working unchanged. The canonical definition lives in
+// sessions.ts — see the comment there for why.
+export { SESSION_COOKIE };
 
 /** One message for every failure mode, so the form is not an enumeration oracle. */
 const INVALID = { error: "invalid email or password" };
@@ -144,17 +149,18 @@ export function authRoutes(deps: { db: DatabaseSync; secureCookies: boolean }): 
     {
       method: "GET",
       path: "/api/me",
-      handler: (req, res) => {
-        const sid = parseCookies(req.headers.cookie)[SESSION_COOKIE];
-        const user = sid === undefined ? null : resolveSession(db, sid);
-        if (user === null) {
-          sendJson(res, 401, { error: "not authenticated" });
-          return;
-        }
-        // Explicit field list, never the whole row: `user` carries the password
-        // hash, and a spread would ship it to the client.
-        sendJson(res, 200, { id: user.id, email: user.email, spendCapUsd: user.spendCapUsd });
-      },
+      // Was a hand-rolled parseCookies -> resolveSession -> 401 sequence,
+      // identical to requireSession's — two implementations of the same
+      // check meant a future change to one could silently miss the other.
+      handler: requireSession(db, (_req, res, ctx) => {
+        // Explicit field list, never the whole row: `user` carries the
+        // password hash, and a spread would ship it to the client.
+        sendJson(res, 200, {
+          id: ctx.user.id,
+          email: ctx.user.email,
+          spendCapUsd: ctx.user.spendCapUsd,
+        });
+      }),
     },
   ];
 }

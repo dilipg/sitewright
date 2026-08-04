@@ -37,6 +37,26 @@ describe("loadMasterKey", () => {
     expect(() => loadMasterKey({ [MASTER_KEY_ENV_VAR]: "!!!not base64!!!" })).toThrow(/base64/);
   });
 
+  it("rejects base64url — even though it decodes to a correct 32-byte key — and names the real cause", () => {
+    // base64url and unpadded base64 both decode to the right bytes but are
+    // rejected by the re-encoding check, which is correct — but the old
+    // message ("is not valid base64") blamed the wrong thing for a value
+    // that no typo produced. The fix is the message, not the check.
+    const canonical = randomBytes(32).toString("base64");
+    // 32 bytes always needs exactly one '=' of padding (32 % 3 === 2), so
+    // stripping it deterministically produces a different, base64url-shaped
+    // string from any random 32-byte key.
+    const base64url = canonical.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    expect(base64url).not.toBe(canonical);
+    try {
+      loadMasterKey({ [MASTER_KEY_ENV_VAR]: base64url });
+      throw new Error("expected loadMasterKey to throw");
+    } catch (error) {
+      expect((error as Error).message).toMatch(/base64url/i);
+      expect((error as Error).message).toMatch(/padded/i);
+    }
+  });
+
   it("never puts the key value in the error message", () => {
     // An operator pastes this into a terminal and a shell history; a boot error
     // that echoes it back defeats the point of keeping it out of the repo.

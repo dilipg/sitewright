@@ -25,6 +25,21 @@ export interface Route {
 }
 
 export function createRequestListener(routes: Route[]) {
+  // The table IS the allowlist, and `.find()` below returns the first match
+  // — so a duplicate (method, path) pair would be silently shadowed rather
+  // than rejected. Checked once, at construction, not per request: the route
+  // table is fixed for the process's lifetime, and a duplicate is a wiring
+  // bug that should fail the moment the listener is built, not get buried in
+  // whichever handler happened to register first.
+  const seen = new Set<string>();
+  for (const route of routes) {
+    const key = `${route.method} ${route.path}`;
+    if (seen.has(key)) {
+      throw new Error(`duplicate route registered: ${route.method} ${route.path}`);
+    }
+    seen.add(key);
+  }
+
   return async function listener(req: IncomingMessage, res: ServerResponse): Promise<void> {
     // Constructing the URL can throw (a malformed Host header, e.g. "a b" or
     // "a:99999999", makes `new URL` throw TypeError: Invalid URL). That must

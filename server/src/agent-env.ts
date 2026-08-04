@@ -15,6 +15,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import { getApiKeyPlaintext } from "./api-keys.ts";
 import { MASTER_KEY_ENV_VAR } from "./master-key.ts";
+import { findUserById } from "./users.ts";
 
 /** Typed so a route can map it to a 400 with an actionable message. */
 export class MissingApiKeyError extends Error {
@@ -25,8 +26,27 @@ export class MissingApiKeyError extends Error {
 }
 
 /**
+ * Typed so a caller (a live route today; a project's owner_id lookup once
+ * slice 4 lands) can map it to a 4xx rather than spending a disabled
+ * account's key. `disable` revokes sessions, which closes the HTTP surface —
+ * but that is not the same guarantee as this: slice 4 resolves keys from a
+ * project's owner_id, not from a live session, so an offboarded or
+ * suspected-compromised user's key must be refused here too, or `disable`
+ * alone is not enough to stop it being spent.
+ */
+export class DisabledUserError extends Error {
+  constructor() {
+    super("this account is disabled: no key can be resolved for it, pasted or stored");
+    this.name = "DisabledUserError";
+  }
+}
+
+/**
  * A pasted key wins over the stored one: storing is a convenience, not a
- * requirement (spec, BYOK requirement 4).
+ * requirement (spec, BYOK requirement 4). But a disabled account gets
+ * neither — checked first, and before the pasted-key short circuit, so a
+ * disabled user cannot spend anything through this system, whoever's key it
+ * is.
  */
 export function resolveApiKey(
   db: DatabaseSync,
@@ -34,6 +54,8 @@ export function resolveApiKey(
   userId: string,
   pastedKey?: string,
 ): string {
+  const user = findUserById(db, userId);
+  if (user === null || user.disabledAt !== null) throw new DisabledUserError();
   if (pastedKey !== undefined && pastedKey !== "") return pastedKey;
   const stored = getApiKeyPlaintext(db, masterKey, userId);
   if (stored === null || stored === "") throw new MissingApiKeyError();

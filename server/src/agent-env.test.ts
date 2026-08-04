@@ -12,9 +12,9 @@ import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import type { DatabaseSync } from "node:sqlite";
 import { openDatabase } from "./db.ts";
-import { createUser } from "./users.ts";
+import { createUser, setDisabled } from "./users.ts";
 import { setApiKey } from "./api-keys.ts";
-import { buildAgentEnv, MissingApiKeyError, resolveApiKey } from "./agent-env.ts";
+import { buildAgentEnv, DisabledUserError, MissingApiKeyError, resolveApiKey } from "./agent-env.ts";
 
 const masterKey = randomBytes(32);
 const STORED = "sk-ant-api03-stored-key-value-goes-here-XY9z";
@@ -68,6 +68,33 @@ describe("resolveApiKey", () => {
     } catch (error) {
       expect((error as Error).message).not.toContain("sk-ant");
     }
+  });
+
+  it("refuses a stored key once the user is disabled", () => {
+    // `disable` revokes sessions, closing the HTTP surface — but slice 4
+    // resolves keys from a project's owner_id, not a live session, so the
+    // key itself must be refused here too.
+    const { db, user } = fresh();
+    setApiKey(db, masterKey, user.id, STORED);
+    setDisabled(db, user.id, true);
+    expect(() => resolveApiKey(db, masterKey, user.id)).toThrow(DisabledUserError);
+  });
+
+  it("refuses even a pasted key once the user is disabled", () => {
+    // The sub-decision this pins: disabled means no work through this
+    // system, whoever's key it is — the pasted-key short circuit must not
+    // bypass the disabled check.
+    const { db, user } = fresh();
+    setDisabled(db, user.id, true);
+    expect(() => resolveApiKey(db, masterKey, user.id, PASTED)).toThrow(DisabledUserError);
+  });
+
+  it("still resolves normally for an enabled user", () => {
+    // The disabled check must not be a false positive for the common case.
+    const { db, user } = fresh();
+    setApiKey(db, masterKey, user.id, STORED);
+    expect(resolveApiKey(db, masterKey, user.id)).toBe(STORED);
+    expect(resolveApiKey(db, masterKey, user.id, PASTED)).toBe(PASTED);
   });
 });
 
@@ -130,5 +157,15 @@ describe("buildAgentEnv", () => {
     // fails inside the orchestrator with an auth error.
     const { db, user } = fresh();
     expect(() => buildAgentEnv({ db, masterKey, userId: user.id })).toThrow(MissingApiKeyError);
+  });
+
+  it("refuses to build an env for a disabled user, even with a stored key", () => {
+    // The child never spawns for a disabled user's work — checked here, not
+    // just in resolveApiKey, because this is the actual call site slice 4
+    // will use to spawn the orchestrator.
+    const { db, user } = fresh();
+    setApiKey(db, masterKey, user.id, STORED);
+    setDisabled(db, user.id, true);
+    expect(() => buildAgentEnv({ db, masterKey, userId: user.id })).toThrow(DisabledUserError);
   });
 });

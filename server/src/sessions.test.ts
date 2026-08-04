@@ -53,6 +53,14 @@ describe("sessions", () => {
     db.close();
   });
 
+  it("is dead exactly at its expiry instant", () => {
+    const db = freshDb();
+    const user = createUser(db, "a@example.com", "h");
+    const session = createSession(db, user.id, 1000);
+    expect(resolveSession(db, session.id, 1000 + SESSION_TTL_MS)).toBeNull();
+    db.close();
+  });
+
   it("refuses a session belonging to a disabled user, without needing revocation", () => {
     // This is what makes invite-only revocation immediate: disabling the
     // account must lock out live sessions, not just prevent new logins.

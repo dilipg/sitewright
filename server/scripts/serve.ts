@@ -9,9 +9,8 @@
  * Usage: node scripts/serve.ts [--port 4000] [--db ./data/identity.db]
  */
 import { createServer } from "node:http";
-import { authRoutes } from "../src/auth-routes.ts";
+import { buildRoutes } from "../src/compose.ts";
 import { openDatabase } from "../src/db.ts";
-import { keyRoutes } from "../src/key-routes.ts";
 import { loadMasterKey, MASTER_KEY_ENV_VAR } from "../src/master-key.ts";
 import { createRequestListener } from "../src/router.ts";
 import { deleteExpiredSessions } from "../src/sessions.ts";
@@ -78,10 +77,7 @@ const pruned = deleteExpiredSessions(db);
 if (pruned > 0) console.log(`pruned ${pruned} expired session(s)`);
 
 const server = createServer(
-  createRequestListener([
-    ...authRoutes({ db, secureCookies }),
-    ...keyRoutes({ db, masterKey }),
-  ]),
+  createRequestListener(buildRoutes({ db, masterKey, secureCookies })),
 );
 
 // A failure to bind (EADDRINUSE, EACCES on a privileged port) is a failed boot,

@@ -6,13 +6,30 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import type { DatabaseSync } from "node:sqlite";
 import { openDatabase } from "./db.ts";
 import { hashPassword } from "./passwords.ts";
 import { createUser, setDisabled } from "./users.ts";
 import { authRoutes } from "./auth-routes.ts";
 import { createRequestListener } from "./router.ts";
+
+// Same idiom as passwords.test.ts / sessions-entropy.test.ts: wrap the real
+// implementation rather than stub it out, so hashing/verifying still works
+// for every other test in this file (harness() logs users in for real), and
+// count real calls to `verify` so a test can pin "argon2 verification
+// actually ran" without touching the clock.
+let verifyCallCount = 0;
+vi.mock("@node-rs/argon2", async () => {
+  const actual = await vi.importActual<typeof import("@node-rs/argon2")>("@node-rs/argon2");
+  return {
+    ...actual,
+    verify: (...args: Parameters<typeof actual.verify>) => {
+      verifyCallCount += 1;
+      return actual.verify(...args);
+    },
+  };
+});
 
 const dirs: string[] = [];
 // Tracked so afterAll can close every handle before removing its temp dir —
@@ -112,6 +129,18 @@ describe("POST /api/login", () => {
     const unknownEmail = await call("POST", "/api/login", { email: "nobody@example.com", password: "wrong" });
     expect(unknownEmail.status).toBe(wrongPassword.status);
     expect(unknownEmail.json).toEqual(wrongPassword.json);
+  });
+
+  // Without this, the entire dummy-hash mechanism (auth-routes.ts's
+  // dummyHash()) could be deleted — skip verifyPassword whenever no user
+  // matches — and every other test in this describe block would still pass,
+  // since they only assert status and body shape. This pins the actual
+  // mechanism: a real argon2 verification runs even when no user matched.
+  it("actually runs an argon2 verification on the unknown-email path", async () => {
+    const { call } = await harness();
+    const before = verifyCallCount;
+    await call("POST", "/api/login", { email: "nobody@example.com", password: "whatever" });
+    expect(verifyCallCount - before).toBe(1);
   });
 
   it("refuses a disabled user", async () => {

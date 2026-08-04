@@ -12,6 +12,16 @@ import type { DatabaseSync } from "node:sqlite";
 import type { User } from "./users.ts";
 import { findUserById } from "./users.ts";
 
+/**
+ * Lives here, not in auth-routes.ts: require-session.ts needs this string and
+ * nothing else from the unauthenticated-routes module, and importing it from
+ * there would pull in @node-rs/argon2 just to learn "sid" — and, once
+ * anything wraps GET /api/me in requireSession, become a real import cycle
+ * (auth-routes.ts -> require-session.ts -> auth-routes.ts). auth-routes.ts
+ * re-exports this so existing importers keep working unchanged.
+ */
+export const SESSION_COOKIE = "sid";
+
 export const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 export function createSession(

@@ -3,6 +3,7 @@
  * (spec, threat model). These tests are as much about what the CLI refuses to
  * do as what it does.
  */
+import { randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,6 +13,7 @@ import { openDatabase } from "./db.ts";
 import { findUserByEmail, listUsers } from "./users.ts";
 import { verifyPassword } from "./passwords.ts";
 import { createSession, resolveSession } from "./sessions.ts";
+import { getApiKeyFingerprint, setApiKey } from "./api-keys.ts";
 import { runUserCommand } from "./user-cli.ts";
 
 const dirs: string[] = [];
@@ -167,6 +169,31 @@ describe("user set-cap and list", () => {
     const output = await runUserCommand(db, ["list"]);
     expect(output).toContain("a@example.com");
     expect(output).not.toContain("argon2");
+  });
+});
+
+describe("user clear-key", () => {
+  it("removes a stored key without needing the master key", async () => {
+    const db = freshDb();
+    await runUserCommand(db, ["create", "--email", "a@example.com"]);
+    const user = findUserByEmail(db, "a@example.com")!;
+    setApiKey(db, randomBytes(32), user.id, "sk-ant-api03-something-stored-XY9z");
+
+    await runUserCommand(db, ["clear-key", "--email", "a@example.com"]);
+
+    expect(getApiKeyFingerprint(db, user.id)).toBeNull();
+    // No db.close() here: freshDb() already registers this handle in `dbs`
+    // for the shared afterAll to close. Closing it again threw "database is
+    // not open" from inside afterAll and turned the whole file into a
+    // reported failed suite even though all 18 tests passed — confirmed live
+    // before this line was removed. Every other test in this file relies on
+    // the same afterAll-only cleanup; these two now match that convention.
+  });
+
+  it("errors on an unknown email rather than silently succeeding", async () => {
+    const db = freshDb();
+    await expect(runUserCommand(db, ["clear-key", "--email", "ghost@example.com"]))
+      .rejects.toThrow(/no user/i);
   });
 });
 

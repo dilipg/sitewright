@@ -96,6 +96,24 @@ describe("createRequestListener", () => {
     expect(status).toBe(400);
   });
 
+  it("throws at construction time when the same (method, path) is registered twice", () => {
+    // The table IS the allowlist, and `.find()` returns the first match, so a
+    // duplicate would otherwise be silently shadowed rather than rejected.
+    // Slice 4 adds ten routes across multiple arrays — exactly the situation
+    // where a duplicate registered in the wrong one is otherwise invisible.
+    const first: Route = { method: "GET", path: "/api/dup", handler: () => {} };
+    const second: Route = { method: "GET", path: "/api/dup", handler: () => {} };
+    expect(() => createRequestListener([first, second])).toThrow(/duplicate/i);
+  });
+
+  it("does not throw for the same path registered under different methods", () => {
+    // Not every same-path repeat is a duplicate — GET and PUT on /api/key are
+    // both legitimate and must keep working.
+    const getRoute: Route = { method: "GET", path: "/api/key", handler: () => {} };
+    const putRoute: Route = { method: "PUT", path: "/api/key", handler: () => {} };
+    expect(() => createRequestListener([getRoute, putRoute])).not.toThrow();
+  });
+
   it("terminates the response exactly once when a handler throws after sending headers", async () => {
     // Once writeHead has run, a 500 can no longer be sent (writeHead cannot
     // be called twice) — but the connection must still be closed, or the

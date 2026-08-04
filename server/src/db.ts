@@ -35,6 +35,13 @@ const MIGRATIONS = [
      created_at INTEGER NOT NULL
    )`,
   `CREATE INDEX IF NOT EXISTS session_user_idx ON session(user_id)`,
+  `CREATE TABLE IF NOT EXISTS api_key (
+     user_id     TEXT PRIMARY KEY REFERENCES user(id) ON DELETE CASCADE,
+     ciphertext  BLOB NOT NULL,
+     nonce       BLOB NOT NULL,
+     fingerprint TEXT NOT NULL,
+     created_at  INTEGER NOT NULL
+   )`,
 ];
 
 export function openDatabase(path: string): DatabaseSync {

@@ -58,6 +58,27 @@ describe("createProject", () => {
     const { db, alice } = fresh();
     expect(() => createProject(db, alice.id, "../secrets", "bad")).toThrow(/relative|escape/i);
     expect(() => createProject(db, alice.id, "a/../../b", "bad")).toThrow(/relative|escape/i);
+    expect(() => createProject(db, alice.id, "a\\..\\..\\b", "bad")).toThrow(/relative|escape/i);
+  });
+
+  it("accepts a directory that merely begins with two dots, and resolveProjectDirectory agrees", () => {
+    // "..foo" is a safe sibling-looking name, not a traversal — only a
+    // component that IS ".." (or that starts with "..<sep>") is a traversal.
+    // createProject and resolveProjectDirectory are two independent guards on
+    // the same rule and must accept exactly the same directories.
+    const { db, alice } = fresh();
+    const p = createProject(db, alice.id, "..foo", "Backup");
+    expect(p.directory).toBe("..foo");
+    const root = process.platform === "win32" ? "C:\\projects" : "/projects";
+    expect(() => resolveProjectDirectory(root, "..foo")).not.toThrow();
+    expect(resolveProjectDirectory(root, "..foo")).toBe(join(root, "..foo"));
+  });
+
+  it("refuses the bare current-directory segment and its slashed form", () => {
+    // The projects root itself is not a project.
+    const { db, alice } = fresh();
+    expect(() => createProject(db, alice.id, ".", "bad")).toThrow(/relative|escape/i);
+    expect(() => createProject(db, alice.id, "./", "bad")).toThrow(/relative|escape/i);
   });
 
   it("returns null for an unknown id rather than throwing", () => {

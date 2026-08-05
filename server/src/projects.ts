@@ -50,7 +50,13 @@ function assertRelativeContained(directory: string): void {
     throw new Error("project directory must be a relative path inside the projects root");
   }
   const normalized = normalize(directory);
-  if (normalized === ".." || normalized.startsWith(`..${sep}`) || normalized.includes(`${sep}..${sep}`)) {
+  if (
+    normalized === "." ||
+    normalized === `.${sep}` ||
+    normalized === ".." ||
+    normalized.startsWith(`..${sep}`) ||
+    normalized.includes(`${sep}..${sep}`)
+  ) {
     throw new Error("project directory must not escape the projects root");
   }
 }
@@ -109,7 +115,12 @@ export function listAllProjects(db: DatabaseSync): Project[] {
 export function resolveProjectDirectory(projectsRoot: string, directory: string): string {
   const resolved = join(projectsRoot, directory);
   const rel = relative(projectsRoot, resolved);
-  if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) {
+  // Mirrors assertRelativeContained's pattern exactly: a name that merely
+  // BEGINS with two dots (e.g. "..foo") is a safe sibling-looking directory
+  // name, not a traversal, and must not be rejected here just because the
+  // create-time guard already accepted it — the two checks are meant to
+  // agree, not for the recheck to be stricter than the check it rechecks.
+  if (rel === "" || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
     throw new Error("project directory would escape the projects root");
   }
   return resolved;

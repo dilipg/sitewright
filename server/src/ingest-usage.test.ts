@@ -42,7 +42,14 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  db.close();
+  try {
+    db.close();
+  } catch {
+    // Already closed by the "database itself fails" test, which closes db
+    // mid-test to exercise the outer backstop. A second close throws
+    // "database is not open" in node:sqlite; swallow it here rather than
+    // giving that one test a bespoke teardown.
+  }
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -160,5 +167,20 @@ describe("ingestUsageLog", () => {
     const window = spendSince(db, user.id, 0);
     expect(window.costUsd).toBe(2);
     expect(window.unpricedEvents).toBe(1);
+  });
+
+  it("returns rather than throwing when the database itself fails", () => {
+    const path = writeLog("m.jsonl", [row(), row()]);
+    db.close();
+    let result: IngestResult | undefined;
+    expect(() => {
+      result = ingestUsageLog(db, { path, userId: user.id, projectId: null, now: NOW });
+    }).not.toThrow();
+    // findUserById is the first db call reached (projectId is null, so
+    // findProjectById is short-circuited), and it throws "database is not
+    // open" before either row is processed — so both counts are 0, not
+    // "2 skipped" the way a stale-user or stale-project run would report.
+    // The outer backstop can only return what was counted before it fired.
+    expect(result).toEqual({ ingested: 0, skipped: 0 });
   });
 });

@@ -63,18 +63,36 @@ Run: `ls compiler/src/preview*.ts compiler/src/*preview*` and read whatever test
 
 Add to the existing preview test file:
 
+**CORRECTED — read this before writing the port test.** The plan originally told you to ask Vite for port 0 and let the OS assign one. **That does not work, verified empirically twice:** Vite treats `0` as falsy when deciding whether a port was configured, so `--port 0` silently serves on Vite's own default (5173), and two children both asking for port 0 collide. The port therefore has to be chosen by the PARENT and passed concretely — that is task 2's `findFreePort`.
+
+The original assertion here was also too weak to catch it: it asserted `port !== 5273`, and 5173 (Vite's default) satisfies that, so the test passed green under a title that was false. Do not reproduce it. Write this instead:
+
 ```ts
-  it("binds an OS-assigned port when asked for port 0", async () => {
-    // The pool needs a dynamic port: six fixed ports would collide with a
-    // developer's own `npm run preview`, and strictPort means a collision is
-    // a hard failure rather than a silent increment.
-    const server = await startPreviewServer(fixtureDir, { port: 0 });
+  it("honours the concrete port it is given", async () => {
+    // The pool picks the port itself and passes it, so this is the contract
+    // that actually matters.
+    const port = await someFreePortHelper();   // bind :0 with node:net, read the port, close
+    const server = await startPreviewServer(fixtureDir, { port });
     try {
       const address = server.httpServer?.address();
-      expect(typeof address === "object" && address !== null).toBe(true);
-      const port = (address as { port: number }).port;
+      expect((address as { port: number }).port).toBe(port);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("does NOT treat port 0 as a request for an ephemeral port", async () => {
+    // Documents the trap rather than leaving it to be rediscovered: Vite
+    // treats 0 as "no port configured" and falls back to its own default, so
+    // asking for 0 gives every child the SAME port and the second one dies on
+    // strictPort. This is why the parent probes for a port instead.
+    const server = await startPreviewServer(fixtureDir, { port: 0 });
+    try {
+      const port = (server.httpServer?.address() as { port: number }).port;
+      // Deliberately not asserting a specific number — Vite's default is
+      // Vite's business. What matters is that 0 did not mean "ephemeral".
       expect(port).toBeGreaterThan(0);
-      expect(port).not.toBe(5273);
+      expect(server.config.server.port).not.toBe(0);
     } finally {
       await server.close();
     }
@@ -163,6 +181,7 @@ git commit -m "feat(compiler): allow a dynamic port, a base path, and a machine-
 **Interfaces:**
 - Consumes: `buildAgentEnv`, `MissingApiKeyError`, `UnknownUserError`, `DisabledUserError` from `./agent-env.ts`; `redactSecrets` from `./redact.ts`; `resolveProjectDirectory` from `./projects.ts`; `Project` from `./projects.ts`.
 - Produces:
+  - `findFreePort(): Promise<number>`
   - `const MAX_PREVIEWS = 6`
   - `class PreviewCapacityError extends Error` — message names the cap.
   - `interface PreviewProcess { projectId: string; port: number; base: string; inFlight: number; lastUsedAt: number }`
@@ -338,11 +357,16 @@ describe("spawning", () => {
     expect(preview.projectId).toBe(project.id);
   });
 
-  it("asks for a dynamic port and the project's proxy base", async () => {
+  it("passes a concrete probed port, never 0, and the project's proxy base", async () => {
+    // Vite treats port 0 as "no port configured" and falls back to its own
+    // default, so every child asking for 0 would get the SAME port and the
+    // second would die on strictPort. Verified empirically — the parent must
+    // pick the port. See findFreePort.
     const pool = makePool();
     const preview = await pool.acquire(project, ownerId);
     const { args } = spawned[0]!;
-    expect(args[args.indexOf("--port") + 1]).toBe("0");
+    const passedPort = Number(args[args.indexOf("--port") + 1]);
+    expect(passedPort).toBeGreaterThan(0);
     expect(args[args.indexOf("--base") + 1]).toBe(`/preview/${project.id}/`);
     expect(preview.base).toBe(`/preview/${project.id}/`);
   });
@@ -541,6 +565,7 @@ Expected: FAIL — `Cannot find module './preview-pool.ts'`.
 
 Write it to satisfy the tests above. The design points that the tests pin, so you know what the shape has to be:
 
+- `findFreePort()` binds a `node:net` server on port 0, reads the assigned port, closes it, and resolves that number. This is inherently a check-then-use race, and that is acceptable **only because `strictPort` makes losing the race a loud child exit rather than a silent rebind**: `acquire` retries the whole spawn up to 3 times on a child that dies without announcing readiness, and gives up with a clear error after that. Comment both halves — the race and why it is tolerable.
 - One `Map<string, Entry>` keyed by project id, where an `Entry` holds the child, port, base, `inFlight`, `lastUsedAt`, and the pending-ready promise.
 - `acquire` returns the existing entry's `PreviewProcess` if the child is alive, and **stores the in-flight spawn promise in the map before awaiting it**, so two concurrent first requests share one spawn.
 - Readiness: accumulate `stdout` data into a buffer, split on `\n`, and resolve on the first line starting with `PREVIEW_READY `. Reject if the child exits first, and reject on a spawn timeout — pick a generous one (a cold Vite start on a large generated project is seconds, not milliseconds; 60s with a comment).

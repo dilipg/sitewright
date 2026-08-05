@@ -7,7 +7,7 @@ import { openDatabase } from "./db.ts";
 import { createUser, type User } from "./users.ts";
 import { createProject } from "./projects.ts";
 import { spendSince } from "./usage.ts";
-import { ingestUsageLog } from "./ingest-usage.ts";
+import { ingestUsageLog, type IngestResult } from "./ingest-usage.ts";
 
 const NOW = 1_800_000_000_000;
 
@@ -136,5 +136,29 @@ describe("ingestUsageLog", () => {
     const stored = db.prepare("SELECT project_id FROM usage_event").get() as { project_id: unknown };
     expect(stored.project_id).toBe(null);
     expect(spendSince(db, user.id, 0).costUsd).toBe(0.5);
+  });
+
+  it("reports every line as skipped, rather than throwing, when the user has gone", () => {
+    const path = writeLog("j.jsonl", [row(), row()]);
+    let result: IngestResult | undefined;
+    expect(() => {
+      result = ingestUsageLog(db, { path, userId: "no-such-user", projectId: null, now: NOW });
+    }).not.toThrow();
+    expect(result).toEqual({ ingested: 0, skipped: 2 });
+  });
+
+  it("survives a line that is the literal JSON null", () => {
+    // typeof null === "object", so the null guard is what stops this crashing.
+    const path = writeLog("k.jsonl", [row(), "null"]);
+    const result = ingestUsageLog(db, { path, userId: user.id, projectId: null, now: NOW });
+    expect(result).toEqual({ ingested: 1, skipped: 1 });
+  });
+
+  it("treats a negative cost as unpriced rather than letting it reduce the total", () => {
+    const path = writeLog("l.jsonl", [row({ cost_usd: 2 }), row({ cost_usd: -5 })]);
+    ingestUsageLog(db, { path, userId: user.id, projectId: null, now: NOW });
+    const window = spendSince(db, user.id, 0);
+    expect(window.costUsd).toBe(2);
+    expect(window.unpricedEvents).toBe(1);
   });
 });

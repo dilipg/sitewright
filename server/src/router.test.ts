@@ -99,10 +99,22 @@ describe("createRequestListener", () => {
   it("throws at construction time when the same (method, path) is registered twice", () => {
     // The table IS the allowlist, and `.find()` returns the first match, so a
     // duplicate would otherwise be silently shadowed rather than rejected.
-    // Slice 4 adds ten routes across multiple arrays — exactly the situation
+    // Slice 4 adds two routes across multiple arrays — exactly the situation
     // where a duplicate registered in the wrong one is otherwise invisible.
     const first: Route = { method: "GET", path: "/api/dup", handler: () => {} };
     const second: Route = { method: "GET", path: "/api/dup", handler: () => {} };
+    expect(() => createRequestListener([first, second])).toThrow(/duplicate/i);
+  });
+
+  it("throws at construction time for two parameterised routes with the same pattern but different param names", () => {
+    // Before parameterised routes existed, string equality on the path WAS
+    // pattern equality. It no longer is: match() only ever looks at a
+    // parameter's POSITION, never its name, so "GET /a/:x" and "GET /a/:y"
+    // match exactly the same requests, and the second would be silently
+    // unreachable — exactly the kind of duplicate this guard exists to catch,
+    // just not detectable by literal string equality alone.
+    const first: Route = { method: "GET", path: "/a/:x", handler: () => {} };
+    const second: Route = { method: "GET", path: "/a/:y", handler: () => {} };
     expect(() => createRequestListener([first, second])).toThrow(/duplicate/i);
   });
 

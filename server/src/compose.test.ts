@@ -60,7 +60,7 @@ describe("buildRoutes", () => {
   it("has no duplicate (method, path) pair", () => {
     // The table IS the allowlist; router.ts's `.find()` returns the first
     // match, so a duplicate here would be silently shadowed rather than
-    // caught. Slice 4 adds ten more routes across multiple arrays — exactly
+    // caught. Slice 4 adds two more routes across multiple arrays — exactly
     // the situation where a duplicate registered in the wrong one is
     // otherwise invisible.
     const db = fresh();

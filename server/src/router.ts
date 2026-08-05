@@ -86,16 +86,35 @@ function match(compiled: CompiledRoute, method: string, pathname: string) {
   return params;
 }
 
+/**
+ * Before parameterised routes existed, string equality on `${method} ${path}`
+ * WAS pattern equality: every segment was literal, so two equal strings and
+ * two colliding patterns were the same fact. They no longer are — `match()`
+ * below never looks at a parameter's NAME, only its position, so "GET
+ * /a/:x" and "GET /a/:y" match exactly the same requests and the second is
+ * unreachable the instant the first is registered. As raw strings, though,
+ * they are two different keys. Every `:name` segment is normalised to the
+ * same placeholder here so the dedupe key reflects the pattern a request is
+ * actually matched against, not the literal characters used to write it.
+ */
+function dedupeKey(route: Route): string {
+  const normalizedPath = route.path
+    .split("/")
+    .map((segment) => (segment.startsWith(":") ? ":param" : segment))
+    .join("/");
+  return `${route.method} ${normalizedPath}`;
+}
+
 export function createRequestListener(routes: Route[]) {
   // The table IS the allowlist, and `.find()` below returns the first match
-  // — so a duplicate (method, path) pair would be silently shadowed rather
-  // than rejected. Checked once, at construction, not per request: the route
-  // table is fixed for the process's lifetime, and a duplicate is a wiring
-  // bug that should fail the moment the listener is built, not get buried in
-  // whichever handler happened to register first.
+  // — so two routes matching the same request pattern would be silently
+  // shadowed rather than rejected. Checked once, at construction, not per
+  // request: the route table is fixed for the process's lifetime, and a
+  // duplicate is a wiring bug that should fail the moment the listener is
+  // built, not get buried in whichever handler happened to register first.
   const seen = new Set<string>();
   for (const route of routes) {
-    const key = `${route.method} ${route.path}`;
+    const key = dedupeKey(route);
     if (seen.has(key)) {
       throw new Error(`duplicate route registered: ${route.method} ${route.path}`);
     }

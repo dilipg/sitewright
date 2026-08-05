@@ -15,6 +15,7 @@ import { verifyPassword } from "./passwords.ts";
 import { createSession, resolveSession } from "./sessions.ts";
 import { getApiKeyFingerprint, setApiKey } from "./api-keys.ts";
 import { createProject } from "./projects.ts";
+import { recordUsageEvent } from "./usage.ts";
 import { runUserCommand } from "./user-cli.ts";
 
 const dirs: string[] = [];
@@ -220,6 +221,42 @@ describe("user list-projects", () => {
   it("reports no projects rather than an empty string", async () => {
     const output = await runUserCommand(freshDb(), ["list-projects"]);
     expect(output).toBe("no projects");
+  });
+});
+
+describe("user usage", () => {
+  it("reports a user's 24h spend against their cap", async () => {
+    const db = freshDb();
+    await runUserCommand(db, ["create", "--email", "a@example.com"]);
+    const user = findUserByEmail(db, "a@example.com")!;
+    recordUsageEvent(db, {
+      userId: user.id, projectId: null, role: "section", model: "claude-sonnet-5",
+      inputTokens: 0, outputTokens: 0, cacheCreationInputTokens: 0, cacheReadInputTokens: 0,
+      costUsd: 4.5, at: Date.now(),
+    });
+    const output = await runUserCommand(db, ["usage", "--email", "a@example.com"]);
+    expect(output).toContain("$4.50");
+    expect(output).toContain("$10.00");
+    expect(output).toContain("under the cap");
+  });
+
+  it("says plainly when a user is over the cap, and when they can resume", async () => {
+    const db = freshDb();
+    await runUserCommand(db, ["create", "--email", "b@example.com"]);
+    const user = findUserByEmail(db, "b@example.com")!;
+    recordUsageEvent(db, {
+      userId: user.id, projectId: null, role: "section", model: "claude-sonnet-5",
+      inputTokens: 0, outputTokens: 0, cacheCreationInputTokens: 0, cacheReadInputTokens: 0,
+      costUsd: 12, at: Date.now(),
+    });
+    const output = await runUserCommand(db, ["usage", "--email", "b@example.com"]);
+    expect(output).toContain("AT OR OVER THE CAP");
+    expect(output).toContain("resets");
+  });
+
+  it("refuses usage for an unknown email", async () => {
+    const db = freshDb();
+    await expect(runUserCommand(db, ["usage", "--email", "nobody@example.com"])).rejects.toThrow();
   });
 });
 

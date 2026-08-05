@@ -50,15 +50,37 @@ describe("createProject", () => {
     // The column holds a path relative to the projects root. An absolute path
     // here is a traversal waiting for a caller that trusts the database.
     const { db, alice } = fresh();
-    expect(() => createProject(db, alice.id, "C:\\Windows\\Temp", "bad")).toThrow(/relative/i);
+    // "/etc" is absolute under both node:path flavours (POSIX outright; win32
+    // treats a leading separator as an absolute, UNC-style path too), so this
+    // assertion needs no gating.
     expect(() => createProject(db, alice.id, "/etc", "bad")).toThrow(/relative/i);
+    // "C:\\Windows\\Temp" is absolute only under win32 semantics. node:path is
+    // POSIX on CI (ubuntu-latest), where backslash is not a separator: the
+    // whole string is one opaque relative segment (isAbsolute is false, and
+    // normalize is a no-op on it), so it would silently NOT throw there.
+    // Verified against node:path/posix directly (see this fix round's
+    // report) rather than assumed.
+    if (process.platform === "win32") {
+      expect(() => createProject(db, alice.id, "C:\\Windows\\Temp", "bad")).toThrow(/relative/i);
+    } else {
+      expect(() => createProject(db, alice.id, "C:\\Windows\\Temp", "bad")).not.toThrow();
+    }
   });
 
   it("refuses a directory containing a parent-traversal segment", () => {
     const { db, alice } = fresh();
     expect(() => createProject(db, alice.id, "../secrets", "bad")).toThrow(/relative|escape/i);
     expect(() => createProject(db, alice.id, "a/../../b", "bad")).toThrow(/relative|escape/i);
-    expect(() => createProject(db, alice.id, "a\\..\\..\\b", "bad")).toThrow(/relative|escape/i);
+    // "a\\..\\..\\b" is a parent-traversal only under win32 semantics, where
+    // backslash is the separator. On POSIX (CI) it is one literal filename
+    // containing backslash characters — normalize is a no-op and it does not
+    // escape anything, so it must NOT throw there. The forward-slash case
+    // above already exercises this same traversal shape on POSIX.
+    if (process.platform === "win32") {
+      expect(() => createProject(db, alice.id, "a\\..\\..\\b", "bad")).toThrow(/relative|escape/i);
+    } else {
+      expect(() => createProject(db, alice.id, "a\\..\\..\\b", "bad")).not.toThrow();
+    }
   });
 
   it("accepts a directory that merely begins with two dots, and resolveProjectDirectory agrees", () => {
@@ -138,6 +160,26 @@ describe("resolveProjectDirectory", () => {
   });
 
   it("throws for an absolute directory", () => {
-    expect(() => resolveProjectDirectory(root, root)).toThrow(/escape|relative/i);
+    // This branch exists for a WINDOWS cross-drive absolute path: joining
+    // "C:\\projects" with another drive-rooted absolute path does not nest
+    // anywhere on disk, so relative() itself returns another absolute,
+    // drive-rooted string and isAbsolute(rel) catches it — confirmed by
+    // running this exact guard body against node:path/win32 directly (see
+    // this fix round's report).
+    //
+    // On POSIX there is only one root: path.join always folds a second
+    // absolute-looking argument in as a nested segment
+    // (join("/projects","/projects") === "/projects/projects", confirmed the
+    // same way against node:path/posix), so relative(root, resolved) can
+    // never itself be absolute — the result is safely contained under root
+    // either way, so there is no actual escape to reject. This branch is
+    // genuinely unreachable on POSIX through this input, not merely
+    // untested, so it is gated rather than asserted unconditionally — the
+    // same pattern this file already uses above for `root`.
+    if (process.platform === "win32") {
+      expect(() => resolveProjectDirectory(root, root)).toThrow(/escape|relative/i);
+    } else {
+      expect(() => resolveProjectDirectory(root, root)).not.toThrow();
+    }
   });
 });

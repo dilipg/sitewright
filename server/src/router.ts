@@ -65,7 +65,20 @@ function match(compiled: CompiledRoute, method: string, pathname: string) {
       // an empty id, which downstream would look up row "" and 404 anyway —
       // but only after a database read on unvalidated input.
       if (raw === "") return null;
-      params[compiled.paramName!] = decodeURIComponent(raw);
+      // decodeURIComponent throws URIError on a malformed escape (e.g. "%ZZ").
+      // This call sits outside both of the listener's try/catch blocks, so an
+      // uncaught throw here would become a rejected promise on an async
+      // listener that node:http never awaits — no response is ever written,
+      // and the connection hangs until a timeout. A malformed percent-escape
+      // is a malformed path: treat it as a non-match so the request falls
+      // through to the normal 404, the same honest answer a missing or extra
+      // segment gets. Never pass the raw undecoded value through instead —
+      // a handler expects a decoded string, not a percent-escaped one.
+      try {
+        params[compiled.paramName!] = decodeURIComponent(raw);
+      } catch {
+        return null;
+      }
       continue;
     }
     if (actual[i] !== compiled.segments[i]) return null;

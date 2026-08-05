@@ -241,6 +241,40 @@ describe("declared-parameter routes", () => {
     expect((await call([withParam, literal], "GET", "/api/thing/mine")).body).toBe("literal");
   });
 
+  it("resolves rather than rejecting when the parameter segment has a malformed percent-escape", async () => {
+    // decodeURIComponent throws URIError on input like "%ZZ". That call sits
+    // outside both of the listener's try/catch blocks (after the URL-parse
+    // try/catch, before the handler's), and the listener is async — so an
+    // uncaught throw here would become a rejected promise on a value
+    // node:http never awaits or attaches a .catch to. No response would ever
+    // be written and the connection would hang until a timeout. This is the
+    // same property the malformed-Host test above pins, for the same reason:
+    // a resolved promise, not merely an eventual status, is the real
+    // guarantee — a status-only assertion would pass even if the promise
+    // rejected, because `call()`'s harness awaits it for you.
+    const listener = createRequestListener([withParam]);
+    const chunks: string[] = [];
+    let status = 0;
+    const res = {
+      headersSent: false,
+      writeHead(code: number, _hdrs?: Record<string, string | string[]>) {
+        status = code; res.headersSent = true; return res;
+      },
+      setHeader() {},
+      end(chunk?: string) { if (chunk !== undefined) chunks.push(chunk); },
+    };
+    const req = { method: "GET", url: "/api/thing/%ZZ", headers: { host: "localhost" } };
+    await expect(listener(req as never, res as never)).resolves.toBeUndefined();
+    expect(status).toBe(404);
+  });
+
+  it("does not match a trailing slash after a valid value", async () => {
+    // "/api/thing/abc/" is 5 segments against a 4-segment pattern — already
+    // covered by the segment-count check, but the specific combination
+    // (valid value + trailing slash) was untested.
+    expect((await call([withParam], "GET", "/api/thing/abc/")).status).toBe(404);
+  });
+
   it("rejects a path declaring more than one parameter", () => {
     // Not needed by anything here, and each extra one multiplies the ways a
     // route can overlap another. Refuse at composition time.

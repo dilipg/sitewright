@@ -10,12 +10,14 @@ import { deleteApiKey } from "./api-keys.ts";
 import { generatePassword, hashPassword } from "./passwords.ts";
 import { revokeAllSessionsForUser } from "./sessions.ts";
 import { listAllProjects } from "./projects.ts";
+import { checkSpendCap } from "./spend-cap.ts";
 import {
   createUser, findUserByEmail, findUserById, listUsers, setDisabled, setPasswordHash, setSpendCap,
 } from "./users.ts";
 
 const COMMANDS = [
   "create", "disable", "enable", "reset-password", "set-cap", "list", "clear-key", "list-projects",
+  "usage",
 ] as const;
 
 /**
@@ -130,6 +132,24 @@ export async function runUserCommand(db: DatabaseSync, argv: string[]): Promise<
     return projects
       .map((p) => `${p.directory}  ${findUserById(db, p.ownerId)?.email ?? "(unknown owner)"}`)
       .join("\n");
+  }
+
+  if (command === "usage") {
+    const email = requireEmail(argv);
+    const user = requireExisting(db, email);
+    const status = checkSpendCap(db, user, Date.now());
+    const lines = [
+      `${email}: $${status.spentUsd.toFixed(2)} spent of $${status.capUsd.toFixed(2)} in the last 24h`,
+      `  status: ${status.allowed ? "under the cap" : "AT OR OVER THE CAP"}`,
+    ];
+    if (status.resetAt !== null) lines.push(`  resets: ${new Date(status.resetAt).toISOString()}`);
+    // Named rather than folded into the total: a non-zero count means the
+    // figure above is a floor, and an operator comparing it to a provider
+    // invoice needs to know that before they trust it.
+    if (status.unpricedEvents > 0) {
+      lines.push(`  note: ${status.unpricedEvents} event(s) had no published rate; spend is a floor`);
+    }
+    return lines.join("\n");
   }
 
   throw new Error(`unknown command ${String(command)}; expected one of: ${COMMANDS.join(", ")}`);

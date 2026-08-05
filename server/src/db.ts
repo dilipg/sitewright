@@ -49,6 +49,22 @@ const MIGRATIONS = [
      name       TEXT NOT NULL,
      created_at INTEGER NOT NULL
    )`,
+  `CREATE TABLE IF NOT EXISTS usage_event (
+     id                          TEXT PRIMARY KEY,
+     user_id                     TEXT NOT NULL REFERENCES user(id) ON DELETE CASCADE,
+     project_id                  TEXT REFERENCES project(id) ON DELETE SET NULL,
+     role                        TEXT NOT NULL,
+     model                       TEXT NOT NULL,
+     input_tokens                INTEGER NOT NULL DEFAULT 0,
+     output_tokens               INTEGER NOT NULL DEFAULT 0,
+     cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+     cache_read_input_tokens     INTEGER NOT NULL DEFAULT 0,
+     cost_usd                    REAL,
+     at                          INTEGER NOT NULL
+   )`,
+  // Every cap check is "this user, this window" — without the index that is a
+  // full scan of every user's history on each request that starts work.
+  `CREATE INDEX IF NOT EXISTS usage_event_user_at_idx ON usage_event(user_id, at)`,
 ];
 
 export function openDatabase(path: string): DatabaseSync {

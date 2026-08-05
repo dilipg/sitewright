@@ -15,6 +15,7 @@ import { findUserByEmail } from "./users.ts";
 import { generatePassword, hashPassword, verifyPassword } from "./passwords.ts";
 import { createSession, revokeSession, SESSION_COOKIE, SESSION_TTL_MS } from "./sessions.ts";
 import { requireSession } from "./require-session.ts";
+import { checkSpendCap } from "./spend-cap.ts";
 
 // Re-exported so existing importers (require-session.test.ts,
 // key-routes.test.ts, and anything else that reaches for "the login cookie's
@@ -153,12 +154,28 @@ export function authRoutes(deps: { db: DatabaseSync; secureCookies: boolean }): 
       // identical to requireSession's — two implementations of the same
       // check meant a future change to one could silently miss the other.
       handler: requireSession(db, (_req, res, ctx) => {
+        // The cap alone is not actionable — a user cannot tell they are near
+        // it until a request is refused. Same computation the gate uses, so
+        // the two can never disagree about the number shown and the number
+        // enforced.
+        const status = checkSpendCap(db, ctx.user, Date.now());
         // Explicit field list, never the whole row: `user` carries the
         // password hash, and a spread would ship it to the client.
         sendJson(res, 200, {
           id: ctx.user.id,
           email: ctx.user.email,
           spendCapUsd: ctx.user.spendCapUsd,
+          spentUsd24h: status.spentUsd,
+          resetAt: status.resetAt,
+          // Both other surfaces that show this number already call it a
+          // floor when this is non-zero — describeSpendCap's "at least $X
+          // spent (N call(s) used a model with no published rate)" and the
+          // `usage` CLI's identical caveat. Without this field, this is the
+          // one surface a user actually sees that presented spentUsd24h as
+          // exact: under the gemini escape hatch a user could see
+          // `spentUsd24h: 0` while genuinely burning budget on unpriced
+          // calls, with nothing telling them the number understates reality.
+          unpricedEvents: status.unpricedEvents,
         });
       }),
     },

@@ -1,0 +1,13 @@
+# fixtures/usage-log-contract.jsonl is a GOLDEN FILE: the checked-in contract
+# between the orchestrator's usage-log writer (Python, record_usage) and the
+# hosted server's reader (TypeScript, ingestUsageLog). Two suites in two
+# languages assert against these exact bytes.
+#
+# core.autocrlf=true is set on the machine this was developed on, so without
+# this line a fresh Windows clone would check the file out with CRLF endings
+# while CI's ubuntu runner sees LF. Both readers happen to tolerate a trailing
+# CR today (Python's splitlines() handles it; JSON.parse treats it as
+# whitespace per RFC 8259), so this is insurance rather than a live fix — but a
+# file whose whole purpose is byte-level agreement should not have its bytes
+# depend on which OS cloned it.
+fixtures/usage-log-contract.jsonl -text

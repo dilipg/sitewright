@@ -21,6 +21,26 @@ import {
   UNAUTHENTICATED_ENDPOINTS,
 } from "./project-registry.ts";
 
+// Shared by both "registry vs. the live route table" and "billable
+// endpoints" below: the ONE way this file builds a real, composed route
+// table. Anything that wants to know what is actually reachable today must
+// go through this, not through a hand-maintained list or a path-prefix
+// predicate — see the "fails the moment 4c mounts one" test for why that
+// distinction is the entire point of this fix.
+const registryDirs: string[] = [];
+const registryDbs: DatabaseSync[] = [];
+function freshRoutes() {
+  const dir = mkdtempSync(join(tmpdir(), "server-registry-"));
+  registryDirs.push(dir);
+  const db = openDatabase(join(dir, "identity.db"));
+  registryDbs.push(db);
+  return buildRoutes({ db, masterKey: randomBytes(32), secureCookies: true });
+}
+afterAll(() => {
+  for (const db of registryDbs) db.close();
+  for (const dir of registryDirs) rmSync(dir, { recursive: true, force: true });
+});
+
 describe("the registry itself", () => {
   it("has no duplicate (method, path) entries", () => {
     const keys = PROJECT_SCOPED_ENDPOINTS.map((e) => `${e.method} ${e.path}`);
@@ -69,20 +89,6 @@ describe("the registry itself", () => {
  * against buildRoutes — the actual, live, composed route table — instead.
  */
 describe("registry vs. the live route table", () => {
-  const dirs: string[] = [];
-  const dbs: DatabaseSync[] = [];
-  function freshRoutes() {
-    const dir = mkdtempSync(join(tmpdir(), "server-registry-"));
-    dirs.push(dir);
-    const db = openDatabase(join(dir, "identity.db"));
-    dbs.push(db);
-    return buildRoutes({ db, masterKey: randomBytes(32), secureCookies: true });
-  }
-  afterAll(() => {
-    for (const db of dbs) db.close();
-    for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
-  });
-
   it("places every buildRoutes entry in exactly one of the three lists", () => {
     // The direction that matters most: a route mounted in compose.ts that
     // nobody declared here would ship with whatever wrapper its author
@@ -141,5 +147,53 @@ describe("registry vs. the live route table", () => {
       "PUT /__overrides-history",
       "PUT /__overrides/:slug",
     ].sort());
+  });
+});
+
+describe("billable endpoints", () => {
+  const all = [...PROJECT_SCOPED_ENDPOINTS, ...SESSION_ONLY_ENDPOINTS];
+
+  it("is exactly the set that starts a model call", () => {
+    const billable = all
+      .filter((entry) => entry.billable)
+      .map((entry) => `${entry.method} ${entry.path}`)
+      .sort();
+    expect(billable).toEqual([
+      "POST /__add-section",
+      "POST /__edit-prompt",
+      "POST /__regen",
+      "POST /__regen-page",
+    ]);
+  });
+
+  it("marks no identity endpoint billable", () => {
+    for (const entry of all) {
+      if (entry.path.startsWith("/api/")) expect(entry.billable).toBe(false);
+    }
+  });
+
+  // Named for what it can actually observe: MOUNTEDNESS, not gatedness. A
+  // Route is { method, path, handler } — nothing records whether a handler is
+  // wrapped in requireBudget, so no test at this level can tell a gated
+  // billable route from an ungated one. That is exactly why this is a
+  // placeholder: it fails when 4c mounts anything billable, forcing a real
+  // enforcement test to be written against routes that can be driven.
+  it("has no billable endpoint mounted at all — fails the moment 4c mounts one", () => {
+    // Keyed on the LIVE table (freshRoutes/buildRoutes), not on
+    // isUnmountedCompilerEndpoint's "/__" prefix check. That predicate is a
+    // pure function of the path string: mounting a route in buildRoutes
+    // cannot change what a path starts with, so a test built on it can never
+    // fail no matter what compose.ts does — it was a tripwire that could not
+    // fire. This version asks the real, composed route table instead.
+    const live = new Set(freshRoutes().map((r) => `${r.method} ${r.path}`));
+    const mountedBillable = all
+      .filter((entry) => entry.billable && live.has(`${entry.method} ${entry.path}`))
+      .map((entry) => `${entry.method} ${entry.path}`);
+    // Empty today because every billable endpoint is still unmounted. When
+    // 4c mounts one, this fails — which is the signal to write "every mounted
+    // billable route refuses over the cap" against the real table and delete
+    // this placeholder. Keyed on the LIVE table, not on a path prefix: a
+    // predicate over the path string cannot notice a route being mounted.
+    expect(mountedBillable).toEqual([]);
   });
 });

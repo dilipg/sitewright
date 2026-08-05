@@ -96,9 +96,21 @@ function usd(amount: number): string {
  * The refusal, in words. The spec requires all three numbers: "Insufficient
  * budget" with no numbers produces a support conversation instead of an
  * obvious action.
+ *
+ * Callers reach this only inside `if (!status.allowed)`. Saying so here
+ * stops a future caller rendering "spend cap reached" to a user who is
+ * comfortably under it.
  */
 export function describeSpendCap(status: SpendStatus): string {
-  const head = `spend cap reached: ${usd(status.spentUsd)} spent of ${usd(status.capUsd)} in the last 24 hours`;
+  if (status.allowed) throw new Error("describeSpendCap called for a permitted request");
+
+  // The spend is a floor, not a total, when some in-window call used a model
+  // with no published rate. Saying so is the whole reason usage.ts counts
+  // them separately instead of folding them in as zero.
+  const spent = status.unpricedEvents > 0
+    ? `at least ${usd(status.spentUsd)} spent (${status.unpricedEvents} call(s) used a model with no published rate)`
+    : `${usd(status.spentUsd)} spent`;
+  const head = `spend cap reached: ${spent} of ${usd(status.capUsd)} in the last 24 hours`;
   if (status.resetAt === null) {
     return `${head}; no further work is permitted until an operator raises the cap`;
   }

@@ -184,4 +184,29 @@ describe("describeSpendCap", () => {
     expect(message).toContain("$0.00");
     expect(message.toLowerCase()).not.toContain("resets");
   });
+
+  it("says the spend is a floor when some in-window events had no published rate", () => {
+    spend(6, NOW - 10_000);
+    spend(6, NOW - 5_000);
+    spend(null, NOW - 4_000);
+    spend(null, NOW - 3_000);
+    const message = describeSpendCap(checkSpendCap(db, user, NOW));
+    expect(message).toContain("$12.00");
+    // The user must be able to tell the figure is incomplete, and by how many events.
+    expect(message).toContain("2");
+    expect(message.toLowerCase()).toContain("at least");
+  });
+
+  it("makes no such claim when every event was priced", () => {
+    spend(6, NOW - 10_000);
+    spend(6, NOW - 5_000);
+    const message = describeSpendCap(checkSpendCap(db, user, NOW));
+    expect(message.toLowerCase()).not.toContain("at least");
+  });
+
+  it("throws when called for an allowed status", () => {
+    const status = checkSpendCap(db, user, NOW);
+    expect(status.allowed).toBe(true);
+    expect(() => describeSpendCap(status)).toThrow();
+  });
 });

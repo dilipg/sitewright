@@ -61,6 +61,18 @@ export async function startPreviewServer(
     // editor while the preview is live — the preview app never consumes it,
     // so the watcher must not react (a reload would interrupt editing).
     server: {
+      // Explicit, not left to Vite's own "localhost" default: on at least one
+      // real Windows dev machine, Node resolves the bare hostname "localhost"
+      // to the IPv6 loopback (::1) ONLY, not 127.0.0.1 — confirmed empirically
+      // (task 4's manual verification, the first time a real Vite child ran
+      // behind server/src/preview-pool.ts's real, non-mocked `verifyPort`).
+      // That check, and preview-proxy.ts's upstream requests, both target the
+      // IPv4 loopback address by a literal IP, so a child that bound only to
+      // ::1 was unreachable to both — `acquire()` failed every single spawn,
+      // on every retry, with no test able to see it (every unit test injects
+      // a fake `verifyPort`). Binding by IP number removes the ambiguity
+      // "localhost" carries across machines/OS DNS configuration.
+      host: "127.0.0.1",
       port: options.port ?? 5273,
       strictPort: true,
       cors: true,

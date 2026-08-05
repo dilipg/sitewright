@@ -30,16 +30,37 @@ export interface Route {
  * `/`. That restriction is what preserves the allowlist property — if `:id`
  * could swallow `abc/def`, registering one route would silently expose every
  * path beneath it, including paths with their own intended authorization rule.
+ *
+ * A trailing `*` is the one deliberate, opt-in exception: it also spans
+ * slashes, but only as the FINAL segment of a route explicitly written that
+ * way — never implicitly, and never anywhere else in the path. `compile()`
+ * throws at table-build time for a `*` in any other position, the same way it
+ * already throws for a second `:name`.
  */
 interface CompiledRoute {
   route: Route;
+  /** Pattern segments, EXCLUDING a trailing wildcard marker — see `wildcard`. */
   segments: string[];
   paramName: string | null;
   paramIndex: number;
+  /** True when the route's final segment is a literal `*`. */
+  wildcard: boolean;
 }
 
 function compile(route: Route): CompiledRoute {
-  const segments = route.path.split("/");
+  const allSegments = route.path.split("/");
+  // A "*" is meaningful only as the trailing segment. Anywhere else it is
+  // ambiguous (one segment? every remaining one?) and nothing here ever
+  // needed that meaning, so it is refused outright — a throw at table-build
+  // time, exactly like the duplicate-route and multi-parameter guards below.
+  for (let i = 0; i < allSegments.length; i += 1) {
+    if (allSegments[i] === "*" && i !== allSegments.length - 1) {
+      throw new Error(`route ${route.method} ${route.path} has a "*" that is not the final segment`);
+    }
+  }
+  const wildcard = allSegments[allSegments.length - 1] === "*";
+  const segments = wildcard ? allSegments.slice(0, -1) : allSegments;
+
   const indices = segments.flatMap((s, i) => (s.startsWith(":") ? [i] : []));
   if (indices.length > 1) {
     throw new Error(`route ${route.method} ${route.path} declares more than one parameter`);
@@ -50,13 +71,20 @@ function compile(route: Route): CompiledRoute {
     segments,
     paramName: paramIndex === -1 ? null : segments[paramIndex]!.slice(1),
     paramIndex,
+    wildcard,
   };
 }
 
 function match(compiled: CompiledRoute, method: string, pathname: string) {
   if (compiled.route.method !== method) return null;
   const actual = pathname.split("/");
-  if (actual.length !== compiled.segments.length) return null;
+  // A wildcard route's fixed prefix must be present, but the request may have
+  // any number of segments past it (including none); a non-wildcard route
+  // still requires an exact segment count, which is what keeps a plain
+  // `:name` from ever spanning a `/`.
+  if (compiled.wildcard ? actual.length < compiled.segments.length : actual.length !== compiled.segments.length) {
+    return null;
+  }
   const params: Record<string, string> = {};
   for (let i = 0; i < compiled.segments.length; i += 1) {
     if (i === compiled.paramIndex) {
@@ -83,6 +111,22 @@ function match(compiled: CompiledRoute, method: string, pathname: string) {
     }
     if (actual[i] !== compiled.segments[i]) return null;
   }
+  if (compiled.wildcard) {
+    // Decoded PER SEGMENT, with the same malformed-escape guard as a `:name`
+    // segment above — an unguarded decodeURIComponent on the whole tail would
+    // reject the listener's promise on a bad "%ZZ" and leave the request with
+    // no response at all, exactly the failure mode the guard above exists to
+    // prevent.
+    const tailSegments: string[] = [];
+    for (const raw of actual.slice(compiled.segments.length)) {
+      try {
+        tailSegments.push(decodeURIComponent(raw));
+      } catch {
+        return null;
+      }
+    }
+    params["*"] = tailSegments.join("/");
+  }
   return params;
 }
 
@@ -95,7 +139,11 @@ function match(compiled: CompiledRoute, method: string, pathname: string) {
  * unreachable the instant the first is registered. As raw strings, though,
  * they are two different keys. Every `:name` segment is normalised to the
  * same placeholder here so the dedupe key reflects the pattern a request is
- * actually matched against, not the literal characters used to write it.
+ * actually matched against, not the literal characters used to write it. A
+ * trailing `*` needs no normalisation of its own: it is not a `:name`
+ * segment, so it already passes through unchanged, and two wildcard routes
+ * differing only in their param's name collapse to the same key exactly the
+ * way two `:name` routes do.
  */
 function dedupeKey(route: Route): string {
   const normalizedPath = route.path
@@ -123,12 +171,16 @@ export function createRequestListener(routes: Route[]) {
 
   // Compiled once, outside the returned listener: the route table is fixed
   // for the process's lifetime, so per-request recompilation would be pure
-  // waste. Literals and parameterised routes are held in separate arrays —
-  // not sorted together — so that a literal always wins regardless of the
-  // order routes were registered in; see the match order in the listener.
+  // waste. Literals, single-param routes, and wildcard routes are held in
+  // three separate arrays — not sorted together — so that a literal or
+  // single-param route always wins over a wildcard, regardless of the order
+  // routes were registered in; see the three-pass match order in the
+  // listener. A future `/preview/:id/status` alongside `/preview/:id/*`
+  // depends on exactly this: the wildcard must never shadow it.
   const compiled = routes.map(compile);
-  const literals = compiled.filter((c) => c.paramName === null);
-  const parameterised = compiled.filter((c) => c.paramName !== null);
+  const literals = compiled.filter((c) => !c.wildcard && c.paramName === null);
+  const parameterised = compiled.filter((c) => !c.wildcard && c.paramName !== null);
+  const wildcards = compiled.filter((c) => c.wildcard);
 
   return async function listener(req: IncomingMessage, res: ServerResponse): Promise<void> {
     // Constructing the URL can throw (a malformed Host header, e.g. "a b" or
@@ -147,9 +199,10 @@ export function createRequestListener(routes: Route[]) {
       return;
     }
     // Exact match, never prefix: prefix matching is how a guard on one path
-    // accidentally covers — or fails to cover — a neighbouring one. Literals
-    // are tried before parameterised routes so a literal always wins, no
-    // matter which order the two were registered in.
+    // accidentally covers — or fails to cover — a neighbouring one. Three
+    // passes, in order of specificity, so a literal or single-param route
+    // always wins over a wildcard, no matter which order any of them were
+    // registered in.
     const method = req.method ?? "";
     let found: { route: Route; params: Record<string, string> } | null = null;
     for (const c of literals) {
@@ -158,6 +211,12 @@ export function createRequestListener(routes: Route[]) {
     }
     if (found === null) {
       for (const c of parameterised) {
+        const params = match(c, method, url.pathname);
+        if (params !== null) { found = { route: c.route, params }; break; }
+      }
+    }
+    if (found === null) {
+      for (const c of wildcards) {
         const params = match(c, method, url.pathname);
         if (params !== null) { found = { route: c.route, params }; break; }
       }

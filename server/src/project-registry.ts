@@ -61,6 +61,12 @@ export const PROJECT_SCOPED_ENDPOINTS: ReadonlyArray<{
   { method: "GET", path: "/__plan", idFrom: BY_QUERY, billable: false },
   { method: "POST", path: "/__plan/section-brief", idFrom: BY_QUERY, billable: false },
   { method: "POST", path: "/__plan/approve", idFrom: BY_QUERY, billable: false },
+  // Task 4: serves the project's own Vite dev server through the pool +
+  // proxy. Project-scoped (the id is the route's own :projectId segment,
+  // not a query param, since it is the FIRST endpoint reached before any
+  // asset path is even known) and not billable — serving files spends
+  // nothing; the model call already happened when the project was generated.
+  { method: "GET", path: "/preview/:projectId/*", idFrom: { from: "param", name: "projectId" }, billable: false },
 ];
 
 /**

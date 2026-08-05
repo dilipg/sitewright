@@ -3,9 +3,19 @@
  * A raw byte-shuffling reverse proxy between the server's HTTP boundary and
  * a single preview child's Vite dev server (see `preview-pool.ts`). This
  * module deliberately knows nothing about projects, ownership, or the pool —
- * a caller resolves a port and a rewritten path (the child is served under a
- * Vite `base` of `/preview/<projectId>/`, so the caller has already stripped
- * that prefix before calling in); this module only forwards bytes.
+ * a caller resolves a port and a `path` to forward; this module only
+ * forwards bytes, whatever `path` it is given.
+ *
+ * The real caller (`preview-routes.ts`, `scripts/serve.ts`'s upgrade handler)
+ * passes the request's ORIGINAL path, `/preview/<projectId>/...` prefix and
+ * all — never a version with that prefix stripped off. An earlier version of
+ * this comment claimed the opposite, and only a real Vite child behind a
+ * real proxy proved it wrong (task 4's manual verification): the child is
+ * spawned with `--base /preview/<projectId>/` (`preview-pool.ts`), and Vite's
+ * dev server, given a non-root `base`, expects every incoming request to
+ * already carry that prefix — a stripped request gets redirected right back
+ * to it. Proxying that redirect through unexamined loops the client against
+ * its own original URL forever.
  *
  * Two functions, two protocols: `proxyHttp` forwards a normal request/
  * response pair; `proxyUpgrade` forwards the WebSocket handshake Vite's HMR
@@ -116,7 +126,18 @@ export function proxyHttp(args: {
     let upstreamReq!: ReturnType<typeof httpRequest>;
     try {
       upstreamReq = httpRequest({
-        hostname: "localhost",
+        // A literal IP, not the string "localhost": Node's resolution of
+        // that bare hostname is platform/DNS-configuration dependent, and on
+        // at least one real Windows machine it resolves to the IPv6 loopback
+        // (::1) only — which does not match the IPv4 loopback address
+        // compiler/src/preview.ts deliberately binds Vite to (see that
+        // file's comment; found via this exact module's first live run,
+        // task 4's manual verification). Connecting by IP number removes the
+        // ambiguity. The `Host` HEADER below stays "localhost" on purpose —
+        // that is a different, independent check (Vite's allowedHosts, which
+        // permits localhost/127.0.0.1/[::1] regardless of bind address), not
+        // the TCP connection target this option controls.
+        hostname: "127.0.0.1",
         port,
         path,
         method: req.method,
@@ -265,7 +286,11 @@ export function proxyUpgrade(args: {
 
   try {
     upstreamReq = httpRequest({
-      hostname: "localhost",
+      // See the matching comment in `proxyHttp`: a literal IP, not the
+      // string "localhost", because Node's resolution of that hostname is
+      // platform-dependent and does not reliably match the IPv4 loopback
+      // address Vite is bound to.
+      hostname: "127.0.0.1",
       port,
       path,
       method: req.method,

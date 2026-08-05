@@ -18,11 +18,24 @@ export function bridgeShimPlugin(): Plugin {
   return {
     name: "website-generator:bridge-shim",
     apply: "serve",
-    transformIndexHtml() {
+    transformIndexHtml(_html, ctx) {
+      // The injected `src` must be BASE-AWARE. Vite's own internally
+      // generated tags (/@vite/client, the react-refresh preamble) are
+      // automatically rewritten against the dev server's configured `base`;
+      // a PLUGIN's own transformIndexHtml-injected tag is not — Vite takes
+      // whatever `src` it is given at face value. Every use of this plugin
+      // ran at the default root base ("/") until the hosted server's preview
+      // pool put a real child behind `/preview/<projectId>/` for the first
+      // time (server/, task 4): the browser then requested this exact bare
+      // path with no prefix, which the reverse proxy has no route for, so
+      // the shim 404'd and the editor lost its one communication channel
+      // with the preview — found live, against a real Vite child, not by
+      // any test (every prior test of this plugin runs at the default base).
+      const base = ctx.server?.config.base ?? "/";
       return [
         {
           tag: "script",
-          attrs: { type: "module", src: SHIM_PATH },
+          attrs: { type: "module", src: `${base}${SHIM_PATH.slice(1)}` },
           injectTo: "head",
         },
       ];

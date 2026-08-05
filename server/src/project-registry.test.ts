@@ -16,6 +16,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import type { DatabaseSync } from "node:sqlite";
 import { openDatabase } from "./db.ts";
 import { buildRoutes } from "./compose.ts";
+import { PreviewPool } from "./preview-pool.ts";
 import {
   isUnmountedCompilerEndpoint, PROJECT_SCOPED_ENDPOINTS, SESSION_ONLY_ENDPOINTS,
   UNAUTHENTICATED_ENDPOINTS,
@@ -27,6 +28,14 @@ import {
 // go through this, not through a hand-maintained list or a path-prefix
 // predicate — see the "fails the moment 4c mounts one" test for why that
 // distinction is the entire point of this fix.
+//
+// A real PreviewPool is passed (never `undefined`): buildRoutes only mounts
+// `/preview/:projectId/*` when given one, so without this the route this
+// file just declared would be "declared but not mounted" against the live
+// table below — not because it is unreachable in production, but because
+// this helper stopped building the same table serve.ts does. Constructing a
+// pool has no side effects on its own (nothing spawns until `acquire()` is
+// called, which nothing here does).
 const registryDirs: string[] = [];
 const registryDbs: DatabaseSync[] = [];
 function freshRoutes() {
@@ -34,7 +43,9 @@ function freshRoutes() {
   registryDirs.push(dir);
   const db = openDatabase(join(dir, "identity.db"));
   registryDbs.push(db);
-  return buildRoutes({ db, masterKey: randomBytes(32), secureCookies: true });
+  const masterKey = randomBytes(32);
+  const pool = new PreviewPool({ db, masterKey, projectsRoot: dir });
+  return buildRoutes({ db, masterKey, secureCookies: true, pool });
 }
 afterAll(() => {
   for (const db of registryDbs) db.close();

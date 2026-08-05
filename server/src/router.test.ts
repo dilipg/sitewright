@@ -300,3 +300,68 @@ describe("declared-parameter routes", () => {
     expect(() => createRequestListener([withParam, withParam])).toThrow(/duplicate/i);
   });
 });
+
+describe("trailing wildcard routes", () => {
+  const withTail: Route = {
+    method: "GET",
+    path: "/preview/:id/*",
+    handler: (_req, res, ctx) => {
+      res.writeHead(200);
+      res.end(JSON.stringify({ id: ctx.params.id ?? null, tail: ctx.params["*"] ?? null }));
+    },
+  };
+
+  it("matches a trailing wildcard across slashes and exposes the tail", async () => {
+    const result = await call([withTail], "GET", "/preview/abc/src/main.tsx");
+    expect(JSON.parse(result.body)).toEqual({ id: "abc", tail: "src/main.tsx" });
+  });
+
+  it("matches an empty tail", async () => {
+    const result = await call([withTail], "GET", "/preview/abc/");
+    expect(JSON.parse(result.body)).toEqual({ id: "abc", tail: "" });
+  });
+
+  it("prefers a literal or single-param route over a wildcard", async () => {
+    // A future "/preview/:id/status" must never be shadowed by a registered
+    // "/preview/:id/*" — regardless of which order they were registered in.
+    const status: Route = {
+      method: "GET",
+      path: "/preview/:id/status",
+      handler: (_req, res) => { res.writeHead(200); res.end("status"); },
+    };
+    expect((await call([withTail, status], "GET", "/preview/abc/status")).body).toBe("status");
+    expect((await call([status, withTail], "GET", "/preview/abc/status")).body).toBe("status");
+  });
+
+  it("throws when a wildcard is not the final segment", () => {
+    expect(() => createRequestListener([
+      { method: "GET", path: "/preview/*/thing", handler: () => {} },
+    ])).toThrow(/final segment/i);
+  });
+
+  it("does not answer a wildcard route for a malformed percent-escape in the tail", async () => {
+    // Same guarantee as the parameter-segment case above, now for the tail: an
+    // uncaught URIError here would reject the listener's promise and leave the
+    // request with NO response at all, not merely the wrong status.
+    const listener = createRequestListener([withTail]);
+    const chunks: string[] = [];
+    let status = 0;
+    const res = {
+      headersSent: false,
+      writeHead(code: number, _hdrs?: Record<string, string | string[]>) {
+        status = code; res.headersSent = true; return res;
+      },
+      setHeader() {},
+      end(chunk?: string) { if (chunk !== undefined) chunks.push(chunk); },
+    };
+    const req = { method: "GET", url: "/preview/abc/%ZZ", headers: { host: "localhost" } };
+    await expect(listener(req as never, res as never)).resolves.toBeUndefined();
+    expect(status).toBe(404);
+  });
+
+  it("still throws a duplicate for two wildcard routes with the same shape but different param names", () => {
+    const first: Route = { method: "GET", path: "/preview/:id/*", handler: () => {} };
+    const second: Route = { method: "GET", path: "/preview/:pid/*", handler: () => {} };
+    expect(() => createRequestListener([first, second])).toThrow(/duplicate/i);
+  });
+});

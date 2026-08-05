@@ -15,6 +15,10 @@ import { afterAll, describe, expect, it } from "vitest";
 import type { DatabaseSync } from "node:sqlite";
 import { openDatabase } from "./db.ts";
 import { buildRoutes } from "./compose.ts";
+import { createProject } from "./projects.ts";
+import { createRequestListener } from "./router.ts";
+import { createSession, SESSION_COOKIE } from "./sessions.ts";
+import { createUser } from "./users.ts";
 
 const dirs: string[] = [];
 const dbs: DatabaseSync[] = [];
@@ -67,6 +71,83 @@ describe("buildRoutes", () => {
       expect(seen.has(key)).toBe(false);
       seen.add(key);
     }
+  });
+});
+
+/**
+ * Every other test in this file inspects buildRoutes's return value as a
+ * plain array. createRequestListener(buildRoutes(...)) — what scripts/serve.ts
+ * actually does — was never called anywhere else in the suite, so the
+ * router's construction-time validation (duplicate-route detection, the
+ * at-most-one-parameter check) never ran against the REAL composed table in
+ * CI. A route with two `:param` segments would pass every other test and
+ * `tsc`, then throw only at boot.
+ */
+describe("createRequestListener(buildRoutes(...))", () => {
+  const dirs: string[] = [];
+  const dbs: DatabaseSync[] = [];
+  function harness() {
+    const dir = mkdtempSync(join(tmpdir(), "server-compose-listener-"));
+    dirs.push(dir);
+    const db = openDatabase(join(dir, "identity.db"));
+    dbs.push(db);
+    const alice = createUser(db, "a@example.com", "h");
+    const bob = createUser(db, "b@example.com", "h");
+    const listener = createRequestListener(
+      buildRoutes({ db, masterKey: randomBytes(32), secureCookies: true }),
+    );
+
+    async function call(method: string, path: string, cookie?: string) {
+      const chunks: string[] = [];
+      let status = 0;
+      const res = {
+        headersSent: false,
+        writeHead(code: number) { status = code; res.headersSent = true; return res; },
+        setHeader() {},
+        end(chunk?: string) { if (chunk !== undefined) chunks.push(chunk); },
+      };
+      const req = Object.assign((async function* () {})(), {
+        method, url: path, headers: { host: "localhost", ...(cookie ? { cookie } : {}) },
+      });
+      await listener(req as never, res as never);
+      const text = chunks.join("");
+      return { status, body: text, json: text === "" ? undefined : JSON.parse(text) };
+    }
+
+    return {
+      db, alice, bob, call,
+      aliceCookie: `${SESSION_COOKIE}=${createSession(db, alice.id).id}`,
+      bobCookie: `${SESSION_COOKIE}=${createSession(db, bob.id).id}`,
+    };
+  }
+  afterAll(() => {
+    for (const db of dbs) db.close();
+    for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("builds without throwing", () => {
+    const db = fresh();
+    expect(() => createRequestListener(
+      buildRoutes({ db, masterKey: randomBytes(32), secureCookies: true }),
+    )).not.toThrow();
+  });
+
+  it("authorizes correctly for two users across the full composed table", async () => {
+    const { db, alice, call, aliceCookie, bobCookie } = harness();
+    const project = createProject(db, alice.id, "alice-run", "Alice");
+
+    const mine = await call("GET", "/api/projects", aliceCookie);
+    expect(mine.status).toBe(200);
+    expect(mine.json).toEqual({ projects: [expect.objectContaining({ id: project.id })] });
+
+    const own = await call("GET", `/api/projects/${project.id}`, aliceCookie);
+    expect(own.status).toBe(200);
+    expect(own.json).toEqual(expect.objectContaining({ id: project.id, name: "Alice" }));
+
+    const foreign = await call("GET", `/api/projects/${project.id}`, bobCookie);
+    const absent = await call("GET", "/api/projects/nope", bobCookie);
+    expect(foreign.status).toBe(404);
+    expect(foreign.body).toBe(absent.body);
   });
 });
 

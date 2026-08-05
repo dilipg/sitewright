@@ -46,6 +46,18 @@ describe("createProject", () => {
     expect(() => createProject(db, bob.id, "shared", "B")).toThrow();
   });
 
+  it("normalises the directory before storing, so equivalent spellings collide", () => {
+    // "run-a", "./run-a", "a/../run-a" and ".//run-a" all name the same real
+    // directory. If the raw argument were stored unchanged, all four would be
+    // accepted as distinct rows despite UNIQUE(directory) — defeating both
+    // "one owner per directory" and adoption's exact-string idempotency
+    // check (findProjectByDirectory).
+    const { db, alice, bob } = fresh();
+    const p = createProject(db, alice.id, "run-a", "A");
+    expect(p.directory).toBe("run-a");
+    expect(() => createProject(db, bob.id, "./run-a", "B")).toThrow();
+  });
+
   it("refuses an absolute directory", () => {
     // The column holds a path relative to the projects root. An absolute path
     // here is a traversal waiting for a caller that trusts the database.

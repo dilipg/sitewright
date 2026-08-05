@@ -67,11 +67,19 @@ export function createProject(
   directory: string,
   name: string,
 ): Project {
-  assertRelativeContained(directory);
+  // Normalised BEFORE validating and BEFORE storing: "run-a", "./run-a",
+  // "a/../run-a" and ".//run-a" all name the same real directory, and must
+  // collapse to the same stored spelling or two guarantees break — UNIQUE
+  // stops meaning "one owner per real directory" (two different spellings of
+  // the same path are two distinct, accepted rows), and adoption's
+  // idempotency (findProjectByDirectory, an exact-string match) can miss a
+  // row written with an equivalent but differently-spelled directory.
+  const normalizedDirectory = normalize(directory);
+  assertRelativeContained(normalizedDirectory);
   const project: Project = {
     id: randomUUID(),
     ownerId,
-    directory,
+    directory: normalizedDirectory,
     name,
     createdAt: Date.now(),
   };

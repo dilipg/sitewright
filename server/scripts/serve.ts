@@ -9,6 +9,7 @@
  * Usage: node scripts/serve.ts [--port 4000] [--db ./data/identity.db]
  */
 import { createServer } from "node:http";
+import { resolve } from "node:path";
 import { adoptExistingProjects } from "../src/adopt.ts";
 import { buildRoutes } from "../src/compose.ts";
 import { openDatabase } from "../src/db.ts";
@@ -43,7 +44,12 @@ function requireValueIfPresent(name: string): string | undefined {
 }
 
 const dbPath = requireValueIfPresent("db") ?? "./data/identity.db";
-const projectsRoot = requireValueIfPresent("projects-root") ?? "./generated";
+// Resolved against CWD, and CWD for the documented invocation (`npm run
+// serve -w server`, per npm workspaces) is server/ — so "./generated" would
+// point at server/generated, which does not exist; the repo's real projects
+// root (worth hundreds of MB of acceptance runs, per the spec's Operational
+// requirement) is one level up, at the repo root's generated/.
+const projectsRoot = requireValueIfPresent("projects-root") ?? "../generated";
 const bootstrapEmail = requireValueIfPresent("bootstrap-email");
 
 const portRaw = requireValueIfPresent("port") ?? "4000";
@@ -91,10 +97,25 @@ if (bootstrapEmail !== undefined) {
       `--bootstrap-email ${bootstrapEmail} does not match any existing user; skipping project adoption`,
     );
   } else {
-    const { adopted, skipped } = adoptExistingProjects(db, projectsRoot, owner.id);
-    console.log(
-      `project adoption: ${adopted.length} adopted, ${skipped.length} already known (owner: ${bootstrapEmail})`,
-    );
+    const { adopted, skipped, rootReadable } = adoptExistingProjects(db, projectsRoot, owner.id);
+    if (!rootReadable) {
+      // Distinct from the success line below on purpose: "0 adopted, 0
+      // already known" reads as a success for a root that turned out to be
+      // missing, unreadable, or not a directory (ENOENT/EACCES/ENOTDIR, all
+      // swallowed the same way by adoptExistingProjects) — exactly the
+      // no-op an operator who mistyped --projects-root would never notice.
+      // The resolved absolute path is named so an operator can see where
+      // this process actually looked, since a relative default resolves
+      // against CWD, which differs by how the process was launched.
+      console.warn(
+        `project adoption: could not read projects root ${resolve(projectsRoot)} `
+        + "(missing, inaccessible, or not a directory) — 0 adopted",
+      );
+    } else {
+      console.log(
+        `project adoption: ${adopted.length} adopted, ${skipped.length} already known (owner: ${bootstrapEmail})`,
+      );
+    }
   }
 }
 

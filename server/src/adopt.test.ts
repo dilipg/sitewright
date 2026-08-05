@@ -63,7 +63,34 @@ describe("adoptExistingProjects", () => {
     // A fresh deployment has no generated/ yet; that is not an error.
     const { db, owner } = fresh([]);
     expect(adoptExistingProjects(db, join(tmpdir(), "definitely-not-here-xyz"), owner.id))
-      .toEqual({ adopted: [], skipped: [] });
+      .toEqual({ adopted: [], skipped: [], rootReadable: false });
+  });
+
+  it("distinguishes a missing/unreadable root from one that is readable but empty", () => {
+    // Both produce zero adopted projects, but they are not the same
+    // situation: an operator who pointed --projects-root at the wrong path
+    // needs a loud warning, while a genuinely empty (but readable) root on a
+    // fresh deployment does not.
+    const { db, root, owner } = fresh([]);
+    const empty = adoptExistingProjects(db, root, owner.id);
+    expect(empty).toEqual({ adopted: [], skipped: [], rootReadable: true });
+
+    const missing = adoptExistingProjects(db, join(tmpdir(), "definitely-not-here-xyz"), owner.id);
+    expect(missing).toEqual({ adopted: [], skipped: [], rootReadable: false });
+
+    expect(empty.rootReadable).not.toBe(missing.rootReadable);
+  });
+
+  it("also reports rootReadable: false for a root that exists but is not a directory", () => {
+    // The bare catch in adoptExistingProjects swallows ENOTDIR (and EACCES)
+    // the same way it swallows a missing path (ENOENT) — all three are
+    // "could not read this as a projects root," which rootReadable collapses
+    // to false rather than throwing.
+    const { db, root, owner } = fresh([]);
+    const notADirectory = join(root, "not-a-directory");
+    writeFileSync(notADirectory, "x");
+    expect(adoptExistingProjects(db, notADirectory, owner.id))
+      .toEqual({ adopted: [], skipped: [], rootReadable: false });
   });
 
   it("never reassigns a project that already has an owner", () => {

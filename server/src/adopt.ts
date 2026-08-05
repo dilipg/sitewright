@@ -19,13 +19,19 @@ export function adoptExistingProjects(
   db: DatabaseSync,
   projectsRoot: string,
   ownerId: string,
-): { adopted: string[]; skipped: string[] } {
+): { adopted: string[]; skipped: string[]; rootReadable: boolean } {
   let entries;
   try {
     entries = readdirSync(projectsRoot, { withFileTypes: true });
   } catch {
-    // A fresh deployment has no projects root yet. Not an error.
-    return { adopted: [], skipped: [] };
+    // A fresh deployment has no projects root yet (ENOENT) — not an error, so
+    // this never throws. But that same catch also swallows EACCES and
+    // ENOTDIR, which ARE operator-actionable: a real projects root that
+    // exists but cannot be listed. `rootReadable: false` is how the caller
+    // (scripts/serve.ts) tells "found nothing because there was nothing to
+    // read" apart from "found nothing because reading it failed" — the two
+    // deserve different log lines, not the same silent zero.
+    return { adopted: [], skipped: [], rootReadable: false };
   }
 
   const adopted: string[] = [];
@@ -42,5 +48,5 @@ export function adoptExistingProjects(
     createProject(db, ownerId, entry.name, entry.name);
     adopted.push(entry.name);
   }
-  return { adopted, skipped };
+  return { adopted, skipped, rootReadable: true };
 }

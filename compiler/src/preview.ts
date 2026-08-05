@@ -18,6 +18,15 @@ import { bridgeShimPlugin } from "./shim/vite-plugin.ts";
 
 export interface PreviewOptions {
   port?: number;
+  /**
+   * Vite's base path. The hosted server proxies each preview at
+   * `/preview/<projectId>/`, and without a matching base every asset URL the
+   * dev server generates (`/src/main.tsx`, `/@vite/client`) points at the
+   * PROXY's root instead of the project's, so the page loads and every module
+   * 404s. Undefined leaves Vite's own default ("/"), which is what the local
+   * `npm run preview` wants.
+   */
+  base?: string;
 }
 
 export async function startPreviewServer(
@@ -33,6 +42,7 @@ export async function startPreviewServer(
   const server = await createServer({
     root,
     configFile,
+    base: options.base,
     plugins: [
       bridgeShimPlugin(),
       overridesApiPlugin(root),

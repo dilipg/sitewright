@@ -167,6 +167,15 @@ export function authRoutes(deps: { db: DatabaseSync; secureCookies: boolean }): 
           spendCapUsd: ctx.user.spendCapUsd,
           spentUsd24h: status.spentUsd,
           resetAt: status.resetAt,
+          // Both other surfaces that show this number already call it a
+          // floor when this is non-zero — describeSpendCap's "at least $X
+          // spent (N call(s) used a model with no published rate)" and the
+          // `usage` CLI's identical caveat. Without this field, this is the
+          // one surface a user actually sees that presented spentUsd24h as
+          // exact: under the gemini escape hatch a user could see
+          // `spentUsd24h: 0` while genuinely burning budget on unpriced
+          // calls, with nothing telling them the number understates reality.
+          unpricedEvents: status.unpricedEvents,
         });
       }),
     },

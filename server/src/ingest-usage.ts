@@ -12,12 +12,26 @@
  * from a `finally` after a spawn that may itself have failed, so it must never
  * throw and must never let one bad line discard the rest of a run's billing.
  * "Never throws" is structural, not merely intended: every known failure mode
- * (missing file, stale user, stale project, a malformed line, a rejected
- * insert) is guarded at its own point, and an outer try/catch around the
- * whole body is the backstop for everything else — an unguarded SQLite read
- * hitting write-lock contention or a closed handle, or any failure this
- * comment doesn't yet know about. The outer catch returns whatever was
- * counted before it fired, so a loss is visible in `skipped`, never silent.
+ * (missing file, unreadable file, stale user, stale project, a malformed
+ * line, a rejected insert) is guarded at its own point, and an outer
+ * try/catch around the whole body is the backstop for everything else — an
+ * unguarded SQLite read hitting write-lock contention or a closed handle, or
+ * any failure this comment doesn't yet know about.
+ *
+ * The line count (`total`, below) is computed from the file BEFORE any
+ * lookup or insert runs, and `ingested`/`skipped` are declared before the
+ * outer try. That ordering is what makes the outer catch's `skipped = total
+ * - ingested` correct rather than a guess: however early the failure hits —
+ * even before the first row is looked at — the number of rows that did NOT
+ * become a usage_event row is always recoverable by subtraction, never
+ * merely "whatever happened to be counted so far."
+ *
+ * `unreadable` exists because the file can exist but not be readable at all
+ * (EBUSY while a subprocess still holds it on Windows, EACCES, EISDIR): that
+ * case cannot know even the row count, so it is reported distinctly rather
+ * than folded into `{ingested: 0, skipped: 0}` — which is ALSO the correct,
+ * legitimate result for a run that made no model calls. Conflating the two
+ * would make an unreadable log invisible to the caller.
  *
  * NOT idempotent. Ingesting the same file twice records the spend twice. The
  * caller must ingest exactly once, from a path unique to that invocation, and
@@ -32,8 +46,14 @@ import { findUserById } from "./users.ts";
 
 export interface IngestResult {
   ingested: number;
-  /** Lines that were not usable. Non-zero is worth logging; it means spend was lost. */
+  /** Usable lines that did not become rows. Non-zero means spend was lost. */
   skipped: number;
+  /**
+   * The file existed but could not be read, so not even the number of lost
+   * rows is knowable. Distinct from `{ingested: 0, skipped: 0}`, which is the
+   * legitimate result for a run that made no model calls.
+   */
+  unreadable: boolean;
 }
 
 function intField(source: Record<string, unknown>, name: string): number {
@@ -48,7 +68,22 @@ export function ingestUsageLog(
   const { path, userId, now } = args;
   // A run that made no model calls writes no file. That is a no-op, not an
   // error — do not make the caller distinguish the two.
-  if (!existsSync(path)) return { ingested: 0, skipped: 0 };
+  if (!existsSync(path)) return { ingested: 0, skipped: 0, unreadable: false };
+
+  let text: string;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch {
+    // The file exists (existsSync above already confirmed it) but couldn't
+    // be read — EBUSY while the subprocess that wrote it still holds it open
+    // on Windows, EACCES, EISDIR. Nothing was counted, so this is reported
+    // as its own case rather than as `skipped`, which promises "this many
+    // rows were counted and lost."
+    return { ingested: 0, skipped: 0, unreadable: true };
+  }
+
+  const usable = text.split("\n").filter((line) => line.trim() !== "");
+  const total = usable.length;
 
   let ingested = 0;
   let skipped = 0;
@@ -60,15 +95,6 @@ export function ingestUsageLog(
     const projectId =
       args.projectId !== null && findProjectById(db, args.projectId) !== null ? args.projectId : null;
 
-    let text: string;
-    try {
-      text = readFileSync(path, "utf8");
-    } catch {
-      return { ingested, skipped };
-    }
-
-    const usableLines = text.split("\n").filter((line) => line.trim() !== "");
-
     // Symmetric with the projectId check above, and for the same reason:
     // user_id is NOT NULL REFERENCES user(id), so a stale id throws on the
     // FIRST insert and takes the whole run's billing with it — unlike
@@ -79,14 +105,14 @@ export function ingestUsageLog(
     // went unrecorded and can log it, instead of an unhandled throw inside the
     // caller's `finally` masking the original spawn error.
     if (findUserById(db, userId) === null) {
-      skipped = usableLines.length;
-      return { ingested, skipped };
+      skipped = total;
+      return { ingested, skipped, unreadable: false };
     }
 
     // No enclosing transaction: a run produces tens of rows, so the speed is
     // irrelevant, and a BEGIN here would be a nested-transaction hazard for
     // whatever calls this in future.
-    for (const line of usableLines) {
+    for (const line of usable) {
       let parsed: unknown;
       try {
         parsed = JSON.parse(line);
@@ -169,9 +195,11 @@ export function ingestUsageLog(
     // straight out of this function. The contract is "never throws", and the
     // caller runs this in a `finally` after a spawn that may itself have
     // failed — an exception here would both lose the billing AND mask the
-    // original error. Whatever was counted before the failure is still
-    // returned, so the loss is visible in `skipped` rather than silent.
+    // original error. `total` was computed before this try began, so the
+    // loss is exactly `total - ingested` — visible, not silent, and not a
+    // guess bounded by however far the loop happened to get.
+    skipped = total - ingested;
   }
 
-  return { ingested, skipped };
+  return { ingested, skipped, unreadable: false };
 }

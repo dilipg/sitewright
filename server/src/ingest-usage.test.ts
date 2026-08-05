@@ -1,6 +1,7 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { DatabaseSync } from "node:sqlite";
 import { openDatabase } from "./db.ts";
@@ -57,7 +58,7 @@ describe("ingestUsageLog", () => {
   it("attributes every row to the user and sums to the file's total", () => {
     const path = writeLog("a.jsonl", [row(), row({ cost_usd: 0.25 }), ""]);
     const result = ingestUsageLog(db, { path, userId: user.id, projectId: null, now: NOW });
-    expect(result).toEqual({ ingested: 2, skipped: 0 });
+    expect(result).toEqual({ ingested: 2, skipped: 0, unreadable: false });
     expect(spendSince(db, user.id, 0).costUsd).toBe(0.75);
   });
 
@@ -86,7 +87,7 @@ describe("ingestUsageLog", () => {
   it("skips a row with no model rather than inventing one", () => {
     const path = writeLog("d.jsonl", [row(), JSON.stringify({ role: "section", cost_usd: 5 })]);
     const result = ingestUsageLog(db, { path, userId: user.id, projectId: null, now: NOW });
-    expect(result).toEqual({ ingested: 1, skipped: 1 });
+    expect(result).toEqual({ ingested: 1, skipped: 1, unreadable: false });
     expect(spendSince(db, user.id, 0).costUsd).toBe(0.5);
   });
 
@@ -121,7 +122,7 @@ describe("ingestUsageLog", () => {
     const result = ingestUsageLog(db, {
       path: join(dir, "absent.jsonl"), userId: user.id, projectId: null, now: NOW,
     });
-    expect(result).toEqual({ ingested: 0, skipped: 0 });
+    expect(result).toEqual({ ingested: 0, skipped: 0, unreadable: false });
   });
 
   it("links rows to a project that exists", () => {
@@ -151,14 +152,14 @@ describe("ingestUsageLog", () => {
     expect(() => {
       result = ingestUsageLog(db, { path, userId: "no-such-user", projectId: null, now: NOW });
     }).not.toThrow();
-    expect(result).toEqual({ ingested: 0, skipped: 2 });
+    expect(result).toEqual({ ingested: 0, skipped: 2, unreadable: false });
   });
 
   it("survives a line that is the literal JSON null", () => {
     // typeof null === "object", so the null guard is what stops this crashing.
     const path = writeLog("k.jsonl", [row(), "null"]);
     const result = ingestUsageLog(db, { path, userId: user.id, projectId: null, now: NOW });
-    expect(result).toEqual({ ingested: 1, skipped: 1 });
+    expect(result).toEqual({ ingested: 1, skipped: 1, unreadable: false });
   });
 
   it("treats a negative cost as unpriced rather than letting it reduce the total", () => {
@@ -178,9 +179,75 @@ describe("ingestUsageLog", () => {
     }).not.toThrow();
     // findUserById is the first db call reached (projectId is null, so
     // findProjectById is short-circuited), and it throws "database is not
-    // open" before either row is processed — so both counts are 0, not
-    // "2 skipped" the way a stale-user or stale-project run would report.
-    // The outer backstop can only return what was counted before it fired.
-    expect(result).toEqual({ ingested: 0, skipped: 0 });
+    // open" before either row is processed. The line count is read from the
+    // file BEFORE that call runs, so the loss is still the true "2", not a
+    // guessed-at "whatever was counted before the failure" — see the next
+    // test for the case this used to get wrong.
+    expect(result).toEqual({ ingested: 0, skipped: 2, unreadable: false });
+  });
+
+  it("reports the true loss when the database dies mid-file, not a no-op", () => {
+    const path = writeLog("n.jsonl", [row(), row(), row()]);
+    db.close();
+    let result: IngestResult | undefined;
+    expect(() => {
+      result = ingestUsageLog(db, { path, userId: user.id, projectId: null, now: NOW });
+    }).not.toThrow();
+    // The distinction that matters: NOT {0, 0}, which is what a run with no
+    // model calls returns. Three rows of spend were lost and the caller must
+    // be able to tell.
+    expect(result).toEqual({ ingested: 0, skipped: 3, unreadable: false });
+  });
+
+  it("flags an unreadable file distinctly from a run that made no model calls", () => {
+    // A directory at the log's path: exists, but readFileSync throws EISDIR.
+    const path = join(dir, "as-a-directory.jsonl");
+    mkdirSync(path);
+    const result = ingestUsageLog(db, { path, userId: user.id, projectId: null, now: NOW });
+    expect(result).toEqual({ ingested: 0, skipped: 0, unreadable: true });
+  });
+});
+
+/**
+ * `fixtures/usage-log-contract.jsonl` (repo root) is the contract shared with
+ * the orchestrator's writer, `record_usage`
+ * (orchestrator/src/orchestrator/accounting.py) — the two sides were built
+ * from separate briefs and, before this test and its Python counterpart in
+ * orchestrator/tests/test_accounting.py, were never checked against each
+ * other. This half ingests the checked-in file directly (never a hardcoded
+ * absolute path — resolved from this file's own URL, since the golden file
+ * lives outside this package) and asserts the reader can still make sense of
+ * exactly what the writer produces.
+ */
+describe("the golden-file contract with the orchestrator's writer", () => {
+  const goldenPath = fileURLToPath(new URL("../../fixtures/usage-log-contract.jsonl", import.meta.url));
+
+  it("ingests all three golden rows, treating the unpriced model as a floor rather than losing it", () => {
+    const result = ingestUsageLog(db, { path: goldenPath, userId: user.id, projectId: null, now: NOW });
+    expect(result).toEqual({ ingested: 3, skipped: 0, unreadable: false });
+
+    const window = spendSince(db, user.id, 0);
+    expect(window.events).toBe(3);
+    expect(window.unpricedEvents).toBe(1);
+
+    // The sonnet row is the golden file's "all four token fields non-zero"
+    // case. Its full token counts, not just its cost, must survive the round
+    // trip, and its own timestamp — not the ingest time `NOW` — is what it
+    // must be attributed to.
+    const goldenRows = readFileSync(goldenPath, "utf8")
+      .split("\n")
+      .filter((line) => line.trim() !== "")
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    const sonnetRow = goldenRows.find((r) => r.model === "claude-sonnet-5");
+    if (sonnetRow === undefined) throw new Error("golden file has no claude-sonnet-5 row");
+
+    const stored = db.prepare(
+      "SELECT * FROM usage_event WHERE model = 'claude-sonnet-5'",
+    ).get() as Record<string, unknown>;
+    expect(stored.input_tokens).toBe(sonnetRow.input_tokens);
+    expect(stored.output_tokens).toBe(sonnetRow.output_tokens);
+    expect(stored.cache_creation_input_tokens).toBe(sonnetRow.cache_creation_input_tokens);
+    expect(stored.cache_read_input_tokens).toBe(sonnetRow.cache_read_input_tokens);
+    expect(stored.at).toBe(Date.parse(sonnetRow.timestamp as string));
   });
 });

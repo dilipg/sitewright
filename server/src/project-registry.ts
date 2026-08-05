@@ -22,13 +22,18 @@
  * an undeclared new endpoint at compile time instead of at review time.
  *
  * Every billable endpoint today is a `/__*` compiler endpoint, and every one
- * of those is still unmounted (see isUnmountedCompilerEndpoint). That means
- * the "a billable route is wrapped in requireBudget" property is not yet
- * observable on the live table — the set is empty, and a test asserting it
- * would pass without checking anything. What IS asserted here is the exclusion
- * itself: the moment 4c mounts these, the exclusion test fails and forces the
- * enforcement test to be written against real routes. Same mechanism 4a used
- * for the authorization rule.
+ * of those is still unmounted. That means the "a billable route is wrapped in
+ * requireBudget" property is not yet observable on the live table — the set
+ * of mounted billable routes is empty, and a test asserting that would pass
+ * without checking anything. What IS asserted, in
+ * project-registry.test.ts's "billable endpoints" block, is that exclusion —
+ * checked against the LIVE route table built by `buildRoutes`, not against
+ * `isUnmountedCompilerEndpoint`'s path-prefix string check. A predicate over
+ * the path string cannot notice a route being mounted (mounting doesn't
+ * change what a path string starts with), so a test built on it can never
+ * fail no matter what compose.ts does. The moment 4c mounts a billable route,
+ * the live-table version of that test fails — which is the signal to write
+ * the enforcement test against real routes and delete the placeholder.
  */
 import type { ProjectIdSource } from "./require-project.ts";
 import type { Route } from "./router.ts";

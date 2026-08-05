@@ -272,18 +272,29 @@ describe("GET /api/me", () => {
     expect((await call("GET", "/api/me", undefined, "sid=forged")).status).toBe(401);
   });
 
-  it("reports the current 24h spend alongside the cap", async () => {
+  it("reports the current 24h spend alongside the cap, and flags it as a floor when a call went unpriced", async () => {
     const { db, user, call } = await harness();
     recordUsageEvent(db, {
       userId: user.id, projectId: null, role: "section", model: "claude-sonnet-5",
       inputTokens: 0, outputTokens: 0, cacheCreationInputTokens: 0, cacheReadInputTokens: 0,
       costUsd: 3.25, at: Date.now(),
     });
+    // Under the gemini escape hatch a call can carry no published rate.
+    // spentUsd24h alone would then understate the real bill with nothing
+    // telling the caller so — the same caveat describeSpendCap and the
+    // `usage` CLI already surface on the two other places this number shows
+    // up. /api/me must not be the one surface that presents it as exact.
+    recordUsageEvent(db, {
+      userId: user.id, projectId: null, role: "section", model: "gemini-flash-latest",
+      inputTokens: 0, outputTokens: 0, cacheCreationInputTokens: 0, cacheReadInputTokens: 0,
+      costUsd: null, at: Date.now(),
+    });
     const login = await call("POST", "/api/login", { email: "a@example.com", password: "s3cret-password" });
     const me = await call("GET", "/api/me", undefined, `sid=${sidFrom(login.headers)}`);
     expect(me.status).toBe(200);
     expect(me.json.spendCapUsd).toBe(10);
     expect(me.json.spentUsd24h).toBe(3.25);
+    expect(me.json.unpricedEvents).toBe(1);
   });
 
   it("does not leak the password hash alongside the new fields", async () => {

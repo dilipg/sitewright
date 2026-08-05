@@ -15,7 +15,7 @@ const MAX_BODY_BYTES = 1_000_000;
 export type Handler = (
   req: IncomingMessage,
   res: ServerResponse,
-  ctx: { url: URL },
+  ctx: { url: URL; params: Record<string, string> },
 ) => Promise<void> | void;
 
 export interface Route {
@@ -24,21 +24,111 @@ export interface Route {
   handler: Handler;
 }
 
+/**
+ * A route path may declare at most ONE `:name` segment. Matching stays
+ * segment-exact: a parameter captures exactly one segment and never spans a
+ * `/`. That restriction is what preserves the allowlist property — if `:id`
+ * could swallow `abc/def`, registering one route would silently expose every
+ * path beneath it, including paths with their own intended authorization rule.
+ */
+interface CompiledRoute {
+  route: Route;
+  segments: string[];
+  paramName: string | null;
+  paramIndex: number;
+}
+
+function compile(route: Route): CompiledRoute {
+  const segments = route.path.split("/");
+  const indices = segments.flatMap((s, i) => (s.startsWith(":") ? [i] : []));
+  if (indices.length > 1) {
+    throw new Error(`route ${route.method} ${route.path} declares more than one parameter`);
+  }
+  const paramIndex = indices[0] ?? -1;
+  return {
+    route,
+    segments,
+    paramName: paramIndex === -1 ? null : segments[paramIndex]!.slice(1),
+    paramIndex,
+  };
+}
+
+function match(compiled: CompiledRoute, method: string, pathname: string) {
+  if (compiled.route.method !== method) return null;
+  const actual = pathname.split("/");
+  if (actual.length !== compiled.segments.length) return null;
+  const params: Record<string, string> = {};
+  for (let i = 0; i < compiled.segments.length; i += 1) {
+    if (i === compiled.paramIndex) {
+      const raw = actual[i]!;
+      // An empty segment is not a value: "/api/thing/" must not resolve with
+      // an empty id, which downstream would look up row "" and 404 anyway —
+      // but only after a database read on unvalidated input.
+      if (raw === "") return null;
+      // decodeURIComponent throws URIError on a malformed escape (e.g. "%ZZ").
+      // This call sits outside both of the listener's try/catch blocks, so an
+      // uncaught throw here would become a rejected promise on an async
+      // listener that node:http never awaits — no response is ever written,
+      // and the connection hangs until a timeout. A malformed percent-escape
+      // is a malformed path: treat it as a non-match so the request falls
+      // through to the normal 404, the same honest answer a missing or extra
+      // segment gets. Never pass the raw undecoded value through instead —
+      // a handler expects a decoded string, not a percent-escaped one.
+      try {
+        params[compiled.paramName!] = decodeURIComponent(raw);
+      } catch {
+        return null;
+      }
+      continue;
+    }
+    if (actual[i] !== compiled.segments[i]) return null;
+  }
+  return params;
+}
+
+/**
+ * Before parameterised routes existed, string equality on `${method} ${path}`
+ * WAS pattern equality: every segment was literal, so two equal strings and
+ * two colliding patterns were the same fact. They no longer are — `match()`
+ * below never looks at a parameter's NAME, only its position, so "GET
+ * /a/:x" and "GET /a/:y" match exactly the same requests and the second is
+ * unreachable the instant the first is registered. As raw strings, though,
+ * they are two different keys. Every `:name` segment is normalised to the
+ * same placeholder here so the dedupe key reflects the pattern a request is
+ * actually matched against, not the literal characters used to write it.
+ */
+function dedupeKey(route: Route): string {
+  const normalizedPath = route.path
+    .split("/")
+    .map((segment) => (segment.startsWith(":") ? ":param" : segment))
+    .join("/");
+  return `${route.method} ${normalizedPath}`;
+}
+
 export function createRequestListener(routes: Route[]) {
   // The table IS the allowlist, and `.find()` below returns the first match
-  // — so a duplicate (method, path) pair would be silently shadowed rather
-  // than rejected. Checked once, at construction, not per request: the route
-  // table is fixed for the process's lifetime, and a duplicate is a wiring
-  // bug that should fail the moment the listener is built, not get buried in
-  // whichever handler happened to register first.
+  // — so two routes matching the same request pattern would be silently
+  // shadowed rather than rejected. Checked once, at construction, not per
+  // request: the route table is fixed for the process's lifetime, and a
+  // duplicate is a wiring bug that should fail the moment the listener is
+  // built, not get buried in whichever handler happened to register first.
   const seen = new Set<string>();
   for (const route of routes) {
-    const key = `${route.method} ${route.path}`;
+    const key = dedupeKey(route);
     if (seen.has(key)) {
       throw new Error(`duplicate route registered: ${route.method} ${route.path}`);
     }
     seen.add(key);
   }
+
+  // Compiled once, outside the returned listener: the route table is fixed
+  // for the process's lifetime, so per-request recompilation would be pure
+  // waste. Literals and parameterised routes are held in separate arrays —
+  // not sorted together — so that a literal always wins regardless of the
+  // order routes were registered in; see the match order in the listener.
+  const compiled = routes.map(compile);
+  const literals = compiled.filter((c) => c.paramName === null);
+  const parameterised = compiled.filter((c) => c.paramName !== null);
 
   return async function listener(req: IncomingMessage, res: ServerResponse): Promise<void> {
     // Constructing the URL can throw (a malformed Host header, e.g. "a b" or
@@ -57,14 +147,27 @@ export function createRequestListener(routes: Route[]) {
       return;
     }
     // Exact match, never prefix: prefix matching is how a guard on one path
-    // accidentally covers — or fails to cover — a neighbouring one.
-    const route = routes.find((r) => r.method === req.method && r.path === url.pathname);
-    if (route === undefined) {
+    // accidentally covers — or fails to cover — a neighbouring one. Literals
+    // are tried before parameterised routes so a literal always wins, no
+    // matter which order the two were registered in.
+    const method = req.method ?? "";
+    let found: { route: Route; params: Record<string, string> } | null = null;
+    for (const c of literals) {
+      const params = match(c, method, url.pathname);
+      if (params !== null) { found = { route: c.route, params }; break; }
+    }
+    if (found === null) {
+      for (const c of parameterised) {
+        const params = match(c, method, url.pathname);
+        if (params !== null) { found = { route: c.route, params }; break; }
+      }
+    }
+    if (found === null) {
       sendJson(res, 404, { error: "not found" });
       return;
     }
     try {
-      await route.handler(req, res, { url });
+      await found.route.handler(req, res, { url, params: found.params });
     } catch {
       // Deliberately no detail: a stack trace in a response body leaks paths,
       // versions, and sometimes secrets.

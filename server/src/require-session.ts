@@ -16,7 +16,7 @@ import { resolveSession, SESSION_COOKIE } from "./sessions.ts";
 export type AuthedHandler = (
   req: IncomingMessage,
   res: ServerResponse,
-  ctx: { url: URL; user: User },
+  ctx: { url: URL; params: Record<string, string>; user: User },
 ) => Promise<void> | void;
 
 export function requireSession(db: DatabaseSync, handler: AuthedHandler): Handler {

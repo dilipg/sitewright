@@ -14,6 +14,7 @@ import { findUserByEmail, listUsers } from "./users.ts";
 import { verifyPassword } from "./passwords.ts";
 import { createSession, resolveSession } from "./sessions.ts";
 import { getApiKeyFingerprint, setApiKey } from "./api-keys.ts";
+import { createProject } from "./projects.ts";
 import { runUserCommand } from "./user-cli.ts";
 
 const dirs: string[] = [];
@@ -194,6 +195,31 @@ describe("user clear-key", () => {
     const db = freshDb();
     await expect(runUserCommand(db, ["clear-key", "--email", "ghost@example.com"]))
       .rejects.toThrow(/no user/i);
+  });
+});
+
+describe("user list-projects", () => {
+  it("prints every project's directory and owner email, and never a password hash", async () => {
+    const db = freshDb();
+    await runUserCommand(db, ["create", "--email", "a@example.com"]);
+    await runUserCommand(db, ["create", "--email", "b@example.com"]);
+    const alice = findUserByEmail(db, "a@example.com")!;
+    const bob = findUserByEmail(db, "b@example.com")!;
+    createProject(db, alice.id, "alice-run", "Alice");
+    createProject(db, bob.id, "bob-run", "Bob");
+
+    const output = await runUserCommand(db, ["list-projects"]);
+
+    expect(output).toContain("alice-run");
+    expect(output).toContain("a@example.com");
+    expect(output).toContain("bob-run");
+    expect(output).toContain("b@example.com");
+    expect(output).not.toContain("argon2");
+  });
+
+  it("reports no projects rather than an empty string", async () => {
+    const output = await runUserCommand(freshDb(), ["list-projects"]);
+    expect(output).toBe("no projects");
   });
 });
 

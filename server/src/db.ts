@@ -42,6 +42,13 @@ const MIGRATIONS = [
      fingerprint TEXT NOT NULL,
      created_at  INTEGER NOT NULL
    )`,
+  `CREATE TABLE IF NOT EXISTS project (
+     id         TEXT PRIMARY KEY,
+     owner_id   TEXT NOT NULL REFERENCES user(id) ON DELETE CASCADE,
+     directory  TEXT NOT NULL UNIQUE,
+     name       TEXT NOT NULL,
+     created_at INTEGER NOT NULL
+   )`,
 ];
 
 export function openDatabase(path: string): DatabaseSync {

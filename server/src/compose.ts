@@ -12,6 +12,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import { authRoutes } from "./auth-routes.ts";
 import { keyRoutes } from "./key-routes.ts";
+import { projectRoutes } from "./project-routes.ts";
 import type { Route } from "./router.ts";
 
 export function buildRoutes(args: {
@@ -23,5 +24,6 @@ export function buildRoutes(args: {
   return [
     ...authRoutes({ db, secureCookies }),
     ...keyRoutes({ db, masterKey }),
+    ...projectRoutes({ db }),
   ];
 }

@@ -56,3 +56,35 @@ export const SESSION_ONLY_ENDPOINTS: ReadonlyArray<{ method: Route["method"]; pa
   { method: "PUT", path: "/api/key" },
   { method: "DELETE", path: "/api/key" },
 ];
+
+/**
+ * Reachable with no session at all. Listed for the same reason as
+ * SESSION_ONLY_ENDPOINTS: without an explicit third list, these two endpoints
+ * belonged to neither list, and the bidirectional partition test
+ * (project-registry.test.ts) could not be written at all — there was no
+ * complete set of lists to check buildRoutes's output against.
+ */
+export const UNAUTHENTICATED_ENDPOINTS: ReadonlyArray<{ method: Route["method"]; path: string }> = [
+  { method: "POST", path: "/api/login" },
+  { method: "POST", path: "/api/logout" },
+];
+
+/**
+ * Every `/__*` path above is a compiler-owned handler (regen-api, export-api,
+ * plan-api, preview.ts) declared here so the authorization rule exists before
+ * the endpoint is reachable, but not yet mounted on the hosted composition
+ * root (compose.ts) — that needs 4c's preview pool, which is what turns a
+ * projectId into a running preview process to route to. Until then these
+ * entries are correct but unreachable, which is the safe direction to be
+ * wrong in.
+ *
+ * This predicate is what lets the bidirectional test assert agreement with
+ * the LIVE route table for everything that IS mounted today, while still
+ * keeping every declared endpoint in exactly one of the three lists above. An
+ * explicit, commented function rather than an inline filter, so a reader —
+ * and the "excluded set is exactly this" test in project-registry.test.ts —
+ * can see the exclusion instead of the check quietly discarding entries.
+ */
+export function isUnmountedCompilerEndpoint(path: string): boolean {
+  return path.startsWith("/__");
+}

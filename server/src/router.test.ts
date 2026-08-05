@@ -193,3 +193,64 @@ describe("readJsonBody", () => {
     await expect(readJsonBody(req as never)).rejects.toThrow("body too large");
   });
 });
+
+describe("declared-parameter routes", () => {
+  const withParam: Route = {
+    method: "GET",
+    path: "/api/thing/:id",
+    handler: (_req, res, ctx) => { res.writeHead(200); res.end(ctx.params.id ?? ""); },
+  };
+
+  it("captures the segment and passes it in ctx.params", async () => {
+    expect((await call([withParam], "GET", "/api/thing/abc")).body).toBe("abc");
+  });
+
+  it("does not match a missing segment", async () => {
+    // "/api/thing" must not reach a handler expecting an id.
+    expect((await call([withParam], "GET", "/api/thing")).status).toBe(404);
+  });
+
+  it("does not match an extra segment — a parameter is ONE segment, not a prefix", async () => {
+    // This is the property that keeps the table an allowlist. If ":id" swallowed
+    // "abc/def", then registering "/api/thing/:id" would silently expose every
+    // path beneath it, including ones with their own intended rules.
+    expect((await call([withParam], "GET", "/api/thing/abc/def")).status).toBe(404);
+  });
+
+  it("does not match an empty segment", async () => {
+    expect((await call([withParam], "GET", "/api/thing/")).status).toBe(404);
+  });
+
+  it("percent-decodes the captured value", async () => {
+    expect((await call([withParam], "GET", "/api/thing/a%20b")).body).toBe("a b");
+  });
+
+  it("still requires the method to match", async () => {
+    expect((await call([withParam], "POST", "/api/thing/abc")).status).toBe(404);
+  });
+
+  it("prefers a literal route over a parameterised one at the same shape", async () => {
+    // Registering both "/api/thing/mine" and "/api/thing/:id" is a realistic
+    // combination; the literal must win regardless of array order, or a
+    // collection endpoint gets shadowed by an id lookup.
+    const literal: Route = {
+      method: "GET",
+      path: "/api/thing/mine",
+      handler: (_req, res) => { res.writeHead(200); res.end("literal"); },
+    };
+    expect((await call([withParam, literal], "GET", "/api/thing/mine")).body).toBe("literal");
+  });
+
+  it("rejects a path declaring more than one parameter", () => {
+    // Not needed by anything here, and each extra one multiplies the ways a
+    // route can overlap another. Refuse at composition time.
+    expect(() => createRequestListener([
+      { method: "GET", path: "/a/:x/b/:y", handler: () => {} },
+    ])).toThrow(/one/i);
+  });
+
+  it("still throws on a duplicate (method, path)", () => {
+    // The slice-3 guarantee must survive this change.
+    expect(() => createRequestListener([withParam, withParam])).toThrow(/duplicate/i);
+  });
+});

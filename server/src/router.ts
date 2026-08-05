@@ -15,13 +15,62 @@ const MAX_BODY_BYTES = 1_000_000;
 export type Handler = (
   req: IncomingMessage,
   res: ServerResponse,
-  ctx: { url: URL },
+  ctx: { url: URL; params: Record<string, string> },
 ) => Promise<void> | void;
 
 export interface Route {
   method: "GET" | "POST" | "PUT" | "DELETE";
   path: string;
   handler: Handler;
+}
+
+/**
+ * A route path may declare at most ONE `:name` segment. Matching stays
+ * segment-exact: a parameter captures exactly one segment and never spans a
+ * `/`. That restriction is what preserves the allowlist property — if `:id`
+ * could swallow `abc/def`, registering one route would silently expose every
+ * path beneath it, including paths with their own intended authorization rule.
+ */
+interface CompiledRoute {
+  route: Route;
+  segments: string[];
+  paramName: string | null;
+  paramIndex: number;
+}
+
+function compile(route: Route): CompiledRoute {
+  const segments = route.path.split("/");
+  const indices = segments.flatMap((s, i) => (s.startsWith(":") ? [i] : []));
+  if (indices.length > 1) {
+    throw new Error(`route ${route.method} ${route.path} declares more than one parameter`);
+  }
+  const paramIndex = indices[0] ?? -1;
+  return {
+    route,
+    segments,
+    paramName: paramIndex === -1 ? null : segments[paramIndex]!.slice(1),
+    paramIndex,
+  };
+}
+
+function match(compiled: CompiledRoute, method: string, pathname: string) {
+  if (compiled.route.method !== method) return null;
+  const actual = pathname.split("/");
+  if (actual.length !== compiled.segments.length) return null;
+  const params: Record<string, string> = {};
+  for (let i = 0; i < compiled.segments.length; i += 1) {
+    if (i === compiled.paramIndex) {
+      const raw = actual[i]!;
+      // An empty segment is not a value: "/api/thing/" must not resolve with
+      // an empty id, which downstream would look up row "" and 404 anyway —
+      // but only after a database read on unvalidated input.
+      if (raw === "") return null;
+      params[compiled.paramName!] = decodeURIComponent(raw);
+      continue;
+    }
+    if (actual[i] !== compiled.segments[i]) return null;
+  }
+  return params;
 }
 
 export function createRequestListener(routes: Route[]) {
@@ -40,6 +89,15 @@ export function createRequestListener(routes: Route[]) {
     seen.add(key);
   }
 
+  // Compiled once, outside the returned listener: the route table is fixed
+  // for the process's lifetime, so per-request recompilation would be pure
+  // waste. Literals and parameterised routes are held in separate arrays —
+  // not sorted together — so that a literal always wins regardless of the
+  // order routes were registered in; see the match order in the listener.
+  const compiled = routes.map(compile);
+  const literals = compiled.filter((c) => c.paramName === null);
+  const parameterised = compiled.filter((c) => c.paramName !== null);
+
   return async function listener(req: IncomingMessage, res: ServerResponse): Promise<void> {
     // Constructing the URL can throw (a malformed Host header, e.g. "a b" or
     // "a:99999999", makes `new URL` throw TypeError: Invalid URL). That must
@@ -57,14 +115,27 @@ export function createRequestListener(routes: Route[]) {
       return;
     }
     // Exact match, never prefix: prefix matching is how a guard on one path
-    // accidentally covers — or fails to cover — a neighbouring one.
-    const route = routes.find((r) => r.method === req.method && r.path === url.pathname);
-    if (route === undefined) {
+    // accidentally covers — or fails to cover — a neighbouring one. Literals
+    // are tried before parameterised routes so a literal always wins, no
+    // matter which order the two were registered in.
+    const method = req.method ?? "";
+    let found: { route: Route; params: Record<string, string> } | null = null;
+    for (const c of literals) {
+      const params = match(c, method, url.pathname);
+      if (params !== null) { found = { route: c.route, params }; break; }
+    }
+    if (found === null) {
+      for (const c of parameterised) {
+        const params = match(c, method, url.pathname);
+        if (params !== null) { found = { route: c.route, params }; break; }
+      }
+    }
+    if (found === null) {
       sendJson(res, 404, { error: "not found" });
       return;
     }
     try {
-      await route.handler(req, res, { url });
+      await found.route.handler(req, res, { url, params: found.params });
     } catch {
       // Deliberately no detail: a stack trace in a response body leaks paths,
       // versions, and sometimes secrets.

@@ -17,6 +17,12 @@ import { regenApiPlugin } from "./regen-api.ts";
 import { bridgeShimPlugin } from "./shim/vite-plugin.ts";
 
 export interface PreviewOptions {
+  /**
+   * NOTE: 0 does not mean "let the OS choose". Vite treats 0 as "no port
+   * configured" and falls back to its own default, so two callers passing 0
+   * collide. Callers that need a dynamic port must probe for one and pass it
+   * concretely (see server/src/preview-pool.ts's findFreePort).
+   */
   port?: number;
   /**
    * Vite's base path. The hosted server proxies each preview at

@@ -31,10 +31,13 @@ export function checkSpendCap(db: DatabaseSync, user: User, now: number): SpendS
   const since = now - SPEND_WINDOW_MS;
   const window = spendSince(db, user.id, since);
 
-  // A non-positive or corrupt cap means no work, ever — and no reset time,
-  // because waiting cannot fix it. Checked before the comparison so that a
-  // NaN cap (every comparison against which is false) refuses rather than
-  // silently permitting unlimited spend.
+  // A non-positive, NaN or INFINITE cap means no work, and no reset time,
+  // because waiting cannot fix it. Infinity is the case that makes this
+  // guard load-bearing rather than decorative: the comparison below would
+  // ACCEPT it (`spent < Infinity` is always true), authorising unlimited
+  // spend from a single corrupt row. Fail closed instead. The other values
+  // the comparison already refuses on its own; they are covered here so one
+  // branch owns every unusable cap.
   if (!Number.isFinite(capUsd) || capUsd <= 0) {
     return { allowed: false, capUsd, spentUsd: window.costUsd, resetAt: null, unpricedEvents: window.unpricedEvents };
   }

@@ -95,6 +95,28 @@ describe("the cap comparison", () => {
     expect(status.spentUsd).toBe(0);
     expect(status.resetAt).toBe(null);
   });
+
+  it("fails closed on a corrupt, non-finite cap rather than permitting unlimited spend", () => {
+    // Infinity is the one cap value the comparison alone would ACCEPT:
+    // `spent < Infinity` is always true. `set-cap` validates Number.isFinite,
+    // so this only arrives from a corrupted row — and a corrupted cap must
+    // refuse work, not authorise all of it.
+    const status = checkSpendCap(db, { ...user, spendCapUsd: Infinity }, NOW);
+    expect(status.allowed).toBe(false);
+    expect(status.resetAt).toBe(null);
+  });
+
+  it("refuses on a negative cap", () => {
+    const status = checkSpendCap(db, { ...user, spendCapUsd: -5 }, NOW);
+    expect(status.allowed).toBe(false);
+    expect(status.resetAt).toBe(null);
+  });
+
+  it("refuses on a NaN cap", () => {
+    const status = checkSpendCap(db, { ...user, spendCapUsd: Number.NaN }, NOW);
+    expect(status.allowed).toBe(false);
+    expect(status.resetAt).toBe(null);
+  });
 });
 
 describe("the reset time", () => {

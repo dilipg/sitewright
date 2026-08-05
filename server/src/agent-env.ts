@@ -79,6 +79,29 @@ export function resolveApiKey(
   return stored;
 }
 
+/**
+ * A copy of the environment with everything a child must never inherit
+ * removed. Two deletions, for two different reasons:
+ *
+ * - The master key decrypts every user's stored API key. A preview child runs
+ *   the project's own model-generated vite.config.ts, so anything in its
+ *   environment is reachable by untrusted code.
+ * - The HOST's ANTHROPIC_API_KEY. This one is easy to miss because it looks
+ *   like a harmless default: if a user has no stored key and the child
+ *   inherits the operator's, generation still works — and the operator pays,
+ *   for a user the spend cap will happily record as having spent nothing they
+ *   were billed for. Absent is correct; inherited is a silent transfer.
+ *
+ * A copy, never a mutation of process.env, which would leak into every later
+ * spawn in this process.
+ */
+export function scrubbedEnv(baseEnv: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...baseEnv };
+  delete env[MASTER_KEY_ENV_VAR];
+  delete env.ANTHROPIC_API_KEY;
+  return env;
+}
+
 export function buildAgentEnv(args: {
   db: DatabaseSync;
   masterKey: Buffer;
@@ -88,12 +111,9 @@ export function buildAgentEnv(args: {
 }): NodeJS.ProcessEnv {
   const { db, masterKey, userId, pastedKey, baseEnv = process.env } = args;
   const apiKey = resolveApiKey(db, masterKey, userId, pastedKey);
-  // A COPY. Mutating process.env would leak this user's key into every later
-  // subprocess and into any diagnostic dump.
-  const env: NodeJS.ProcessEnv = { ...baseEnv };
-  delete env[MASTER_KEY_ENV_VAR];
-  // Last assignment wins deliberately: the host's own key may be inherited,
-  // but under the hosted server the request's user pays for the request.
+  const env = scrubbedEnv(baseEnv);
+  // Last assignment wins deliberately: the host's own key was just removed by
+  // scrubbedEnv, and the request's user pays for the request.
   env.ANTHROPIC_API_KEY = apiKey;
   return env;
 }

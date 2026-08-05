@@ -15,8 +15,10 @@ import { openDatabase } from "./db.ts";
 import { createUser, setDisabled } from "./users.ts";
 import { setApiKey } from "./api-keys.ts";
 import {
-  buildAgentEnv, DisabledUserError, MissingApiKeyError, resolveApiKey, UnknownUserError,
+  buildAgentEnv, DisabledUserError, MissingApiKeyError, resolveApiKey, scrubbedEnv,
+  UnknownUserError,
 } from "./agent-env.ts";
+import { MASTER_KEY_ENV_VAR } from "./master-key.ts";
 
 const masterKey = randomBytes(32);
 const STORED = "sk-ant-api03-stored-key-value-goes-here-XY9z";
@@ -180,5 +182,24 @@ describe("buildAgentEnv", () => {
     setApiKey(db, masterKey, user.id, STORED);
     setDisabled(db, user.id, true);
     expect(() => buildAgentEnv({ db, masterKey, userId: user.id })).toThrow(DisabledUserError);
+  });
+});
+
+describe("scrubbedEnv", () => {
+  it("removes the host's own ANTHROPIC_API_KEY, so an absent user key is absent rather than the operator's", () => {
+    const env = scrubbedEnv({ ANTHROPIC_API_KEY: "sk-ant-host", PATH: "/usr/bin" });
+    expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(env.PATH).toBe("/usr/bin");
+  });
+
+  it("removes the master key", () => {
+    const env = scrubbedEnv({ [MASTER_KEY_ENV_VAR]: "secret" });
+    expect(env[MASTER_KEY_ENV_VAR]).toBeUndefined();
+  });
+
+  it("does not mutate the environment it was given", () => {
+    const base = { ANTHROPIC_API_KEY: "sk-ant-host" };
+    scrubbedEnv(base);
+    expect(base.ANTHROPIC_API_KEY).toBe("sk-ant-host");
   });
 });

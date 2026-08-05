@@ -90,6 +90,24 @@ export function proxyHttp(args: {
       upstreamReq.destroy();
       settle();
     });
+    // The far more common shape of "client walked away," per an empirical
+    // check against a real aborted request: a client disconnecting BEFORE
+    // anything has been written back fires 'close' on `res`, not 'error'.
+    // Without this, an abandoned request (closed tab, navigation away, a
+    // retry) sits waiting on the upstream for up to the full
+    // `PREVIEW_PROXY_TIMEOUT_MS` even though nothing is listening for the
+    // answer any more — realistic here precisely because that timeout is 15
+    // minutes and users do close tabs mid-regen. Registered once, at the
+    // top: `res.on("close", settle)` further down (inside the "response"
+    // handler) additionally fires on a NORMAL completion, which is fine —
+    // `settle`/`settled` below coalesce either way — but only this
+    // top-level listener also destroys the upstream request, so it must
+    // exist before the upstream has even answered.
+    res.on("close", () => {
+      if (settled) return;
+      upstreamReq.destroy();
+      settle();
+    });
 
     // Definite-assignment (`!`): referenced above inside a listener that can
     // only ever run in a later microtask/event, by which point the
@@ -104,7 +122,13 @@ export function proxyHttp(args: {
         method: req.method,
         // `host` rewritten to the upstream's own loopback address and port:
         // leaving the proxy's own Host header on the forwarded request makes
-        // Vite's origin/host checks reject it outright.
+        // Vite's origin/host checks reject it outright. The rest of
+        // `req.headers` — INCLUDING hop-by-hop headers (Connection,
+        // Transfer-Encoding, Upgrade, …) that RFC 7230 says a proxy should
+        // strip — is forwarded verbatim, deliberately: this hop goes
+        // straight to the one Vite dev server this proxy exists to reach
+        // over loopback, never through a further proxy hop where a
+        // hop-by-hop header surviving would actually matter.
         headers: { ...req.headers, host: `localhost:${port}` },
       });
     } catch (err) {
@@ -139,8 +163,16 @@ export function proxyHttp(args: {
     upstreamReq.on("response", (upstreamRes) => {
       try {
         res.writeHead(upstreamRes.statusCode ?? 502, upstreamRes.headers);
-      } catch {
+      } catch (err) {
+        // `headersSent` is still false here — writeHead threw before
+        // committing anything — so a 502 is still deliverable. Hard to
+        // trigger against a real Vite (Node's own HTTP parser already
+        // rejects header syntax Node itself would refuse to WRITE, which
+        // surfaces as 'error' on `upstreamReq`, already handled above), but
+        // cheap defence-in-depth against whatever header shape does slip
+        // through parsing yet still fail `writeHead`.
         upstreamRes.destroy();
+        safeSendJson(res, 502, { error: `could not relay upstream response: ${String(err)}` });
         settle();
         return;
       }
@@ -181,33 +213,122 @@ export function proxyUpgrade(args: {
 }): void {
   const { req, socket, head, port, path } = args;
 
-  // See the module comment: an unlistened 'error' event on the inbound
-  // socket throws. This also catches the client vanishing before the
-  // upstream even answers.
-  socket.on("error", () => {
-    upstreamReq.destroy();
-  });
+  // True once the fate of the HANDSHAKE ATTEMPT itself has been decided —
+  // successfully upgraded, declined with an ordinary HTTP response, errored,
+  // or abandoned because the client vanished first. Guards the handlers
+  // below from acting twice on the same outcome (e.g. a client 'close'
+  // arriving the same tick as an upstream 'error'), and — once a successful
+  // upgrade below hands off to the bidirectional relay, which owns
+  // `upstreamSocket` from that point on — turns the pre-handshake handlers
+  // registered here into no-ops instead of reaching for a socket that relay
+  // already owns. There is no equivalent flag needed once `settled` is set
+  // via a successful upgrade: the relay's own close/error handlers (inside
+  // the "upgrade" callback below) take over from there, unchanged.
+  let settled = false;
 
   // See the definite-assignment note in `proxyHttp` above — same pattern.
   let upstreamReq!: ReturnType<typeof httpRequest>;
+
+  // Pre-handshake only: the client disconnecting before the upstream has
+  // resolved the handshake must not leave that upstream request open
+  // indefinitely. There is deliberately no timeout on this path (see the
+  // function comment), so without this an abandoned handshake attempt — a
+  // closed tab, a navigation away, a retry — would hang forever rather than
+  // for a bounded 15 minutes like `proxyHttp`. Three distinct events cover
+  // three distinct ways a client goes away, confirmed empirically rather
+  // than assumed: an abrupt reset fires 'error'; a graceful disconnect with
+  // something already written back (mirrors `proxyHttp`'s `res`) fires
+  // 'close'; but `socket` here is a bare `net.Duplex`, not an
+  // `http.ServerResponse` — and node:http accepts connections with
+  // `allowHalfOpen: true`, so a plain graceful FIN with NOTHING written
+  // back yet (the common case: the handshake hasn't resolved) fires only
+  // 'end', never 'close', because nothing on this side has completed the
+  // other half of the close. Missing 'end' here left this exact case
+  // hanging in testing — the client had disconnected, but neither 'close'
+  // nor 'error' ever fired.
+  socket.on("error", () => {
+    if (settled) return;
+    settled = true;
+    upstreamReq.destroy();
+  });
+  socket.on("close", () => {
+    if (settled) return;
+    settled = true;
+    upstreamReq.destroy();
+  });
+  socket.on("end", () => {
+    if (settled) return;
+    settled = true;
+    upstreamReq.destroy();
+    try { socket.destroy(); } catch { /* already gone */ }
+  });
+
   try {
     upstreamReq = httpRequest({
       hostname: "localhost",
       port,
       path,
       method: req.method,
+      // See the matching comment in `proxyHttp`: hop-by-hop headers are
+      // forwarded verbatim on purpose, same reasoning.
       headers: { ...req.headers, host: `localhost:${port}` },
     });
   } catch {
+    if (settled) return;
+    settled = true;
     try { socket.destroy(); } catch { /* already gone */ }
     return;
   }
 
   upstreamReq.on("error", () => {
+    if (settled) return;
+    settled = true;
     try { socket.destroy(); } catch { /* already gone */ }
   });
 
+  // The upstream declining the handshake with an ORDINARY HTTP response
+  // instead of 101 — exactly how `ws` (which Vite's dev server uses)
+  // rejects a bad handshake: a failed origin/host check, a path mismatch,
+  // or the dev server not yet fully up. Node fires 'response' here, not
+  // 'upgrade', for that case. Without this handler the client socket
+  // received zero bytes and was never destroyed — hanging indefinitely,
+  // since (as above) this path has no timeout by design.
+  upstreamReq.on("response", (upstreamRes) => {
+    if (settled) { upstreamRes.resume(); return; }
+    settled = true;
+    try {
+      // Same reconstruction technique as the successful-upgrade path below:
+      // relay the refusal as a raw HTTP response on the client socket.
+      const statusLine = `HTTP/1.1 ${upstreamRes.statusCode ?? 502} ${upstreamRes.statusMessage ?? ""}`;
+      const headerLines = Object.entries(upstreamRes.headers).flatMap(([name, value]) => {
+        if (value === undefined) return [];
+        const values = Array.isArray(value) ? value : [value];
+        return values.map((v) => `${name}: ${v}`);
+      });
+      socket.write([statusLine, ...headerLines, "", ""].join("\r\n"));
+    } catch {
+      try { socket.destroy(); } catch { /* already gone */ }
+      upstreamRes.resume();
+      return;
+    }
+    upstreamRes.on("error", () => {
+      try { socket.destroy(); } catch { /* already gone */ }
+    });
+    // Drains whatever body the refusal carries onto the client socket, then
+    // closes it the moment the body ends — `pipe`'s default behaviour ends
+    // the destination when the source ends, which is exactly "relay the
+    // body, then end" for a plain Duplex target.
+    upstreamRes.pipe(socket);
+  });
+
   upstreamReq.on("upgrade", (upstreamRes, upstreamSocket, upstreamHead) => {
+    // A late upgrade racing an already-decided outcome (the client vanished
+    // while the upstream was still deciding): don't hand off to the relay
+    // below for a client socket that is already gone, just drop the
+    // now-pointless upstream socket.
+    if (settled) { upstreamSocket.destroy(); return; }
+    settled = true;
+
     upstreamSocket.on("error", () => {
       try { socket.destroy(); } catch { /* already gone */ }
     });

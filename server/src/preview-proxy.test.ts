@@ -21,6 +21,15 @@ import type { Duplex } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PREVIEW_PROXY_TIMEOUT_MS, proxyHttp, proxyUpgrade } from "./preview-proxy.ts";
 
+/** Polls `predicate` until it is true, or throws after `timeoutMs`. Used instead of a fixed sleep to avoid flakiness while still bounding a hang. */
+async function waitUntil(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
+  const start = Date.now();
+  while (!predicate()) {
+    if (Date.now() - start > timeoutMs) throw new Error("condition never became true within timeout");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 let upstream: Server;
 let upstreamPort: number;
 let seen: Array<{ url: string; method: string; headers: Record<string, unknown>; body: string }>;
@@ -89,10 +98,14 @@ function rewritePath(url: string): string {
  * server's own 'upgrade' event handed off before closing — see the note on
  * `upstreamUpgradedSockets` above; the same Node behaviour applies here.
  */
-function startProxyServer(targetPort: number): Promise<{ server: Server; origin: string; port: number; close: () => Promise<void> }> {
+function startProxyServer(
+  targetPort: number,
+  options?: { onRequest?: (req: import("node:http").IncomingMessage, res: import("node:http").ServerResponse) => void },
+): Promise<{ server: Server; origin: string; port: number; close: () => Promise<void> }> {
   return new Promise((resolve) => {
     const upgradedSockets = new Set<Duplex>();
     const server = createServer((req, res) => {
+      options?.onRequest?.(req, res);
       void proxyHttp({ req, res, port: targetPort, path: rewritePath(req.url ?? "/") });
     });
     server.on("upgrade", (req, socket, head) => {
@@ -218,6 +231,75 @@ describe("proxyHttp", () => {
       await close();
     }
   });
+
+  it("destroys the upstream connection when the client disconnects before the upstream ever answers", async () => {
+    // A "holding" upstream that deliberately never responds — standing in
+    // for a preview child still doing real work (a page regen, a build)
+    // when the client gives up: a closed tab, a navigation away, a retry.
+    // Without a top-level 'close' listener on `res`, nothing here would
+    // notice and the upstream connection would sit open for up to the full
+    // 15-minute `PREVIEW_PROXY_TIMEOUT_MS`.
+    let upstreamRequestReceived = false;
+    let upstreamRequestEnded = false;
+    const holdingUpstream = createServer((req) => {
+      upstreamRequestReceived = true;
+      req.on("close", () => { upstreamRequestEnded = true; });
+      req.on("aborted", () => { upstreamRequestEnded = true; });
+      // Deliberately no res.writeHead()/res.end() — the client's own abort
+      // has to be what tears this connection down.
+    });
+    holdingUpstream.listen(0);
+    await once(holdingUpstream, "listening");
+    const holdingPort = (holdingUpstream.address() as { port: number }).port;
+
+    const { origin, close } = await startProxyServer(holdingPort);
+    try {
+      const controller = new AbortController();
+      const fetchPromise = fetch(`${origin}/`, { signal: controller.signal });
+      // Asserting `upstreamRequestEnded` below is only meaningful once the
+      // request has actually reached the upstream — wait for that rather
+      // than a fixed sleep.
+      await waitUntil(() => upstreamRequestReceived);
+      controller.abort();
+
+      await expect(fetchPromise).rejects.toBeTruthy();
+      await waitUntil(() => upstreamRequestEnded);
+    } finally {
+      await close();
+      holdingUpstream.closeAllConnections();
+      holdingUpstream.close();
+      await once(holdingUpstream, "close");
+    }
+  });
+
+  it("falls back to a 502 JSON body if relaying the upstream's response headers throws", async () => {
+    // `res.writeHead` on the REAL ServerResponse for this one request is
+    // stubbed to throw exactly once, standing in for a header shape that
+    // slips past Node's own parser on receipt but still fails on write —
+    // hard to produce with a genuinely malformed upstream (see the comment
+    // at the call site), so this forces the branch directly instead of
+    // leaving it unverified. Nothing about the socket or the network is
+    // faked: the request and response still travel over a real connection.
+    const { origin, close } = await startProxyServer(upstreamPort, {
+      onRequest: (_req, res) => {
+        const originalWriteHead = res.writeHead.bind(res);
+        let calls = 0;
+        res.writeHead = ((...writeHeadArgs: Parameters<typeof res.writeHead>) => {
+          calls += 1;
+          if (calls === 1) throw new Error("simulated header relay failure");
+          return originalWriteHead(...writeHeadArgs);
+        }) as typeof res.writeHead;
+      },
+    });
+    try {
+      const response = await fetch(`${origin}/`);
+      expect(response.status).toBe(502);
+      const body: unknown = await response.json();
+      expect(body).toHaveProperty("error");
+    } finally {
+      await close();
+    }
+  });
 });
 
 /** Accumulates 'data' chunks until the buffer contains `marker`, or rejects after `timeoutMs`. */
@@ -316,6 +398,65 @@ describe("proxyUpgrade", () => {
         upstreamSideSocket?.destroy();
 
         await closed; // Would hang forever if proxyUpgrade did not react.
+      } finally {
+        client.destroy();
+      }
+    } finally {
+      await close();
+    }
+  });
+
+  it("relays an ordinary HTTP response as a handshake refusal, instead of hanging, when the upstream declines the upgrade", async () => {
+    // Mirrors exactly how `ws` (which Vite's dev server uses) rejects a bad
+    // handshake: a plain HTTP response instead of 101, on the very socket
+    // Node handed the server for what it still parsed as an upgrade
+    // request (Connection/Upgrade headers were present — that's why this is
+    // the upstream's own 'upgrade' event, not 'request').
+    upstream.on("upgrade", (_req, socket) => {
+      socket.write("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+      socket.end();
+    });
+
+    const { port, close } = await startProxyServer(upstreamPort);
+    try {
+      const client = await openRawUpgradeSocket(port);
+      try {
+        const response = await readUntil(client, "400");
+        expect(response).toContain("400");
+        await once(client, "close"); // Would hang forever without the "response" handler.
+      } finally {
+        client.destroy();
+      }
+    } finally {
+      await close();
+    }
+  });
+
+  it("destroys the upstream connection when the client disconnects before the upstream ever answers", async () => {
+    let upstreamGotUpgrade = false;
+    let upstreamSocketClosed = false;
+    upstream.on("upgrade", (_req, socket) => {
+      upstreamGotUpgrade = true;
+      socket.on("close", () => { upstreamSocketClosed = true; });
+      // node:http accepts connections with `allowHalfOpen: true`, so this
+      // fixture's own socket would otherwise sit half-open forever after
+      // receiving the proxy's FIN — a real server (Vite/`ws`) closes its
+      // own side once it sees the peer end, so this mirrors that rather
+      // than leaving a test artifact for `proxyUpgrade` to work around.
+      socket.on("end", () => socket.end());
+      // Otherwise deliberately never answers — a slow/hanging handshake,
+      // so the client disconnecting has to be what tears this connection
+      // down. There is no timeout on this path by design, so without the
+      // fix this hangs forever rather than for a bounded 15 minutes.
+    });
+
+    const { port, close } = await startProxyServer(upstreamPort);
+    try {
+      const client = await openRawUpgradeSocket(port);
+      try {
+        await waitUntil(() => upstreamGotUpgrade);
+        client.destroy();
+        await waitUntil(() => upstreamSocketClosed);
       } finally {
         client.destroy();
       }

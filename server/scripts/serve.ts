@@ -9,11 +9,13 @@
  * Usage: node scripts/serve.ts [--port 4000] [--db ./data/identity.db]
  */
 import { createServer } from "node:http";
+import { adoptExistingProjects } from "../src/adopt.ts";
 import { buildRoutes } from "../src/compose.ts";
 import { openDatabase } from "../src/db.ts";
 import { loadMasterKey, MASTER_KEY_ENV_VAR } from "../src/master-key.ts";
 import { createRequestListener } from "../src/router.ts";
 import { deleteExpiredSessions } from "../src/sessions.ts";
+import { findUserByEmail } from "../src/users.ts";
 // Reuses the flag() already fixed twice (server/src/user-cli.ts, applied to
 // scripts/user.ts in commit 72dd44b) rather than keeping this script's own
 // independent copy of the same swallowed-value defect: one implementation,
@@ -41,6 +43,8 @@ function requireValueIfPresent(name: string): string | undefined {
 }
 
 const dbPath = requireValueIfPresent("db") ?? "./data/identity.db";
+const projectsRoot = requireValueIfPresent("projects-root") ?? "./generated";
+const bootstrapEmail = requireValueIfPresent("bootstrap-email");
 
 const portRaw = requireValueIfPresent("port") ?? "4000";
 const port = Number(portRaw);
@@ -75,6 +79,24 @@ delete process.env[MASTER_KEY_ENV_VAR];
 const db = openDatabase(dbPath);
 const pruned = deleteExpiredSessions(db);
 if (pruned > 0) console.log(`pruned ${pruned} expired session(s)`);
+
+// Adoption runs on EVERY boot (idempotent by construction — see adopt.ts) so
+// that acceptance runs already on disk get an owner instead of being orphaned.
+// It must never create a user itself: only server/src/user-cli.ts may do that,
+// so an unresolved --bootstrap-email is a skip, not a fallback account.
+if (bootstrapEmail !== undefined) {
+  const owner = findUserByEmail(db, bootstrapEmail);
+  if (owner === null) {
+    console.warn(
+      `--bootstrap-email ${bootstrapEmail} does not match any existing user; skipping project adoption`,
+    );
+  } else {
+    const { adopted, skipped } = adoptExistingProjects(db, projectsRoot, owner.id);
+    console.log(
+      `project adoption: ${adopted.length} adopted, ${skipped.length} already known (owner: ${bootstrapEmail})`,
+    );
+  }
+}
 
 const server = createServer(
   createRequestListener(buildRoutes({ db, masterKey, secureCookies })),

@@ -9,11 +9,14 @@ import type { DatabaseSync } from "node:sqlite";
 import { deleteApiKey } from "./api-keys.ts";
 import { generatePassword, hashPassword } from "./passwords.ts";
 import { revokeAllSessionsForUser } from "./sessions.ts";
+import { listAllProjects } from "./projects.ts";
 import {
-  createUser, findUserByEmail, listUsers, setDisabled, setPasswordHash, setSpendCap,
+  createUser, findUserByEmail, findUserById, listUsers, setDisabled, setPasswordHash, setSpendCap,
 } from "./users.ts";
 
-const COMMANDS = ["create", "disable", "enable", "reset-password", "set-cap", "list", "clear-key"] as const;
+const COMMANDS = [
+  "create", "disable", "enable", "reset-password", "set-cap", "list", "clear-key", "list-projects",
+] as const;
 
 /**
  * Returns the token following `--name`, unless that token is itself another
@@ -118,6 +121,14 @@ export async function runUserCommand(db: DatabaseSync, argv: string[]): Promise<
     // Never the hash.
     return users
       .map((u) => `${u.email}  cap=$${u.spendCapUsd}  ${u.disabledAt === null ? "active" : "disabled"}`)
+      .join("\n");
+  }
+
+  if (command === "list-projects") {
+    const projects = listAllProjects(db);
+    if (projects.length === 0) return "no projects";
+    return projects
+      .map((p) => `${p.directory}  ${findUserById(db, p.ownerId)?.email ?? "(unknown owner)"}`)
       .join("\n");
   }
 

@@ -38,6 +38,8 @@ const EXPECTED_ROUTES: Array<[string, string]> = [
   ["PUT", "/api/key"],
   ["GET", "/api/key"],
   ["DELETE", "/api/key"],
+  ["GET", "/api/projects"],
+  ["GET", "/api/projects/:id"],
 ];
 
 describe("buildRoutes", () => {

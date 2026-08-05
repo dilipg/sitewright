@@ -36,12 +36,15 @@ import type { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import {
   buildAgentEnv,
+  DisabledUserError,
   MissingApiKeyError,
   scrubbedEnv,
+  UnknownUserError,
 } from "./agent-env.ts";
 import type { Project } from "./projects.ts";
 import { resolveProjectDirectory } from "./projects.ts";
 import { redactSecrets } from "./redact.ts";
+import { findUserById } from "./users.ts";
 
 export const MAX_PREVIEWS = 6;
 
@@ -275,6 +278,12 @@ export class PreviewPool {
    * kill the process out from under it.
    */
   async acquire(project: Project, ownerId: string): Promise<PreviewProcess> {
+    // Checked before even the reuse lookup: a preview already running for
+    // this project must stop being reachable the moment its owner is
+    // disabled, not only for a fresh spawn. Without this, revocation would
+    // depend on nothing else holding a warm process for that project.
+    this.assertOwnerUsable(ownerId);
+
     const existing = this.entries.get(project.id);
     if (existing !== undefined) {
       const ready = await existing.readyPromise;
@@ -420,6 +429,25 @@ export class PreviewPool {
         this.entries.delete(projectId);
       }
     });
+  }
+
+  /**
+   * Refuses an owner who cannot use the system at all. Called on BOTH the
+   * fresh-spawn and the reuse path: without it, a preview already running
+   * keeps serving an owner who was disabled after it started, which would
+   * make revocation depend on nothing else holding a warm process. One
+   * indexed read per call, against a `requireSession` that already does a
+   * session lookup plus a user read on the same request.
+   *
+   * `buildChildEnv` (via `resolveApiKey`) performs this exact same check
+   * again on the fresh-spawn path. That duplication is deliberate, not an
+   * oversight to clean up: two cheap reads here are far cheaper than the one
+   * place either check is skipped.
+   */
+  private assertOwnerUsable(ownerId: string): void {
+    const user = findUserById(this.db, ownerId);
+    if (user === null) throw new UnknownUserError();
+    if (user.disabledAt !== null) throw new DisabledUserError();
   }
 
   /**

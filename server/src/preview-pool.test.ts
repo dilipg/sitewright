@@ -16,6 +16,7 @@ import { openDatabase } from "./db.ts";
 import { createUser } from "./users.ts";
 import { createProject, type Project } from "./projects.ts";
 import { setApiKey } from "./api-keys.ts";
+import { DisabledUserError, UnknownUserError } from "./agent-env.ts";
 import { MASTER_KEY_ENV_VAR } from "./master-key.ts";
 import { MAX_PREVIEWS, PreviewCapacityError, PreviewPool } from "./preview-pool.ts";
 
@@ -376,13 +377,28 @@ describe("lifecycle", () => {
     setApiKey(db, MASTER_KEY, ownerId, "sk-ant-user-key-1234");
     db.prepare("UPDATE user SET disabled_at = ? WHERE id = ?").run(Date.now(), ownerId);
     const pool = makePool();
-    await expect(pool.acquire(project, ownerId)).rejects.toThrow();
+    await expect(pool.acquire(project, ownerId)).rejects.toThrow(DisabledUserError);
     expect(spawned).toHaveLength(0);
   });
 
   it("refuses an unknown owner", async () => {
+    // .toThrow() alone would still pass if UnknownUserError's own check were
+    // deleted: agent-env.ts's next line (`user.disabledAt`) would throw a
+    // TypeError on a null user, and the assertion would not notice the
+    // difference. The specific error class is what this test claims to pin.
     const pool = makePool();
-    await expect(pool.acquire(project, "no-such-user-id")).rejects.toThrow();
+    await expect(pool.acquire(project, "no-such-user-id")).rejects.toThrow(UnknownUserError);
     expect(spawned).toHaveLength(0);
+  });
+
+  it("refuses a disabled owner on the reuse path, and does not hand back the still-running child", async () => {
+    // A preview already running for a project must stop being reachable the
+    // moment its owner is disabled — revocation is immediate elsewhere in
+    // this codebase (see agent-env.ts's DisabledUserError), and a warm
+    // process must not be the one place that guarantee quietly lapses.
+    const pool = makePool();
+    await pool.acquire(project, ownerId);
+    db.prepare("UPDATE user SET disabled_at = ? WHERE id = ?").run(Date.now(), ownerId);
+    await expect(pool.acquire(project, ownerId)).rejects.toThrow(DisabledUserError);
   });
 });

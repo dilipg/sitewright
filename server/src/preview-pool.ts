@@ -20,10 +20,18 @@
  *   - a child is never `unref()`'d — an orphaned Vite server holding a port
  *     open past the parent's own lifetime is the exact failure this pool
  *     exists to bound.
+ *
+ * A fourth, easy to miss until a review found it: the child's `stdout` is
+ * NOT a trust boundary. It runs the project's own model-generated
+ * `vite.config.ts` — untrusted code that can print to stdout before
+ * `compiler/scripts/preview.ts` ever does. A well-formed `PREVIEW_READY`
+ * line is therefore only ever a HINT that the child believes it is ready,
+ * never the source of truth for the port traffic gets proxied to — see
+ * `spawnAndAwaitReady` and `verifyPort`.
  */
 import { spawn } from "node:child_process";
 import type { EventEmitter } from "node:events";
-import { createServer } from "node:net";
+import { createConnection, createServer } from "node:net";
 import type { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import {
@@ -128,6 +136,58 @@ export function findFreePort(): Promise<number> {
   });
 }
 
+/** A few attempts a short distance apart — see `defaultVerifyPort`. */
+const VERIFY_ATTEMPTS = 10;
+const VERIFY_INTERVAL_MS = 150;
+
+function connectOnce(port: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const socket = createConnection({ port, host: "127.0.0.1" });
+    socket.once("connect", () => {
+      socket.destroy();
+      resolve();
+    });
+    socket.once("error", (err) => {
+      socket.destroy();
+      reject(err);
+    });
+  });
+}
+
+/**
+ * Confirms `port` actually accepts a TCP connection — the one thing the
+ * child cannot lie about via stdout, unlike a `PREVIEW_READY` line. A few
+ * attempts a short distance apart: there is a small, real window between
+ * Vite deciding to print its own readiness line and the listener actually
+ * accepting connections, not because the connection itself is expected to
+ * be flaky.
+ *
+ * Overridable via `PreviewPoolDeps.verifyPort` — the tests inject a fake
+ * here for the same reason they inject a fake `spawnFn`: a test's fake
+ * child never opens a real socket, so proving "acquire resolves once the
+ * child is ready" and "acquire rejects and kills the child when it never
+ * becomes ready" needs deterministic, instant control over this decision
+ * rather than a real (and, against a port nothing is listening on, always
+ * failing) network wait.
+ */
+async function defaultVerifyPort(port: number): Promise<void> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= VERIFY_ATTEMPTS; attempt += 1) {
+    try {
+      await connectOnce(port);
+      return;
+    } catch (err) {
+      lastError = err;
+      if (attempt < VERIFY_ATTEMPTS) {
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, VERIFY_INTERVAL_MS));
+      }
+    }
+  }
+  throw new Error(
+    `port ${port} never accepted a connection after ${VERIFY_ATTEMPTS} attempts (last error: ${String(lastError)})`,
+  );
+}
+
 // Resolved from this file's own URL, never a hardcoded absolute path — the
 // pool must keep working regardless of where the repo is checked out.
 const DEFAULT_PREVIEW_SCRIPT = fileURLToPath(
@@ -171,6 +231,8 @@ export interface PreviewPoolDeps {
    * mutating this process's real environment.
    */
   baseEnv?: NodeJS.ProcessEnv;
+  /** Overridable for tests; production default is `defaultVerifyPort` (a real TCP connect). */
+  verifyPort?: (port: number) => Promise<void>;
 }
 
 const defaultSpawnFn: SpawnFn = (command, args, options) => {
@@ -191,6 +253,7 @@ export class PreviewPool {
   private readonly now: () => number;
   private readonly spawnFn: SpawnFn;
   private readonly baseEnv: NodeJS.ProcessEnv;
+  private readonly verifyPort: (port: number) => Promise<void>;
   private readonly entries = new Map<string, Entry>();
 
   constructor(deps: PreviewPoolDeps) {
@@ -202,6 +265,7 @@ export class PreviewPool {
     this.now = deps.now ?? (() => Date.now());
     this.spawnFn = deps.spawnFn ?? defaultSpawnFn;
     this.baseEnv = deps.baseEnv ?? process.env;
+    this.verifyPort = deps.verifyPort ?? defaultVerifyPort;
   }
 
   /**
@@ -218,6 +282,17 @@ export class PreviewPool {
       return { projectId: project.id, port: ready.port, base: ready.base, inFlight: existing.inFlight, lastUsedAt: existing.lastUsedAt };
     }
 
+    const directory = resolveProjectDirectory(this.projectsRoot, project.directory);
+    const base = `/preview/${project.id}/`;
+    // Authorization BEFORE capacity, deliberately: `buildChildEnv` is also
+    // where an unknown or disabled owner gets refused
+    // (UnknownUserError/DisabledUserError). `ensureCapacity()` below can
+    // reap — and kill — another tenant's idle preview to make room; running
+    // it before this owner is even confirmed allowed to use the system
+    // would let a bogus or disabled request evict a legitimate one on its
+    // way to being refused anyway.
+    const env = this.buildChildEnv(ownerId);
+
     this.ensureCapacity();
 
     // `entry` is referenced by the `.then`/`.catch` closures below before it
@@ -225,7 +300,7 @@ export class PreviewPool {
     // microtask, and `entry` is fully assigned before this synchronous
     // function body yields (at the `await readyPromise` a few lines down).
     let entry!: Entry;
-    const readyPromise = this.spawnAndWait(project, ownerId)
+    const readyPromise = this.spawnWithRetries(project.id, directory, base, env)
       .then((result) => {
         entry.child = result.child;
         entry.port = result.port;
@@ -367,17 +442,17 @@ export class PreviewPool {
     }
   }
 
-  private async spawnAndWait(
-    project: Project,
-    ownerId: string,
+  /**
+   * The retry loop only — authorization (`buildChildEnv`) has already run in
+   * `acquire`, before capacity was even consulted, so nothing in here can
+   * fail for an authorization reason.
+   */
+  private async spawnWithRetries(
+    projectId: string,
+    directory: string,
+    base: string,
+    env: NodeJS.ProcessEnv,
   ): Promise<{ child: SpawnedChild; port: number; base: string }> {
-    const directory = resolveProjectDirectory(this.projectsRoot, project.directory);
-    const base = `/preview/${project.id}/`;
-    // Resolved ONCE, outside the retry loop below: a failure here has
-    // nothing to do with a lost port race, and must fail the whole acquire
-    // immediately rather than being retried three times for no reason.
-    const env = this.buildChildEnv(ownerId);
-
     let lastError: unknown;
     for (let attempt = 1; attempt <= MAX_SPAWN_ATTEMPTS; attempt += 1) {
       // Probing then handing Vite a concrete port is a check-then-use race —
@@ -395,7 +470,7 @@ export class PreviewPool {
       }
     }
     throw new Error(
-      `preview process for project ${project.id} failed to start after ${MAX_SPAWN_ATTEMPTS} attempts: ${String(lastError)}`,
+      `preview process for project ${projectId} failed to start after ${MAX_SPAWN_ATTEMPTS} attempts: ${String(lastError)}`,
     );
   }
 
@@ -411,13 +486,49 @@ export class PreviewPool {
 
     return new Promise((resolve, reject) => {
       let settled = false;
+      let verifyStarted = false;
       let buffer = "";
 
-      const onExit = (code: number | null): void => {
+      function cleanup(): void {
+        clearTimeout(timeoutHandle);
+        child.off("exit", onExit);
+        child.off("error", onError);
+      }
+
+      // The one place every rejection path funnels through. A failed
+      // readiness wait must never leave a live, untracked Vite server
+      // holding a port open — that is the exact failure this module exists
+      // to bound — so every path that can end this promise in rejection
+      // kills the child first (unless it is already dead). Structural on
+      // purpose: a future new failure path calls this and cannot forget to
+      // kill, the way the old direct-reject-on-parse-failure path once did.
+      const fail = (error: Error): void => {
         if (settled) return;
         settled = true;
-        clearTimeout(timeoutHandle);
-        reject(new Error(`preview process for ${directory} exited (code ${String(code)}) before announcing readiness`));
+        cleanup();
+        if (child.killed !== true) child.kill();
+        reject(error);
+      };
+
+      const succeed = (): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        // Always the port and base THIS pool chose — never read back from
+        // the child. See the PREVIEW_READY handling below for why.
+        resolve({ child, port, base });
+      };
+
+      const onExit = (code: number | null): void => {
+        fail(new Error(`preview process for ${directory} exited (code ${String(code)}) before announcing readiness`));
+      };
+
+      const onError = (err: Error): void => {
+        // spawn() itself failing to launch at all (ENOENT, EACCES, …)
+        // surfaces as an "error" event, not "exit". Without this handler
+        // `acquire` would hang for the full SPAWN_TIMEOUT_MS on every one of
+        // its retries instead of failing fast.
+        fail(err);
       };
 
       const onStdoutData = (chunk: Buffer | string): void => {
@@ -425,22 +536,42 @@ export class PreviewPool {
         const lines = buffer.split("\n");
         buffer = lines.pop() ?? "";
         for (const line of lines) {
-          if (!settled && line.startsWith("PREVIEW_READY ")) {
-            settled = true;
-            clearTimeout(timeoutHandle);
-            child.off("exit", onExit);
+          if (line.startsWith("PREVIEW_READY ")) {
+            // A HINT that the child believes it is ready — never the source
+            // of truth for where to send traffic. The child runs the
+            // project's own model-generated vite.config.ts: untrusted code
+            // that could print an early, well-formed PREVIEW_READY line
+            // naming any port it likes. Believing it would hand untrusted
+            // input a redirect primitive (the pool would proxy every
+            // request for this project to whatever port it claims). Parsed
+            // only so a malformed line is logged instead of silently
+            // ignored — never to extract a port or base to act on;
+            // `succeed` above always uses the port/base THIS pool chose.
             try {
-              const announced = JSON.parse(line.slice("PREVIEW_READY ".length)) as { port: number; base: string };
-              resolve({ child, port: announced.port, base: announced.base });
+              JSON.parse(line.slice("PREVIEW_READY ".length));
             } catch {
-              reject(new Error(`could not parse preview readiness line: ${redactSecrets(line)}`));
+              console.log(`[preview:${port}] malformed readiness line: ${redactSecrets(line)}`);
+            }
+            if (!verifyStarted) {
+              verifyStarted = true;
+              // The line only claims readiness; this confirms it against the
+              // one thing that is not the child's to lie about — whether the
+              // port THIS pool chose actually accepts a connection. If it
+              // never does, `verifyPort` rejects and `fail` takes over
+              // (which is also what closes the early-bogus-line case:
+              // untrusted code printing a line before Vite is listening no
+              // longer makes the pool declare readiness).
+              this.verifyPort(port).then(succeed, (err: unknown) => {
+                fail(err instanceof Error ? err : new Error(String(err)));
+              });
             }
           } else if (line.length > 0) {
             // The CLI's own human-readable log line, or a stray console.log
-            // from the generated project's own code path. This is
-            // redactSecrets' first real call site: the moment a child's
-            // output reaches a log call, "no key is ever logged" stops being
-            // true by construction and starts depending on this line.
+            // from the generated project's own code path — one of
+            // redactSecrets' three call sites in this function (see
+            // redact.ts): the moment a child's output reaches a log call,
+            // "no key is ever logged" stops being true by construction and
+            // starts depending on this line.
             console.log(`[preview:${port}] ${redactSecrets(line)}`);
           }
         }
@@ -451,14 +582,11 @@ export class PreviewPool {
       };
 
       const timeoutHandle = setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        child.off("exit", onExit);
-        child.kill();
-        reject(new Error(`preview process for ${directory} did not become ready within ${SPAWN_TIMEOUT_MS}ms`));
+        fail(new Error(`preview process for ${directory} did not become ready within ${SPAWN_TIMEOUT_MS}ms`));
       }, SPAWN_TIMEOUT_MS);
 
       child.on("exit", onExit);
+      child.on("error", onError);
       child.stdout.on("data", onStdoutData);
       child.stderr.on("data", onStderrData);
     });

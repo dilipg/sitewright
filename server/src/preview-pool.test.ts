@@ -16,6 +16,7 @@ import { openDatabase } from "./db.ts";
 import { createUser } from "./users.ts";
 import { createProject, type Project } from "./projects.ts";
 import { setApiKey } from "./api-keys.ts";
+import { MASTER_KEY_ENV_VAR } from "./master-key.ts";
 import { MAX_PREVIEWS, PreviewCapacityError, PreviewPool } from "./preview-pool.ts";
 
 const MASTER_KEY = Buffer.alloc(32, 7);
@@ -67,6 +68,12 @@ function makePool(overrides: Record<string, unknown> = {}) {
       });
       return child;
     },
+    // Real `verifyPort` opens an actual TCP connection to confirm a
+    // PREVIEW_READY line's claim; the fake child above never opens a real
+    // socket, so this pool would otherwise wait out every retry and fail
+    // every single test. Individual tests override this to prove the
+    // failure path (see "readiness" below).
+    verifyPort: async () => {},
     ...overrides,
   });
 }
@@ -93,8 +100,26 @@ describe("spawning", () => {
     const pool = makePool();
     const preview = await pool.acquire(project, ownerId);
     expect(spawned).toHaveLength(1);
-    expect(preview.port).toBe(40001);
+    const { args } = spawned[0]!;
+    const passedPort = Number(args[args.indexOf("--port") + 1]);
+    expect(preview.port).toBe(passedPort);
     expect(preview.projectId).toBe(project.id);
+  });
+
+  it("is proxied on the port it was passed, not a different port the child announces", async () => {
+    // The child runs the project's own model-generated vite.config.ts —
+    // untrusted code that could print an early, well-formed PREVIEW_READY
+    // line naming any port it likes. Believing that value would hand
+    // untrusted input a redirect primitive: the pool would proxy every
+    // request for this project to whatever port the child claims. The fake
+    // spawnFn above always announces a fabricated port (40000 + n) unrelated
+    // to the one it was actually passed — this pins that the pool ignores it.
+    const pool = makePool();
+    const preview = await pool.acquire(project, ownerId);
+    const { args } = spawned[0]!;
+    const passedPort = Number(args[args.indexOf("--port") + 1]);
+    expect(preview.port).toBe(passedPort);
+    expect(preview.port).not.toBe(40001);
   });
 
   it("passes a concrete probed port, never 0, and the project's proxy base", async () => {
@@ -144,10 +169,14 @@ describe("the child's environment", () => {
   });
 
   it("never passes the master key", async () => {
-    setApiKey(db, MASTER_KEY, ownerId, "sk-ant-user-key-1234");
-    const pool = makePool();
+    // Planted explicitly in baseEnv, the way the adjacent host-key test
+    // does: `process.env` (the default baseEnv) never has WEBGEN_MASTER_KEY
+    // set in this test process, so asserting against the default would pass
+    // whether or not scrubbedEnv's deletion exists — see task-2-report.md's
+    // FIX 3 perturbation for proof this version actually pins the behavior.
+    const pool = makePool({ baseEnv: { [MASTER_KEY_ENV_VAR]: "master-key-plaintext", PATH: "/usr/bin" } });
     await pool.acquire(project, ownerId);
-    expect(spawned[0]!.env.WEBGEN_MASTER_KEY).toBeUndefined();
+    expect(spawned[0]!.env[MASTER_KEY_ENV_VAR]).toBeUndefined();
   });
 
   it("spawns without a key when the user stored none, rather than refusing to preview", async () => {
@@ -155,7 +184,7 @@ describe("the child's environment", () => {
     // able to open a project.
     const pool = makePool();
     const preview = await pool.acquire(project, ownerId);
-    expect(preview.port).toBe(40001);
+    expect(preview.port).toBeGreaterThan(0);
     expect(spawned[0]!.env.ANTHROPIC_API_KEY).toBeUndefined();
   });
 
@@ -163,6 +192,50 @@ describe("the child's environment", () => {
     const pool = makePool({ baseEnv: { ANTHROPIC_API_KEY: "sk-ant-HOST" } });
     await pool.acquire(project, ownerId);
     expect(spawned[0]!.env.ANTHROPIC_API_KEY).toBeUndefined();
+  });
+});
+
+describe("readiness", () => {
+  it("kills the child and rejects when a readiness line never leads to a verifiably listening port", async () => {
+    // The line is deliberately malformed JSON — proving it doesn't crash the
+    // handler (it's logged, never trusted) — and `verifyPort` is rigged to
+    // never succeed, simulating "claims ready but the port never actually
+    // accepts a connection." Either way, the required outcome is the same:
+    // the child dies and the pool stays clean, never an orphaned live
+    // process outside the pool's own tracking and cap.
+    const pool = new PreviewPool({
+      db, masterKey: MASTER_KEY, projectsRoot, now: () => clock,
+      verifyPort: async () => {
+        throw new Error("simulated: port never accepted a connection");
+      },
+      spawnFn: () => {
+        const c = fakeChild();
+        children.push(c);
+        setImmediate(() => c.stdout.emit("data", Buffer.from("PREVIEW_READY {garbage\n")));
+        return c;
+      },
+    });
+    await expect(pool.acquire(project, ownerId)).rejects.toThrow();
+    expect(children[0]!.killed).toBe(true);
+    expect(pool.list()).toHaveLength(0);
+  });
+
+  it("fails fast, rather than hanging out the full timeout, when spawn itself errors", async () => {
+    // spawn() failing to launch at all (a bad command, ENOENT, EACCES) emits
+    // "error", not "exit". Without a listener for it, acquire would hang
+    // until SPAWN_TIMEOUT_MS on every one of its retries instead of failing
+    // immediately.
+    const pool = new PreviewPool({
+      db, masterKey: MASTER_KEY, projectsRoot, now: () => clock,
+      spawnFn: () => {
+        const c = fakeChild();
+        children.push(c);
+        setImmediate(() => c.emit("error", new Error("spawn ENOENT")));
+        return c;
+      },
+    });
+    await expect(pool.acquire(project, ownerId)).rejects.toThrow();
+    expect(pool.list()).toHaveLength(0);
   });
 });
 
@@ -203,6 +276,26 @@ describe("capacity", () => {
     }
     clock += 5000;
     await expect(pool.acquire(projectN(99), ownerId)).rejects.toThrow(PreviewCapacityError);
+  });
+
+  it("does not reap other tenants' idle previews to serve a disabled owner's request", async () => {
+    // Authorization (buildChildEnv, which raises DisabledUserError) must run
+    // BEFORE ensureCapacity ever reaps: otherwise a request that is going to
+    // be refused anyway gets to kill another tenant's idle preview on its
+    // way to being refused.
+    const pool = makePool({ idleMs: 1000 });
+    const acquired: Project[] = [];
+    for (let n = 0; n < MAX_PREVIEWS; n += 1) {
+      const p = projectN(n);
+      acquired.push(p);
+      await pool.acquire(p, ownerId);
+    }
+    clock += 5000; // every existing preview is now idle enough to be reclaimable
+    const disabledOwnerId = createUser(db, "disabled@example.com", "hash").id;
+    db.prepare("UPDATE user SET disabled_at = ? WHERE id = ?").run(Date.now(), disabledOwnerId);
+    await expect(pool.acquire(projectN(99), disabledOwnerId)).rejects.toThrow();
+    expect(pool.list()).toHaveLength(MAX_PREVIEWS);
+    expect(pool.list().map((p) => p.projectId).sort()).toEqual(acquired.map((p) => p.id).sort());
   });
 });
 
@@ -284,6 +377,12 @@ describe("lifecycle", () => {
     db.prepare("UPDATE user SET disabled_at = ? WHERE id = ?").run(Date.now(), ownerId);
     const pool = makePool();
     await expect(pool.acquire(project, ownerId)).rejects.toThrow();
+    expect(spawned).toHaveLength(0);
+  });
+
+  it("refuses an unknown owner", async () => {
+    const pool = makePool();
+    await expect(pool.acquire(project, "no-such-user-id")).rejects.toThrow();
     expect(spawned).toHaveLength(0);
   });
 });

@@ -13,6 +13,7 @@ import { hashPassword } from "./passwords.ts";
 import { createUser, setDisabled } from "./users.ts";
 import { authRoutes } from "./auth-routes.ts";
 import { createRequestListener } from "./router.ts";
+import { recordUsageEvent } from "./usage.ts";
 
 // Same idiom as passwords.test.ts / sessions-entropy.test.ts: wrap the real
 // implementation rather than stub it out, so hashing/verifying still works
@@ -269,6 +270,28 @@ describe("GET /api/me", () => {
   it("401s with a forged session id", async () => {
     const { call } = await harness();
     expect((await call("GET", "/api/me", undefined, "sid=forged")).status).toBe(401);
+  });
+
+  it("reports the current 24h spend alongside the cap", async () => {
+    const { db, user, call } = await harness();
+    recordUsageEvent(db, {
+      userId: user.id, projectId: null, role: "section", model: "claude-sonnet-5",
+      inputTokens: 0, outputTokens: 0, cacheCreationInputTokens: 0, cacheReadInputTokens: 0,
+      costUsd: 3.25, at: Date.now(),
+    });
+    const login = await call("POST", "/api/login", { email: "a@example.com", password: "s3cret-password" });
+    const me = await call("GET", "/api/me", undefined, `sid=${sidFrom(login.headers)}`);
+    expect(me.status).toBe(200);
+    expect(me.json.spendCapUsd).toBe(10);
+    expect(me.json.spentUsd24h).toBe(3.25);
+  });
+
+  it("does not leak the password hash alongside the new fields", async () => {
+    const { call } = await harness();
+    const login = await call("POST", "/api/login", { email: "a@example.com", password: "s3cret-password" });
+    const me = await call("GET", "/api/me", undefined, `sid=${sidFrom(login.headers)}`);
+    expect(me.json).not.toHaveProperty("passwordHash");
+    expect(me.json).not.toHaveProperty("password_hash");
   });
 });
 

@@ -15,6 +15,20 @@
  * one project's plan, so they are project-scoped by any reading, and omitting
  * them under deny-by-default would leave plan approval unreachable. Raised for
  * a human ruling rather than resolved by editing the spec.
+ *
+ * `billable` marks an endpoint that STARTS a model call, and so must be
+ * wrapped in requireBudget when it is mounted. It is a required field rather
+ * than an optional one on purpose: omitting it is a type error, which catches
+ * an undeclared new endpoint at compile time instead of at review time.
+ *
+ * Every billable endpoint today is a `/__*` compiler endpoint, and every one
+ * of those is still unmounted (see isUnmountedCompilerEndpoint). That means
+ * the "a billable route is wrapped in requireBudget" property is not yet
+ * observable on the live table — the set is empty, and a test asserting it
+ * would pass without checking anything. What IS asserted here is the exclusion
+ * itself: the moment 4c mounts these, the exclusion test fails and forces the
+ * enforcement test to be written against real routes. Same mechanism 4a used
+ * for the authorization rule.
  */
 import type { ProjectIdSource } from "./require-project.ts";
 import type { Route } from "./router.ts";
@@ -25,22 +39,23 @@ export const PROJECT_SCOPED_ENDPOINTS: ReadonlyArray<{
   method: Route["method"];
   path: string;
   idFrom: ProjectIdSource;
+  billable: boolean;
 }> = [
-  { method: "GET", path: "/api/projects/:id", idFrom: { from: "param", name: "id" } },
-  { method: "PUT", path: "/__overrides/:slug", idFrom: BY_QUERY },
-  { method: "GET", path: "/__overrides/:slug", idFrom: BY_QUERY },
-  { method: "GET", path: "/__overrides-history", idFrom: BY_QUERY },
-  { method: "PUT", path: "/__overrides-history", idFrom: BY_QUERY },
-  { method: "POST", path: "/__regen", idFrom: BY_QUERY },
-  { method: "POST", path: "/__regen-page", idFrom: BY_QUERY },
-  { method: "POST", path: "/__regen-revert", idFrom: BY_QUERY },
-  { method: "POST", path: "/__add-section", idFrom: BY_QUERY },
-  { method: "POST", path: "/__edit-prompt", idFrom: BY_QUERY },
-  { method: "POST", path: "/__export", idFrom: BY_QUERY },
-  { method: "GET", path: "/__export-download", idFrom: BY_QUERY },
-  { method: "GET", path: "/__plan", idFrom: BY_QUERY },
-  { method: "POST", path: "/__plan/section-brief", idFrom: BY_QUERY },
-  { method: "POST", path: "/__plan/approve", idFrom: BY_QUERY },
+  { method: "GET", path: "/api/projects/:id", idFrom: { from: "param", name: "id" }, billable: false },
+  { method: "PUT", path: "/__overrides/:slug", idFrom: BY_QUERY, billable: false },
+  { method: "GET", path: "/__overrides/:slug", idFrom: BY_QUERY, billable: false },
+  { method: "GET", path: "/__overrides-history", idFrom: BY_QUERY, billable: false },
+  { method: "PUT", path: "/__overrides-history", idFrom: BY_QUERY, billable: false },
+  { method: "POST", path: "/__regen", idFrom: BY_QUERY, billable: true },
+  { method: "POST", path: "/__regen-page", idFrom: BY_QUERY, billable: true },
+  { method: "POST", path: "/__regen-revert", idFrom: BY_QUERY, billable: false },
+  { method: "POST", path: "/__add-section", idFrom: BY_QUERY, billable: true },
+  { method: "POST", path: "/__edit-prompt", idFrom: BY_QUERY, billable: true },
+  { method: "POST", path: "/__export", idFrom: BY_QUERY, billable: false },
+  { method: "GET", path: "/__export-download", idFrom: BY_QUERY, billable: false },
+  { method: "GET", path: "/__plan", idFrom: BY_QUERY, billable: false },
+  { method: "POST", path: "/__plan/section-brief", idFrom: BY_QUERY, billable: false },
+  { method: "POST", path: "/__plan/approve", idFrom: BY_QUERY, billable: false },
 ];
 
 /**
@@ -48,13 +63,13 @@ export const PROJECT_SCOPED_ENDPOINTS: ReadonlyArray<{
  * implied, so "no project id" is a stated decision per endpoint and the
  * authorization test can assert these are NOT project-scoped.
  */
-export const SESSION_ONLY_ENDPOINTS: ReadonlyArray<{ method: Route["method"]; path: string }> = [
-  { method: "GET", path: "/__archetypes" },
-  { method: "GET", path: "/api/projects" },
-  { method: "GET", path: "/api/me" },
-  { method: "GET", path: "/api/key" },
-  { method: "PUT", path: "/api/key" },
-  { method: "DELETE", path: "/api/key" },
+export const SESSION_ONLY_ENDPOINTS: ReadonlyArray<{ method: Route["method"]; path: string; billable: boolean }> = [
+  { method: "GET", path: "/__archetypes", billable: false },
+  { method: "GET", path: "/api/projects", billable: false },
+  { method: "GET", path: "/api/me", billable: false },
+  { method: "GET", path: "/api/key", billable: false },
+  { method: "PUT", path: "/api/key", billable: false },
+  { method: "DELETE", path: "/api/key", billable: false },
 ];
 
 /**

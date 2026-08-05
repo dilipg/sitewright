@@ -143,3 +143,34 @@ describe("registry vs. the live route table", () => {
     ].sort());
   });
 });
+
+describe("billable endpoints", () => {
+  const all = [...PROJECT_SCOPED_ENDPOINTS, ...SESSION_ONLY_ENDPOINTS];
+
+  it("is exactly the set that starts a model call", () => {
+    const billable = all
+      .filter((entry) => entry.billable)
+      .map((entry) => `${entry.method} ${entry.path}`)
+      .sort();
+    expect(billable).toEqual([
+      "POST /__add-section",
+      "POST /__edit-prompt",
+      "POST /__regen",
+      "POST /__regen-page",
+    ]);
+  });
+
+  it("marks no identity endpoint billable", () => {
+    for (const entry of all) {
+      if (entry.path.startsWith("/api/")) expect(entry.billable).toBe(false);
+    }
+  });
+
+  it("has every billable endpoint still unmounted, so the enforcement test cannot yet be written against live routes", () => {
+    // When 4c mounts these, this assertion fails — deliberately. That is the
+    // signal to write "every mounted billable route refuses over the cap"
+    // against the real route table, and to delete this placeholder.
+    const mountedBillable = all.filter((entry) => entry.billable && !isUnmountedCompilerEndpoint(entry.path));
+    expect(mountedBillable).toEqual([]);
+  });
+});

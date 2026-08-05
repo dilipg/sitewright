@@ -172,7 +172,13 @@ describe("billable endpoints", () => {
     }
   });
 
-  it("has no billable endpoint mounted without a budget gate — fails the moment 4c mounts one", () => {
+  // Named for what it can actually observe: MOUNTEDNESS, not gatedness. A
+  // Route is { method, path, handler } — nothing records whether a handler is
+  // wrapped in requireBudget, so no test at this level can tell a gated
+  // billable route from an ungated one. That is exactly why this is a
+  // placeholder: it fails when 4c mounts anything billable, forcing a real
+  // enforcement test to be written against routes that can be driven.
+  it("has no billable endpoint mounted at all — fails the moment 4c mounts one", () => {
     // Keyed on the LIVE table (freshRoutes/buildRoutes), not on
     // isUnmountedCompilerEndpoint's "/__" prefix check. That predicate is a
     // pure function of the path string: mounting a route in buildRoutes

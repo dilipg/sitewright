@@ -25,6 +25,7 @@ import { connect } from "node:net";
 import { once } from "node:events";
 import type { Duplex } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { USAGE_ID_HEADER } from "../../compiler/src/usage-log-path.ts";
 import { PREVIEW_PROXY_TIMEOUT_MS, proxyHttp, proxyUpgrade } from "./preview-proxy.ts";
 
 /** Polls `predicate` until it is true, or throws after `timeoutMs`. Used instead of a fixed sleep to avoid flakiness while still bounding a hang. */
@@ -183,6 +184,24 @@ describe("proxyHttp", () => {
       });
       expect(seen[0]?.headers.cookie).toBeUndefined();
       expect(seen[0]?.headers.authorization).toBeUndefined();
+    } finally {
+      await close();
+    }
+  });
+
+  it("does not forward a client-supplied x-webgen-usage-id header to the upstream child", async () => {
+    // That header selects where a billable request's model-usage log gets
+    // written (compiler/src/usage-log-path.ts) — a client-supplied value
+    // would choose the write path for a subprocess it does not own. Task 3
+    // (compiler-routes.ts) re-adds the SERVER's own value deliberately, after
+    // this deletion runs; what must never happen is a client's own value
+    // surviving the trip, which is what this test pins.
+    const { origin, close } = await startProxyServer(upstreamPort);
+    try {
+      await fetch(`${origin}/`, {
+        headers: { [USAGE_ID_HEADER]: "0123456789abcdef0123456789abcdef" },
+      });
+      expect(seen[0]?.headers[USAGE_ID_HEADER]).toBeUndefined();
     } finally {
       await close();
     }
@@ -426,6 +445,46 @@ describe("proxyUpgrade", () => {
         await readUntil(client, "101");
         expect(seenHeaders.cookie).toBeUndefined();
         expect(seenHeaders.authorization).toBeUndefined();
+      } finally {
+        client.destroy();
+      }
+    } finally {
+      await close();
+    }
+  });
+
+  it("does not forward a client-supplied x-webgen-usage-id header on a WebSocket upgrade", async () => {
+    // upstreamHeaders is the one function both proxyHttp and proxyUpgrade
+    // build their outbound headers from — this pins that the deletion
+    // added for the HTTP path is not, in fact, HTTP-only.
+    let seenHeaders: Record<string, unknown> = {};
+    upstream.on("upgrade", (req, socket) => {
+      seenHeaders = req.headers as Record<string, unknown>;
+      socket.write(
+        "HTTP/1.1 101 Switching Protocols\r\n"
+        + "Upgrade: websocket\r\n"
+        + "Connection: Upgrade\r\n"
+        + "\r\n",
+      );
+    });
+
+    const { port, close } = await startProxyServer(upstreamPort);
+    try {
+      const client = connect(port, "127.0.0.1");
+      await once(client, "connect");
+      client.write(
+        "GET /preview/abc/ws HTTP/1.1\r\n"
+        + "Host: localhost\r\n"
+        + "Connection: Upgrade\r\n"
+        + "Upgrade: websocket\r\n"
+        + "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+        + "Sec-WebSocket-Version: 13\r\n"
+        + `${USAGE_ID_HEADER}: 0123456789abcdef0123456789abcdef\r\n`
+        + "\r\n",
+      );
+      try {
+        await readUntil(client, "101");
+        expect(seenHeaders[USAGE_ID_HEADER]).toBeUndefined();
       } finally {
         client.destroy();
       }

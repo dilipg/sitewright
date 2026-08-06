@@ -38,17 +38,24 @@
  */
 import { request as httpRequest, type IncomingMessage, type ServerResponse } from "node:http";
 import type { Duplex } from "node:stream";
+import { USAGE_ID_HEADER } from "../../compiler/src/usage-log-path.ts";
 import { sendJson } from "./router.ts";
 
 /**
  * The headers to send upstream: `req.headers` verbatim (see the module
  * comment — hop-by-hop headers survive on purpose), except `host` (rewritten
  * to the upstream's own loopback address, same reasoning as before), and
- * `cookie`/`authorization`, dropped rather than forwarded. The child never
- * needs either — it serves one project's own static/dev-server assets, not
- * anything session-aware — and forwarding either hands the browser's session
- * id (or a bearer credential) to a subprocess running the project's own
- * unvalidated `vite.config.ts` and plugin chain. Applied identically for
+ * `cookie`/`authorization`/`USAGE_ID_HEADER`, dropped rather than forwarded.
+ * The child never needs `cookie` or `authorization` — it serves one
+ * project's own static/dev-server assets, not anything session-aware — and
+ * forwarding either hands the browser's session id (or a bearer credential)
+ * to a subprocess running the project's own unvalidated `vite.config.ts` and
+ * plugin chain. `USAGE_ID_HEADER` is dropped for a different reason: it
+ * selects where a billable request's model-usage log gets written
+ * (compiler/src/usage-log-path.ts), so a client-supplied value would choose
+ * that path for a subprocess it does not own. A later caller re-adds the
+ * server's OWN value deliberately (compiler-routes.ts) — what must never
+ * happen is a client's value surviving the trip. Applied identically for
  * both protocols this module forwards (`proxyHttp`'s ordinary request/
  * response and `proxyUpgrade`'s WebSocket handshake): Vite's HMR upgrade
  * carries the same session cookie an ordinary request does.
@@ -57,6 +64,7 @@ function upstreamHeaders(req: IncomingMessage, port: number): IncomingMessage["h
   const headers = { ...req.headers };
   delete headers.cookie;
   delete headers.authorization;
+  delete headers[USAGE_ID_HEADER];
   headers.host = `localhost:${port}`;
   return headers;
 }

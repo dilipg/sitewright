@@ -430,6 +430,105 @@ describe("compilerRoutes: attributing billable spend", () => {
     expect(window.events).toBe(1);
     expect(window.costUsd).toBe(5);
   });
+
+  /**
+   * Fix from code review: `ingestUsageLog`'s result used to be discarded
+   * entirely — `skipped`/`unreadable` exist, per that function's own
+   * docstring, "precisely so the caller can log them," and the caller did
+   * not. These pin that a loss is now surfaced (with enough to act on: the
+   * user and project id) and that a clean ingest stays silent, since a log
+   * line on every successful regen would be noise an operator learns to
+   * ignore.
+   */
+  it("logs a warning naming the user and project when the ingest loses spend (skipped > 0)", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const pool = fakePool();
+      const { call, project, alice, aliceCookie } = harness(pool);
+      proxyMocks.impl = async (args) => {
+        const usageId = args.setHeaders?.[USAGE_ID_HEADER];
+        if (usageId === undefined) throw new Error("expected a usage id header on a billable request");
+        // One valid row and one row missing model/role: ingest-usage.ts
+        // counts the second as `skipped`, not a throw — exactly the "lost
+        // spend, but silently" shape this warning exists to surface.
+        writeUsageLog(usageId, [usageRow({ cost_usd: 1 }), { bogus: true }]);
+        args.res.writeHead(200);
+        args.res.end("proxied");
+      };
+      const result = await call(billableEntry.method, pathFor(billableEntry, project.id), aliceCookie);
+      expect(result.status).toBe(200);
+      expect(errorSpy).toHaveBeenCalled();
+      const logged = errorSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+      expect(logged).toContain(alice.id);
+      expect(logged).toContain(project.id);
+      expect(logged).toMatch(/skipped/i);
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("logs a warning naming the user and project when the usage log is unreadable", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    let dirPath: string | undefined;
+    try {
+      const pool = fakePool();
+      const { call, project, alice, aliceCookie } = harness(pool);
+      proxyMocks.impl = async (args) => {
+        const usageId = args.setHeaders?.[USAGE_ID_HEADER];
+        if (usageId === undefined) throw new Error("expected a usage id header on a billable request");
+        // A directory at the log's path: exists, but unreadable as a file --
+        // the same trick ingest-usage.test.ts uses for this exact case.
+        dirPath = usageLogPathFor(usageId);
+        mkdirSync(dirPath, { recursive: true });
+        args.res.writeHead(200);
+        args.res.end("proxied");
+      };
+      const result = await call(billableEntry.method, pathFor(billableEntry, project.id), aliceCookie);
+      expect(result.status).toBe(200);
+      expect(errorSpy).toHaveBeenCalled();
+      const logged = errorSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+      expect(logged).toContain(alice.id);
+      expect(logged).toContain(project.id);
+      expect(logged).toMatch(/unreadable/i);
+    } finally {
+      errorSpy.mockRestore();
+      if (dirPath !== undefined) rmSync(dirPath, { recursive: true, force: true });
+    }
+  });
+
+  it("does not log anything when the ingest is clean (rows recorded, nothing lost)", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const pool = fakePool();
+      const { call, project, aliceCookie } = harness(pool);
+      proxyMocks.impl = async (args) => {
+        const usageId = args.setHeaders?.[USAGE_ID_HEADER];
+        if (usageId === undefined) throw new Error("expected a usage id header on a billable request");
+        writeUsageLog(usageId, [usageRow({ cost_usd: 1 }), usageRow({ cost_usd: 2 })]);
+        args.res.writeHead(200);
+        args.res.end("proxied");
+      };
+      const result = await call(billableEntry.method, pathFor(billableEntry, project.id), aliceCookie);
+      expect(result.status).toBe(200);
+      expect(errorSpy).not.toHaveBeenCalled();
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("does not log anything when the child wrote no usage log at all (the legitimate no-op)", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const pool = fakePool();
+      const { call, project, aliceCookie } = harness(pool);
+      // beforeEach's default impl never writes a log file for any id.
+      const result = await call(billableEntry.method, pathFor(billableEntry, project.id), aliceCookie);
+      expect(result.status).toBe(200);
+      expect(errorSpy).not.toHaveBeenCalled();
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
 });
 
 /**

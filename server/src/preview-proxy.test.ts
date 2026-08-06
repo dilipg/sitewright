@@ -107,13 +107,17 @@ function rewritePath(url: string): string {
  */
 function startProxyServer(
   targetPort: number,
-  options?: { onRequest?: (req: import("node:http").IncomingMessage, res: import("node:http").ServerResponse) => void },
+  options?: {
+    onRequest?: (req: import("node:http").IncomingMessage, res: import("node:http").ServerResponse) => void;
+    /** Forwarded verbatim as `proxyHttp`'s own `setHeaders` — lets a test stand in for compiler-routes.ts's server-generated usage id. */
+    setHeaders?: Record<string, string>;
+  },
 ): Promise<{ server: Server; origin: string; port: number; close: () => Promise<void> }> {
   return new Promise((resolve) => {
     const upgradedSockets = new Set<Duplex>();
     const server = createServer((req, res) => {
       options?.onRequest?.(req, res);
-      void proxyHttp({ req, res, port: targetPort, path: rewritePath(req.url ?? "/") });
+      void proxyHttp({ req, res, port: targetPort, path: rewritePath(req.url ?? "/"), setHeaders: options?.setHeaders });
     });
     server.on("upgrade", (req, socket, head) => {
       upgradedSockets.add(socket);
@@ -202,6 +206,32 @@ describe("proxyHttp", () => {
         headers: { [USAGE_ID_HEADER]: "0123456789abcdef0123456789abcdef" },
       });
       expect(seen[0]?.headers[USAGE_ID_HEADER]).toBeUndefined();
+    } finally {
+      await close();
+    }
+  });
+
+  it("applies the server's own x-webgen-usage-id over a client-supplied value on the same header name", async () => {
+    // The previous test only proves a client-supplied id is DELETED — it says
+    // nothing about what happens once compiler-routes.ts's real caller also
+    // supplies its OWN value via `setHeaders` (task 3). This is the test that
+    // can actually fail if a regression reintroduces client control: it
+    // proves the server's value is what reaches upstream, and that the
+    // client's original value is not merely overwritten in appearance but
+    // genuinely absent anywhere in what the upstream received.
+    const serverUsageId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const clientUsageId = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const { origin, close } = await startProxyServer(upstreamPort, {
+      setHeaders: { [USAGE_ID_HEADER]: serverUsageId },
+    });
+    try {
+      await fetch(`${origin}/`, {
+        headers: { [USAGE_ID_HEADER]: clientUsageId },
+      });
+      expect(seen[0]?.headers[USAGE_ID_HEADER]).toBe(serverUsageId);
+      // Not just "the header we checked" -- the client's value must not have
+      // leaked into any OTHER header the upstream received either.
+      expect(Object.values(seen[0]?.headers ?? {})).not.toContain(clientUsageId);
     } finally {
       await close();
     }

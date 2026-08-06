@@ -51,7 +51,13 @@
  * request and the file is removed immediately after: re-ingesting the same
  * path would double a real user's bill. A non-billable entry keeps using the
  * plain `forward` with no id at all — generating one nobody writes to would
- * create a file an ingest can only ever find empty.
+ * create a file an ingest can only ever find empty. The result is captured
+ * and, when `skipped > 0` or `unreadable` (lost spend, per that function's
+ * own docstring), logged with the user/project id and the counts — nothing
+ * from the log's own content, which the ingest never hands back anyway.
+ * Nothing is logged on the clean path (`{skipped: 0, unreadable: false}`,
+ * which also covers the legitimate "no model calls" no-op) — a line per
+ * successful billable request would be noise an operator learns to ignore.
  *
  * Task 4 closes two gaps, both scoped to the four billable entries only —
  * `requireProject`'s ownership check and `requireBudget`'s spend cap already
@@ -177,7 +183,25 @@ export function compilerRoutes(deps: { db: DatabaseSync; pool: PreviewPool }): R
           // unconditionally, including for a run that wrote no log at all
           // (the "no model calls" case), which is a legitimate no-op, not
           // an error.
-          ingestUsageLog(db, { path, userId: ctx.user.id, projectId: ctx.project.id, now: Date.now() });
+          const result = ingestUsageLog(db, {
+            path, userId: ctx.user.id, projectId: ctx.project.id, now: Date.now(),
+          });
+          // `skipped > 0` or `unreadable` means spend was lost, not merely
+          // that nothing happened — ingest-usage.ts's own docstring calls out
+          // that distinction "precisely so the caller can log it." Only the
+          // counts and ids are logged (no line from the child's file, which
+          // could in principle carry redacted-but-still-sensitive content) —
+          // an operator needs to know WHO and WHERE to look, not the content.
+          // Nothing logged on the clean path: a line per successful regen
+          // would be noise, and `{skipped: 0, unreadable: false}` is the
+          // legitimate result for both "ingested fine" and "no model calls."
+          if (result.skipped > 0 || result.unreadable) {
+            console.error(
+              `[compiler-routes] usage log ingest lost spend for user ${ctx.user.id} `
+              + `(project ${ctx.project.id}): ingested=${result.ingested} skipped=${result.skipped} `
+              + `unreadable=${result.unreadable} — spend may be unrecorded`,
+            );
+          }
           try {
             unlinkSync(path);
           } catch {

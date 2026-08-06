@@ -15,7 +15,14 @@
  * `release` runs in a `finally`: a client that disconnects mid-request — or
  * a proxy call that somehow throws — must still free the slot, or one
  * aborted request pins the preview forever and `MAX_PREVIEWS` leaks down
- * over the life of the process. The forwarded path is `req.url`, VERBATIM —
+ * over the life of the process. Since residual 1 (see `proxyHttp`'s own
+ * comment), "still free the slot" can mean LATER than the disconnect itself
+ * for an abort specifically: `proxyHttp` no longer resolves early on one, so
+ * this `finally` — and with it `pool.release()` and, one layer up in
+ * `compiler-routes.ts`, `releaseBillableSlot()` — does not run until the
+ * upstream (and whatever it is driving) genuinely finishes, which is the
+ * point: freeing either one while a paid run is still going is exactly the
+ * bug residual 1 closed. The forwarded path is `req.url`, VERBATIM —
  * see preview-routes.ts's module comment for the full account of why
  * stripping any part of it (a `/preview/<id>/` prefix, a query string) loops
  * the client against Vite's own base-redirect or breaks its HMR handshake.
@@ -30,22 +37,28 @@
  * reports that the exchange actually COMPLETED (see that function's own
  * comment). The claim this comment used to make here — "after the proxy
  * call resolves OR rejects, never before, since ... the child only returns
- * once the run is actually done" — was false: `proxyHttp` resolves early,
- * by design, on a client abort or `PREVIEW_PROXY_TIMEOUT_MS`, while the
- * orchestrator subprocess behind it may still be running and still
- * appending to its usage log. Ingesting unconditionally at that point read a
- * PARTIAL file and then deleted it, so every line the subprocess wrote
- * afterward landed in a file nobody would ever ingest again — silent
- * under-counting. `after` still runs whenever `proxyHttp` REJECTS (it never
- * does today, by that function's own contract, but nothing here depends on
- * that): a call that throws is treated the same as "completed" for this
- * gate, because a run that failed partway through still spent money and
- * `ingestUsageLog`'s own docstring says exactly that ("even when it
- * threw"). It is skipped ONLY for the specific case `proxyHttp` resolves
+ * once the run is actually done" — was false when FIX 3 landed: `proxyHttp`
+ * used to resolve early, by design, on a client abort or
+ * `PREVIEW_PROXY_TIMEOUT_MS`, while the orchestrator subprocess behind it
+ * may still be running and still appending to its usage log. Ingesting
+ * unconditionally at that point read a PARTIAL file and then deleted it, so
+ * every line the subprocess wrote afterward landed in a file nobody would
+ * ever ingest again — silent under-counting. Residual 1 (a further
+ * whole-branch review) closed the ABORT half of that at the SOURCE rather
+ * than only detecting it here: `proxyHttp` no longer resolves early on a
+ * client disconnect at all, so an aborted-but-completed exchange now reports
+ * `completed: true` and ingests a WHOLE log, not a partial one this gate
+ * used to have to skip. `after` still runs whenever `proxyHttp` REJECTS (it
+ * never does today, by that function's own contract, but nothing here
+ * depends on that): a call that throws is treated the same as "completed"
+ * for this gate, because a run that failed partway through still spent
+ * money and `ingestUsageLog`'s own docstring says exactly that ("even when
+ * it threw"). It is skipped ONLY for the specific case `proxyHttp` resolves
  * `{ completed: false }` — an exchange that settled without the upstream
- * ever finishing. `preview-routes.ts` never passes this option, so its own
- * behaviour is unchanged: `setHeaders` is `undefined` and `after` never
- * runs.
+ * ever finishing, which today means only `PREVIEW_PROXY_TIMEOUT_MS` or a
+ * dead/erroring upstream, never a plain client abort. `preview-routes.ts`
+ * never passes this option, so its own behaviour is unchanged: `setHeaders`
+ * is `undefined` and `after` never runs.
  */
 import { PreviewCapacityError, type PreviewPool } from "./preview-pool.ts";
 import { proxyHttp } from "./preview-proxy.ts";

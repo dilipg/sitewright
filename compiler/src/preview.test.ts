@@ -1,10 +1,14 @@
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { EventEmitter } from "node:events";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import { createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import type { Plugin } from "vite";
 import { afterEach, describe, expect, it } from "vitest";
-import { resolveFsAllow, startPreviewServer } from "./preview";
+import { MAX_BODY_BYTES } from "./max-body-bytes";
+import { overridesApiPlugin, resolveFsAllow, startPreviewServer } from "./preview";
 
 const fixtureDir = fileURLToPath(new URL("../../fixtures/acme-landing", import.meta.url));
 
@@ -284,5 +288,98 @@ describe("startPreviewServer: fs.allow / fs.deny (security)", () => {
     } finally {
       await server.close();
     }
+  });
+});
+
+/**
+ * Residual 2 (2026-08-06 decisions.md row / CLAUDE.md's slice-4c paragraph):
+ * `PUT /__overrides/<slug>` collects the whole request body into a
+ * `Buffer[]` before ever calling `JSON.parse`. `server/src/preview-proxy.ts`
+ * pipes a proxied request straight through rather than buffering it, so
+ * router.ts's own MAX_BODY_BYTES never sees this body at all — the failure
+ * that matters is unbounded memory HERE, in this process, the one serving
+ * every other request for the project (and, unauthenticated, the local
+ * `npm run preview` too).
+ *
+ * A lightweight harness rather than a real Vite dev server (unlike the
+ * `startPreviewServer` tests above): `handleFileEndpoint` reads `req` via
+ * plain `"data"`/`"end"` events, so a bare `EventEmitter` with the handful
+ * of members it and `overridesApiPlugin`'s own URL/method checks read is
+ * enough — the same "give it only what it actually reads" idiom
+ * regen-api.test.ts uses to drive `regenApiPlugin` directly.
+ */
+describe("overridesApiPlugin: bounds a proxied body before ever parsing it (residual 2)", () => {
+  function mountOverridesApi(root: string) {
+    const plugin: Plugin = overridesApiPlugin(root);
+    let handler: ((req: IncomingMessage, res: ServerResponse, next: () => void) => void) | undefined;
+    const fakeServer = {
+      middlewares: { use: (fn: typeof handler) => { handler = fn; } },
+    };
+    (plugin.configureServer as unknown as (server: typeof fakeServer) => void)(fakeServer);
+    if (handler === undefined) throw new Error("overridesApiPlugin never registered its middleware");
+    const middleware = handler;
+
+    /** Drives one PUT with a RAW body (not JSON.stringify'd for it), sent as a single chunk. */
+    function put(slug: string, body: Buffer): Promise<{ status: number; body: string }> {
+      return new Promise((resolveCall) => {
+        const outChunks: string[] = [];
+        let destroyed = false;
+        const res = {
+          statusCode: 200,
+          end(chunk?: string) {
+            if (chunk !== undefined) outChunks.push(String(chunk));
+            resolveCall({ status: res.statusCode, body: outChunks.join("") });
+          },
+        } as unknown as ServerResponse;
+
+        const req = new EventEmitter() as unknown as IncomingMessage;
+        Object.assign(req, {
+          method: "PUT", url: `/__overrides/${slug}`, headers: {},
+          destroy: () => { destroyed = true; },
+        });
+
+        middleware(req, res, () => resolveCall({ status: 404, body: "" }));
+
+        const emitter = req as unknown as EventEmitter;
+        if (!destroyed) emitter.emit("data", body);
+        if (!destroyed) emitter.emit("end");
+      });
+    }
+
+    return { put };
+  }
+
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
+    dirs.length = 0;
+  });
+  function freshRoot(): string {
+    const dir = mkdtempSync(join(tmpdir(), "overrides-bodycap-"));
+    dirs.push(dir);
+    return dir;
+  }
+
+  it("answers 413 and never calls JSON.parse on a body over MAX_BODY_BYTES, and never writes the overrides file", async () => {
+    const root = freshRoot();
+    const { put } = mountOverridesApi(root);
+    // Well-formed JSON, genuinely oversized: if the cap were removed, this
+    // would parse fine and write the overrides file, which is exactly the
+    // difference this test needs to be able to see.
+    const overrides = "x".repeat(MAX_BODY_BYTES + 10_000);
+    const payload = Buffer.from(JSON.stringify({ version: 1, route: "/", overrides }));
+    const result = await put("home", payload);
+    expect(result.status).toBe(413);
+    expect(existsSync(join(root, "overrides", "home.overrides.json"))).toBe(false);
+  });
+
+  it("still accepts a body comfortably under MAX_BODY_BYTES", async () => {
+    const root = freshRoot();
+    const { put } = mountOverridesApi(root);
+    const overrides = "x".repeat(MAX_BODY_BYTES - 1_000);
+    const payload = Buffer.from(JSON.stringify({ version: 1, route: "/", overrides }));
+    const result = await put("home", payload);
+    expect(result.status).toBe(204);
+    expect(existsSync(join(root, "overrides", "home.overrides.json"))).toBe(true);
   });
 });

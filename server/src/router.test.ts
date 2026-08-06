@@ -5,8 +5,9 @@
  * forgetting to add a guard — it has to be added deliberately.
  */
 import { describe, expect, it } from "vitest";
+import { MAX_BODY_BYTES as COMPILER_MAX_BODY_BYTES } from "../../compiler/src/max-body-bytes.ts";
 import {
-  createRequestListener, parseCookies, readJsonBody, serializeCookie, type Route,
+  createRequestListener, MAX_BODY_BYTES, parseCookies, readJsonBody, serializeCookie, type Route,
 } from "./router.ts";
 
 /** Drives the listener without opening a socket. */
@@ -203,6 +204,16 @@ describe("readJsonBody", () => {
     // JSON.parse failure on non-JSON filler bytes.
     const req = fakeReqWithBody([Buffer.alloc(1_500_000, "a")]);
     await expect(readJsonBody(req as never)).rejects.toThrow("body too large");
+  });
+
+  it("uses the exact same body-size cap compiler/src/max-body-bytes.ts uses for its own (unbounded-memory) proxied-body fix", () => {
+    // This router's own cap protects only requests THIS process parses —
+    // proxyHttp pipes a proxied /__* body straight through, so the figure
+    // that actually matters for the preview child's memory lives in
+    // compiler/, independently defined (compiler/ has no dependency on
+    // server/). The two numbers are deliberately the same for the same
+    // reason; this is what catches them drifting apart.
+    expect(MAX_BODY_BYTES).toBe(COMPILER_MAX_BODY_BYTES);
   });
 });
 

@@ -15,6 +15,7 @@ import { createServer, normalizePath } from "vite";
 import { exportApiPlugin } from "./export-api.ts";
 import { planApiPlugin } from "./plan-api.ts";
 import { regenApiPlugin } from "./regen-api.ts";
+import { ROUTE_SLUG } from "./route-slug.ts";
 import { bridgeShimPlugin } from "./shim/vite-plugin.ts";
 
 export interface PreviewOptions {
@@ -224,8 +225,6 @@ export async function startPreviewServer(
   await server.listen();
   return server;
 }
-
-const ROUTE_SLUG = /^[a-z0-9-]+$/;
 
 /**
  * Editor persistence endpoints (PRD 6): the preview server owns the project

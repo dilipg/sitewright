@@ -36,9 +36,49 @@ import { basename, dirname, join, resolve } from "node:path";
 import type { Plugin } from "vite";
 import type { EditAgentResult } from "./edit-protocol.ts";
 import { mockEditOperations } from "./edit-mock.ts";
+import { ROUTE_SLUG } from "./route-slug.ts";
 import { isValidUsageId, USAGE_ID_HEADER, usageLogPathFor } from "./usage-log-path.ts";
 
 const MOCK_DELAY_MS = 1500; // keeps the in-place progress state observable in e2e
+
+/**
+ * Guards every filesystem path this plugin builds from proxied, otherwise-
+ * unvalidated request input. `route` and `section`'s route component both
+ * end up joined straight into a project-relative path (`snapshotRoute`,
+ * below) — `path.join` normalises `..` segments, so an unchecked value can
+ * walk outside the project root before any handler logic even runs. Found in
+ * review: the hosted server proxies `route`/`section` bytes verbatim and
+ * neither it nor this file validated them, so
+ * `route = "../../../../victim/src"` escaped the project directory and
+ * copied another tenant's files into the caller's own `.regen-backup`.
+ *
+ * Shares `ROUTE_SLUG` with `preview.ts`'s `/__overrides/<route-slug>` guard
+ * rather than redefining it — one definition, so the two call sites cannot
+ * silently drift apart.
+ */
+function isValidRouteSlug(value: unknown): value is string {
+  return typeof value === "string" && ROUTE_SLUG.test(value);
+}
+
+/**
+ * The route component of a section (or bare-route) id — same rule
+ * `snapshotSection`/`restoreSnapshot` use to derive a route slug from a
+ * section id, applied here so the VALIDATION sees exactly what the
+ * filesystem call will. A `..`-shaped id (e.g. `"../../secret.hero"`) starts
+ * with a literal `.`, so this always yields `""` for that specific shape —
+ * not itself exploitable — but the guard is applied regardless, for the same
+ * reason `route` is: an unvalidated value has no business reaching
+ * `path.join` at all, and a non-string body field must fail closed here
+ * rather than throw deeper in `.split()`.
+ */
+function routeSlugOfSection(section: unknown): string | undefined {
+  return typeof section === "string" ? section.split(".")[0] : undefined;
+}
+
+/** Sends the uniform 400 every route-slug rejection below uses. */
+function respondInvalidRouteSlug(res: ServerResponse): void {
+  respondJson(res, 400, { error: "invalid route slug" });
+}
 
 export function regenApiPlugin(projectRoot: string): Plugin {
   const root = resolve(projectRoot);
@@ -52,6 +92,10 @@ export function regenApiPlugin(projectRoot: string): Plugin {
           void readBody(req).then(async (body) => {
             try {
               const { section, instruction } = body as { section: string; instruction: string };
+              if (!isValidRouteSlug(routeSlugOfSection(section))) {
+                respondInvalidRouteSlug(res);
+                return;
+              }
               snapshotSection(root, section);
               const result =
                 process.env.WG_REGEN_MOCK === "1"
@@ -72,6 +116,10 @@ export function regenApiPlugin(projectRoot: string): Plugin {
           void readBody(req).then(async (body) => {
             try {
               const { route, instruction } = body as { route: string; instruction: string };
+              if (!isValidRouteSlug(route)) {
+                respondInvalidRouteSlug(res);
+                return;
+              }
               // once, before any section runs — see the header comment
               snapshotRoute(root, route);
               const result =
@@ -100,6 +148,10 @@ export function regenApiPlugin(projectRoot: string): Plugin {
                 archetype: string;
                 instruction: string;
               };
+              if (!isValidRouteSlug(route)) {
+                respondInvalidRouteSlug(res);
+                return;
+              }
               // Same route-wide snapshot as a regen, so an added section is
               // revertable by the same one step — adding one is as much a
               // change to the page as regenerating it (PRD 4.4).
@@ -124,6 +176,10 @@ export function regenApiPlugin(projectRoot: string): Plugin {
                 instruction: string;
                 selection?: string;
               };
+              if (!isValidRouteSlug(route)) {
+                respondInvalidRouteSlug(res);
+                return;
+              }
               // No snapshot here, unlike regen: this endpoint changes nothing on
               // disk. It returns operations; the editor applies them as ordinary
               // overrides, which the existing undo stack already covers.
@@ -141,7 +197,12 @@ export function regenApiPlugin(projectRoot: string): Plugin {
         if (req.method === "POST" && url === "/__regen-revert") {
           void readBody(req).then((body) => {
             try {
-              restoreSnapshot(root, (body as { section: string }).section);
+              const { section } = body as { section: string };
+              if (!isValidRouteSlug(routeSlugOfSection(section))) {
+                respondInvalidRouteSlug(res);
+                return;
+              }
+              restoreSnapshot(root, section);
               server.moduleGraph.invalidateAll();
               respondJson(res, 200, { ok: true });
             } catch (error) {

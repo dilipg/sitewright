@@ -30,12 +30,13 @@
  */
 
 import { spawn } from "node:child_process";
-import { cpSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import type { Plugin } from "vite";
 import type { EditAgentResult } from "./edit-protocol.ts";
 import { mockEditOperations } from "./edit-mock.ts";
+import { isValidUsageId, USAGE_ID_HEADER, usageLogPathFor } from "./usage-log-path.ts";
 
 const MOCK_DELAY_MS = 1500; // keeps the in-place progress state observable in e2e
 
@@ -55,7 +56,7 @@ export function regenApiPlugin(projectRoot: string): Plugin {
               const result =
                 process.env.WG_REGEN_MOCK === "1"
                   ? await mockRegen(root, section, instruction)
-                  : await realRegen(root, section, instruction);
+                  : await realRegen(root, section, instruction, usageEnvFor(req));
               // the editor reloads the frame immediately on response; the
               // watcher's async invalidation would race it and serve stale
               // transforms from the module cache
@@ -76,7 +77,7 @@ export function regenApiPlugin(projectRoot: string): Plugin {
               const result =
                 process.env.WG_REGEN_MOCK === "1"
                   ? await mockRegenPage(root, route, instruction)
-                  : await realRegenPage(root, route, instruction);
+                  : await realRegenPage(root, route, instruction, usageEnvFor(req));
               server.moduleGraph.invalidateAll();
               respondJson(res, 200, { ...result, canRevert: true });
             } catch (error) {
@@ -106,7 +107,7 @@ export function regenApiPlugin(projectRoot: string): Plugin {
               const result =
                 process.env.WG_REGEN_MOCK === "1"
                   ? await mockAddSection(root, route, archetype, instruction)
-                  : await realAddSection(root, route, archetype, instruction);
+                  : await realAddSection(root, route, archetype, instruction, usageEnvFor(req));
               server.moduleGraph.invalidateAll();
               respondJson(res, 200, { ...result, canRevert: true });
             } catch (error) {
@@ -129,7 +130,7 @@ export function regenApiPlugin(projectRoot: string): Plugin {
               const result =
                 process.env.WG_REGEN_MOCK === "1"
                   ? mockEditOperations(instruction, route)
-                  : await realEditPrompt(root, route, instruction, selection);
+                  : await realEditPrompt(root, route, instruction, selection, usageEnvFor(req));
               respondJson(res, 200, result);
             } catch (error) {
               respondJson(res, 500, { error: String(error) });
@@ -200,16 +201,37 @@ interface PageRegenOutcome extends RegenOutcome {
   perSection: Record<string, boolean>;
 }
 
-function realRegen(root: string, section: string, instruction: string): Promise<RegenOutcome> {
-  return runRegenCli(root, ["--section", section], instruction);
+function realRegen(
+  root: string,
+  section: string,
+  instruction: string,
+  env?: NodeJS.ProcessEnv,
+): Promise<RegenOutcome> {
+  return runRegenCli(root, ["--section", section], instruction, env);
 }
 
-function realRegenPage(root: string, route: string, instruction: string): Promise<PageRegenOutcome> {
-  return runRegenCli(root, ["--route", route], instruction) as Promise<PageRegenOutcome>;
+function realRegenPage(
+  root: string,
+  route: string,
+  instruction: string,
+  env?: NodeJS.ProcessEnv,
+): Promise<PageRegenOutcome> {
+  return runRegenCli(root, ["--route", route], instruction, env) as Promise<PageRegenOutcome>;
 }
 
-function runRegenCli(root: string, scopeArgs: string[], instruction: string): Promise<RegenOutcome> {
-  return runCli<RegenOutcome>(root, ["orchestrator.regenerate", ...scopeArgs], instruction, "REGEN_RESULT ");
+function runRegenCli(
+  root: string,
+  scopeArgs: string[],
+  instruction: string,
+  env?: NodeJS.ProcessEnv,
+): Promise<RegenOutcome> {
+  return runCli<RegenOutcome>(
+    root,
+    ["orchestrator.regenerate", ...scopeArgs],
+    instruction,
+    "REGEN_RESULT ",
+    env,
+  );
 }
 
 /**
@@ -233,9 +255,15 @@ export function runProcess(
   command: string,
   args: string[],
   cwd: string,
+  extraEnv?: NodeJS.ProcessEnv,
 ): Promise<{ stdout: string; stderr: string; code: number | null }> {
   return new Promise((resolvePromise, rejectPromise) => {
-    const child = spawn(command, args, { cwd });
+    // Merged over the inherited environment rather than replacing it: the
+    // orchestrator needs PATH, and under the hosted server it needs the
+    // ANTHROPIC_API_KEY the preview pool put in this process's environment
+    // for its owner. Only the caller's additions are new.
+    const env = extraEnv === undefined ? undefined : { ...process.env, ...extraEnv };
+    const child = spawn(command, args, env === undefined ? { cwd } : { cwd, env });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
@@ -247,6 +275,25 @@ export function runProcess(
   });
 }
 
+/**
+ * The env addition for a request that may spend money. Absent header → no
+ * addition, so the local unauthenticated preview behaves exactly as before
+ * and keeps writing to the orchestrator's own shared runlog.
+ *
+ * Exported (though not part of the plugin's public surface) so it can be
+ * tested directly rather than only through a live orchestrator spawn — the
+ * header-to-env translation is the actual new logic here; `runProcess`'s
+ * merge behavior is already covered on its own.
+ */
+export function usageEnvFor(req: IncomingMessage): NodeJS.ProcessEnv | undefined {
+  const raw = req.headers[USAGE_ID_HEADER];
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  if (!isValidUsageId(value)) return undefined;
+  const path = usageLogPathFor(value);
+  mkdirSync(dirname(path), { recursive: true });
+  return { WEBGEN_USAGE_LOG: path };
+}
+
 /** Spawns an orchestrator CLI and reads its single machine-readable result
  *  line. `moduleAndArgs` starts with the module name; --run-id (the project
  *  directory's own name) and --instruction are added here. */
@@ -255,6 +302,7 @@ async function runCli<T>(
   moduleAndArgs: string[],
   instruction: string,
   marker: string,
+  env?: NodeJS.ProcessEnv,
 ): Promise<T> {
   const orchestratorDir = resolve(root, "..", "..", "orchestrator");
   const runId = basename(root);
@@ -263,6 +311,7 @@ async function runCli<T>(
     "uv",
     ["run", "python", "-m", moduleName!, "--run-id", runId, ...args, "--instruction", instruction],
     orchestratorDir,
+    env,
   );
   const resultLine = stdout.split("\n").find((line) => line.startsWith(marker));
   if (resultLine === undefined) {
@@ -282,12 +331,14 @@ function realAddSection(
   route: string,
   archetype: string,
   instruction: string,
+  env?: NodeJS.ProcessEnv,
 ): Promise<AddSectionOutcome> {
   return runCli<AddSectionOutcome>(
     root,
     ["orchestrator.add_section", "--route", route, "--archetype", archetype],
     instruction,
     "ADD_SECTION_RESULT ",
+    env,
   );
 }
 
@@ -296,10 +347,11 @@ function realEditPrompt(
   route: string,
   instruction: string,
   selection: string | undefined,
+  env?: NodeJS.ProcessEnv,
 ): Promise<EditAgentResult> {
   const scope = ["orchestrator.edit_agent", "--route", route];
   if (selection !== undefined) scope.push("--selection", selection);
-  return runCli<EditAgentResult>(root, scope, instruction, "EDIT_RESULT ");
+  return runCli<EditAgentResult>(root, scope, instruction, "EDIT_RESULT ", env);
 }
 
 /**

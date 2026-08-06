@@ -31,7 +31,17 @@ export function isValidUsageId(value: unknown): value is string {
   return typeof value === "string" && USAGE_ID.test(value);
 }
 
+/**
+ * The directory every usage log lives in — exported so a caller that needs
+ * the directory itself (server/src/usage-log-sweep.ts, sweeping stale files
+ * at startup) derives it from the same one literal `usageLogPathFor` uses,
+ * rather than a second copy of "webgen-usage" that could silently drift.
+ */
+export function usageLogDir(): string {
+  return join(tmpdir(), "webgen-usage");
+}
+
 export function usageLogPathFor(usageId: string): string {
   if (!isValidUsageId(usageId)) throw new Error("invalid usage id");
-  return join(tmpdir(), "webgen-usage", `${usageId}.jsonl`);
+  return join(usageLogDir(), `${usageId}.jsonl`);
 }

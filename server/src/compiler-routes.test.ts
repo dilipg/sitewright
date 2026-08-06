@@ -48,12 +48,18 @@ import { UndecryptableApiKeyError } from "./api-keys.ts";
 import { USAGE_ID_HEADER, isValidUsageId, usageLogPathFor } from "../../compiler/src/usage-log-path.ts";
 
 const proxyMocks = vi.hoisted(() => ({
+  // Return type matches the REAL proxyHttp's contract (FIX 3): `{ completed
+  // }`, not bare `void` — preview-forward.ts reads `.completed` off
+  // whatever this resolves to, so a test that wants the ingest gate to run
+  // (the common case) must resolve `{ completed: true }`, exactly like a
+  // real, fully-relayed exchange would.
   impl: async (args: {
     res: { writeHead: (code: number) => unknown; end: (chunk?: string) => unknown };
     setHeaders?: Record<string, string>;
-  }) => {
+  }): Promise<{ completed: boolean }> => {
     args.res.writeHead(200);
     args.res.end("proxied");
+    return { completed: true };
   },
   calls: [] as Array<{ port: number; path: string; setHeaders?: Record<string, string> | undefined }>,
 }));
@@ -192,6 +198,7 @@ beforeEach(() => {
   proxyMocks.impl = async (args) => {
     args.res.writeHead(200);
     args.res.end("proxied");
+    return { completed: true };
   };
 });
 
@@ -385,6 +392,7 @@ describe("compilerRoutes: attributing billable spend", () => {
       capturedPath = writeUsageLog(usageId, [usageRow({ cost_usd: 1 }), usageRow({ cost_usd: 2 })]);
       args.res.writeHead(200);
       args.res.end("proxied");
+      return { completed: true };
     };
 
     const result = await call(billableEntry.method, pathFor(billableEntry, project.id), aliceCookie);
@@ -432,6 +440,52 @@ describe("compilerRoutes: attributing billable spend", () => {
   });
 
   /**
+   * FIX 3 (whole-branch review): a client abort or PREVIEW_PROXY_TIMEOUT_MS
+   * resolves the REAL proxyHttp with `{ completed: false }` WITHOUT throwing
+   * — the orchestrator subprocess behind it may still be running and still
+   * appending to its log. Ingesting now would read a PARTIAL file and then
+   * delete it, so every later line lands nowhere. This is the one case that
+   * must skip `after()` entirely: no ingest, and no delete either (the
+   * eventual startup sweep is what cleans this file up, not this handler).
+   */
+  it("does not ingest — and does not delete the log file — when the proxy resolves without the exchange completing", async () => {
+    const pool = fakePool();
+    const { db, call, project, alice, aliceCookie } = harness(pool);
+    let capturedPath = "";
+    try {
+      proxyMocks.impl = async (args) => {
+        const usageId = args.setHeaders?.[USAGE_ID_HEADER];
+        if (usageId === undefined) throw new Error("expected a usage id header on a billable request");
+        // A partial write — standing in for a subprocess still appending when
+        // the run timed out — followed by resolving (not throwing) with
+        // completed: false, exactly like the real proxyHttp's own
+        // PREVIEW_PROXY_TIMEOUT_MS path: it still writes a 504 to the client,
+        // but the exchange with the upstream never finished.
+        capturedPath = writeUsageLog(usageId, [usageRow({ cost_usd: 7 })]);
+        args.res.writeHead(504);
+        args.res.end("timed out");
+        return { completed: false };
+      };
+
+      const result = await call(billableEntry.method, pathFor(billableEntry, project.id), aliceCookie);
+      expect(result.status).toBe(504);
+
+      // Nothing ingested — the spend from this partial file must NOT be
+      // recorded now (it would double-count once the file is eventually
+      // ingested some other way, and this file is never ingested any other
+      // way today — it is left for usage-log-sweep.ts to clear on the next
+      // restart).
+      expect(spendSince(db, alice.id, 0)).toEqual({ costUsd: 0, events: 0, unpricedEvents: 0 });
+      // And the file itself must survive this request — deleting an
+      // un-ingested, still-partial file would lose whatever the subprocess
+      // still appends to it after this response returns.
+      expect(existsSync(capturedPath)).toBe(true);
+    } finally {
+      if (capturedPath !== "") rmSync(capturedPath, { force: true });
+    }
+  });
+
+  /**
    * Fix from code review: `ingestUsageLog`'s result used to be discarded
    * entirely — `skipped`/`unreadable` exist, per that function's own
    * docstring, "precisely so the caller can log them," and the caller did
@@ -454,6 +508,7 @@ describe("compilerRoutes: attributing billable spend", () => {
         writeUsageLog(usageId, [usageRow({ cost_usd: 1 }), { bogus: true }]);
         args.res.writeHead(200);
         args.res.end("proxied");
+        return { completed: true };
       };
       const result = await call(billableEntry.method, pathFor(billableEntry, project.id), aliceCookie);
       expect(result.status).toBe(200);
@@ -482,6 +537,7 @@ describe("compilerRoutes: attributing billable spend", () => {
         mkdirSync(dirPath, { recursive: true });
         args.res.writeHead(200);
         args.res.end("proxied");
+        return { completed: true };
       };
       const result = await call(billableEntry.method, pathFor(billableEntry, project.id), aliceCookie);
       expect(result.status).toBe(200);
@@ -507,6 +563,7 @@ describe("compilerRoutes: attributing billable spend", () => {
         writeUsageLog(usageId, [usageRow({ cost_usd: 1 }), usageRow({ cost_usd: 2 })]);
         args.res.writeHead(200);
         args.res.end("proxied");
+        return { completed: true };
       };
       const result = await call(billableEntry.method, pathFor(billableEntry, project.id), aliceCookie);
       expect(result.status).toBe(200);
@@ -678,9 +735,9 @@ describe("compilerRoutes: concurrent-start bound", () => {
     // genuinely concurrent requests finishes.
     const pending: Array<{ resolve: () => void; reject: (err: Error) => void }> = [];
     proxyMocks.impl = (args) =>
-      new Promise<void>((resolve, reject) => {
+      new Promise<{ completed: boolean }>((resolve, reject) => {
         pending.push({
-          resolve: () => { args.res.writeHead(200); args.res.end("proxied"); resolve(); },
+          resolve: () => { args.res.writeHead(200); args.res.end("proxied"); resolve({ completed: true }); },
           reject,
         });
       });

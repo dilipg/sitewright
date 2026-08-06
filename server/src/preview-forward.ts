@@ -26,11 +26,26 @@
  * acquire/retain/proxy/release sequence: `setHeaders` reaches `proxyHttp`
  * (which applies it AFTER its own client-header strip, so the server's value
  * always wins), and `after` runs in the SAME `finally` as `pool.release` —
- * after the proxy call resolves OR rejects, never before, since the
- * orchestrator writes its usage log as it goes and the child only returns
- * once the run is actually done. `preview-routes.ts` never passes this
- * option, so its own behaviour is unchanged: `setHeaders` is `undefined` and
- * `after` never runs.
+ * but, since FIX 3 (a whole-branch review), only when `proxyHttp` itself
+ * reports that the exchange actually COMPLETED (see that function's own
+ * comment). The claim this comment used to make here — "after the proxy
+ * call resolves OR rejects, never before, since ... the child only returns
+ * once the run is actually done" — was false: `proxyHttp` resolves early,
+ * by design, on a client abort or `PREVIEW_PROXY_TIMEOUT_MS`, while the
+ * orchestrator subprocess behind it may still be running and still
+ * appending to its usage log. Ingesting unconditionally at that point read a
+ * PARTIAL file and then deleted it, so every line the subprocess wrote
+ * afterward landed in a file nobody would ever ingest again — silent
+ * under-counting. `after` still runs whenever `proxyHttp` REJECTS (it never
+ * does today, by that function's own contract, but nothing here depends on
+ * that): a call that throws is treated the same as "completed" for this
+ * gate, because a run that failed partway through still spent money and
+ * `ingestUsageLog`'s own docstring says exactly that ("even when it
+ * threw"). It is skipped ONLY for the specific case `proxyHttp` resolves
+ * `{ completed: false }` — an exchange that settled without the upstream
+ * ever finishing. `preview-routes.ts` never passes this option, so its own
+ * behaviour is unchanged: `setHeaders` is `undefined` and `after` never
+ * runs.
  */
 import { PreviewCapacityError, type PreviewPool } from "./preview-pool.ts";
 import { proxyHttp } from "./preview-proxy.ts";
@@ -74,23 +89,36 @@ export function forwardToPreview(
     // subprocess mid-request. release() runs in a finally so an aborted
     // or failed proxy call still frees the slot.
     pool.retain(ctx.project.id);
+    // Defaults to true: a `proxyHttp` call that THROWS (never happens in
+    // production — see that function's own "never rejects" contract — but
+    // several tests script exactly this to stand in for a run that failed
+    // partway through) must still ingest, because a run that errored halfway
+    // still spent money (ingest-usage.ts's own docstring). The ONLY way this
+    // becomes false is `proxyHttp` RESOLVING with `{ completed: false }` —
+    // see the module comment.
+    let completed = true;
     try {
       // req.url, unmodified — see the module comment for why.
-      await proxyHttp({
+      const result = await proxyHttp({
         req,
         res,
         port: preview.port,
         path: req.url ?? "/",
         setHeaders: billable?.setHeaders,
       });
+      completed = result.completed;
     } finally {
-      // Ingest AFTER the proxy call settles (success or throw) — the child
-      // only returns once its run is done — and even when it threw: a run
-      // that errored halfway still spent money. Runs before release() only
-      // because that is the natural order of this block; both are inside the
-      // same finally, which is the load-bearing property.
+      // Ingest AFTER the proxy call settles (success or throw), and even
+      // when it threw — but only when the exchange actually COMPLETED (see
+      // the module comment on why "settled" is not the same thing).
+      // Skipping `after()` on an incomplete exchange leaves that request's
+      // usage id unswept here; `usage-log-sweep.ts` clears it out of
+      // `<tmpdir>/webgen-usage` at the next server startup instead. Runs
+      // before release() only because that is the natural order of this
+      // block; both are inside the same finally, which is the load-bearing
+      // property.
       try {
-        await billable?.after();
+        if (completed) await billable?.after();
       } finally {
         pool.release(ctx.project.id);
       }

@@ -26,9 +26,16 @@ import { MAX_PREVIEWS, PreviewCapacityError, type PreviewPool } from "./preview-
 import { previewRoutes } from "./preview-routes.ts";
 
 const proxyMocks = vi.hoisted(() => ({
-  impl: async (args: { res: { writeHead: (code: number) => unknown; end: (chunk?: string) => unknown } }) => {
+  // Return type matches the real proxyHttp's contract (FIX 3): `{ completed
+  // }`, not bare `void` — irrelevant to THIS route (it never passes
+  // `billable`, so nothing here reads `.completed`), but a mock should still
+  // shape its return value like the real function.
+  impl: async (args: {
+    res: { writeHead: (code: number) => unknown; end: (chunk?: string) => unknown };
+  }): Promise<{ completed: boolean }> => {
     args.res.writeHead(200);
     args.res.end("proxied");
+    return { completed: true };
   },
   calls: [] as Array<{ port: number; path: string }>,
 }));
@@ -103,6 +110,7 @@ beforeEach(() => {
   proxyMocks.impl = async (args) => {
     args.res.writeHead(200);
     args.res.end("proxied");
+    return { completed: true };
   };
 });
 

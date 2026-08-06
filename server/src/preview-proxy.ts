@@ -114,6 +114,33 @@ function safeEnd(res: ServerResponse): void {
  *
  * Resolves once the exchange is over — success, upstream error, or timeout —
  * and NEVER rejects: every exit path is funnelled through `settle()` below.
+ *
+ * Resolves with `{ completed }`, not bare `void` — added for FIX 3 (a
+ * whole-branch review): a client abort (the top-level `res.on("close", ...)`
+ * below), `PREVIEW_PROXY_TIMEOUT_MS`, and an unreachable upstream all resolve
+ * this promise WITHOUT ever genuinely relaying an upstream response, while
+ * the orchestrator subprocess behind `port` may still be running and still
+ * appending to its usage log. A caller that treats "this promise settled" as
+ * "the run is over" (`preview-forward.ts` used to) ingests that log while it
+ * is still partial, then deletes it — every line the subprocess writes
+ * afterward lands in a file nobody will ever read again.
+ *
+ * `completed` is `true` in EXACTLY one place below: once the upstream's own
+ * response has fully finished being written to the client (`res`'s `finish`
+ * event, inside the `upstreamReq.on("response", ...)` handler). It stays
+ * `false` for every other settle path — an abort before the upstream ever
+ * answered, a timeout, a dead upstream (502), or a `writeHead` throw — even
+ * though several of those ALSO end up writing a complete, well-formed error
+ * response of their own (a small 502/504 JSON body, written and finished
+ * synchronously via `safeSendJson`). That is deliberate, not an oversight: a
+ * plain `res.writableFinished` check right after one of those synchronous
+ * writes reads back `true` regardless (confirmed empirically — Node marks a
+ * small, unbuffered write finished before this function's own next
+ * statement runs), which would call an upstream nobody ever actually reached
+ * "completed." The only thing this signal is FOR is deciding whether it is
+ * safe to ingest-and-delete the usage log; none of those short-circuit paths
+ * represent the upstream (and whatever it may have spawned) genuinely
+ * finishing its work, so they must all read `false`.
  */
 export function proxyHttp(args: {
   req: IncomingMessage;
@@ -132,15 +159,18 @@ export function proxyHttp(args: {
    * even applied.
    */
   setHeaders?: Record<string, string> | undefined;
-}): Promise<void> {
+}): Promise<{ completed: boolean }> {
   const { req, res, port, path, setHeaders } = args;
 
-  return new Promise<void>((resolve) => {
+  return new Promise<{ completed: boolean }>((resolve) => {
     let settled = false;
+    // Flipped to `true` in exactly one place — see the function comment —
+    // and read at whichever `settle()` call actually wins.
+    let completed = false;
     const settle = (): void => {
       if (settled) return;
       settled = true;
-      resolve();
+      resolve({ completed });
     };
 
     // A response the client has already walked away from must not keep this
@@ -254,8 +284,18 @@ export function proxyHttp(args: {
         safeEnd(res);
         settle();
       });
+      // `close` can ALSO fire on a normal completion (confirmed empirically
+      // against a real Vite child — see the historical note this comment
+      // used to carry) — harmless for settling (`settled` coalesces either
+      // way), but it must never be the thing that sets `completed`: unlike
+      // `finish`, `close` fires just as readily when the client vanishes
+      // mid-body, and that case is exactly what `completed` must read as
+      // `false`.
       res.on("close", settle);
-      res.on("finish", settle);
+      res.on("finish", () => {
+        completed = true;
+        settle();
+      });
       upstreamRes.pipe(res);
     });
 

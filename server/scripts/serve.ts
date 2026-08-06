@@ -18,6 +18,7 @@ import { PreviewPool } from "../src/preview-pool.ts";
 import { createPreviewUpgradeListener } from "../src/preview-upgrade.ts";
 import { createRequestListener } from "../src/router.ts";
 import { deleteExpiredSessions } from "../src/sessions.ts";
+import { sweepStaleUsageLogs } from "../src/usage-log-sweep.ts";
 import { findUserByEmail } from "../src/users.ts";
 // Reuses the flag() already fixed twice (server/src/user-cli.ts, applied to
 // scripts/user.ts in commit 72dd44b) rather than keeping this script's own
@@ -88,6 +89,19 @@ delete process.env[MASTER_KEY_ENV_VAR];
 const db = openDatabase(dbPath);
 const pruned = deleteExpiredSessions(db);
 if (pruned > 0) console.log(`pruned ${pruned} expired session(s)`);
+
+// FIX 3 (whole-branch review): a billable request whose client aborted or
+// hit PREVIEW_PROXY_TIMEOUT_MS skips ingesting its usage log (preview-
+// forward.ts) rather than risk ingesting-then-deleting a file the
+// orchestrator subprocess might still be appending to. That leaves the file
+// sitting in <tmpdir>/webgen-usage forever unless something sweeps it. By
+// the time THIS process restarts, the user/project context that could
+// attribute it correctly is gone, so the only honest disposal left is
+// deleting it unread — see usage-log-sweep.ts's own module comment. Runs
+// before the pool (or any route) exists, so nothing on THIS server can yet
+// be writing into that directory to race against.
+const { swept } = sweepStaleUsageLogs();
+if (swept > 0) console.log(`swept ${swept} stale usage log(s) from a previous run`);
 
 // Adoption runs on EVERY boot (idempotent by construction — see adopt.ts) so
 // that acceptance runs already on disk get an owner instead of being orphaned.

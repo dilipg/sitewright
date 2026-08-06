@@ -32,6 +32,26 @@
  * line is therefore only ever a HINT that the child believes it is ready,
  * never the source of truth for the port traffic gets proxied to — see
  * `spawnAndAwaitReady` and `verifyPort`.
+ *
+ * A fifth (FIX 2, a whole-branch review): a warm child's key is fixed at the
+ * moment it was spawned — `buildChildEnv` only ever runs again for a FRESH
+ * spawn, never for a reused entry. Before this fix, `acquire()`'s reuse path
+ * (below) handed back an already-running child without ever asking whether
+ * the owner's key had changed since spawn — a keyless user who saves a key,
+ * or ANY user who rotates one, kept talking to a child holding the OLD
+ * state (no key at all, or the old key) until the next idle reap, up to 15
+ * minutes away and never sooner while the project stayed in use. The first
+ * of those is the dangerous direction: `orchestrator/src/orchestrator/
+ * config.py`'s `load_dotenv(..., override=False)` means an ABSENT injected
+ * key silently falls through to `orchestrator/.env` — the OPERATOR's own
+ * key — so a keyless child spawned before a user ever saved one would go on
+ * to spend the operator's money on that user's behalf, the exact "silent
+ * transfer" `scrubbedEnv`'s own comment (below) says it exists to prevent.
+ * `acquire()` now fingerprints (never stores, see `fingerprintOf`) the key a
+ * child was ACTUALLY spawned with, compares it against the owner's CURRENT
+ * key on every reuse, and — for a warm, idle entry only — kills and
+ * respawns on a mismatch. See `acquire()`'s own comment for the busy-child
+ * policy this cannot apply unconditionally.
  */
 import { spawn } from "node:child_process";
 import type { EventEmitter } from "node:events";
@@ -46,6 +66,7 @@ import {
   scrubbedEnv,
   UnknownUserError,
 } from "./agent-env.ts";
+import { fingerprintOf, getApiKeyFingerprint } from "./api-keys.ts";
 import type { Project } from "./projects.ts";
 import { resolveProjectDirectory } from "./projects.ts";
 import { redactSecrets } from "./redact.ts";
@@ -234,6 +255,17 @@ interface Entry {
   base?: string;
   inFlight: number;
   lastUsedAt: number;
+  /**
+   * A fingerprint (never the raw key — see `fingerprintOf`) of whatever
+   * `ANTHROPIC_API_KEY` this entry's child was actually spawned with, or
+   * `null` for a keyless spawn. Set once, at spawn time, and never mutated
+   * in place afterward — `acquire()` compares it against the owner's
+   * CURRENT fingerprint on every reuse and replaces the whole entry (see
+   * `installEntry`) rather than editing this field, so a stale value is
+   * never silently "corrected" out from under a caller still holding a
+   * reference to the old entry object.
+   */
+  keyFingerprint: string | null;
 }
 
 function toPreviewProcess(projectId: string, entry: Entry & { port: number; base: string }): PreviewProcess {
@@ -398,6 +430,39 @@ export class PreviewPool {
    * running. Increments nothing — a caller doing work across an `await`
    * boundary (a regen, say) must call `retain()` itself so the reaper cannot
    * kill the process out from under it.
+   *
+   * FIX 2 (a whole-branch review — see the module comment's fifth property):
+   * a WARM entry (one that already has a child) is checked against the
+   * owner's CURRENT key fingerprint on every reuse. A mismatch — a keyless
+   * spawn whose owner has since saved a key, a rotated key, or a key that
+   * was cleared — is stale. What happens to a stale entry depends on whether
+   * it is busy:
+   *
+   *   - IDLE (`inFlight === 0`): killed and respawned with the current key,
+   *     right here, before this call returns.
+   *   - BUSY (`inFlight > 0`): served AS IS, stale key and all. This is a
+   *     deliberate choice, not an oversight — 4c-1's invariant is that a
+   *     process with work in flight is never killed, and spec decision 13
+   *     forbids killing a run halfway. The alternative (refusing the
+   *     request instead of killing the child) was rejected: `acquire()` is
+   *     also the plain, non-billable preview path, and refusing an ordinary
+   *     asset request just because a DIFFERENT concurrent regen happens to
+   *     be in flight would break live preview for the whole time that regen
+   *     runs. The window this leaves open is bounded and narrow: at most
+   *     the duration of whatever work is already in flight, and strictly
+   *     smaller than the bug this fix closes (which could persist for the
+   *     full idle-reap window, up to 15 minutes, or indefinitely while the
+   *     project stayed in active use). The MOMENT `inFlight` returns to
+   *     zero, the next `acquire()` — for ANY endpoint, not only a billable
+   *     one — re-checks and respawns.
+   *
+   * A still-spawning entry (no child yet) is never treated as stale here:
+   * `inFlight` is guaranteed zero for it (nothing can have called `retain()`
+   * before THIS very `acquire()` call — every caller retains only after its
+   * own `acquire()` resolves), so killing it out from under its own spawn
+   * attempt would race `spawnWithRetries` for no benefit. It becomes
+   * eligible for the stale check on the very next `acquire()`, once it is
+   * actually warm.
    */
   async acquire(project: Project, ownerId: string): Promise<PreviewProcess> {
     // Checked before even the reuse lookup: a preview already running for
@@ -408,11 +473,47 @@ export class PreviewPool {
 
     const existing = this.entries.get(project.id);
     if (existing !== undefined) {
+      // Every read here is synchronous (no `await` before `installEntry`'s
+      // own synchronous map mutation, for the branch that takes it) — see
+      // `installEntry`'s comment for why that is load-bearing: it is what
+      // stops a second, concurrent `acquire()` for this SAME project from
+      // also deciding to respawn and leaking an untracked second child.
+      const currentFingerprint = getApiKeyFingerprint(this.db, ownerId);
+      const warmAndStale = existing.child !== undefined && existing.keyFingerprint !== currentFingerprint;
+      if (warmAndStale && existing.inFlight === 0) {
+        return this.installEntry(project, ownerId, existing.child);
+      }
+      // Matching key, still spawning, or busy (served as-is — see this
+      // method's own comment on the busy-child policy).
       const ready = await existing.readyPromise;
       existing.lastUsedAt = this.now();
       return { projectId: project.id, port: ready.port, base: ready.base, inFlight: existing.inFlight, lastUsedAt: existing.lastUsedAt };
     }
 
+    return this.installEntry(project, ownerId, undefined);
+  }
+
+  /**
+   * The one place a map entry is created OR replaced — a brand new spawn
+   * (`priorChild` undefined) and a stale-key respawn (`priorChild` the
+   * WARM child being replaced) share this so there is exactly one place
+   * that constructs the readyPromise chain and writes it into `entries`.
+   *
+   * Everything from the synchronous top of this function down to
+   * `this.entries.set(...)` runs with NO `await` in between — that is what
+   * makes "two concurrent callers for the same project never both decide to
+   * spawn/respawn" true, exactly the same argument the pre-existing "two
+   * concurrent first requests share one spawn" comment already made for the
+   * fresh-spawn case: once a caller's synchronous turn reaches this far, no
+   * other call can observe `entries` mid-decision, because nothing yields
+   * control back to the event loop until the replacement is already in the
+   * map.
+   */
+  private installEntry(
+    project: Project,
+    ownerId: string,
+    priorChild: SpawnedChild | undefined,
+  ): Promise<PreviewProcess> {
     const directory = resolveProjectDirectory(this.projectsRoot, project.directory);
     const base = `/preview/${project.id}/`;
     // Authorization BEFORE capacity, deliberately: `buildChildEnv` is also
@@ -423,15 +524,30 @@ export class PreviewPool {
     // would let a bogus or disabled request evict a legitimate one on its
     // way to being refused anyway.
     const env = this.buildChildEnv(ownerId);
+    // The fingerprint of whatever key THIS env actually carries (or `null`
+    // for a keyless spawn) — derived from the env handed to the child, not
+    // a second, separate database read, so this can never disagree with
+    // what the child was actually given.
+    const keyFingerprint = env.ANTHROPIC_API_KEY !== undefined ? fingerprintOf(env.ANTHROPIC_API_KEY) : null;
 
-    this.ensureCapacity();
+    // Only a BRAND NEW map entry can trip MAX_PREVIEWS — replacing an
+    // existing project's entry (the stale-key respawn path, `priorChild`
+    // defined) overwrites the SAME map key, so `entries.size` never changes
+    // and capacity is not a question worth asking.
+    if (priorChild === undefined) this.ensureCapacity();
 
     // `entry` is referenced by the `.then`/`.catch` closures below before it
     // is assigned. That is safe: those closures only ever run in a later
     // microtask, and `entry` is fully assigned before this synchronous
-    // function body yields (at the `await readyPromise` a few lines down).
+    // function body yields (at the `await` inside the `.then` chain below).
     let entry!: Entry;
-    const readyPromise = this.spawnWithRetries(project.id, directory, base, env)
+    const spawnAttempt = priorChild === undefined
+      ? this.spawnWithRetries(project.id, directory, base, env)
+      // The stale child is killed FIRST, and only then is a replacement
+      // spawned — never the reverse, which would risk two live children for
+      // one project directory at once.
+      : killWithEscalation(priorChild).then(() => this.spawnWithRetries(project.id, directory, base, env));
+    const readyPromise = spawnAttempt
       .then((result) => {
         entry.child = result.child;
         entry.port = result.port;
@@ -448,14 +564,17 @@ export class PreviewPool {
         }
         throw err;
       });
-    entry = { readyPromise, inFlight: 0, lastUsedAt: this.now() };
+    entry = { readyPromise, inFlight: 0, lastUsedAt: this.now(), keyFingerprint };
     // Stored BEFORE awaiting: this is what makes two concurrent first
     // requests for the same project share this one spawn rather than both
-    // independently starting a second Vite server on the same directory.
+    // independently starting a second Vite server on the same directory —
+    // and, for the respawn path, what stops a second concurrent caller from
+    // ALSO deciding to respawn (see this method's own comment).
     this.entries.set(project.id, entry);
 
-    const ready = await readyPromise;
-    return { projectId: project.id, port: ready.port, base: ready.base, inFlight: entry.inFlight, lastUsedAt: entry.lastUsedAt };
+    return readyPromise.then((ready) => ({
+      projectId: project.id, port: ready.port, base: ready.base, inFlight: entry.inFlight, lastUsedAt: entry.lastUsedAt,
+    }));
   }
 
   /** Marks `projectId` as doing work, so `reapIdle` will not kill it mid-run. Nested: two `retain`s need two `release`s. */
@@ -481,13 +600,27 @@ export class PreviewPool {
    * actually starts a model call) calls this before ever reaching
    * `acquire`/proxy, so a keyless, disabled, unknown, or
    * undecryptable-key owner gets a mapped, actionable status immediately
-   * instead of a request that reaches a (possibly already-warm) child,
-   * spawns the orchestrator, and fails deep inside a subprocess as a bare
-   * 500. Unlike `buildChildEnv`, this does NOT catch `MissingApiKeyError`:
-   * previewing tolerates no key (buildChildEnv falls back to a scrubbed
-   * env), but a billable call genuinely needs one, so the caller must see
-   * this throw. The resolved plaintext itself is discarded — this method
-   * exists only for the side effect of throwing, never to hand back a key.
+   * instead of a request that reaches the orchestrator and fails deep
+   * inside a subprocess as a bare 500. Unlike `buildChildEnv`, this does NOT
+   * catch `MissingApiKeyError`: previewing tolerates no key (buildChildEnv
+   * falls back to a scrubbed env), but a billable call genuinely needs one,
+   * so the caller must see this throw. The resolved plaintext itself is
+   * discarded — this method exists only for the side effect of throwing,
+   * never to hand back a key.
+   *
+   * This method ONLY ever consults the database — it never touches a
+   * warm child, so on its own it says nothing about whether an
+   * ALREADY-RUNNING child for this owner's project holds the SAME key it
+   * just confirmed exists. (An earlier version of this comment claimed
+   * otherwise — that the mapped status here stood in for "a request that
+   * reaches a possibly already-warm child," which was false: a warm,
+   * keyless child could still receive a request unchanged and go on to
+   * spend the OPERATOR's key via the orchestrator's dotenv fallback, not
+   * fail loudly at all. FIX 2, a whole-branch review, closed that gap
+   * separately.) The warm case is covered by `acquire()`'s own fingerprint
+   * check, not by this method: `acquire()` kills and respawns a warm, idle
+   * entry whose child's key no longer matches what this method would
+   * currently resolve.
    */
   assertApiKeyUsable(ownerId: string): void {
     resolveApiKey(this.db, this.masterKey, ownerId);

@@ -70,11 +70,20 @@
  * `PreviewPool.assertApiKeyUsable` — called BEFORE the request ever reaches
  * `acquire`/proxy, so a keyless user gets an actionable 400 instead of the
  * orchestrator failing on a missing key deep inside a subprocess and
- * surfacing as an opaque 500. Deliberately NOT added to `forwardToPreview`
- * itself (shared with `preview-routes.ts`'s `/preview/:projectId/*`,
- * task 3's module comment): previewing and exporting spend nothing and must
- * keep working for a keyless user (`PreviewPool.buildChildEnv` already falls
- * back to a scrubbed, keyless child env for exactly that reason), so mapping
+ * surfacing as an opaque 500. `assertApiKeyUsable` only ever consults the
+ * DATABASE, though — on its own it says nothing about a warm child whose
+ * key no longer matches (a keyless spawn whose owner has since saved one, a
+ * rotated key, ...), which does NOT fail loudly: the orchestrator's own
+ * dotenv fallback (`override=False`) means an absent injected key silently
+ * spends the OPERATOR's instead. That gap is closed separately, in
+ * `PreviewPool.acquire()` itself (FIX 2, a whole-branch review): every
+ * reuse of a warm entry re-checks the child's key fingerprint against the
+ * owner's current one and, if idle, respawns before this request ever
+ * reaches it. Deliberately NOT added to `forwardToPreview` itself (shared
+ * with `preview-routes.ts`'s `/preview/:projectId/*`, task 3's module
+ * comment): previewing and exporting spend nothing and must keep working
+ * for a keyless user (`PreviewPool.buildChildEnv` already falls back to a
+ * scrubbed, keyless child env for exactly that reason), so mapping
  * `MissingApiKeyError` in the shared handler would refuse those endpoints
  * too. `UndecryptableApiKeyError` is logged (never the key itself — only the
  * typed error's own message, which names none): the ciphertext no longer

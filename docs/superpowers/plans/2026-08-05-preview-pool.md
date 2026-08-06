@@ -143,10 +143,13 @@ and in the `createServer` call add `base: options.base` alongside `root` and `co
 In `compiler/scripts/preview.ts`, add a `--base` flag and the ready line. Note the existing arg parsing filters out flag values positionally — read it carefully and extend it so `--base` does not break the `<projectDir>` detection. Then after listening:
 
 ```ts
-// Machine-readable, for the hosted server's preview pool: the parent needs
-// the OS-assigned port when it spawned us with `--port 0`. Prefixed like
-// REGEN_RESULT in regen-api.ts, the existing convention for a line a parent
-// process parses. The human line above stays for local use.
+// Machine-readable, for the hosted server's preview pool: a READINESS signal.
+// The parent probes a free port itself and passes it concretely (Vite does not
+// honour port 0 — see the CORRECTED banner above), and it deliberately
+// DISCARDS the port named here, because this line comes from a child running
+// unvalidated project code. Prefixed like REGEN_RESULT in regen-api.ts, the
+// existing convention for a line a parent process parses. The human line
+// above stays for local use.
 console.log(`PREVIEW_READY ${JSON.stringify({ port: actualPort, base })}`);
 ```
 
@@ -155,11 +158,13 @@ console.log(`PREVIEW_READY ${JSON.stringify({ port: actualPort, base })}`);
 Run: `npm test -w compiler -- preview`
 Expected: PASS. Then run the whole compiler suite (`npm test -w compiler`) — 170 tests must stay green, and the compiler e2e (`npm run test:e2e -w compiler`, 13 tests) must too, since it drives the preview server.
 
-**If port 0 does not work with `strictPort: true`**, stop and report exactly what happened rather than removing `strictPort` — that flag is what makes a port collision loud instead of silent, and the pool depends on it.
+**Never remove `strictPort: true`** to make a port problem go away — that flag is what turns a collision into a loud child exit the pool can retry, instead of a silent rebind onto a port the parent is not proxying to.
 
 - [ ] **Step 5: Verify the CLI end to end by hand**
 
-Run: `node compiler/scripts/preview.ts fixtures --port 0` (adjust the fixture path to the real one), confirm a `PREVIEW_READY {"port":<n>,...}` line appears with a plausible ephemeral port, `curl` that port's root to confirm HTML comes back, then kill it. Paste the observed line into your report.
+Run `node compiler/scripts/preview.ts fixtures/acme-landing --port <a free port>` (note the fixture project is `fixtures/acme-landing` — `fixtures/` itself has no `vite.config.ts`). Confirm a `PREVIEW_READY {"port":<n>,...}` line appears naming **the port you asked for**, `curl` it to confirm HTML comes back, then kill it. Paste the observed line into your report.
+
+**Do not pass `--port 0` expecting an ephemeral port** — Vite treats 0 as "no port configured" and serves on its own default instead, so two children asking for 0 collide. That is why the pool probes and passes a concrete port; see the CORRECTED banner above.
 
 - [ ] **Step 6: Commit**
 
@@ -663,7 +668,7 @@ afterEach(async () => {
 Then drive `proxyHttp` through a second real server that proxies to the first, and use `fetch` against the proxy. Assert, each as its own case:
 
 1. A GET's body, status and upstream headers reach the client (`X-Upstream: yes`, `hello from upstream`).
-2. The rewritten path arrives upstream — proxying `/preview/abc/src/main.tsx` with `path: "/src/main.tsx"` makes `seen[0].url` exactly `/src/main.tsx`.
+2. The `path` argument is what reaches the upstream, in preference to the inbound request's own URL — proxying a request for `/preview/abc/src/main.tsx` with `path: "/src/main.tsx"` makes `seen[0].url` exactly `/src/main.tsx`. **This proves `path` is honoured; it is NOT the convention the real caller uses.** Production passes `req.url` unmodified — see the CORRECTED banner in task 4, step 2.
 3. A POST's request body arrives intact upstream (send JSON, assert `seen[0].body`).
 4. An upstream 500 is passed through as 500, not converted to 502.
 5. When the upstream is not listening at all (use a port you bind and immediately close), the client gets **502**, and the response is JSON with an `error` — not a hung socket. This is the case a dead preview process produces.
@@ -765,17 +770,23 @@ One route: `GET /preview/:projectId/*`, wrapped in `requireProject` with `{ from
         // aborted request pins a preview forever and the cap leaks.
         pool.retain(ctx.project.id);
         try {
-          await proxyHttp({ req, res, port: preview.port, path: `/${ctx.params["*"] ?? ""}` });
+          // CORRECTED — see the banner below this code block. The original
+          // plan built the path from the wildcard tail; that is wrong.
+          await proxyHttp({ req, res, port: preview.port, path: req.url ?? "/" });
         } finally {
           pool.release(ctx.project.id);
         }
       }),
 ```
 
+**CORRECTED — the forwarded path is `req.url` VERBATIM, not the wildcard tail.** The plan originally said to strip the `/preview/<projectId>` prefix and forward only the tail. That is wrong, and only a real Vite child behind a real proxy could show it (task 4's manual step): the child is spawned with `--base /preview/<projectId>/`, so Vite expects every request to arrive **with** that prefix and uses it to route internally. Strip it and Vite answers a 302 back to the very prefix just removed — proxied through unexamined, that is an infinite loop, because the "corrected" URL is the one the client already sent. The query string must survive too: Vite's HMR handshake carries a token in it.
+
+`ctx.params["*"]` still exists, because the wildcard is what lets the route match every path under the project's prefix at all. It is simply not used to build the forwarded path. **Anyone extending this — 4c-2 mounting the twelve `/__*` endpoints included — forwards `req.url` unmodified.**
+
 Tests (drive the real route table through `createRequestListener`, with a fake pool):
 1. An unauthenticated request gets 401 and **never touches the pool** (assert `acquire` was not called — a pool that spawns before authentication is a denial-of-service surface).
 2. A logged-in user requesting **another user's** project gets 404, and the pool is never touched.
-3. The owner's request proxies, and the tail path arrives at the proxy verbatim.
+3. The owner's request proxies, and the **full inbound URL** — prefix and query string included — arrives at the proxy verbatim.
 4. `PreviewCapacityError` becomes 503 with the cap in the message.
 5. Any other spawn failure becomes 500 and the body contains no stack trace and no environment value.
 6. `release` is called even when the proxy throws. Assert with a proxy fake that rejects.

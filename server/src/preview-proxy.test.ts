@@ -6,12 +6,18 @@
  * two real TCP connections, and a mock would only ever prove that the mock
  * was configured correctly, not that the proxy behaves like a proxy.
  *
- * The proxy server in these tests plays the role task 4 will play for real:
- * it strips a `/preview/<id>` prefix before calling `proxyHttp`/
- * `proxyUpgrade`, so the tests can independently prove "the caller's
- * rewritten path is what reaches upstream" rather than "whatever the client
+ * The proxy server in these tests strips a `/preview/<id>` prefix before
+ * calling `proxyHttp`/`proxyUpgrade` -- the OPPOSITE of what the real caller
+ * does (`preview-routes.ts`, `preview-upgrade.ts` both forward `req.url`
+ * unmodified, prefix and all; see those files' module comments for why a
+ * stripped path loops the client against Vite's own base-redirect). The
+ * stripping here is deliberate harness behaviour, not a stand-in for
+ * production: it exists so these tests can independently prove "the caller's
+ * `path` argument is what reaches upstream" rather than "whatever the client
  * happened to request reaches upstream unchanged" (those would pass under a
  * broken implementation that just forwarded `req.url` and ignored `path`).
+ * This file is the last place in the tree that describes stripping as
+ * anything other than a test-only convenience.
  */
 import * as http from "node:http";
 import { createServer, type Server } from "node:http";
@@ -84,7 +90,7 @@ afterEach(async () => {
   await once(upstream, "close");
 });
 
-/** Mirrors what a caller does before invoking either proxy function: strip the `/preview/<id>` base off the incoming URL. */
+/** Test-harness-only path rewrite, the opposite of what the real caller does (see the module comment) -- exists so a test can tell "the caller's `path` argument reached upstream" apart from "req.url reached upstream unchanged". */
 function rewritePath(url: string): string {
   const stripped = url.replace(/^\/preview\/[^/]+/, "");
   return stripped === "" ? "/" : stripped;
@@ -160,6 +166,23 @@ describe("proxyHttp", () => {
     try {
       await fetch(`${origin}/`);
       expect(seen[0]?.headers.host).toBe(`localhost:${upstreamPort}`);
+    } finally {
+      await close();
+    }
+  });
+
+  it("does not forward the client's cookie or authorization header to the upstream child", async () => {
+    // The child never needs either: it serves one project's own dev-server
+    // assets, not anything session-aware. Forwarding the cookie hands the
+    // browser's session id to a subprocess running the project's own
+    // unvalidated vite.config.ts and plugin chain.
+    const { origin, close } = await startProxyServer(upstreamPort);
+    try {
+      await fetch(`${origin}/`, {
+        headers: { cookie: "sid=super-secret-session", authorization: "Bearer sk-ant-should-not-leak" },
+      });
+      expect(seen[0]?.headers.cookie).toBeUndefined();
+      expect(seen[0]?.headers.authorization).toBeUndefined();
     } finally {
       await close();
     }
@@ -369,6 +392,48 @@ describe("proxyUpgrade", () => {
     }
   });
 
+  it("does not forward the client's cookie or authorization header on a WebSocket upgrade", async () => {
+    // Vite's HMR upgrade carries the same session cookie an ordinary request
+    // does (see preview-upgrade.ts's module comment) — the child must not
+    // receive it any more than an ordinary proxied request should.
+    let seenHeaders: Record<string, unknown> = {};
+    upstream.on("upgrade", (req, socket) => {
+      seenHeaders = req.headers as Record<string, unknown>;
+      socket.write(
+        "HTTP/1.1 101 Switching Protocols\r\n"
+        + "Upgrade: websocket\r\n"
+        + "Connection: Upgrade\r\n"
+        + "\r\n",
+      );
+    });
+
+    const { port, close } = await startProxyServer(upstreamPort);
+    try {
+      const client = connect(port, "127.0.0.1");
+      await once(client, "connect");
+      client.write(
+        "GET /preview/abc/ws HTTP/1.1\r\n"
+        + "Host: localhost\r\n"
+        + "Connection: Upgrade\r\n"
+        + "Upgrade: websocket\r\n"
+        + "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+        + "Sec-WebSocket-Version: 13\r\n"
+        + "Cookie: sid=super-secret-session\r\n"
+        + "Authorization: Bearer sk-ant-should-not-leak\r\n"
+        + "\r\n",
+      );
+      try {
+        await readUntil(client, "101");
+        expect(seenHeaders.cookie).toBeUndefined();
+        expect(seenHeaders.authorization).toBeUndefined();
+      } finally {
+        client.destroy();
+      }
+    } finally {
+      await close();
+    }
+  });
+
   it("tears down the client-facing socket when the upstream side dies — a killed preview must not leak the client's half", async () => {
     // This is the direction the brief calls out by name: a killed preview
     // subprocess drops the upstream side of the socket abruptly. If
@@ -406,14 +471,16 @@ describe("proxyUpgrade", () => {
     }
   });
 
-  it("relays an ordinary HTTP response as a handshake refusal, instead of hanging, when the upstream declines the upgrade", async () => {
+  it("relays an ordinary HTTP response, body included, as a handshake refusal, instead of hanging, when the upstream declines the upgrade", async () => {
     // Mirrors exactly how `ws` (which Vite's dev server uses) rejects a bad
     // handshake: a plain HTTP response instead of 101, on the very socket
     // Node handed the server for what it still parsed as an upgrade
     // request (Connection/Upgrade headers were present — that's why this is
-    // the upstream's own 'upgrade' event, not 'request').
+    // the upstream's own 'upgrade' event, not 'request'). A body-bearing
+    // decline (not just Content-Length: 0) so the body-relay path — not
+    // only the status line/headers — is actually exercised.
     upstream.on("upgrade", (_req, socket) => {
-      socket.write("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+      socket.write("HTTP/1.1 400 Bad Request\r\nContent-Length: 13\r\nConnection: close\r\n\r\nBad handshake");
       socket.end();
     });
 
@@ -421,14 +488,63 @@ describe("proxyUpgrade", () => {
     try {
       const client = await openRawUpgradeSocket(port);
       try {
-        const response = await readUntil(client, "400");
+        const response = await readUntil(client, "Bad handshake");
         expect(response).toContain("400");
+        expect(response).toContain("Bad handshake");
         await once(client, "close"); // Would hang forever without the "response" handler.
       } finally {
         client.destroy();
       }
     } finally {
       await close();
+    }
+  });
+
+  it("destroys the SERVER-SIDE socket once the decline response body finishes, not just its write half", async () => {
+    // The case above proves the CLIENT eventually sees 'close' — but a plain
+    // `net.connect()` client defaults to `allowHalfOpen: false`, so it closes
+    // itself the instant it receives the FIN that `upstreamRes.pipe(socket)`
+    // sends on ending the write half alone, regardless of whether THIS
+    // module ever called `.destroy()`. That leaves the actual regression
+    // (the module comment's "settled === true, so socket's own close/end
+    // handlers early-return without destroying") unobservable from the
+    // client's side. `node:http` server sockets, by contrast, ARE
+    // `allowHalfOpen: true` (see this module's own repeated comments on
+    // exactly that) — the same kind of socket `proxyUpgrade` actually
+    // operates on in production — so a server-side socket that is only
+    // half-ended, never destroyed, would sit open indefinitely waiting for a
+    // FIN back that a slow or misbehaving real client might not send
+    // promptly. This test drives `proxyUpgrade` directly against a second
+    // real `node:http` server so it can hold a reference to that exact
+    // server-side socket and check its OWN `destroyed` flag, independent of
+    // whatever the client does.
+    upstream.on("upgrade", (_req, socket) => {
+      socket.write("HTTP/1.1 400 Bad Request\r\nContent-Length: 13\r\nConnection: close\r\n\r\nBad handshake");
+      socket.end();
+    });
+
+    const rawServer = createServer();
+    rawServer.listen(0, "127.0.0.1");
+    await once(rawServer, "listening");
+    const rawPort = (rawServer.address() as { port: number }).port;
+
+    let serverSideSocket: Duplex | undefined;
+    rawServer.on("upgrade", (req, socket, head) => {
+      serverSideSocket = socket;
+      proxyUpgrade({ req, socket, head, port: upstreamPort, path: "/ws" });
+    });
+
+    try {
+      const client = await openRawUpgradeSocket(rawPort);
+      try {
+        await readUntil(client, "Bad handshake");
+        await waitUntil(() => serverSideSocket?.destroyed === true);
+      } finally {
+        client.destroy();
+      }
+    } finally {
+      rawServer.close();
+      await once(rawServer, "close");
     }
   });
 

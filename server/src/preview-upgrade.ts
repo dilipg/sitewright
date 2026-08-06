@@ -39,6 +39,23 @@
  * included: Vite's HMR handshake carries its own token
  * (`?token=<...>`), and a version of this that reconstructed the path from
  * decoded segments would silently drop it.
+ *
+ * Deliberately ASYMMETRIC with `preview-routes.ts` in one respect: that
+ * handler brackets its `proxyHttp` call in `pool.retain()`/`pool.release()`
+ * so the reaper cannot kill the subprocess mid-request. This handler does
+ * neither, and that omission is intentional, not a mirror this file forgot —
+ * an HMR socket is meant to sit open and idle for long stretches between
+ * events by design (see `proxyUpgrade`'s own "no timeout on this path"
+ * comment); `retain()`-ing it for the socket's entire lifetime would mean one
+ * open browser tab pins its project's preview alive forever, defeating
+ * `idleMs` for every project with a tab left open. The consequence is worth
+ * stating plainly rather than leaving implicit: an open HMR socket does NOT
+ * count as "use" against the pool's idle clock, so once `idleMs` elapses the
+ * underlying child CAN be reaped out from under a still-open socket. When
+ * that happens, Vite's own HMR client notices the dropped connection and
+ * retries — but nothing on this path respawns the child for it; the project
+ * stays down until the next ordinary HTTP request (`preview-routes.ts`)
+ * calls `pool.acquire()` again.
  */
 import type { IncomingMessage } from "node:http";
 import type { DatabaseSync } from "node:sqlite";
@@ -61,6 +78,20 @@ export function createPreviewUpgradeListener(deps: { db: DatabaseSync; pool: Pre
     socket.on("error", () => { /* nothing to clean up beyond the destroy() calls below */ });
 
     void (async () => {
+      // The route table's own entry for this path (preview-routes.ts) is
+      // `method: "GET"`, but an upgrade never reaches that table (see above)
+      // — node:http fires 'upgrade' for ANY method carrying Connection:
+      // Upgrade + Upgrade headers, not only GET, so that constraint has to
+      // be re-derived here too, by hand, exactly like the ownership check
+      // above. Refusing anything else costs nothing (a WebSocket handshake
+      // per RFC 6455 is always a GET) and closes the one path where this
+      // listener's own work — a session lookup, a `pool.acquire()` that can
+      // spawn a real subprocess — would run for a request shape Vite's own
+      // handshake code would refuse anyway.
+      if (req.method !== "GET") {
+        socket.destroy();
+        return;
+      }
       let url: URL;
       try {
         url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);

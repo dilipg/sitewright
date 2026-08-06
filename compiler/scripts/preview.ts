@@ -70,12 +70,22 @@ async function main(): Promise<void> {
   const address = server.httpServer?.address();
   const actualPort = typeof address === "object" && address !== null ? address.port : port;
   console.log(`Preview with bridge shim: http://localhost:${actualPort}/`);
-  // Machine-readable, for the hosted server's preview pool: the parent needs
-  // the OS-assigned port when it spawned us with `--port 0`. Prefixed like
-  // REGEN_RESULT in regen-api.ts, the existing convention for a line a parent
-  // process parses. The human line above stays for local use. Reports the
-  // resolved base (always a string, defaulting to "/") rather than the raw
-  // CLI arg, mirroring actualPort's use of the resolved value over the request.
+  // Machine-readable, for the hosted server's preview pool. NOT how the pool
+  // learns the port: it probes a free port itself and passes it concretely
+  // via --port (Vite cannot honour `--port 0` -- it treats 0 as "unset" and
+  // falls back to its own fixed default, so two callers passing 0 would
+  // collide), and the pool deliberately DISCARDS whatever port this line
+  // claims (see server/src/preview-pool.ts's spawnAndAwaitReady, around the
+  // `succeed` closure) because this process's stdout is not a trust boundary
+  // -- it runs the project's own unvalidated vite.config.ts, which could print
+  // an early, well-formed line naming any port it likes. This line is read
+  // only as a READINESS HINT (the pool still independently verifies the port
+  // it chose actually accepts a connection before proxying to it), never as
+  // the source of truth for where traffic goes. Prefixed like REGEN_RESULT in
+  // regen-api.ts, the existing convention for a line a parent process parses.
+  // The human line above stays for local use. Reports the resolved base
+  // (always a string, defaulting to "/") rather than the raw CLI arg,
+  // mirroring actualPort's use of the resolved value over the request.
   console.log(`PREVIEW_READY ${JSON.stringify({ port: actualPort, base: server.config.base })}`);
 }
 

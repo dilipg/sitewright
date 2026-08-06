@@ -10,7 +10,7 @@ import { EventEmitter } from "node:events";
 import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DatabaseSync } from "node:sqlite";
 import { openDatabase } from "./db.ts";
 import { createUser } from "./users.ts";
@@ -18,7 +18,13 @@ import { createProject, type Project } from "./projects.ts";
 import { setApiKey } from "./api-keys.ts";
 import { DisabledUserError, UnknownUserError } from "./agent-env.ts";
 import { MASTER_KEY_ENV_VAR } from "./master-key.ts";
-import { MAX_PREVIEWS, PreviewCapacityError, PreviewPool } from "./preview-pool.ts";
+import {
+  KILL_GRACE_MS,
+  MAX_PREVIEWS,
+  PreviewCapacityError,
+  PreviewPool,
+  SHUTDOWN_SPAWN_WAIT_MS,
+} from "./preview-pool.ts";
 
 const MASTER_KEY = Buffer.alloc(32, 7);
 
@@ -33,6 +39,37 @@ function fakeChild() {
   child.killed = false;
   child.pid = 4242;
   child.kill = () => { child.killed = true; child.emit("exit", 0, null); return true; };
+  return child;
+}
+
+/**
+ * A child that ignores its first `kill()` (the default SIGTERM) — standing
+ * in for Vite's own `process.once("SIGTERM")` handler stalling on
+ * `server.close()` — but honours an explicit "SIGKILL", which a real OS
+ * process cannot ignore. `killCalls` records every signal argument the pool
+ * actually passed, in order, so a test can tell "sent SIGTERM, then escalated
+ * to SIGKILL" apart from "sent SIGTERM twice" or "went straight to SIGKILL".
+ */
+function stubbornChild() {
+  const child = new EventEmitter() as EventEmitter & {
+    stdout: EventEmitter; stderr: EventEmitter; kill: (signal?: string) => boolean;
+    killed: boolean; pid: number; killCalls: Array<string | undefined>;
+  };
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.killed = false;
+  child.pid = 4343;
+  child.killCalls = [];
+  child.kill = (signal?: string) => {
+    child.killCalls.push(signal);
+    if (signal === "SIGKILL") {
+      child.killed = true;
+      child.emit("exit", null, "SIGKILL");
+    }
+    // The first call (SIGTERM, i.e. no explicit signal) is deliberately a
+    // no-op: no "exit", no `killed` flip — exactly a stalled graceful close.
+    return true;
+  };
   return child;
 }
 
@@ -108,8 +145,8 @@ describe("spawning", () => {
   });
 
   it("is proxied on the port it was passed, not a different port the child announces", async () => {
-    // The child runs the project's own model-generated vite.config.ts —
-    // untrusted code that could print an early, well-formed PREVIEW_READY
+    // The child runs the project's own unvalidated vite.config.ts — nobody
+    // has reviewed it, and it could print an early, well-formed PREVIEW_READY
     // line naming any port it likes. Believing that value would hand
     // untrusted input a redirect primitive: the pool would proxy every
     // request for this project to whatever port the child claims. The fake
@@ -400,5 +437,152 @@ describe("lifecycle", () => {
     await pool.acquire(project, ownerId);
     db.prepare("UPDATE user SET disabled_at = ? WHERE id = ?").run(Date.now(), ownerId);
     await expect(pool.acquire(project, ownerId)).rejects.toThrow(DisabledUserError);
+  });
+});
+
+describe("output redaction", () => {
+  it("buffers stderr into lines before redacting, so a key split across two pipe chunks is not logged whole", async () => {
+    // Pipe chunk boundaries carry no semantic meaning -- a key can land split
+    // across two separate 'data' events on stderr exactly as easily as on
+    // stdout. Redacting each chunk independently (rather than buffering into
+    // complete lines first, the way stdout already does) would let either
+    // half evade KEY_PATTERN and log both halves in plaintext.
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const pool = makePool({
+        spawnFn: (command: string, args: string[], options: { env: NodeJS.ProcessEnv }) => {
+          spawned.push({ command, args, env: options.env });
+          const child = fakeChild();
+          children.push(child);
+          setImmediate(() => {
+            const baseIndex = args.indexOf("--base");
+            child.stdout.emit(
+              "data",
+              Buffer.from(`PREVIEW_READY ${JSON.stringify({ port: 40001, base: baseIndex >= 0 ? args[baseIndex + 1] : "/" })}\n`),
+            );
+            // The key arrives split across two chunks with no line break in
+            // between -- exactly the shape a real pipe can deliver.
+            child.stderr.emit("data", Buffer.from("leaked key: sk-ant-abc"));
+            child.stderr.emit("data", Buffer.from("def123\n"));
+          });
+          return child;
+        },
+      });
+      await pool.acquire(project, ownerId);
+      const logged = errorSpy.mock.calls.map((call) => String(call[0])).join("\n");
+      expect(logged).not.toContain("sk-ant-abcdef123");
+      expect(logged).toContain("sk-ant-[redacted]");
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+});
+
+describe("post-readiness child error handling", () => {
+  it("keeps an 'error' listener attached to a running child, so a later kill() failure does not throw unhandled", async () => {
+    // ChildProcess emits 'error' when a LATER kill() cannot deliver its
+    // signal (see preview-proxy.ts's module comment, which states "an
+    // 'error' event with no listener attached throws synchronously" as an
+    // absolute rule). spawnAndAwaitReady's OWN "error" listener is removed
+    // the moment readiness settles (success or failure either way) -- this
+    // pins that something else picks the slot up once the child is actually
+    // running, by proving `emit` itself does not throw for lack of a
+    // listener.
+    const pool = makePool();
+    await pool.acquire(project, ownerId);
+    expect(() => children[0]!.emit("error", new Error("kill ESRCH"))).not.toThrow();
+  });
+});
+
+describe("bounded shutdown / kill escalation", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("escalates a reaped child to SIGKILL when it ignores SIGTERM within the grace period", async () => {
+    vi.useFakeTimers();
+    const child = stubbornChild();
+    const pool = makePool({
+      idleMs: 1000,
+      spawnFn: (command: string, args: string[], options: { env: NodeJS.ProcessEnv }) => {
+        spawned.push({ command, args, env: options.env });
+        children.push(child);
+        const baseIndex = args.indexOf("--base");
+        const base = baseIndex >= 0 ? args[baseIndex + 1] : "/";
+        // A microtask, not setImmediate/setTimeout: this must fire
+        // regardless of the fake timers installed above, and before the
+        // listeners registered synchronously just below are attached would
+        // lose the event entirely.
+        void Promise.resolve().then(() => {
+          child.stdout.emit("data", Buffer.from(`PREVIEW_READY ${JSON.stringify({ port: 40001, base })}\n`));
+        });
+        return child;
+      },
+    });
+    await pool.acquire(project, ownerId);
+    clock += 1001;
+    expect(pool.reapIdle()).toEqual([project.id]);
+    // Only SIGTERM (no explicit signal) has been sent so far — the grace
+    // period has not elapsed yet.
+    expect(child.killCalls).toEqual([undefined]);
+
+    await vi.advanceTimersByTimeAsync(KILL_GRACE_MS + 100);
+    expect(child.killCalls).toEqual([undefined, "SIGKILL"]);
+  });
+
+  it("escalates to SIGKILL on shutdown() too, for an already-running child that ignores SIGTERM", async () => {
+    vi.useFakeTimers();
+    const child = stubbornChild();
+    const pool = makePool({
+      spawnFn: (command: string, args: string[], options: { env: NodeJS.ProcessEnv }) => {
+        spawned.push({ command, args, env: options.env });
+        children.push(child);
+        const baseIndex = args.indexOf("--base");
+        const base = baseIndex >= 0 ? args[baseIndex + 1] : "/";
+        void Promise.resolve().then(() => {
+          child.stdout.emit("data", Buffer.from(`PREVIEW_READY ${JSON.stringify({ port: 40001, base })}\n`));
+        });
+        return child;
+      },
+    });
+    await pool.acquire(project, ownerId);
+
+    const shutdownPromise = pool.shutdown();
+    // shutdown() must not resolve while the child is still ignoring SIGTERM.
+    await vi.advanceTimersByTimeAsync(KILL_GRACE_MS - 500);
+    expect(child.killCalls).toEqual([undefined]);
+
+    await vi.advanceTimersByTimeAsync(1000); // past the grace period
+    await shutdownPromise; // must now resolve, having escalated
+    expect(child.killCalls).toEqual([undefined, "SIGKILL"]);
+  });
+
+  it("shutdown() resolves promptly on a still-spawning entry, instead of hanging for up to 180s", async () => {
+    vi.useFakeTimers();
+    const pool = makePool({
+      spawnFn: (command: string, args: string[], options: { env: NodeJS.ProcessEnv }) => {
+        spawned.push({ command, args, env: options.env });
+        const child = fakeChild();
+        children.push(child);
+        // Deliberately never announces readiness — stands in for a cold
+        // spawn still in progress the moment shutdown() is called.
+        return child;
+      },
+    });
+    // Not awaited: this call never settles during the test (the child never
+    // announces readiness, and time is never advanced far enough to trip
+    // SPAWN_TIMEOUT_MS), so it must not block the assertions below.
+    void pool.acquire(project, ownerId).catch(() => { /* never actually reached */ });
+    await vi.advanceTimersByTimeAsync(0); // let acquire()'s spawn attempt register its entry
+
+    const shutdownPromise = pool.shutdown();
+    let shutdownResolved = false;
+    void shutdownPromise.then(() => { shutdownResolved = true; });
+
+    // Advance by exactly the bound: shutdown() must be done by now, well
+    // short of MAX_SPAWN_ATTEMPTS * SPAWN_TIMEOUT_MS (180s) — the unbounded
+    // wait this fix closes.
+    await vi.advanceTimersByTimeAsync(SHUTDOWN_SPAWN_WAIT_MS + 100);
+    expect(shutdownResolved).toBe(true);
   });
 });

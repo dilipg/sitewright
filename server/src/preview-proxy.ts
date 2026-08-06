@@ -41,6 +41,27 @@ import type { Duplex } from "node:stream";
 import { sendJson } from "./router.ts";
 
 /**
+ * The headers to send upstream: `req.headers` verbatim (see the module
+ * comment — hop-by-hop headers survive on purpose), except `host` (rewritten
+ * to the upstream's own loopback address, same reasoning as before), and
+ * `cookie`/`authorization`, dropped rather than forwarded. The child never
+ * needs either — it serves one project's own static/dev-server assets, not
+ * anything session-aware — and forwarding either hands the browser's session
+ * id (or a bearer credential) to a subprocess running the project's own
+ * unvalidated `vite.config.ts` and plugin chain. Applied identically for
+ * both protocols this module forwards (`proxyHttp`'s ordinary request/
+ * response and `proxyUpgrade`'s WebSocket handshake): Vite's HMR upgrade
+ * carries the same session cookie an ordinary request does.
+ */
+function upstreamHeaders(req: IncomingMessage, port: number): IncomingMessage["headers"] {
+  const headers = { ...req.headers };
+  delete headers.cookie;
+  delete headers.authorization;
+  headers.host = `localhost:${port}`;
+  return headers;
+}
+
+/**
  * The spec's own measurements: section regen ~90s, add-section ~84s, page
  * regen ~5 minutes, and an export's production build "several minutes". This
  * sits well above all of them, with margin, on purpose — a 504 does NOT stop
@@ -149,16 +170,17 @@ export function proxyHttp(args: {
         port,
         path,
         method: req.method,
-        // `host` rewritten to the upstream's own loopback address and port:
-        // leaving the proxy's own Host header on the forwarded request makes
-        // Vite's origin/host checks reject it outright. The rest of
-        // `req.headers` — INCLUDING hop-by-hop headers (Connection,
-        // Transfer-Encoding, Upgrade, …) that RFC 7230 says a proxy should
-        // strip — is forwarded verbatim, deliberately: this hop goes
+        // See `upstreamHeaders`: verbatim except `host` (rewritten — leaving
+        // the proxy's own Host header makes Vite's origin/host checks reject
+        // it outright) and `cookie`/`authorization` (dropped — the child
+        // never needs either, and forwarding hands it a session id or bearer
+        // credential it has no business seeing). Otherwise deliberately
+        // includes hop-by-hop headers (Connection, Transfer-Encoding,
+        // Upgrade, …) that RFC 7230 says a proxy should strip: this hop goes
         // straight to the one Vite dev server this proxy exists to reach
-        // over loopback, never through a further proxy hop where a
-        // hop-by-hop header surviving would actually matter.
-        headers: { ...req.headers, host: `localhost:${port}` },
+        // over loopback, never through a further proxy hop where that would
+        // actually matter.
+        headers: upstreamHeaders(req, port),
       });
     } catch (err) {
       safeSendJson(res, 502, { error: `could not construct upstream request: ${String(err)}` });
@@ -302,9 +324,10 @@ export function proxyUpgrade(args: {
       port,
       path,
       method: req.method,
-      // See the matching comment in `proxyHttp`: hop-by-hop headers are
-      // forwarded verbatim on purpose, same reasoning.
-      headers: { ...req.headers, host: `localhost:${port}` },
+      // See `upstreamHeaders` / the matching comment in `proxyHttp`: hop-by-
+      // hop headers are forwarded verbatim on purpose, same reasoning;
+      // `cookie`/`authorization` are dropped, same reasoning too.
+      headers: upstreamHeaders(req, port),
     });
   } catch {
     if (settled) return;
@@ -352,6 +375,22 @@ export function proxyUpgrade(args: {
     // the destination when the source ends, which is exactly "relay the
     // body, then end" for a plain Duplex target.
     upstreamRes.pipe(socket);
+    // `pipe`'s "end the destination" above only ends socket's WRITE half
+    // (a plain `.end()`, i.e. a FIN) — and by the time this fires, `settled`
+    // is already `true`, so `socket`'s own "close"/"end" handlers (this
+    // module doesn't register any on the pre-handshake path, but a caller
+    // might, and node:http's server sockets accept `allowHalfOpen: true`)
+    // have nothing here forcing the READ half closed too. That happens to be
+    // correct for `ws` (Vite's own WebSocket implementation), which sends
+    // `Connection: close` on a decline and destroys its end right after —
+    // the client's FIN back is enough to fully close things — but it is
+    // NOT correct for a decline from anything that doesn't self-destruct the
+    // same way, and this path has no timeout (see the function comment) to
+    // fall back on. Destroying outright once the body is fully relayed closes
+    // both halves unconditionally, regardless of what the upstream does next.
+    upstreamRes.on("end", () => {
+      try { socket.destroy(); } catch { /* already gone */ }
+    });
   });
 
   upstreamReq.on("upgrade", (upstreamRes, upstreamSocket, upstreamHead) => {

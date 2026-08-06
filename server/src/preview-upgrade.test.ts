@@ -95,7 +95,7 @@ describe("createPreviewUpgradeListener", () => {
     const pool = fakePool();
     const { listener, project } = harness(pool);
     const socket = fakeSocket();
-    const req = { url: `/preview/${project.id}/`, headers: { host: "localhost" } };
+    const req = { url: `/preview/${project.id}/`, method: "GET", headers: { host: "localhost" } };
     listener(req as never, socket as never, Buffer.alloc(0));
     await tick();
     expect(socket.destroy).toHaveBeenCalled();
@@ -109,6 +109,7 @@ describe("createPreviewUpgradeListener", () => {
     const socket = fakeSocket();
     const req = {
       url: `/preview/${project.id}/`,
+      method: "GET",
       headers: { host: "localhost", cookie: `${SESSION_COOKIE}=not-a-real-session-id` },
     };
     listener(req as never, socket as never, Buffer.alloc(0));
@@ -126,7 +127,7 @@ describe("createPreviewUpgradeListener", () => {
     const pool = fakePool();
     const { listener, project, bobCookie } = harness(pool);
     const socket = fakeSocket();
-    const req = { url: `/preview/${project.id}/`, headers: { host: "localhost", cookie: bobCookie } };
+    const req = { url: `/preview/${project.id}/`, method: "GET", headers: { host: "localhost", cookie: bobCookie } };
     listener(req as never, socket as never, Buffer.alloc(0));
     await tick();
     expect(socket.destroy).toHaveBeenCalled();
@@ -138,7 +139,7 @@ describe("createPreviewUpgradeListener", () => {
     const pool = fakePool();
     const { listener, aliceCookie } = harness(pool);
     const socket = fakeSocket();
-    const req = { url: "/preview/does-not-exist/", headers: { host: "localhost", cookie: aliceCookie } };
+    const req = { url: "/preview/does-not-exist/", method: "GET", headers: { host: "localhost", cookie: aliceCookie } };
     listener(req as never, socket as never, Buffer.alloc(0));
     await tick();
     expect(socket.destroy).toHaveBeenCalled();
@@ -153,7 +154,7 @@ describe("createPreviewUpgradeListener", () => {
     // ?token=<...>, and a version of this that reconstructed the path from
     // decoded segments would silently drop it.
     const url = `/preview/${project.id}/?token=abc123`;
-    const req = { url, headers: { host: "localhost", cookie: aliceCookie } };
+    const req = { url, method: "GET", headers: { host: "localhost", cookie: aliceCookie } };
     listener(req as never, socket as never, Buffer.alloc(0));
     await tick();
     expect(pool.acquire).toHaveBeenCalledWith(expect.objectContaining({ id: project.id }), expect.any(String));
@@ -161,11 +162,30 @@ describe("createPreviewUpgradeListener", () => {
     expect(socket.destroy).not.toHaveBeenCalled();
   });
 
+  it("destroys the socket and never touches the pool when the request method is not GET", async () => {
+    // node:http fires 'upgrade' for ANY method carrying Connection: Upgrade +
+    // Upgrade headers, not only GET -- the route table's own entry for this
+    // path is method: "GET", but an upgrade never reaches that table, so this
+    // has to be re-derived here too, by hand.
+    const pool = fakePool();
+    const { listener, project, aliceCookie } = harness(pool);
+    const socket = fakeSocket();
+    const req = {
+      url: `/preview/${project.id}/`,
+      method: "POST",
+      headers: { host: "localhost", cookie: aliceCookie },
+    };
+    listener(req as never, socket as never, Buffer.alloc(0));
+    await tick();
+    expect(socket.destroy).toHaveBeenCalled();
+    expect(pool.acquire).not.toHaveBeenCalled();
+  });
+
   it("destroys the socket when the path is not under /preview/", async () => {
     const pool = fakePool();
     const { listener, aliceCookie } = harness(pool);
     const socket = fakeSocket();
-    const req = { url: "/not-preview/abc/", headers: { host: "localhost", cookie: aliceCookie } };
+    const req = { url: "/not-preview/abc/", method: "GET", headers: { host: "localhost", cookie: aliceCookie } };
     listener(req as never, socket as never, Buffer.alloc(0));
     await tick();
     expect(socket.destroy).toHaveBeenCalled();
@@ -176,7 +196,7 @@ describe("createPreviewUpgradeListener", () => {
     const pool = fakePool();
     const { listener, aliceCookie } = harness(pool);
     const socket = fakeSocket();
-    const req = { url: "/preview/%ZZ/", headers: { host: "localhost", cookie: aliceCookie } };
+    const req = { url: "/preview/%ZZ/", method: "GET", headers: { host: "localhost", cookie: aliceCookie } };
     listener(req as never, socket as never, Buffer.alloc(0));
     await tick();
     expect(socket.destroy).toHaveBeenCalled();

@@ -35,9 +35,16 @@ import { createSession, SESSION_COOKIE } from "./sessions.ts";
 import { createProject, type Project } from "./projects.ts";
 import { recordUsageEvent, spendSince } from "./usage.ts";
 import { createRequestListener } from "./router.ts";
-import { MAX_PREVIEWS, PreviewCapacityError, type PreviewPool } from "./preview-pool.ts";
+import {
+  MAX_BILLABLE_IN_FLIGHT_PER_USER,
+  MAX_PREVIEWS,
+  PreviewCapacityError,
+  type PreviewPool,
+} from "./preview-pool.ts";
 import { PROJECT_SCOPED_ENDPOINTS } from "./project-registry.ts";
 import { compilerRoutes } from "./compiler-routes.ts";
+import { DisabledUserError, MissingApiKeyError, UnknownUserError } from "./agent-env.ts";
+import { UndecryptableApiKeyError } from "./api-keys.ts";
 import { USAGE_ID_HEADER, isValidUsageId, usageLogPathFor } from "../../compiler/src/usage-log-path.ts";
 
 const proxyMocks = vi.hoisted(() => ({
@@ -78,13 +85,41 @@ interface FakePool {
   acquire: ReturnType<typeof vi.fn>;
   retain: ReturnType<typeof vi.fn>;
   release: ReturnType<typeof vi.fn>;
+  assertApiKeyUsable: ReturnType<typeof vi.fn>;
+  // Explicitly typed (not the bare `ReturnType<typeof vi.fn>` the other
+  // fields use): those are only ever asserted ON, never called BY test code,
+  // so the untyped default (which TS widens to the constraint `Procedure |
+  // Constructable`, and a union of those two is not directly callable) never
+  // mattered until these two — the concurrency tests below call them
+  // directly to seed/drain reservations.
+  reserveBillableSlot: ReturnType<typeof vi.fn<(userId: string) => boolean>>;
+  releaseBillableSlot: ReturnType<typeof vi.fn<(userId: string) => void>>;
 }
 
 function fakePool(acquireImpl?: (project: Project, ownerId: string) => Promise<{ port: number; base: string }>): FakePool {
+  // A real (small, in-memory) per-user counter, not just a spy that always
+  // succeeds — the concurrency tests below need genuine reserve/refuse/
+  // release behaviour to prove compiler-routes.ts actually WIRES the
+  // wrapper around the forward call correctly. PreviewPool's OWN counting
+  // logic is separately, directly unit-tested in preview-pool.test.ts; this
+  // is deliberately an independent implementation of the same small rule; a
+  // shared bug in both would still be caught by preview-pool.test.ts.
+  const billableInFlight = new Map<string, number>();
   return {
     acquire: vi.fn(acquireImpl ?? (async () => ({ port: 6001, base: "/preview/x/" }))),
     retain: vi.fn(),
     release: vi.fn(),
+    assertApiKeyUsable: vi.fn(),
+    reserveBillableSlot: vi.fn<(userId: string) => boolean>((userId) => {
+      const current = billableInFlight.get(userId) ?? 0;
+      if (current >= MAX_BILLABLE_IN_FLIGHT_PER_USER) return false;
+      billableInFlight.set(userId, current + 1);
+      return true;
+    }),
+    releaseBillableSlot: vi.fn<(userId: string) => void>((userId) => {
+      const current = billableInFlight.get(userId) ?? 0;
+      billableInFlight.set(userId, Math.max(0, current - 1));
+    }),
   };
 }
 
@@ -394,5 +429,190 @@ describe("compilerRoutes: attributing billable spend", () => {
     const window = spendSince(db, alice.id, 0);
     expect(window.events).toBe(1);
     expect(window.costUsd).toBe(5);
+  });
+});
+
+/**
+ * Task 4, gap 1: mapping agent-env.ts's/api-keys.ts's typed key-resolution
+ * errors to a status, scoped to the four billable entries only. `fakePool`'s
+ * `assertApiKeyUsable` defaults to a no-op (every test above relies on
+ * that), so these tests override it per case to prove compiler-routes.ts's
+ * OWN mapping logic — the real `PreviewPool.assertApiKeyUsable` (does it
+ * throw the right typed error for the right stored state) is separately,
+ * directly unit-tested in preview-pool.test.ts.
+ */
+describe("compilerRoutes: API key error mapping", () => {
+  it.each(BILLABLE_ENTRIES)(
+    "maps MissingApiKeyError to 400 with the error's own message on $method $path, never touching the pool",
+    async (entry) => {
+      const pool = fakePool();
+      pool.assertApiKeyUsable.mockImplementation(() => { throw new MissingApiKeyError(); });
+      const { call, project, aliceCookie } = harness(pool);
+      const result = await call(entry.method, pathFor(entry, project.id), aliceCookie);
+      expect(result.status).toBe(400);
+      expect(JSON.parse(result.body)).toEqual({ error: new MissingApiKeyError().message });
+      expect(pool.acquire).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(BILLABLE_ENTRIES)(
+    "maps DisabledUserError to 403 on $method $path, never touching the pool",
+    async (entry) => {
+      const pool = fakePool();
+      pool.assertApiKeyUsable.mockImplementation(() => { throw new DisabledUserError(); });
+      const { call, project, aliceCookie } = harness(pool);
+      const result = await call(entry.method, pathFor(entry, project.id), aliceCookie);
+      expect(result.status).toBe(403);
+      expect(JSON.parse(result.body)).toEqual({ error: new DisabledUserError().message });
+      expect(pool.acquire).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(BILLABLE_ENTRIES)(
+    "maps UndecryptableApiKeyError to 500, logs it, and never touches the pool ($method $path)",
+    async (entry) => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      try {
+        const pool = fakePool();
+        pool.assertApiKeyUsable.mockImplementation(() => { throw new UndecryptableApiKeyError(); });
+        const { call, project, aliceCookie } = harness(pool);
+        const result = await call(entry.method, pathFor(entry, project.id), aliceCookie);
+        expect(result.status).toBe(500);
+        expect(JSON.parse(result.body)).toEqual({ error: new UndecryptableApiKeyError().message });
+        expect(pool.acquire).not.toHaveBeenCalled();
+        expect(errorSpy).toHaveBeenCalled();
+        const logged = errorSpy.mock.calls.map((c) => String(c[0])).join("\n");
+        expect(logged).toContain("undecryptable");
+      } finally {
+        errorSpy.mockRestore();
+      }
+    },
+  );
+
+  it.each(BILLABLE_ENTRIES)(
+    "maps UnknownUserError to 500 and never touches the pool ($method $path)",
+    async (entry) => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      try {
+        const pool = fakePool();
+        pool.assertApiKeyUsable.mockImplementation(() => { throw new UnknownUserError(); });
+        const { call, project, aliceCookie } = harness(pool);
+        const result = await call(entry.method, pathFor(entry, project.id), aliceCookie);
+        expect(result.status).toBe(500);
+        expect(JSON.parse(result.body)).toEqual({ error: new UnknownUserError().message });
+        expect(pool.acquire).not.toHaveBeenCalled();
+        expect(errorSpy).toHaveBeenCalled();
+      } finally {
+        errorSpy.mockRestore();
+      }
+    },
+  );
+
+  it.each(COMPILER_ENTRIES.filter((e) => !e.billable))(
+    "never checks the API key on a non-billable entry — a keyless user still reaches the proxy ($method $path)",
+    async (entry) => {
+      // Only billable endpoints need a key (spec, task 4): a preview or an
+      // export must keep working for a user with no stored key at all. This
+      // proves it structurally — assertApiKeyUsable would refuse EVERY
+      // request if it were called, so a 200 here is only possible because
+      // the wrapper is never applied to this entry.
+      const pool = fakePool();
+      pool.assertApiKeyUsable.mockImplementation(() => { throw new MissingApiKeyError(); });
+      const { call, project, aliceCookie } = harness(pool);
+      const result = await call(entry.method, pathFor(entry, project.id), aliceCookie);
+      expect(result.status).toBe(200);
+      expect(pool.assertApiKeyUsable).not.toHaveBeenCalled();
+    },
+  );
+});
+
+/**
+ * Task 4, gap 2: bounding the concurrent-start multiplier. `fakePool`'s
+ * `reserveBillableSlot`/`releaseBillableSlot` are a real (if independent)
+ * per-user counter — see the module comment on `fakePool` above — so these
+ * tests exercise genuine concurrency through the composed route table,
+ * matching the brief's own framing: the second concurrent request is
+ * allowed, the third refused, and the count drops when a request completes,
+ * including when it fails.
+ */
+describe("compilerRoutes: concurrent-start bound", () => {
+  it(`refuses a billable request with 429 once ${MAX_BILLABLE_IN_FLIGHT_PER_USER} are already reserved for that user, never touching the pool`, async () => {
+    const pool = fakePool();
+    const { call, project, alice, aliceCookie } = harness(pool);
+    for (let i = 0; i < MAX_BILLABLE_IN_FLIGHT_PER_USER; i += 1) pool.reserveBillableSlot(alice.id);
+    const entry = BILLABLE_ENTRIES[0]!;
+    const result = await call(entry.method, pathFor(entry, project.id), aliceCookie);
+    expect(result.status).toBe(429);
+    expect(result.body).toContain(String(MAX_BILLABLE_IN_FLIGHT_PER_USER));
+    expect(pool.acquire).not.toHaveBeenCalled();
+  });
+
+  it("never reserves a billable slot for a non-billable entry", async () => {
+    const pool = fakePool();
+    const { call, project, aliceCookie } = harness(pool);
+    const entry = COMPILER_ENTRIES.find((e) => !e.billable)!;
+    await call(entry.method, pathFor(entry, project.id), aliceCookie);
+    expect(pool.reserveBillableSlot).not.toHaveBeenCalled();
+  });
+
+  it("releases the reservation once a billable request completes, even when the forward call fails", async () => {
+    proxyMocks.impl = async () => { throw new Error("boom"); };
+    const pool = fakePool();
+    const { call, project, alice, aliceCookie } = harness(pool);
+    const entry = BILLABLE_ENTRIES[0]!;
+    const result = await call(entry.method, pathFor(entry, project.id), aliceCookie);
+    expect(result.status).toBe(500); // the router's own catch-all
+    // If the reservation had leaked, one of these would already be false.
+    for (let i = 0; i < MAX_BILLABLE_IN_FLIGHT_PER_USER; i += 1) {
+      expect(pool.reserveBillableSlot(alice.id)).toBe(true);
+    }
+  });
+
+  it("allows a second concurrent billable request but refuses a third, then frees a slot once one of the two finishes — even by failing", async () => {
+    const pool = fakePool();
+    const { call, project, aliceCookie } = harness(pool);
+    const entry = BILLABLE_ENTRIES[0]!;
+    const path = pathFor(entry, project.id);
+
+    // proxyHttp is mocked at module scope; this impl hands back a controller
+    // per call so the test can decide exactly when — and how — each of two
+    // genuinely concurrent requests finishes.
+    const pending: Array<{ resolve: () => void; reject: (err: Error) => void }> = [];
+    proxyMocks.impl = (args) =>
+      new Promise<void>((resolve, reject) => {
+        pending.push({
+          resolve: () => { args.res.writeHead(200); args.res.end("proxied"); resolve(); },
+          reject,
+        });
+      });
+
+    const first = call(entry.method, path, aliceCookie);
+    const second = call(entry.method, path, aliceCookie);
+    // Let both requests actually reach proxyHttp (and so hold their
+    // reservation) before the third is sent — everything on the path there
+    // is promise-chained with no real I/O, so a single macrotask tick
+    // flushes it.
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(pending).toHaveLength(2);
+
+    const third = await call(entry.method, path, aliceCookie);
+    expect(third.status).toBe(429);
+    expect(pending).toHaveLength(2); // the third never reached the proxy at all
+
+    // The SECOND in-flight request fails outright — proving a reservation is
+    // freed on failure, not only on success.
+    pending[1]!.reject(new Error("simulated mid-run failure"));
+    expect((await second).status).toBe(500);
+
+    // A slot just freed by that failure — a fresh concurrent request is
+    // allowed again, alongside the still-unfinished first one.
+    const fourth = call(entry.method, path, aliceCookie);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(pending).toHaveLength(3);
+
+    pending[0]!.resolve();
+    pending[2]!.resolve();
+    expect((await first).status).toBe(200);
+    expect((await fourth).status).toBe(200);
   });
 });

@@ -42,6 +42,7 @@ import {
   buildAgentEnv,
   DisabledUserError,
   MissingApiKeyError,
+  resolveApiKey,
   scrubbedEnv,
   UnknownUserError,
 } from "./agent-env.ts";
@@ -51,6 +52,19 @@ import { redactSecrets } from "./redact.ts";
 import { findUserById } from "./users.ts";
 
 export const MAX_PREVIEWS = 6;
+
+/**
+ * Bounds the CONCURRENT-START multiplier on the spend cap, task 4's second
+ * gap. `checkSpendCap` (require-budget.ts) only ever evaluates spend already
+ * recorded in `usage_event`, and a billable request's own spend lands there
+ * at ingest — after the run finishes, not before. So N billable requests
+ * in flight at once for one user all evaluate the SAME pre-run total: the
+ * spec accepts one run overshooting the cap, but nothing before this bounded
+ * N. Small and per-user on purpose: it caps how many runs one user can have
+ * simultaneously under-evaluation, not overall throughput, and one user
+ * hammering this must never throttle a different one.
+ */
+export const MAX_BILLABLE_IN_FLIGHT_PER_USER = 2;
 
 /** A truly idle preview (no requests, no in-flight work) this long gets reaped. */
 const DEFAULT_IDLE_MS = 15 * 60 * 1000;
@@ -364,6 +378,8 @@ export class PreviewPool {
   private readonly baseEnv: NodeJS.ProcessEnv;
   private readonly verifyPort: (port: number) => Promise<void>;
   private readonly entries = new Map<string, Entry>();
+  /** Per-user count of billable requests currently in flight — see `reserveBillableSlot`. */
+  private readonly billableInFlight = new Map<string, number>();
 
   constructor(deps: PreviewPoolDeps) {
     this.db = deps.db;
@@ -456,6 +472,58 @@ export class PreviewPool {
     entry.inFlight = Math.max(0, entry.inFlight - 1);
     if (entry.inFlight === 0) {
       entry.lastUsedAt = this.now();
+    }
+  }
+
+  /**
+   * Confirms `ownerId` currently has a resolvable API key, WITHOUT spawning
+   * or touching any child — a billable compiler endpoint (the only kind that
+   * actually starts a model call) calls this before ever reaching
+   * `acquire`/proxy, so a keyless, disabled, unknown, or
+   * undecryptable-key owner gets a mapped, actionable status immediately
+   * instead of a request that reaches a (possibly already-warm) child,
+   * spawns the orchestrator, and fails deep inside a subprocess as a bare
+   * 500. Unlike `buildChildEnv`, this does NOT catch `MissingApiKeyError`:
+   * previewing tolerates no key (buildChildEnv falls back to a scrubbed
+   * env), but a billable call genuinely needs one, so the caller must see
+   * this throw. The resolved plaintext itself is discarded — this method
+   * exists only for the side effect of throwing, never to hand back a key.
+   */
+  assertApiKeyUsable(ownerId: string): void {
+    resolveApiKey(this.db, this.masterKey, ownerId);
+  }
+
+  /**
+   * Reserves one of `userId`'s `MAX_BILLABLE_IN_FLIGHT_PER_USER` billable
+   * slots, returning false (reserving nothing) once they are all held. See
+   * that constant's comment for why this exists. Independent of
+   * `retain`/`release`, which count work in flight against a PROJECT (for
+   * the reaper); this counts billable requests in flight for a USER (for the
+   * spend cap's concurrent-start multiplier) — one user can hold slots
+   * against several different projects at once, and this map does not care
+   * which.
+   */
+  reserveBillableSlot(userId: string): boolean {
+    const current = this.billableInFlight.get(userId) ?? 0;
+    if (current >= MAX_BILLABLE_IN_FLIGHT_PER_USER) return false;
+    this.billableInFlight.set(userId, current + 1);
+    return true;
+  }
+
+  /**
+   * The counterpart to `reserveBillableSlot`. Must run even when the
+   * reserved request FAILS — a caller that only releases on success leaks
+   * one slot per failure and permanently shrinks that user's allowance.
+   * Safe to call with nothing reserved (a no-op), so a caller never needs to
+   * track whether its own `reserveBillableSlot` call actually succeeded
+   * before deciding whether to release.
+   */
+  releaseBillableSlot(userId: string): void {
+    const current = this.billableInFlight.get(userId) ?? 0;
+    if (current <= 1) {
+      this.billableInFlight.delete(userId);
+    } else {
+      this.billableInFlight.set(userId, current - 1);
     }
   }
 

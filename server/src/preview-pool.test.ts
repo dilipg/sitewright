@@ -15,11 +15,12 @@ import type { DatabaseSync } from "node:sqlite";
 import { openDatabase } from "./db.ts";
 import { createUser } from "./users.ts";
 import { createProject, type Project } from "./projects.ts";
-import { setApiKey } from "./api-keys.ts";
-import { DisabledUserError, UnknownUserError } from "./agent-env.ts";
+import { setApiKey, UndecryptableApiKeyError } from "./api-keys.ts";
+import { DisabledUserError, MissingApiKeyError, UnknownUserError } from "./agent-env.ts";
 import { MASTER_KEY_ENV_VAR } from "./master-key.ts";
 import {
   KILL_GRACE_MS,
+  MAX_BILLABLE_IN_FLIGHT_PER_USER,
   MAX_PREVIEWS,
   PreviewCapacityError,
   PreviewPool,
@@ -437,6 +438,87 @@ describe("lifecycle", () => {
     await pool.acquire(project, ownerId);
     db.prepare("UPDATE user SET disabled_at = ? WHERE id = ?").run(Date.now(), ownerId);
     await expect(pool.acquire(project, ownerId)).rejects.toThrow(DisabledUserError);
+  });
+});
+
+describe("assertApiKeyUsable", () => {
+  // Task 4, gap 1: a billable compiler endpoint calls this BEFORE ever
+  // reaching acquire/proxy, so a keyless/disabled/unknown/undecryptable-key
+  // owner gets mapped at the boundary instead of failing deep inside the
+  // orchestrator subprocess. Unlike buildChildEnv (exercised above, via
+  // acquire), this must NOT swallow MissingApiKeyError -- a billable call
+  // genuinely needs a key, unlike a plain preview.
+  it("passes silently when the owner has a stored key", () => {
+    setApiKey(db, MASTER_KEY, ownerId, "sk-ant-user-key-1234");
+    const pool = makePool();
+    expect(() => pool.assertApiKeyUsable(ownerId)).not.toThrow();
+  });
+
+  it("throws MissingApiKeyError when the owner has no stored key — unlike acquire, this does NOT fall back", () => {
+    const pool = makePool();
+    expect(() => pool.assertApiKeyUsable(ownerId)).toThrow(MissingApiKeyError);
+  });
+
+  it("throws DisabledUserError for a disabled owner, even one with a stored key", () => {
+    setApiKey(db, MASTER_KEY, ownerId, "sk-ant-user-key-1234");
+    db.prepare("UPDATE user SET disabled_at = ? WHERE id = ?").run(Date.now(), ownerId);
+    const pool = makePool();
+    expect(() => pool.assertApiKeyUsable(ownerId)).toThrow(DisabledUserError);
+  });
+
+  it("throws UnknownUserError for an owner id with no row", () => {
+    const pool = makePool();
+    expect(() => pool.assertApiKeyUsable("no-such-user-id")).toThrow(UnknownUserError);
+  });
+
+  it("throws UndecryptableApiKeyError when the stored ciphertext no longer opens under the pool's master key", () => {
+    setApiKey(db, MASTER_KEY, ownerId, "sk-ant-user-key-1234");
+    // A different 32-byte key, standing in for a rotated WEBGEN_MASTER_KEY --
+    // the ciphertext was sealed under MASTER_KEY and this pool cannot open it.
+    const pool = makePool({ masterKey: Buffer.alloc(32, 9) });
+    expect(() => pool.assertApiKeyUsable(ownerId)).toThrow(UndecryptableApiKeyError);
+  });
+
+  it("never spawns a child or touches pool state", async () => {
+    const pool = makePool();
+    expect(() => pool.assertApiKeyUsable(ownerId)).toThrow(MissingApiKeyError);
+    expect(spawned).toHaveLength(0);
+    expect(pool.list()).toHaveLength(0);
+  });
+});
+
+describe("billable in-flight reservation", () => {
+  // Task 4, gap 2: spend lands in usage_event only at ingest, so N concurrent
+  // billable requests for one user would all evaluate the spend cap against
+  // the same pre-run total. This bounds N directly, independent of the cap.
+  it(`allows up to MAX_BILLABLE_IN_FLIGHT_PER_USER (${MAX_BILLABLE_IN_FLIGHT_PER_USER}) concurrent reservations, refusing the next`, () => {
+    const pool = makePool();
+    for (let i = 0; i < MAX_BILLABLE_IN_FLIGHT_PER_USER; i += 1) {
+      expect(pool.reserveBillableSlot(ownerId)).toBe(true);
+    }
+    expect(pool.reserveBillableSlot(ownerId)).toBe(false);
+  });
+
+  it("frees a slot on release, allowing a new reservation afterward", () => {
+    const pool = makePool();
+    for (let i = 0; i < MAX_BILLABLE_IN_FLIGHT_PER_USER; i += 1) pool.reserveBillableSlot(ownerId);
+    expect(pool.reserveBillableSlot(ownerId)).toBe(false);
+    pool.releaseBillableSlot(ownerId);
+    expect(pool.reserveBillableSlot(ownerId)).toBe(true);
+  });
+
+  it("tracks each user independently — one user's exhaustion never throttles another", () => {
+    const pool = makePool();
+    const otherOwnerId = createUser(db, "other@example.com", "hash").id;
+    for (let i = 0; i < MAX_BILLABLE_IN_FLIGHT_PER_USER; i += 1) pool.reserveBillableSlot(ownerId);
+    expect(pool.reserveBillableSlot(ownerId)).toBe(false);
+    expect(pool.reserveBillableSlot(otherOwnerId)).toBe(true);
+  });
+
+  it("releasing with nothing reserved is a safe no-op", () => {
+    const pool = makePool();
+    expect(() => pool.releaseBillableSlot(ownerId)).not.toThrow();
+    expect(pool.reserveBillableSlot(ownerId)).toBe(true);
   });
 });
 

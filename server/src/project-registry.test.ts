@@ -17,6 +17,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { openDatabase } from "./db.ts";
 import { buildRoutes } from "./compose.ts";
 import { PreviewPool } from "./preview-pool.ts";
+import { setApiKey } from "./api-keys.ts";
 import { createProject } from "./projects.ts";
 import { createRequestListener } from "./router.ts";
 import { createSession, SESSION_COOKIE } from "./sessions.ts";
@@ -52,7 +53,7 @@ function freshHarness() {
   const masterKey = randomBytes(32);
   const pool = new PreviewPool({ db, masterKey, projectsRoot: dir });
   const routes = buildRoutes({ db, masterKey, secureCookies: true, pool });
-  return { db, pool, routes, listener: createRequestListener(routes) };
+  return { db, masterKey, pool, routes, listener: createRequestListener(routes) };
 }
 afterAll(() => {
   for (const db of registryDbs) db.close();
@@ -223,9 +224,14 @@ describe("billable endpoints", () => {
       // SESSION_ONLY_ENDPOINTS union `all` actually has — recovered here so
       // the "in" check below narrows correctly.
       const entry = rawEntry as unknown as ProjectScopedEntry | SessionOnlyEntry;
-      const { db, pool, listener } = freshHarness();
+      const { db, masterKey, pool, listener } = freshHarness();
       const owner = createUser(db, `${randomBytes(4).toString("hex")}@example.com`, "h");
       const cookie = `${SESSION_COOKIE}=${createSession(db, owner.id).id}`;
+      // A stored key, so task 4's requireApiKey (which now runs BEFORE
+      // requireBudget on every billable entry — see compiler-routes.ts) does
+      // not intercept this request with 400 first: this test is specifically
+      // about the CAP, and a keyless owner would never reach it.
+      setApiKey(db, masterKey, owner.id, "sk-ant-test-key-for-cap-test");
       // Default cap is $10; one event alone puts this user over it, the same
       // way require-budget.test.ts proves the wrapper in isolation.
       recordUsageEvent(db, {

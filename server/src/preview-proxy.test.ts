@@ -310,38 +310,59 @@ describe("proxyHttp", () => {
     }
   });
 
-  it("destroys the upstream connection when the client disconnects before the upstream ever answers", async () => {
-    // A "holding" upstream that deliberately never responds — standing in
-    // for a preview child still doing real work (a page regen, a build)
-    // when the client gives up: a closed tab, a navigation away, a retry.
-    // Without a top-level 'close' listener on `res`, nothing here would
-    // notice and the upstream connection would sit open for up to the full
-    // 15-minute `PREVIEW_PROXY_TIMEOUT_MS`.
+  it("residual 1: does NOT destroy the upstream connection when the client disconnects — the exchange completes normally once the upstream answers", async () => {
+    // A "holding" upstream that stands in for a preview child still doing
+    // real work (a page regen, a build) when the client gives up: a closed
+    // tab, a navigation away, a retry. The compiler child has no abort
+    // listener of its own — `uv run python` keeps running regardless — so
+    // this proxy must not destroy the connection to it either; it must let
+    // the "work" (released via `finishUpstreamWork` below) finish and relay
+    // whatever comes back, discarding it since nobody is listening any more.
     let upstreamRequestReceived = false;
-    let upstreamRequestEnded = false;
-    const holdingUpstream = createServer((req) => {
+    let upstreamRequestAbortedOrClosed = false;
+    let finishUpstreamWork!: () => void;
+    const workDone = new Promise<void>((resolve) => { finishUpstreamWork = resolve; });
+    const holdingUpstream = createServer((req, res) => {
       upstreamRequestReceived = true;
-      req.on("close", () => { upstreamRequestEnded = true; });
-      req.on("aborted", () => { upstreamRequestEnded = true; });
-      // Deliberately no res.writeHead()/res.end() — the client's own abort
-      // has to be what tears this connection down.
+      // If the old (buggy) behaviour returns — destroying this connection
+      // the moment the client aborts — one of these fires before
+      // `finishUpstreamWork` is ever called, which is exactly what the
+      // assertions below check for.
+      req.on("close", () => { upstreamRequestAbortedOrClosed = true; });
+      req.on("aborted", () => { upstreamRequestAbortedOrClosed = true; });
+      void workDone.then(() => {
+        try {
+          res.writeHead(200, { "Content-Type": "text/plain" });
+          res.end("finished despite the client leaving");
+        } catch {
+          // Only reachable if the connection WAS torn down underneath this
+          // — i.e. the regression this test exists to catch.
+        }
+      });
     });
     holdingUpstream.listen(0);
     await once(holdingUpstream, "listening");
     const holdingPort = (holdingUpstream.address() as { port: number }).port;
 
-    const { origin, close } = await startProxyServer(holdingPort);
+    const { origin, close, results } = await startProxyServer(holdingPort);
     try {
       const controller = new AbortController();
       const fetchPromise = fetch(`${origin}/`, { signal: controller.signal });
-      // Asserting `upstreamRequestEnded` below is only meaningful once the
-      // request has actually reached the upstream — wait for that rather
-      // than a fixed sleep.
       await waitUntil(() => upstreamRequestReceived);
       controller.abort();
-
       await expect(fetchPromise).rejects.toBeTruthy();
-      await waitUntil(() => upstreamRequestEnded);
+
+      // A macrotask boundary flushes every microtask the abort itself
+      // triggered (settling, if the old behaviour destroyed the upstream) —
+      // deterministic, not a race: nothing here depends on real elapsed
+      // time, only on every already-queued microtask having run.
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(upstreamRequestAbortedOrClosed).toBe(false);
+      expect(results).toHaveLength(0); // proxyHttp must not have settled yet
+
+      finishUpstreamWork();
+      await waitUntil(() => results.length > 0);
+      expect(results).toEqual([{ completed: true }]);
     } finally {
       await close();
       holdingUpstream.closeAllConnections();
@@ -415,12 +436,22 @@ describe("proxyHttp: reporting whether the exchange actually completed", () => {
     }
   });
 
-  it("reports completed: false when the client disconnects before the upstream ever answers", async () => {
+  it("residual 1: reports completed: true once the upstream eventually answers, even though the client already disconnected", async () => {
+    // Distinct from the "does NOT destroy" test above — this pins the
+    // SIGNAL specifically, and drains a response bigger than a trivial
+    // handful of bytes so the drain-only branch (client already gone, no
+    // `res` left to write to) genuinely exercises `resume()`-driven
+    // backpressure rather than trivially succeeding either way.
     let upstreamRequestReceived = false;
-    const holdingUpstream = createServer((req) => {
+    let finishUpstreamWork!: () => void;
+    const workDone = new Promise<void>((resolve) => { finishUpstreamWork = resolve; });
+    const bigBody = "x".repeat(200_000);
+    const holdingUpstream = createServer((req, res) => {
       upstreamRequestReceived = true;
-      req.on("close", () => {});
-      // No response written — the client's own abort must tear this down.
+      void workDone.then(() => {
+        res.writeHead(200, { "Content-Type": "text/plain" });
+        res.end(bigBody);
+      });
     });
     holdingUpstream.listen(0);
     await once(holdingUpstream, "listening");
@@ -433,9 +464,55 @@ describe("proxyHttp: reporting whether the exchange actually completed", () => {
       await waitUntil(() => upstreamRequestReceived);
       controller.abort();
       await expect(fetchPromise).rejects.toBeTruthy();
+
+      finishUpstreamWork();
       await waitUntil(() => results.length > 0);
+      expect(results).toEqual([{ completed: true }]);
+    } finally {
+      await close();
+      holdingUpstream.closeAllConnections();
+      holdingUpstream.close();
+      await once(holdingUpstream, "close");
+    }
+  });
+
+  it("residual 1: a genuine upstream timeout still destroys the connection, answers 504, and reports completed: false", async () => {
+    // The one path residual 1 deliberately leaves alone: 15 minutes in, the
+    // child really is stuck and there is nothing left to wait for. Spying on
+    // (and fully replacing) `setTimeout` lets this test fire that exact
+    // callback without a real 15-minute wait — the same prototype-patching
+    // idiom the "PREVIEW_PROXY_TIMEOUT_MS is ... wired" test above uses, but
+    // this time invoking the captured callback to observe what it does,
+    // rather than only asserting it was registered.
+    let capturedCallback: (() => void) | undefined;
+    const spy = vi.spyOn(http.ClientRequest.prototype, "setTimeout")
+      .mockImplementation(function (this: http.ClientRequest, _ms: number, cb?: () => void) {
+        capturedCallback = cb;
+        return this;
+      });
+
+    let upstreamSocketDestroyed = false;
+    const holdingUpstream = createServer((req) => {
+      req.socket.on("close", () => { upstreamSocketDestroyed = true; });
+      // Deliberately never answers — standing in for a child stuck past the
+      // full timeout window.
+    });
+    holdingUpstream.listen(0);
+    await once(holdingUpstream, "listening");
+    const holdingPort = (holdingUpstream.address() as { port: number }).port;
+
+    const { origin, close, results } = await startProxyServer(holdingPort);
+    try {
+      const responsePromise = fetch(`${origin}/`);
+      await waitUntil(() => capturedCallback !== undefined);
+      capturedCallback!();
+
+      const response = await responsePromise;
+      expect(response.status).toBe(504);
+      await waitUntil(() => upstreamSocketDestroyed);
       expect(results).toEqual([{ completed: false }]);
     } finally {
+      spy.mockRestore();
       await close();
       holdingUpstream.closeAllConnections();
       holdingUpstream.close();

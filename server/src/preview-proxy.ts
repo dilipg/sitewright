@@ -116,31 +116,55 @@ function safeEnd(res: ServerResponse): void {
  * and NEVER rejects: every exit path is funnelled through `settle()` below.
  *
  * Resolves with `{ completed }`, not bare `void` — added for FIX 3 (a
- * whole-branch review): a client abort (the top-level `res.on("close", ...)`
- * below), `PREVIEW_PROXY_TIMEOUT_MS`, and an unreachable upstream all resolve
- * this promise WITHOUT ever genuinely relaying an upstream response, while
- * the orchestrator subprocess behind `port` may still be running and still
- * appending to its usage log. A caller that treats "this promise settled" as
- * "the run is over" (`preview-forward.ts` used to) ingests that log while it
- * is still partial, then deletes it — every line the subprocess writes
- * afterward lands in a file nobody will ever read again.
+ * whole-branch review) and reworked for residual 1 (a later one). FIX 3's
+ * problem: `PREVIEW_PROXY_TIMEOUT_MS` and an unreachable upstream can both
+ * resolve this promise WITHOUT ever genuinely relaying an upstream response,
+ * while the orchestrator subprocess behind `port` may still be running and
+ * still appending to its usage log. A caller that treats "this promise
+ * settled" as "the run is over" (`preview-forward.ts` used to) ingests that
+ * log while it is still partial, then deletes it — every line the
+ * subprocess writes afterward lands in a file nobody will ever read again.
  *
- * `completed` is `true` in EXACTLY one place below: once the upstream's own
- * response has fully finished being written to the client (`res`'s `finish`
- * event, inside the `upstreamReq.on("response", ...)` handler). It stays
- * `false` for every other settle path — an abort before the upstream ever
- * answered, a timeout, a dead upstream (502), or a `writeHead` throw — even
- * though several of those ALSO end up writing a complete, well-formed error
- * response of their own (a small 502/504 JSON body, written and finished
- * synchronously via `safeSendJson`). That is deliberate, not an oversight: a
- * plain `res.writableFinished` check right after one of those synchronous
- * writes reads back `true` regardless (confirmed empirically — Node marks a
- * small, unbuffered write finished before this function's own next
- * statement runs), which would call an upstream nobody ever actually reached
- * "completed." The only thing this signal is FOR is deciding whether it is
- * safe to ingest-and-delete the usage log; none of those short-circuit paths
- * represent the upstream (and whatever it may have spawned) genuinely
- * finishing its work, so they must all read `false`.
+ * FIX 3 originally treated a CLIENT ABORT the same way — settling early,
+ * `completed: false` — which just relocated the same bug: the compiler
+ * child has no abort listener of its own (`uv run python` runs a
+ * regeneration or export to completion regardless of whether anyone is
+ * still waiting on the HTTP response), so a caller gating `pool.release()`/
+ * `releaseBillableSlot()` on this promise (see preview-forward.ts) would
+ * free them while the run was still genuinely going — letting the idle
+ * reaper SIGTERM a paid job, and letting the same user start more concurrent
+ * billable work than the 429 bound is supposed to allow. Residual 1's fix:
+ * a client abort (`res` emitting `close` or `error`) no longer settles this
+ * promise or touches `upstreamReq` at all — see `clientLeft` below. The
+ * upstream keeps running exactly as if the client were still there; once its
+ * response arrives (or, if it already had, once the drain finishes), the
+ * bytes are discarded instead of written to the now-gone `res`, and only
+ * THEN does this promise settle, with `completed: true` — because from the
+ * child's own perspective, that run is genuinely done.
+ *
+ * `completed` is `true` in exactly the shapes below that represent the
+ * upstream genuinely finishing, regardless of whether a live client ever
+ * received any of it: the upstream response fully flushing to `res` in the
+ * ordinary case (`res`'s `finish` event), or — once the client is known
+ * gone — the upstream response fully draining on its own (`clientLeft`, or
+ * the `clientGone` branch inside the `"response"` handler). It stays
+ * `false` for every path where the upstream itself never finished: an abort
+ * before the upstream ever answered (still running when this promise
+ * settles — see above, nothing here waits on it), an upstream error, a dead
+ * upstream (502), a `writeHead` throw, or `PREVIEW_PROXY_TIMEOUT_MS`. That
+ * last one is the one case that still actively tears the upstream down: 15
+ * minutes in, the child really is stuck, there is no more "let it keep
+ * running" left to offer, and that loss stays accepted (see
+ * `PREVIEW_PROXY_TIMEOUT_MS`'s own comment). Note this means `completed`
+ * does NOT mean "settled" any more than it did before residual 1 — several
+ * `false` paths also write a complete, well-formed error response of their
+ * own (a small 502/504 JSON body via `safeSendJson`), and a plain
+ * `res.writableFinished` check right after one of those reads back `true`
+ * regardless (confirmed empirically — Node marks a small, unbuffered write
+ * finished before this function's own next statement runs), which is
+ * exactly the false positive this dedicated signal exists to avoid. The
+ * only thing it is FOR is deciding whether it is safe to ingest-and-delete
+ * the usage log.
  */
 export function proxyHttp(args: {
   req: IncomingMessage;
@@ -164,8 +188,8 @@ export function proxyHttp(args: {
 
   return new Promise<{ completed: boolean }>((resolve) => {
     let settled = false;
-    // Flipped to `true` in exactly one place — see the function comment —
-    // and read at whichever `settle()` call actually wins.
+    // Flipped to `true` in exactly the places described in the function
+    // comment, and read at whichever `settle()` call actually wins.
     let completed = false;
     const settle = (): void => {
       if (settled) return;
@@ -173,30 +197,56 @@ export function proxyHttp(args: {
       resolve({ completed });
     };
 
+    // True once the client is known to be gone (`res` emitted `close` or
+    // `error`, whichever fires first) — recorded, never acted on
+    // destructively, per the function comment. `upstreamRes`, once the
+    // upstream has answered, lets `clientLeft` (a disconnect arriving mid-
+    // pipe) and the `"response"` handler (a disconnect arriving before the
+    // upstream answered) redirect to the same "drain, don't write" behaviour
+    // regardless of which order the two events happen in.
+    let clientGone = false;
+    let upstreamRes: IncomingMessage | undefined;
+
+    /**
+     * Shared by `res`'s `"close"` and `"error"` listeners below. Never
+     * touches `upstreamReq`/`upstreamRes` destructively and never settles —
+     * the upstream keeps running exactly as if the client were still there.
+     * If no response has arrived yet, there is nothing to do: the
+     * `"response"` handler below checks `clientGone` itself and starts
+     * draining from the first byte once one does arrive. If a response was
+     * already mid-pipe to `res`, `res` will never legitimately emit
+     * `"finish"` now (nothing will ever finish writing to it again), so
+     * completion is re-anchored to the upstream response itself.
+     */
+    const clientLeft = (): void => {
+      if (settled || clientGone) return;
+      clientGone = true;
+      if (upstreamRes === undefined) return;
+      upstreamRes.unpipe(res);
+      if (upstreamRes.complete) {
+        // The upstream had already fully arrived before the client left —
+        // it just hadn't all been flushed out over the (now-dead) client
+        // socket yet. From the child's own perspective this run is done.
+        completed = true;
+        settle();
+        return;
+      }
+      upstreamRes.resume();
+      upstreamRes.once("end", () => {
+        completed = true;
+        settle();
+      });
+    };
+
     // A response the client has already walked away from must not keep this
-    // promise (or the upstream request) alive.
-    res.on("error", () => {
-      upstreamReq.destroy();
-      settle();
-    });
+    // promise alive forever (see `PREVIEW_PROXY_TIMEOUT_MS` below for the
+    // bound), but per the function comment it must not tear the upstream
+    // down either.
+    res.on("error", clientLeft);
     // The far more common shape of "client walked away," per an empirical
     // check against a real aborted request: a client disconnecting BEFORE
     // anything has been written back fires 'close' on `res`, not 'error'.
-    // Without this, an abandoned request (closed tab, navigation away, a
-    // retry) sits waiting on the upstream for up to the full
-    // `PREVIEW_PROXY_TIMEOUT_MS` even though nothing is listening for the
-    // answer any more — realistic here precisely because that timeout is 15
-    // minutes and users do close tabs mid-regen. Registered once, at the
-    // top: `res.on("close", settle)` further down (inside the "response"
-    // handler) additionally fires on a NORMAL completion, which is fine —
-    // `settle`/`settled` below coalesce either way — but only this
-    // top-level listener also destroys the upstream request, so it must
-    // exist before the upstream has even answered.
-    res.on("close", () => {
-      if (settled) return;
-      upstreamReq.destroy();
-      settle();
-    });
+    res.on("close", clientLeft);
 
     // Definite-assignment (`!`): referenced above inside a listener that can
     // only ever run in a later microtask/event, by which point the
@@ -264,9 +314,26 @@ export function proxyHttp(args: {
       settle();
     });
 
-    upstreamReq.on("response", (upstreamRes) => {
+    upstreamReq.on("response", (incoming) => {
+      upstreamRes = incoming;
+
+      if (clientGone) {
+        // The client left before the upstream ever answered — `clientLeft`
+        // above already ran and found no `upstreamRes` to drain yet. Drain
+        // this one from the first byte so the child's own handler completes
+        // and backpressure on this end never stalls it, but never attempt to
+        // write to `res` — it is exactly as gone as it was a moment ago.
+        incoming.on("error", () => settle());
+        incoming.on("end", () => {
+          completed = true;
+          settle();
+        });
+        incoming.resume();
+        return;
+      }
+
       try {
-        res.writeHead(upstreamRes.statusCode ?? 502, upstreamRes.headers);
+        res.writeHead(incoming.statusCode ?? 502, incoming.headers);
       } catch (err) {
         // `headersSent` is still false here — writeHead threw before
         // committing anything — so a 502 is still deliverable. Hard to
@@ -275,32 +342,36 @@ export function proxyHttp(args: {
         // surfaces as 'error' on `upstreamReq`, already handled above), but
         // cheap defence-in-depth against whatever header shape does slip
         // through parsing yet still fail `writeHead`.
-        upstreamRes.destroy();
+        incoming.destroy();
         safeSendJson(res, 502, { error: `could not relay upstream response: ${String(err)}` });
         settle();
         return;
       }
-      upstreamRes.on("error", () => {
+      incoming.on("error", () => {
         safeEnd(res);
         settle();
       });
-      // `close` can ALSO fire on a normal completion (confirmed empirically
-      // against a real Vite child — see the historical note this comment
-      // used to carry) — harmless for settling (`settled` coalesces either
-      // way), but it must never be the thing that sets `completed`: unlike
-      // `finish`, `close` fires just as readily when the client vanishes
-      // mid-body, and that case is exactly what `completed` must read as
-      // `false`.
-      res.on("close", settle);
+      // Deliberately NOT also listening for `res`'s `"close"` here: that is
+      // `clientLeft`'s job now (registered once, at the top, covering both
+      // "before" and "during" a response) — a second listener settling
+      // directly would race `clientLeft`'s own drain-then-settle and could
+      // report `completed: false` for an exchange that was, a moment later,
+      // going to finish normally.
       res.on("finish", () => {
         completed = true;
         settle();
       });
-      upstreamRes.pipe(res);
+      incoming.pipe(res);
     });
 
     // The inbound client aborting mid-body must stop the upstream request
     // rather than leaving it open waiting for a body that will never finish.
+    // Unlike a client disconnecting while waiting on the RESPONSE (handled
+    // above by `clientLeft`, which deliberately does NOT destroy anything),
+    // an incomplete REQUEST body means the upstream never received a
+    // complete request to begin with — there is no orchestrator run already
+    // under way to let finish, so there is nothing to preserve by leaving
+    // this side open.
     req.on("error", () => upstreamReq.destroy());
 
     req.pipe(upstreamReq);

@@ -10,7 +10,17 @@
  */
 import type { IncomingMessage, ServerResponse } from "node:http";
 
-const MAX_BODY_BYTES = 1_000_000;
+/**
+ * Bounds every body THIS router parses itself (`readJsonBody`, below) — it
+ * protects nothing past `proxyHttp`, which pipes a proxied `/__*` request's
+ * body straight to the preview child rather than buffering it here. That
+ * gap is real and is closed on the OTHER side of the pipe, in
+ * compiler/src/max-body-bytes.ts's own `MAX_BODY_BYTES` — a second,
+ * independent definition of this exact figure (compiler/ has no dependency
+ * on server/), not a shared import. Exported so router.test.ts can pin the
+ * two against drifting apart.
+ */
+export const MAX_BODY_BYTES = 1_000_000;
 
 export type Handler = (
   req: IncomingMessage,

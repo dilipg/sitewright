@@ -17,6 +17,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { Plugin } from "vite";
+import { MAX_BODY_BYTES } from "./max-body-bytes.ts";
 import { regenApiPlugin, runProcess, usageEnvFor } from "./regen-api.ts";
 import { USAGE_ID_HEADER, usageLogPathFor } from "./usage-log-path.ts";
 
@@ -304,6 +305,108 @@ describe("regenApiPlugin: route-slug validation on proxied route/section fields 
     const { call } = mountRegenApi(root);
     const result = await call("POST", "/__regen", { section: "home.hero", instruction: "x" });
     // mockRegen throws ("not a manifest node") for the same reason as above.
+    expect(result.status).toBe(500);
+    expect(existsSync(join(root, ".regen-backup"))).toBe(true);
+  });
+});
+
+/**
+ * Residual 2 (2026-08-06 decisions.md row / CLAUDE.md's slice-4c paragraph):
+ * `server/src/preview-proxy.ts`'s `proxyHttp` PIPES a proxied request body
+ * straight through rather than buffering it, so `router.ts`'s own
+ * MAX_BODY_BYTES never sees a proxied `/__*` body at all. `readBody` (below)
+ * used to accumulate the whole thing into a `Buffer[]` before ever calling
+ * JSON.parse, so the failure that matters is unbounded memory HERE, in this
+ * process — the one serving every other request for the project.
+ *
+ * A fresh, minimal harness rather than reusing `mountRegenApi` above: this
+ * one sends RAW bytes (not `JSON.stringify(body)`) so a body can be sized
+ * precisely relative to `MAX_BODY_BYTES`, and its fake `req` needs a callable
+ * `.destroy()` — `readBody` now calls it on the over-limit path, which the
+ * FIX 1 harness's bare-EventEmitter `req` never needed.
+ */
+describe("regenApiPlugin: bounds a proxied body before ever parsing it (residual 2)", () => {
+  function mountRegenApiRaw(root: string) {
+    const plugin: Plugin = regenApiPlugin(root);
+    let handler: ((req: IncomingMessage, res: ServerResponse, next: () => void) => void) | undefined;
+    const fakeServer = {
+      middlewares: { use: (fn: typeof handler) => { handler = fn; } },
+      moduleGraph: { invalidateAll: () => { /* not under test here */ } },
+    };
+    (plugin.configureServer as unknown as (server: typeof fakeServer) => void)(fakeServer);
+    if (handler === undefined) throw new Error("regenApiPlugin never registered its middleware");
+    const middleware = handler;
+
+    /** Drives one request with a RAW body, sent as a single chunk. */
+    function call(url: string, body: Buffer): Promise<{ status: number; body: string }> {
+      return new Promise((resolveCall) => {
+        const outChunks: string[] = [];
+        let destroyed = false;
+        const res = {
+          statusCode: 200,
+          setHeader() { /* no-op */ },
+          end(chunk?: string) {
+            if (chunk !== undefined) outChunks.push(String(chunk));
+            resolveCall({ status: res.statusCode, body: outChunks.join("") });
+          },
+        } as unknown as ServerResponse;
+
+        const req = new EventEmitter() as unknown as IncomingMessage;
+        Object.assign(req, {
+          method: "POST", url, headers: {},
+          destroy: () => { destroyed = true; },
+        });
+
+        middleware(req, res, () => resolveCall({ status: 404, body: "" }));
+
+        const emitter = req as unknown as EventEmitter;
+        if (!destroyed) emitter.emit("data", body);
+        if (!destroyed) emitter.emit("end");
+      });
+    }
+
+    return { call };
+  }
+
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
+    dirs.length = 0;
+    delete process.env.WG_REGEN_MOCK;
+  });
+  function freshRoot(): string {
+    const dir = mkdtempSync(join(tmpdir(), "regen-bodycap-"));
+    dirs.push(dir);
+    return dir;
+  }
+
+  it("answers 413 and never calls JSON.parse on a body over MAX_BODY_BYTES", async () => {
+    const root = freshRoot();
+    const { call } = mountRegenApiRaw(root);
+    // Well-formed JSON, genuinely oversized: if the cap were removed, this
+    // would parse fine and reach snapshotRoute, which is exactly the
+    // difference this test needs to be able to see.
+    const bigInstruction = "x".repeat(MAX_BODY_BYTES + 10_000);
+    const payload = Buffer.from(JSON.stringify({ route: "home", instruction: bigInstruction }));
+    const result = await call("/__regen-page", payload);
+    expect(result.status).toBe(413);
+    // Proves the request never reached snapshotRoute/JSON.parse at all.
+    expect(existsSync(join(root, ".regen-backup"))).toBe(false);
+  });
+
+  it("still accepts a body comfortably under MAX_BODY_BYTES", async () => {
+    const root = freshRoot();
+    mkdirSync(join(root, "src", "pages", "home"), { recursive: true });
+    writeFileSync(join(root, "manifest.json"), JSON.stringify({ nodes: {} }));
+    process.env.WG_REGEN_MOCK = "1";
+    const { call } = mountRegenApiRaw(root);
+    const instruction = "x".repeat(MAX_BODY_BYTES - 1_000);
+    const payload = Buffer.from(JSON.stringify({ route: "home", instruction }));
+    const result = await call("/__regen-page", payload);
+    // mockRegenPage throws for the SAME reason the pre-existing "does not
+    // over-reject" test above documents (no active sections in the empty
+    // manifest) — a 500, not 413: the point is which side of the size cap
+    // the request landed on.
     expect(result.status).toBe(500);
     expect(existsSync(join(root, ".regen-backup"))).toBe(true);
   });

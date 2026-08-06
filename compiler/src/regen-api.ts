@@ -36,10 +36,20 @@ import { basename, dirname, join, resolve } from "node:path";
 import type { Plugin } from "vite";
 import type { EditAgentResult } from "./edit-protocol.ts";
 import { mockEditOperations } from "./edit-mock.ts";
+import { MAX_BODY_BYTES } from "./max-body-bytes.ts";
 import { ROUTE_SLUG } from "./route-slug.ts";
 import { isValidUsageId, USAGE_ID_HEADER, usageLogPathFor } from "./usage-log-path.ts";
 
 const MOCK_DELAY_MS = 1500; // keeps the in-place progress state observable in e2e
+
+/**
+ * Resolved by `readBody` in place of a parsed body when the request body
+ * exceeds `MAX_BODY_BYTES` — by that point `readBody` has already answered
+ * 413 and destroyed the request, so every call site checks for this sentinel
+ * FIRST and returns immediately rather than trying to answer the same
+ * request a second time.
+ */
+const BODY_TOO_LARGE = Symbol("body-too-large");
 
 /**
  * Guards every filesystem path this plugin builds from proxied, otherwise-
@@ -89,7 +99,8 @@ export function regenApiPlugin(projectRoot: string): Plugin {
       server.middlewares.use((req, res, next) => {
         const url = req.url?.split("?")[0] ?? "";
         if (req.method === "POST" && url === "/__regen") {
-          void readBody(req).then(async (body) => {
+          void readBody(req, res).then(async (body) => {
+            if (body === BODY_TOO_LARGE) return; // readBody already answered 413
             try {
               const { section, instruction } = body as { section: string; instruction: string };
               if (!isValidRouteSlug(routeSlugOfSection(section))) {
@@ -113,7 +124,8 @@ export function regenApiPlugin(projectRoot: string): Plugin {
           return;
         }
         if (req.method === "POST" && url === "/__regen-page") {
-          void readBody(req).then(async (body) => {
+          void readBody(req, res).then(async (body) => {
+            if (body === BODY_TOO_LARGE) return; // readBody already answered 413
             try {
               const { route, instruction } = body as { route: string; instruction: string };
               if (!isValidRouteSlug(route)) {
@@ -141,7 +153,8 @@ export function regenApiPlugin(projectRoot: string): Plugin {
           return;
         }
         if (req.method === "POST" && url === "/__add-section") {
-          void readBody(req).then(async (body) => {
+          void readBody(req, res).then(async (body) => {
+            if (body === BODY_TOO_LARGE) return; // readBody already answered 413
             try {
               const { route, archetype, instruction } = body as {
                 route: string;
@@ -169,7 +182,8 @@ export function regenApiPlugin(projectRoot: string): Plugin {
           return;
         }
         if (req.method === "POST" && url === "/__edit-prompt") {
-          void readBody(req).then(async (body) => {
+          void readBody(req, res).then(async (body) => {
+            if (body === BODY_TOO_LARGE) return; // readBody already answered 413
             try {
               const { route, instruction, selection } = body as {
                 route: string;
@@ -195,7 +209,8 @@ export function regenApiPlugin(projectRoot: string): Plugin {
           return;
         }
         if (req.method === "POST" && url === "/__regen-revert") {
-          void readBody(req).then((body) => {
+          void readBody(req, res).then((body) => {
+            if (body === BODY_TOO_LARGE) return; // readBody already answered 413
             try {
               const { section } = body as { section: string };
               if (!isValidRouteSlug(routeSlugOfSection(section))) {
@@ -681,11 +696,40 @@ export const ${dataVar}: ${component}Props = {
 
 /* ---------- plumbing ---------- */
 
-function readBody(req: IncomingMessage): Promise<unknown> {
+/**
+ * Bounded BEFORE accumulation, not after — see max-body-bytes.ts's own
+ * comment on why this is the place an unbounded body actually threatens
+ * memory (this process, the one serving every other request for the
+ * project), not `proxyHttp`, which merely pipes.
+ *
+ * On exceeding `MAX_BODY_BYTES`, answers 413 and resolves `BODY_TOO_LARGE`
+ * directly, rather than throwing/rejecting: every call site above is a bare
+ * `.then(...)` with no `.catch`, matching the rest of this file's "never
+ * leave an unhandled rejection on an async listener" discipline (see
+ * preview-proxy.ts's module comment for the exact shape of bug that
+ * habit exists to avoid) — a rejection here would either hang the request
+ * or crash the process, neither of which a 413 should do.
+ */
+function readBody(req: IncomingMessage, res: ServerResponse): Promise<unknown> {
   return new Promise((resolveBody) => {
     const chunks: Buffer[] = [];
-    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    let size = 0;
+    let tooLarge = false;
+    req.on("data", (chunk: Buffer) => {
+      if (tooLarge) return; // already answered and destroyed below
+      size += chunk.length;
+      if (size > MAX_BODY_BYTES) {
+        tooLarge = true;
+        req.destroy();
+        res.statusCode = 413;
+        res.end("request body too large");
+        resolveBody(BODY_TOO_LARGE);
+        return;
+      }
+      chunks.push(chunk);
+    });
     req.on("end", () => {
+      if (tooLarge) return; // 413 already answered above
       try {
         resolveBody(JSON.parse(Buffer.concat(chunks).toString("utf8")));
       } catch {

@@ -13,6 +13,7 @@ import { fileURLToPath } from "node:url";
 import type { Plugin, ViteDevServer } from "vite";
 import { createServer, normalizePath } from "vite";
 import { exportApiPlugin } from "./export-api.ts";
+import { MAX_BODY_BYTES } from "./max-body-bytes.ts";
 import { planApiPlugin } from "./plan-api.ts";
 import { regenApiPlugin } from "./regen-api.ts";
 import { ROUTE_SLUG } from "./route-slug.ts";
@@ -233,7 +234,8 @@ export async function startPreviewServer(
  * GET/PUT /__overrides-history       -> overrides/.editor-history.json
  * Only the editor writes overrides; agents never touch this directory.
  */
-function overridesApiPlugin(projectRoot: string): Plugin {
+/** Exported for direct testing (preview.test.ts) — mirrors regen-api.ts's already-exported `regenApiPlugin`, driven the same way there via a fake Vite `configureServer` server. */
+export function overridesApiPlugin(projectRoot: string): Plugin {
   return {
     name: "website-generator:overrides-api",
     apply: "serve",
@@ -281,9 +283,33 @@ function handleFileEndpoint(
     return;
   }
   if (req.method === "PUT") {
+    // Bounded BEFORE accumulation, not after: `proxyHttp` (the hosted
+    // server's reverse proxy) pipes a request body straight through without
+    // buffering it, so this accumulation — turning the body into one
+    // in-memory Buffer[] before ever calling JSON.parse — is where an
+    // unbounded body actually threatens memory, in THIS process, the one
+    // serving every other request for the project. See max-body-bytes.ts's
+    // own comment for why the cap lives here rather than in the proxy.
     const chunks: Buffer[] = [];
-    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    let size = 0;
+    let tooLarge = false;
+    req.on("data", (chunk: Buffer) => {
+      if (tooLarge) return; // already answered and destroyed below
+      size += chunk.length;
+      if (size > MAX_BODY_BYTES) {
+        tooLarge = true;
+        // Stop reading rather than accumulating further — destroying the
+        // request also stops it from ever emitting "end", so the guard on
+        // "end" below is defence in depth, not the primary mechanism.
+        req.destroy();
+        res.statusCode = 413;
+        res.end("request body too large");
+        return;
+      }
+      chunks.push(chunk);
+    });
     req.on("end", () => {
+      if (tooLarge) return; // 413 already answered above
       try {
         const body: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
         mkdirSync(join(filePath, ".."), { recursive: true });

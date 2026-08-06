@@ -19,13 +19,37 @@
  * see preview-routes.ts's module comment for the full account of why
  * stripping any part of it (a `/preview/<id>/` prefix, a query string) loops
  * the client against Vite's own base-redirect or breaks its HMR handshake.
+ *
+ * The optional `billable` hook (task 3, "attribute the spend") is how
+ * `compiler-routes.ts` attaches a per-request usage id to a billable
+ * endpoint's forwarded request without a second copy of this
+ * acquire/retain/proxy/release sequence: `setHeaders` reaches `proxyHttp`
+ * (which applies it AFTER its own client-header strip, so the server's value
+ * always wins), and `after` runs in the SAME `finally` as `pool.release` —
+ * after the proxy call resolves OR rejects, never before, since the
+ * orchestrator writes its usage log as it goes and the child only returns
+ * once the run is actually done. `preview-routes.ts` never passes this
+ * option, so its own behaviour is unchanged: `setHeaders` is `undefined` and
+ * `after` never runs.
  */
 import { PreviewCapacityError, type PreviewPool } from "./preview-pool.ts";
 import { proxyHttp } from "./preview-proxy.ts";
 import type { ProjectHandler } from "./require-project.ts";
 import { sendJson } from "./router.ts";
 
-export function forwardToPreview(pool: PreviewPool): ProjectHandler {
+type ForwardCtx = Parameters<ProjectHandler>[2];
+
+export interface BillableForward {
+  /** Merged onto the forwarded request's headers after the standard strip — see the module comment. */
+  setHeaders: Record<string, string>;
+  /** Runs in the same `finally` as `pool.release`, whether the proxy call resolved or rejected. */
+  after: () => void | Promise<void>;
+}
+
+export function forwardToPreview(
+  pool: PreviewPool,
+  options?: { billable?: (ctx: ForwardCtx) => BillableForward },
+): ProjectHandler {
   return async (req, res, ctx) => {
     let preview;
     try {
@@ -43,15 +67,33 @@ export function forwardToPreview(pool: PreviewPool): ProjectHandler {
       });
       return;
     }
+    // Resolved once, before the proxy call, so the SAME id backs both the
+    // header the child receives and the path `after()` ingests from.
+    const billable = options?.billable?.(ctx);
     // retain/release BRACKET the proxy so the reaper cannot kill this
     // subprocess mid-request. release() runs in a finally so an aborted
     // or failed proxy call still frees the slot.
     pool.retain(ctx.project.id);
     try {
       // req.url, unmodified — see the module comment for why.
-      await proxyHttp({ req, res, port: preview.port, path: req.url ?? "/" });
+      await proxyHttp({
+        req,
+        res,
+        port: preview.port,
+        path: req.url ?? "/",
+        setHeaders: billable?.setHeaders,
+      });
     } finally {
-      pool.release(ctx.project.id);
+      // Ingest AFTER the proxy call settles (success or throw) — the child
+      // only returns once its run is done — and even when it threw: a run
+      // that errored halfway still spent money. Runs before release() only
+      // because that is the natural order of this block; both are inside the
+      // same finally, which is the load-bearing property.
+      try {
+        await billable?.after();
+      } finally {
+        pool.release(ctx.project.id);
+      }
     }
   };
 }

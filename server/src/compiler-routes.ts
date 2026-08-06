@@ -38,8 +38,26 @@
  * carries no project id — that arrives via the query string, per
  * `BY_QUERY` — so `req.url` is already exactly what the child's middleware
  * expects, with no per-route path construction needed.
+ *
+ * Task 3 ("attribute the spend") adds a second forward, `billableForward`,
+ * used only for the four `billable: true` entries. It supplies
+ * `forwardToPreview`'s `billable` hook: a fresh 32-hex-char id per request
+ * (`randomBytes(16).toString("hex")` — exactly what `isValidUsageId`
+ * accepts, pinned by a test), sent as `x-webgen-usage-id` on the forwarded
+ * request, then — in the same `finally` as `pool.release`, so it runs even
+ * when the proxy call rejected — ingested from `usageLogPathFor(id)` and
+ * deleted. `ingestUsageLog` never throws (it was built for exactly this call
+ * site) and is NOT idempotent, which is why the id is generated once per
+ * request and the file is removed immediately after: re-ingesting the same
+ * path would double a real user's bill. A non-billable entry keeps using the
+ * plain `forward` with no id at all — generating one nobody writes to would
+ * create a file an ingest can only ever find empty.
  */
+import { randomBytes } from "node:crypto";
+import { unlinkSync } from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
+import { USAGE_ID_HEADER, usageLogPathFor } from "../../compiler/src/usage-log-path.ts";
+import { ingestUsageLog } from "./ingest-usage.ts";
 import { forwardToPreview } from "./preview-forward.ts";
 import type { PreviewPool } from "./preview-pool.ts";
 import { PROJECT_SCOPED_ENDPOINTS } from "./project-registry.ts";
@@ -53,17 +71,45 @@ const COMPILER_ENDPOINTS = PROJECT_SCOPED_ENDPOINTS.filter((entry) => entry.path
 export function compilerRoutes(deps: { db: DatabaseSync; pool: PreviewPool }): Route[] {
   const { db, pool } = deps;
   const forward = forwardToPreview(pool);
+  const billableForward = forwardToPreview(pool, {
+    billable: (ctx) => {
+      const usageId = randomBytes(16).toString("hex");
+      return {
+        setHeaders: { [USAGE_ID_HEADER]: usageId },
+        after: () => {
+          const path = usageLogPathFor(usageId);
+          // Never throws, by contract (ingest-usage.ts) — safe to call
+          // unconditionally, including for a run that wrote no log at all
+          // (the "no model calls" case), which is a legitimate no-op, not
+          // an error.
+          ingestUsageLog(db, { path, userId: ctx.user.id, projectId: ctx.project.id, now: Date.now() });
+          try {
+            unlinkSync(path);
+          } catch {
+            // Nothing to delete — either the child wrote no log for this
+            // request, or it's already gone. Either way, ingest above
+            // already ran (or correctly no-opped), so there is nothing left
+            // to protect by throwing here.
+          }
+        },
+      };
+    },
+  });
 
   return COMPILER_ENDPOINTS.map((entry) => ({
     method: entry.method,
     path: entry.path,
     // requireProject runs first (session + ownership), so an
     // unauthenticated or non-owner request never reaches requireBudget, let
-    // alone the pool. requireBudget wraps `forward` only for a billable
+    // alone the pool. requireBudget wraps the forward only for a billable
     // entry — a non-billable one (notably /__export and
     // /__export-download: the exporter is deterministic, and refusing an
     // export over the cap would strand a user's finished work behind a
-    // bill) reaches `forward` directly, ungated.
-    handler: requireProject(db, entry.idFrom, entry.billable ? requireBudget(db, forward) : forward),
+    // bill) reaches `forward` directly, ungated, and never gets a usage id.
+    handler: requireProject(
+      db,
+      entry.idFrom,
+      entry.billable ? requireBudget(db, billableForward) : forward,
+    ),
   }));
 }

@@ -120,8 +120,20 @@ export function proxyHttp(args: {
   res: ServerResponse;
   port: number;
   path: string;
+  /**
+   * Extra headers applied AFTER `upstreamHeaders`' own strip — so a value set
+   * here always reaches the upstream, regardless of what the inbound request
+   * carried (a client's own copy of the same header name is already deleted
+   * by that point, never merely overwritten by something that could race
+   * it). The only caller today (`compiler-routes.ts`, via
+   * `preview-forward.ts`) uses this to set the server's own, freshly
+   * generated `x-webgen-usage-id` on a billable request — never the
+   * client's, which `upstreamHeaders` deletes unconditionally before this is
+   * even applied.
+   */
+  setHeaders?: Record<string, string> | undefined;
 }): Promise<void> {
-  const { req, res, port, path } = args;
+  const { req, res, port, path, setHeaders } = args;
 
   return new Promise<void>((resolve) => {
     let settled = false;
@@ -188,7 +200,10 @@ export function proxyHttp(args: {
         // straight to the one Vite dev server this proxy exists to reach
         // over loopback, never through a further proxy hop where that would
         // actually matter.
-        headers: upstreamHeaders(req, port),
+        // `setHeaders` is spread LAST, after the strip above already ran —
+        // see this function's own arg doc for why the ordering is the whole
+        // point.
+        headers: { ...upstreamHeaders(req, port), ...setHeaders },
       });
     } catch (err) {
       safeSendJson(res, 502, { error: `could not construct upstream request: ${String(err)}` });

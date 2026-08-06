@@ -24,35 +24,45 @@
  * case, where the real (unmocked) upstreamHeaders/proxyHttp genuinely runs.
  * See the task report for Step 5's proof against that test.
  */
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DatabaseSync } from "node:sqlite";
 import { openDatabase } from "./db.ts";
 import { createUser } from "./users.ts";
 import { createSession, SESSION_COOKIE } from "./sessions.ts";
 import { createProject, type Project } from "./projects.ts";
-import { recordUsageEvent } from "./usage.ts";
+import { recordUsageEvent, spendSince } from "./usage.ts";
 import { createRequestListener } from "./router.ts";
 import { MAX_PREVIEWS, PreviewCapacityError, type PreviewPool } from "./preview-pool.ts";
 import { PROJECT_SCOPED_ENDPOINTS } from "./project-registry.ts";
 import { compilerRoutes } from "./compiler-routes.ts";
+import { USAGE_ID_HEADER, isValidUsageId, usageLogPathFor } from "../../compiler/src/usage-log-path.ts";
 
 const proxyMocks = vi.hoisted(() => ({
-  impl: async (args: { res: { writeHead: (code: number) => unknown; end: (chunk?: string) => unknown } }) => {
+  impl: async (args: {
+    res: { writeHead: (code: number) => unknown; end: (chunk?: string) => unknown };
+    setHeaders?: Record<string, string>;
+  }) => {
     args.res.writeHead(200);
     args.res.end("proxied");
   },
-  calls: [] as Array<{ port: number; path: string }>,
+  calls: [] as Array<{ port: number; path: string; setHeaders?: Record<string, string> | undefined }>,
 }));
 
 // Vitest hoists vi.mock calls above every import in this file, so
 // compiler-routes.ts's own `import { proxyHttp } from "./preview-proxy.ts"`
 // resolves to this mock — same idiom preview-routes.test.ts uses.
 vi.mock("./preview-proxy.ts", () => ({
-  proxyHttp: (args: { req: unknown; res: unknown; port: number; path: string }) => {
-    proxyMocks.calls.push({ port: args.port, path: args.path });
+  proxyHttp: (args: {
+    req: unknown;
+    res: unknown;
+    port: number;
+    path: string;
+    setHeaders?: Record<string, string> | undefined;
+  }) => {
+    proxyMocks.calls.push({ port: args.port, path: args.path, setHeaders: args.setHeaders });
     return proxyMocks.impl(args as never);
   },
 }));
@@ -189,7 +199,12 @@ describe("compilerRoutes", () => {
     const requestPath = `${base}${base.includes("?") ? "&" : "?"}extra=1&token=abc`;
     const result = await call(entry.method, requestPath, aliceCookie);
     expect(result.status).toBe(200);
-    expect(proxyMocks.calls).toEqual([{ port: 7777, path: requestPath }]);
+    // A billable entry also carries a setHeaders (task 3's usage id) that
+    // this test isn't about — asserted separately in the "attributing
+    // billable spend" block below — so it's allowed here, not required.
+    expect(proxyMocks.calls).toEqual([
+      { port: 7777, path: requestPath, setHeaders: entry.billable ? expect.any(Object) : undefined },
+    ]);
     expect(pool.acquire).toHaveBeenCalledWith(expect.objectContaining({ id: project.id }), alice.id);
   });
 
@@ -254,5 +269,130 @@ describe("compilerRoutes", () => {
     expect(result.status).toBe(503);
     expect(result.body).toContain(String(MAX_PREVIEWS));
     expect(proxyMocks.calls).toEqual([]);
+  });
+});
+
+/**
+ * Task 3: attributing a billable request's model spend to the user who paid.
+ * The mocked `proxyHttp` from the top of this file stands in for the child:
+ * these tests script its `impl` to read `args.setHeaders[USAGE_ID_HEADER]`
+ * (the id `compiler-routes.ts` generated for THIS request) and write a fake
+ * usage log at exactly the path `usageLogPathFor` derives from it — the same
+ * path `compiler-routes.ts` itself ingests from afterwards — so the test
+ * proves the real id round-trips through the real path derivation, not a
+ * hardcoded stand-in.
+ */
+function usageRow(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    timestamp: new Date().toISOString(),
+    role: "section",
+    model: "claude-sonnet-5",
+    input_tokens: 10,
+    output_tokens: 20,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: 0,
+    cost_usd: 1,
+    ...overrides,
+  };
+}
+
+/** Writes a fake child usage log at the path the given usage id implies, creating the temp directory `usageLogPathFor` expects. */
+function writeUsageLog(usageId: string, rows: Array<Record<string, unknown>>): string {
+  const path = usageLogPathFor(usageId);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, rows.map((row) => JSON.stringify(row)).join("\n"), "utf8");
+  return path;
+}
+
+describe("compilerRoutes: attributing billable spend", () => {
+  const billableEntry = BILLABLE_ENTRIES[0]!;
+
+  it("sets a well-formed x-webgen-usage-id on a billable request, a different one per request", async () => {
+    const pool = fakePool();
+    const { call, project, aliceCookie } = harness(pool);
+    await call(billableEntry.method, pathFor(billableEntry, project.id), aliceCookie);
+    await call(billableEntry.method, pathFor(billableEntry, project.id), aliceCookie);
+
+    expect(proxyMocks.calls).toHaveLength(2);
+    const id1 = proxyMocks.calls[0]?.setHeaders?.[USAGE_ID_HEADER];
+    const id2 = proxyMocks.calls[1]?.setHeaders?.[USAGE_ID_HEADER];
+    expect(id1).toBeDefined();
+    expect(id2).toBeDefined();
+    // Pinned against the real predicate, not a copy of its regex: this fails
+    // if compiler-routes.ts ever generates the id a different way (e.g. a
+    // different byte length, or uppercase hex) even if that value still
+    // "looks like" an id to the eye.
+    expect(isValidUsageId(id1)).toBe(true);
+    expect(isValidUsageId(id2)).toBe(true);
+    expect(id1).toMatch(/^[0-9a-f]{32}$/);
+    // A different one per request — this is the assertion Step 4's third
+    // perturbation (making the id a constant) is proved against.
+    expect(id1).not.toBe(id2);
+  });
+
+  it("sends no usage id header on a non-billable request", async () => {
+    const pool = fakePool();
+    const { call, project, aliceCookie } = harness(pool);
+    const entry = COMPILER_ENTRIES.find((e) => !e.billable)!;
+    await call(entry.method, pathFor(entry, project.id), aliceCookie);
+
+    expect(proxyMocks.calls).toHaveLength(1);
+    expect(proxyMocks.calls[0]?.setHeaders).toBeUndefined();
+  });
+
+  it("ingests the child's usage log into usage_event, attributed to the owner, and deletes the file afterwards", async () => {
+    const pool = fakePool();
+    const { db, call, project, alice, aliceCookie } = harness(pool);
+    let capturedPath = "";
+    proxyMocks.impl = async (args) => {
+      const usageId = args.setHeaders?.[USAGE_ID_HEADER];
+      if (usageId === undefined) throw new Error("expected a usage id header on a billable request");
+      capturedPath = writeUsageLog(usageId, [usageRow({ cost_usd: 1 }), usageRow({ cost_usd: 2 })]);
+      args.res.writeHead(200);
+      args.res.end("proxied");
+    };
+
+    const result = await call(billableEntry.method, pathFor(billableEntry, project.id), aliceCookie);
+    expect(result.status).toBe(200);
+
+    // usage_event holds the rows, attributed to alice — and exactly the two
+    // rows the child wrote, not double: this is Step 1's item 7, "ingest
+    // happens exactly once."
+    const window = spendSince(db, alice.id, 0);
+    expect(window.events).toBe(2);
+    expect(window.costUsd).toBe(3);
+
+    // The log file is gone afterwards.
+    expect(existsSync(capturedPath)).toBe(false);
+  });
+
+  it("ingests nothing and does not throw when the child wrote no usage log", async () => {
+    const pool = fakePool();
+    const { db, call, project, alice, aliceCookie } = harness(pool);
+    // beforeEach's default impl never writes a log file for any id.
+    const result = await call(billableEntry.method, pathFor(billableEntry, project.id), aliceCookie);
+    expect(result.status).toBe(200);
+    expect(spendSince(db, alice.id, 0)).toEqual({ costUsd: 0, events: 0, unpricedEvents: 0 });
+  });
+
+  it("still ingests the usage log when the proxy call rejects — spend survives failure", async () => {
+    const pool = fakePool();
+    const { db, call, project, alice, aliceCookie } = harness(pool);
+    proxyMocks.impl = async (args) => {
+      const usageId = args.setHeaders?.[USAGE_ID_HEADER];
+      if (usageId === undefined) throw new Error("expected a usage id header on a billable request");
+      writeUsageLog(usageId, [usageRow({ cost_usd: 5 })]);
+      throw new Error("proxy exploded partway through a real run");
+    };
+
+    const result = await call(billableEntry.method, pathFor(billableEntry, project.id), aliceCookie);
+    // The router's own top-level catch turns the re-thrown error into a 500
+    // — the property under test is that the spend was still recorded despite
+    // the failed request, because ingest runs in the same finally as
+    // release, not only on the success path.
+    expect(result.status).toBe(500);
+    const window = spendSince(db, alice.id, 0);
+    expect(window.events).toBe(1);
+    expect(window.costUsd).toBe(5);
   });
 });

@@ -15,11 +15,12 @@ import type { DatabaseSync } from "node:sqlite";
 import { openDatabase } from "./db.ts";
 import { createUser } from "./users.ts";
 import { createProject, type Project } from "./projects.ts";
-import { setApiKey } from "./api-keys.ts";
-import { DisabledUserError, UnknownUserError } from "./agent-env.ts";
+import { deleteApiKey, fingerprintOf, setApiKey, UndecryptableApiKeyError } from "./api-keys.ts";
+import { DisabledUserError, MissingApiKeyError, UnknownUserError } from "./agent-env.ts";
 import { MASTER_KEY_ENV_VAR } from "./master-key.ts";
 import {
   KILL_GRACE_MS,
+  MAX_BILLABLE_IN_FLIGHT_PER_USER,
   MAX_PREVIEWS,
   PreviewCapacityError,
   PreviewPool,
@@ -233,6 +234,138 @@ describe("the child's environment", () => {
   });
 });
 
+/**
+ * FIX 2 (a whole-branch review): a warm child's key used to be fixed
+ * forever at spawn time. `acquire()` now fingerprints the key a child was
+ * spawned with and re-checks it against the owner's CURRENT key on every
+ * reuse, replacing a stale, IDLE entry rather than handing it back
+ * unchanged.
+ */
+describe("a warm child's key can go stale", () => {
+  it("respawns a warm KEYLESS child once its owner saves a key — the exact bug report's own sequence", async () => {
+    const pool = makePool();
+    await pool.acquire(project, ownerId); // keyless: no key stored yet
+    expect(spawned).toHaveLength(1);
+    expect(spawned[0]!.env.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(children[0]!.killed).toBe(false);
+
+    setApiKey(db, MASTER_KEY, ownerId, "sk-ant-fresh-key-0001");
+    await pool.acquire(project, ownerId);
+
+    expect(spawned).toHaveLength(2);
+    expect(children[0]!.killed).toBe(true);
+    expect(spawned[1]!.env.ANTHROPIC_API_KEY).toBe("sk-ant-fresh-key-0001");
+    // Exactly one live entry for this project afterward — never two.
+    expect(pool.list()).toHaveLength(1);
+  });
+
+  it("respawns a warm child when the stored key rotates", async () => {
+    setApiKey(db, MASTER_KEY, ownerId, "sk-ant-old-key-0001");
+    const pool = makePool();
+    await pool.acquire(project, ownerId);
+
+    setApiKey(db, MASTER_KEY, ownerId, "sk-ant-new-key-0002");
+    await pool.acquire(project, ownerId);
+
+    expect(spawned).toHaveLength(2);
+    expect(children[0]!.killed).toBe(true);
+    expect(spawned[1]!.env.ANTHROPIC_API_KEY).toBe("sk-ant-new-key-0002");
+  });
+
+  it("respawns a warm child whose owner had a key but has since cleared it", async () => {
+    setApiKey(db, MASTER_KEY, ownerId, "sk-ant-had-a-key-0001");
+    const pool = makePool();
+    await pool.acquire(project, ownerId);
+
+    deleteApiKey(db, ownerId);
+    await pool.acquire(project, ownerId);
+
+    expect(spawned).toHaveLength(2);
+    expect(children[0]!.killed).toBe(true);
+    expect(spawned[1]!.env.ANTHROPIC_API_KEY).toBeUndefined();
+  });
+
+  it("does NOT respawn across repeated requests when the key never changes", async () => {
+    setApiKey(db, MASTER_KEY, ownerId, "sk-ant-stable-key-0001");
+    const pool = makePool();
+    await pool.acquire(project, ownerId);
+    await pool.acquire(project, ownerId);
+    await pool.acquire(project, ownerId);
+    expect(spawned).toHaveLength(1);
+    expect(children[0]!.killed).toBe(false);
+  });
+
+  it("serves the STALE key rather than killing a BUSY child, then respawns once the work finishes", async () => {
+    // The policy this fix had to choose explicitly: a process with work in
+    // flight (retain/release) is never killed, however stale its key —
+    // 4c-1's invariant. The alternative (refusing the request instead)
+    // would also refuse an ordinary, non-billable preview asset request
+    // riding on the same warm child, which is worse.
+    setApiKey(db, MASTER_KEY, ownerId, "sk-ant-old-key-0001");
+    const pool = makePool();
+    const first = await pool.acquire(project, ownerId);
+    pool.retain(project.id); // stands in for an in-flight regen
+
+    setApiKey(db, MASTER_KEY, ownerId, "sk-ant-new-key-0002");
+    const second = await pool.acquire(project, ownerId);
+
+    // Busy: the stale child is served, not killed.
+    expect(spawned).toHaveLength(1);
+    expect(children[0]!.killed).toBe(false);
+    expect(second.port).toBe(first.port);
+
+    pool.release(project.id);
+    await pool.acquire(project, ownerId);
+
+    // Idle now: the very next acquire respawns with the current key.
+    expect(spawned).toHaveLength(2);
+    expect(children[0]!.killed).toBe(true);
+    expect(spawned[1]!.env.ANTHROPIC_API_KEY).toBe("sk-ant-new-key-0002");
+    expect(pool.list()).toHaveLength(1);
+  });
+
+  it("remembers only a fingerprint of the spawned key — the raw key string appears nowhere in the pool's own state", async () => {
+    const RAW_KEY = "sk-ant-super-secret-do-not-store-0000";
+    setApiKey(db, MASTER_KEY, ownerId, RAW_KEY);
+    const pool = makePool();
+    await pool.acquire(project, ownerId);
+
+    // `entries` is a TS-private field, which is erased at compile time —
+    // reaching in here is deliberate: it is the only way to prove the
+    // POOL's OWN bookkeeping (as opposed to the test harness's `spawned`
+    // array, which necessarily records the real key so the tests above can
+    // assert the child received it) never holds the raw key anywhere.
+    const entries = (pool as unknown as { entries: Map<string, Record<string, unknown>> }).entries;
+    const entry = entries.get(project.id)!;
+    expect(entry.keyFingerprint).toBe(fingerprintOf(RAW_KEY));
+
+    for (const [key, value] of Object.entries(entry)) {
+      // `child`/`readyPromise` are opaque handles this pool doesn't
+      // construct the contents of; every OTHER field — whatever gets added
+      // to Entry in the future — must never carry the raw key either.
+      if (key === "child" || key === "readyPromise") continue;
+      expect(JSON.stringify(value)).not.toContain(RAW_KEY);
+    }
+  });
+
+  it("never respawns a still-spawning entry out from under its own spawn attempt", async () => {
+    // A concurrent acquire() arriving while the FIRST spawn for this project
+    // is still in flight (no child yet) must share it, exactly like the
+    // pre-existing "two concurrent first requests" behaviour — even if the
+    // owner's key changes in between. inFlight is guaranteed zero for a
+    // still-spawning entry (nothing can retain() it before its own acquire()
+    // has resolved), so there is nothing to "serve stale" here either; it
+    // simply is not warm yet.
+    const pool = makePool();
+    const firstAcquire = pool.acquire(project, ownerId); // keyless, still spawning
+    setApiKey(db, MASTER_KEY, ownerId, "sk-ant-arrived-mid-spawn-0001");
+    const secondAcquire = pool.acquire(project, ownerId);
+    const [a, b] = await Promise.all([firstAcquire, secondAcquire]);
+    expect(spawned).toHaveLength(1); // shared the one in-flight spawn, never two
+    expect(a.port).toBe(b.port);
+  });
+});
+
 describe("readiness", () => {
   it("kills the child and rejects when a readiness line never leads to a verifiably listening port", async () => {
     // The line is deliberately malformed JSON — proving it doesn't crash the
@@ -437,6 +570,87 @@ describe("lifecycle", () => {
     await pool.acquire(project, ownerId);
     db.prepare("UPDATE user SET disabled_at = ? WHERE id = ?").run(Date.now(), ownerId);
     await expect(pool.acquire(project, ownerId)).rejects.toThrow(DisabledUserError);
+  });
+});
+
+describe("assertApiKeyUsable", () => {
+  // Task 4, gap 1: a billable compiler endpoint calls this BEFORE ever
+  // reaching acquire/proxy, so a keyless/disabled/unknown/undecryptable-key
+  // owner gets mapped at the boundary instead of failing deep inside the
+  // orchestrator subprocess. Unlike buildChildEnv (exercised above, via
+  // acquire), this must NOT swallow MissingApiKeyError -- a billable call
+  // genuinely needs a key, unlike a plain preview.
+  it("passes silently when the owner has a stored key", () => {
+    setApiKey(db, MASTER_KEY, ownerId, "sk-ant-user-key-1234");
+    const pool = makePool();
+    expect(() => pool.assertApiKeyUsable(ownerId)).not.toThrow();
+  });
+
+  it("throws MissingApiKeyError when the owner has no stored key — unlike acquire, this does NOT fall back", () => {
+    const pool = makePool();
+    expect(() => pool.assertApiKeyUsable(ownerId)).toThrow(MissingApiKeyError);
+  });
+
+  it("throws DisabledUserError for a disabled owner, even one with a stored key", () => {
+    setApiKey(db, MASTER_KEY, ownerId, "sk-ant-user-key-1234");
+    db.prepare("UPDATE user SET disabled_at = ? WHERE id = ?").run(Date.now(), ownerId);
+    const pool = makePool();
+    expect(() => pool.assertApiKeyUsable(ownerId)).toThrow(DisabledUserError);
+  });
+
+  it("throws UnknownUserError for an owner id with no row", () => {
+    const pool = makePool();
+    expect(() => pool.assertApiKeyUsable("no-such-user-id")).toThrow(UnknownUserError);
+  });
+
+  it("throws UndecryptableApiKeyError when the stored ciphertext no longer opens under the pool's master key", () => {
+    setApiKey(db, MASTER_KEY, ownerId, "sk-ant-user-key-1234");
+    // A different 32-byte key, standing in for a rotated WEBGEN_MASTER_KEY --
+    // the ciphertext was sealed under MASTER_KEY and this pool cannot open it.
+    const pool = makePool({ masterKey: Buffer.alloc(32, 9) });
+    expect(() => pool.assertApiKeyUsable(ownerId)).toThrow(UndecryptableApiKeyError);
+  });
+
+  it("never spawns a child or touches pool state", async () => {
+    const pool = makePool();
+    expect(() => pool.assertApiKeyUsable(ownerId)).toThrow(MissingApiKeyError);
+    expect(spawned).toHaveLength(0);
+    expect(pool.list()).toHaveLength(0);
+  });
+});
+
+describe("billable in-flight reservation", () => {
+  // Task 4, gap 2: spend lands in usage_event only at ingest, so N concurrent
+  // billable requests for one user would all evaluate the spend cap against
+  // the same pre-run total. This bounds N directly, independent of the cap.
+  it(`allows up to MAX_BILLABLE_IN_FLIGHT_PER_USER (${MAX_BILLABLE_IN_FLIGHT_PER_USER}) concurrent reservations, refusing the next`, () => {
+    const pool = makePool();
+    for (let i = 0; i < MAX_BILLABLE_IN_FLIGHT_PER_USER; i += 1) {
+      expect(pool.reserveBillableSlot(ownerId)).toBe(true);
+    }
+    expect(pool.reserveBillableSlot(ownerId)).toBe(false);
+  });
+
+  it("frees a slot on release, allowing a new reservation afterward", () => {
+    const pool = makePool();
+    for (let i = 0; i < MAX_BILLABLE_IN_FLIGHT_PER_USER; i += 1) pool.reserveBillableSlot(ownerId);
+    expect(pool.reserveBillableSlot(ownerId)).toBe(false);
+    pool.releaseBillableSlot(ownerId);
+    expect(pool.reserveBillableSlot(ownerId)).toBe(true);
+  });
+
+  it("tracks each user independently — one user's exhaustion never throttles another", () => {
+    const pool = makePool();
+    const otherOwnerId = createUser(db, "other@example.com", "hash").id;
+    for (let i = 0; i < MAX_BILLABLE_IN_FLIGHT_PER_USER; i += 1) pool.reserveBillableSlot(ownerId);
+    expect(pool.reserveBillableSlot(ownerId)).toBe(false);
+    expect(pool.reserveBillableSlot(otherOwnerId)).toBe(true);
+  });
+
+  it("releasing with nothing reserved is a safe no-op", () => {
+    const pool = makePool();
+    expect(() => pool.releaseBillableSlot(ownerId)).not.toThrow();
+    expect(pool.reserveBillableSlot(ownerId)).toBe(true);
   });
 });
 

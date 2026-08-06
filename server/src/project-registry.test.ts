@@ -12,45 +12,82 @@ import { randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import type { DatabaseSync } from "node:sqlite";
 import { openDatabase } from "./db.ts";
 import { buildRoutes } from "./compose.ts";
 import { PreviewPool } from "./preview-pool.ts";
+import { setApiKey } from "./api-keys.ts";
+import { createProject } from "./projects.ts";
+import { createRequestListener } from "./router.ts";
+import { createSession, SESSION_COOKIE } from "./sessions.ts";
+import { recordUsageEvent } from "./usage.ts";
+import { createUser } from "./users.ts";
 import {
-  isUnmountedCompilerEndpoint, PROJECT_SCOPED_ENDPOINTS, SESSION_ONLY_ENDPOINTS,
-  UNAUTHENTICATED_ENDPOINTS,
+  PROJECT_SCOPED_ENDPOINTS, SESSION_ONLY_ENDPOINTS, UNAUTHENTICATED_ENDPOINTS,
 } from "./project-registry.ts";
 
-// Shared by both "registry vs. the live route table" and "billable
-// endpoints" below: the ONE way this file builds a real, composed route
-// table. Anything that wants to know what is actually reachable today must
-// go through this, not through a hand-maintained list or a path-prefix
-// predicate — see the "fails the moment 4c mounts one" test for why that
-// distinction is the entire point of this fix.
+// Shared by "registry vs. the live route table" and "billable endpoints"
+// below: the ONE way this file builds a real, composed route table.
+// Anything that wants to know what is actually reachable today must go
+// through this, not through a hand-maintained list or a path-prefix
+// predicate — see decisions.md (2026-08-06) for why that distinction was the
+// entire point of the earlier "no billable route mounted" fix, and is
+// exactly what lets this file's enforcement test (below) drive REAL requests
+// rather than merely inspecting an array.
 //
 // A real PreviewPool is passed (never `undefined`): buildRoutes only mounts
-// `/preview/:projectId/*` when given one, so without this the route this
-// file just declared would be "declared but not mounted" against the live
-// table below — not because it is unreachable in production, but because
-// this helper stopped building the same table serve.ts does. Constructing a
-// pool has no side effects on its own (nothing spawns until `acquire()` is
-// called, which nothing here does).
+// `/preview/:projectId/*` and the compiler's `/__*` endpoints when given one,
+// so without this the routes this file just declared would be "declared but
+// not mounted" against the live table below — not because they are
+// unreachable in production, but because this helper stopped building the
+// same table serve.ts does. Constructing a pool has no side effects on its
+// own (nothing spawns until `acquire()` is called, which nothing here does).
 const registryDirs: string[] = [];
 const registryDbs: DatabaseSync[] = [];
-function freshRoutes() {
+function freshHarness() {
   const dir = mkdtempSync(join(tmpdir(), "server-registry-"));
   registryDirs.push(dir);
   const db = openDatabase(join(dir, "identity.db"));
   registryDbs.push(db);
   const masterKey = randomBytes(32);
   const pool = new PreviewPool({ db, masterKey, projectsRoot: dir });
-  return buildRoutes({ db, masterKey, secureCookies: true, pool });
+  const routes = buildRoutes({ db, masterKey, secureCookies: true, pool });
+  return { db, masterKey, pool, routes, listener: createRequestListener(routes) };
 }
 afterAll(() => {
   for (const db of registryDbs) db.close();
   for (const dir of registryDirs) rmSync(dir, { recursive: true, force: true });
 });
+
+/** Drives one request through a harness's listener; mirrors the idiom every other route-table test file uses. */
+async function call(
+  listener: ReturnType<typeof createRequestListener>,
+  method: string,
+  path: string,
+  cookie?: string,
+): Promise<{ status: number; body: string }> {
+  const chunks: string[] = [];
+  let status = 0;
+  const res = {
+    headersSent: false,
+    writeHead(code: number) { status = code; res.headersSent = true; return res; },
+    setHeader() {},
+    end(chunk?: string) { if (chunk !== undefined) chunks.push(chunk); },
+  };
+  const req = Object.assign((async function* () {})(), {
+    method, url: path, headers: { host: "localhost", ...(cookie ? { cookie } : {}) },
+  });
+  await listener(req as never, res as never);
+  return { status, body: chunks.join("") };
+}
+
+/** Builds a request path for a registry entry: fills a `:name` router param if the id source is `param`, else appends `?<name>=<id>`. */
+function pathFor(entry: { path: string; idFrom: { from: "param" | "query"; name: string } }, projectId: string): string {
+  return entry.idFrom.from === "param"
+    ? entry.path.replace(`:${entry.idFrom.name}`, projectId)
+    : `${entry.path}?${entry.idFrom.name}=${encodeURIComponent(projectId)}`;
+}
 
 describe("the registry itself", () => {
   it("has no duplicate (method, path) entries", () => {
@@ -107,7 +144,7 @@ describe("registry vs. the live route table", () => {
     const scoped = new Set(PROJECT_SCOPED_ENDPOINTS.map((e) => `${e.method} ${e.path}`));
     const sessionOnly = new Set(SESSION_ONLY_ENDPOINTS.map((e) => `${e.method} ${e.path}`));
     const unauthenticated = new Set(UNAUTHENTICATED_ENDPOINTS.map((e) => `${e.method} ${e.path}`));
-    for (const route of freshRoutes()) {
+    for (const route of freshHarness().routes) {
       const key = `${route.method} ${route.path}`;
       const memberships =
         Number(scoped.has(key)) + Number(sessionOnly.has(key)) + Number(unauthenticated.has(key));
@@ -115,51 +152,27 @@ describe("registry vs. the live route table", () => {
     }
   });
 
-  it("has every mountable-today entry from the three lists actually present in buildRoutes", () => {
+  it("has every declared entry from the three lists actually present in buildRoutes", () => {
     // The other direction: an entry declared here that is quietly wrong about
     // its own path or method — a typo, a stale rename — would otherwise never
     // be caught, since nothing before this compared the registry to the real
-    // table at all.
-    const live = new Set(freshRoutes().map((r) => `${r.method} ${r.path}`));
+    // table at all. There used to be an exclusion here for the compiler's
+    // `/__*` endpoints, correct while they were declared but not yet mounted
+    // (see decisions.md, 2026-08-06) — now that compiler-routes.ts mounts
+    // every one of them, EVERY declared entry must be live, with no carve-out.
+    const live = new Set(freshHarness().routes.map((r) => `${r.method} ${r.path}`));
     const declared = [
       ...PROJECT_SCOPED_ENDPOINTS, ...SESSION_ONLY_ENDPOINTS, ...UNAUTHENTICATED_ENDPOINTS,
     ];
     for (const e of declared) {
-      if (isUnmountedCompilerEndpoint(e.path)) continue; // asserted separately below
       expect(live.has(`${e.method} ${e.path}`), `${e.method} ${e.path} is declared but not mounted`)
         .toBe(true);
     }
   });
-
-  it("excludes exactly the compiler endpoints not yet mounted, pending 4c's preview pool", () => {
-    // Pins the exclusion so it cannot quietly grow: if a future entry's path
-    // happens to start with "/__" but IS mounted (or vice versa), this fails
-    // rather than the direction-2 test above silently skipping it forever.
-    const excluded = [
-      ...PROJECT_SCOPED_ENDPOINTS, ...SESSION_ONLY_ENDPOINTS, ...UNAUTHENTICATED_ENDPOINTS,
-    ]
-      .filter((e) => isUnmountedCompilerEndpoint(e.path))
-      .map((e) => `${e.method} ${e.path}`)
-      .sort();
-    expect(excluded).toEqual([
-      "GET /__archetypes",
-      "GET /__export-download",
-      "GET /__overrides-history",
-      "GET /__overrides/:slug",
-      "GET /__plan",
-      "POST /__add-section",
-      "POST /__edit-prompt",
-      "POST /__export",
-      "POST /__plan/approve",
-      "POST /__plan/section-brief",
-      "POST /__regen",
-      "POST /__regen-page",
-      "POST /__regen-revert",
-      "PUT /__overrides-history",
-      "PUT /__overrides/:slug",
-    ].sort());
-  });
 });
+
+type ProjectScopedEntry = (typeof PROJECT_SCOPED_ENDPOINTS)[number];
+type SessionOnlyEntry = (typeof SESSION_ONLY_ENDPOINTS)[number];
 
 describe("billable endpoints", () => {
   const all = [...PROJECT_SCOPED_ENDPOINTS, ...SESSION_ONLY_ENDPOINTS];
@@ -183,28 +196,122 @@ describe("billable endpoints", () => {
     }
   });
 
-  // Named for what it can actually observe: MOUNTEDNESS, not gatedness. A
-  // Route is { method, path, handler } — nothing records whether a handler is
-  // wrapped in requireBudget, so no test at this level can tell a gated
-  // billable route from an ungated one. That is exactly why this is a
-  // placeholder: it fails when 4c mounts anything billable, forcing a real
-  // enforcement test to be written against routes that can be driven.
-  it("has no billable endpoint mounted at all — fails the moment 4c mounts one", () => {
-    // Keyed on the LIVE table (freshRoutes/buildRoutes), not on
-    // isUnmountedCompilerEndpoint's "/__" prefix check. That predicate is a
-    // pure function of the path string: mounting a route in buildRoutes
-    // cannot change what a path starts with, so a test built on it can never
-    // fail no matter what compose.ts does — it was a tripwire that could not
-    // fire. This version asks the real, composed route table instead.
-    const live = new Set(freshRoutes().map((r) => `${r.method} ${r.path}`));
-    const mountedBillable = all
-      .filter((entry) => entry.billable && live.has(`${entry.method} ${entry.path}`))
-      .map((entry) => `${entry.method} ${entry.path}`);
-    // Empty today because every billable endpoint is still unmounted. When
-    // 4c mounts one, this fails — which is the signal to write "every mounted
-    // billable route refuses over the cap" against the real table and delete
-    // this placeholder. Keyed on the LIVE table, not on a path prefix: a
-    // predicate over the path string cannot notice a route being mounted.
-    expect(mountedBillable).toEqual([]);
-  });
+  /**
+   * Replaces the old placeholder ("has no billable endpoint mounted at all —
+   * fails the moment 4c mounts one"), which could only ever observe
+   * MOUNTEDNESS: a `Route` is `{method, path, handler}`, and nothing records
+   * whether a handler is wrapped in `requireBudget`, so that test could not
+   * tell a gated billable route from an ungated one — it was a tripwire
+   * whose whole job was to fail once mounting became real, forcing this test
+   * to be written. Table-driven over BOTH billable lists (`all`, not just
+   * `PROJECT_SCOPED_ENDPOINTS`) against the LIVE, composed route table, so a
+   * future billable endpoint added to EITHER list without a `requireBudget`
+   * wrapper fails this instead of shipping unguarded. `requireBudget`'s own
+   * doc comment names two composition shapes it exists to serve —
+   * `requireProject(db, source, requireBudget(db, handler))` and
+   * `requireSession(db, requireBudget(db, handler))` — and a table that only
+   * ever iterated the first would silently stop covering the second the
+   * moment one existed. That is not hypothetical: slice 5's web-triggered
+   * generation is a session-only billable endpoint, since no project id
+   * exists yet when a generation starts.
+   */
+  it.each(all.filter((e) => e.billable))(
+    "refuses $method $path with 402 over the cap, and never touches the pool",
+    async (rawEntry) => {
+      // it.each's own typings merge the table's element type for its
+      // `$key`-interpolation feature, which erases `idFrom` to `unknown`
+      // rather than preserving the PROJECT_SCOPED_ENDPOINTS |
+      // SESSION_ONLY_ENDPOINTS union `all` actually has — recovered here so
+      // the "in" check below narrows correctly.
+      const entry = rawEntry as unknown as ProjectScopedEntry | SessionOnlyEntry;
+      const { db, masterKey, pool, listener } = freshHarness();
+      const owner = createUser(db, `${randomBytes(4).toString("hex")}@example.com`, "h");
+      const cookie = `${SESSION_COOKIE}=${createSession(db, owner.id).id}`;
+      // A stored key, so task 4's requireApiKey (which now runs BEFORE
+      // requireBudget on every billable entry — see compiler-routes.ts) does
+      // not intercept this request with 400 first: this test is specifically
+      // about the CAP, and a keyless owner would never reach it.
+      setApiKey(db, masterKey, owner.id, "sk-ant-test-key-for-cap-test");
+      // Default cap is $10; one event alone puts this user over it, the same
+      // way require-budget.test.ts proves the wrapper in isolation.
+      recordUsageEvent(db, {
+        userId: owner.id, projectId: null, role: "section", model: "claude-sonnet-5",
+        inputTokens: 0, outputTokens: 0, cacheCreationInputTokens: 0, cacheReadInputTokens: 0,
+        costUsd: 11, at: Date.now(),
+      });
+      const acquireSpy = vi.spyOn(pool, "acquire");
+
+      // A project-scoped entry needs a real project to name; a session-only
+      // one (the "in" check is false for every SESSION_ONLY_ENDPOINTS entry,
+      // since that list's type carries no `idFrom` field at all — see
+      // project-registry.ts) has no project id to supply in the first
+      // place, so the bare path is the whole request.
+      const path = "idFrom" in entry
+        ? pathFor(entry, createProject(db, owner.id, `run-${randomBytes(4).toString("hex")}`, "Over Cap").id)
+        : entry.path;
+
+      const result = await call(listener, entry.method, path, cookie);
+
+      expect(result.status).toBe(402);
+      const body = JSON.parse(result.body) as { capUsd: number; spentUsd: number; resetAt: number | null };
+      expect(body.capUsd).toBe(10);
+      expect(body.spentUsd).toBe(11);
+      expect(typeof body.resetAt).toBe("number");
+      // The authorization-before-capacity ordering matters here too: refusing
+      // on the way past requireBudget must never have touched the pool
+      // first — a spy, not merely the status code, is what proves that.
+      expect(acquireSpy).not.toHaveBeenCalled();
+    },
+  );
+
+  // No session-only billable endpoint exists today, so the "idFrom" absent
+  // branch above never actually runs — it.each only ever iterates the 4
+  // project-scoped ones. That gap is easy to miss because a describe block
+  // running zero cases for a category looks IDENTICAL, from the outside, to
+  // one with full coverage: nothing fails either way. Skipped (visible in
+  // the run, not silently absent) rather than omitted, so the gap stays on
+  // record until SESSION_ONLY_ENDPOINTS actually gains a `billable: true`
+  // entry — at which point it.each above starts covering it for real, and
+  // this placeholder can be deleted.
+  const sessionOnlyBillable = SESSION_ONLY_ENDPOINTS.filter((e) => e.billable);
+  it.skipIf(sessionOnlyBillable.length === 0)(
+    "the it.each table above also exercises a session-only billable endpoint, not only project-scoped ones",
+    () => {
+      expect(sessionOnlyBillable.length).toBeGreaterThan(0);
+    },
+  );
+
+  /**
+   * FIX for the enumeration-oracle ordering: the composition is
+   * `requireProject(db, idFrom, requireBudget(db, forward))`, so a foreign
+   * project must 404 BEFORE the cap is ever consulted. The existing 404 test
+   * (`registry vs. the live route table` above, and preview/compiler-routes'
+   * own suites) all use a requester who is UNDER the cap, so none of them
+   * would notice the order reversed — a 402 would satisfy "not 200" just as
+   * well as a 404 does. This drives an OVER-cap requester at ANOTHER user's
+   * project specifically, so that reversing the order (checking budget
+   * first) would answer 402 instead of 404 — which would leak which project
+   * ids exist to anyone willing to spend past their own cap first.
+   */
+  it.each(PROJECT_SCOPED_ENDPOINTS.filter((e) => e.billable))(
+    "404s another user's project on $method $path even when the requester is over the cap — never 402",
+    async (entry) => {
+      const { db, pool, listener } = freshHarness();
+      const owner = createUser(db, `${randomBytes(4).toString("hex")}@example.com`, "h");
+      const requester = createUser(db, `${randomBytes(4).toString("hex")}@example.com`, "h");
+      const project = createProject(db, owner.id, `run-${randomBytes(4).toString("hex")}`, "Owner's");
+      const cookie = `${SESSION_COOKIE}=${createSession(db, requester.id).id}`;
+      recordUsageEvent(db, {
+        userId: requester.id, projectId: null, role: "section", model: "claude-sonnet-5",
+        inputTokens: 0, outputTokens: 0, cacheCreationInputTokens: 0, cacheReadInputTokens: 0,
+        costUsd: 11, at: Date.now(),
+      });
+      const acquireSpy = vi.spyOn(pool, "acquire");
+
+      const result = await call(listener, entry.method, pathFor(entry, project.id), cookie);
+
+      expect(result.status).toBe(404);
+      expect(acquireSpy).not.toHaveBeenCalled();
+    },
+  );
 });

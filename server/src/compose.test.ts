@@ -16,6 +16,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { openDatabase } from "./db.ts";
 import { buildRoutes } from "./compose.ts";
 import { PreviewPool } from "./preview-pool.ts";
+import { PROJECT_SCOPED_ENDPOINTS } from "./project-registry.ts";
 import { createProject } from "./projects.ts";
 import { createRequestListener } from "./router.ts";
 import { createSession, SESSION_COOKIE } from "./sessions.ts";
@@ -35,7 +36,14 @@ afterAll(() => {
   for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
 });
 
-/** Every (method, path) pair the hosted composition root must expose. */
+/**
+ * Every (method, path) pair the hosted composition root must expose. The
+ * compiler's own `/__*` endpoints are derived from the registry rather than
+ * retyped here — a second hand-written list of the same twelve-plus-one
+ * paths is exactly the drift project-registry.ts exists to prevent, and this
+ * test would otherwise need updating by hand every time compiler-routes.ts's
+ * own source of truth changes.
+ */
 const EXPECTED_ROUTES: Array<[string, string]> = [
   ["POST", "/api/login"],
   ["POST", "/api/logout"],
@@ -46,6 +54,9 @@ const EXPECTED_ROUTES: Array<[string, string]> = [
   ["GET", "/api/projects"],
   ["GET", "/api/projects/:id"],
   ["GET", "/preview/:projectId/*"],
+  ...PROJECT_SCOPED_ENDPOINTS
+    .filter((e) => e.path.startsWith("/__"))
+    .map((e): [string, string] => [e.method, e.path]),
 ];
 
 describe("buildRoutes", () => {

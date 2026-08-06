@@ -34,12 +34,19 @@
  * one it started with. `ctx.params["*"]` still exists (the router match
  * needs the wildcard to accept every path under the project's prefix at
  * all), it just is not used to build the forwarded path.
+ *
+ * The acquire/retain/proxy/release sequence itself lives in
+ * `preview-forward.ts`'s `forwardToPreview`, shared with
+ * `compiler-routes.ts` — the two used to carry byte-identical copies of it,
+ * which is exactly the duplication that would let a later change (mapping
+ * `MissingApiKeyError`/`DisabledUserError`) land in one file and not the
+ * other.
  */
 import type { DatabaseSync } from "node:sqlite";
-import { PreviewCapacityError, type PreviewPool } from "./preview-pool.ts";
-import { proxyHttp } from "./preview-proxy.ts";
+import { forwardToPreview } from "./preview-forward.ts";
+import type { PreviewPool } from "./preview-pool.ts";
 import { requireProject } from "./require-project.ts";
-import { sendJson, type Route } from "./router.ts";
+import type { Route } from "./router.ts";
 
 export function previewRoutes(deps: { db: DatabaseSync; pool: PreviewPool }): Route[] {
   const { db, pool } = deps;
@@ -47,36 +54,7 @@ export function previewRoutes(deps: { db: DatabaseSync; pool: PreviewPool }): Ro
     {
       method: "GET",
       path: "/preview/:projectId/*",
-      handler: requireProject(db, { from: "param", name: "projectId" }, async (req, res, ctx) => {
-        let preview;
-        try {
-          preview = await pool.acquire(ctx.project, ctx.user.id);
-        } catch (error) {
-          // Capacity is the caller's problem to act on, and the message says
-          // so. Anything else is ours, and gets a generic message: the
-          // underlying error can carry a stack trace or (via buildChildEnv's
-          // failure paths) something derived from the environment, neither of
-          // which may ever reach a response body.
-          sendJson(res, error instanceof PreviewCapacityError ? 503 : 500, {
-            error: error instanceof PreviewCapacityError
-              ? error.message
-              : "could not start the preview",
-          });
-          return;
-        }
-        // retain/release BRACKET the proxy so the reaper cannot kill this
-        // subprocess mid-request. release() runs in a finally so an aborted
-        // or failed proxy call still frees the slot.
-        pool.retain(ctx.project.id);
-        try {
-          // req.url, unmodified — see the module comment for why stripping
-          // the project-id prefix here would loop the client against Vite's
-          // own base-redirect forever.
-          await proxyHttp({ req, res, port: preview.port, path: req.url ?? "/" });
-        } finally {
-          pool.release(ctx.project.id);
-        }
-      }),
+      handler: requireProject(db, { from: "param", name: "projectId" }, forwardToPreview(pool)),
     },
   ];
 }

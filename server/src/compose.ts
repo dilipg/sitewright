@@ -11,6 +11,7 @@
  */
 import type { DatabaseSync } from "node:sqlite";
 import { authRoutes } from "./auth-routes.ts";
+import { compilerRoutes } from "./compiler-routes.ts";
 import { keyRoutes } from "./key-routes.ts";
 import type { PreviewPool } from "./preview-pool.ts";
 import { previewRoutes } from "./preview-routes.ts";
@@ -24,8 +25,8 @@ export function buildRoutes(args: {
   /**
    * Optional: a caller with no pool (every pre-existing test, and any future
    * caller with no need for it) gets the exact same route table as before —
-   * the preview route is added only when there is a pool to serve it, never
-   * mounted half-wired.
+   * the preview route and the compiler's own `/__*` endpoints are added only
+   * when there is a pool to serve them, never mounted half-wired.
    */
   pool?: PreviewPool;
 }): Route[] {
@@ -35,5 +36,6 @@ export function buildRoutes(args: {
     ...keyRoutes({ db, masterKey }),
     ...projectRoutes({ db }),
     ...(pool === undefined ? [] : previewRoutes({ db, pool })),
+    ...(pool === undefined ? [] : compilerRoutes({ db, pool })),
   ];
 }

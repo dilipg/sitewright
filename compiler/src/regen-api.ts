@@ -30,14 +30,55 @@
  */
 
 import { spawn } from "node:child_process";
-import { cpSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import type { Plugin } from "vite";
 import type { EditAgentResult } from "./edit-protocol.ts";
 import { mockEditOperations } from "./edit-mock.ts";
+import { ROUTE_SLUG } from "./route-slug.ts";
+import { isValidUsageId, USAGE_ID_HEADER, usageLogPathFor } from "./usage-log-path.ts";
 
 const MOCK_DELAY_MS = 1500; // keeps the in-place progress state observable in e2e
+
+/**
+ * Guards every filesystem path this plugin builds from proxied, otherwise-
+ * unvalidated request input. `route` and `section`'s route component both
+ * end up joined straight into a project-relative path (`snapshotRoute`,
+ * below) — `path.join` normalises `..` segments, so an unchecked value can
+ * walk outside the project root before any handler logic even runs. Found in
+ * review: the hosted server proxies `route`/`section` bytes verbatim and
+ * neither it nor this file validated them, so
+ * `route = "../../../../victim/src"` escaped the project directory and
+ * copied another tenant's files into the caller's own `.regen-backup`.
+ *
+ * Shares `ROUTE_SLUG` with `preview.ts`'s `/__overrides/<route-slug>` guard
+ * rather than redefining it — one definition, so the two call sites cannot
+ * silently drift apart.
+ */
+function isValidRouteSlug(value: unknown): value is string {
+  return typeof value === "string" && ROUTE_SLUG.test(value);
+}
+
+/**
+ * The route component of a section (or bare-route) id — same rule
+ * `snapshotSection`/`restoreSnapshot` use to derive a route slug from a
+ * section id, applied here so the VALIDATION sees exactly what the
+ * filesystem call will. A `..`-shaped id (e.g. `"../../secret.hero"`) starts
+ * with a literal `.`, so this always yields `""` for that specific shape —
+ * not itself exploitable — but the guard is applied regardless, for the same
+ * reason `route` is: an unvalidated value has no business reaching
+ * `path.join` at all, and a non-string body field must fail closed here
+ * rather than throw deeper in `.split()`.
+ */
+function routeSlugOfSection(section: unknown): string | undefined {
+  return typeof section === "string" ? section.split(".")[0] : undefined;
+}
+
+/** Sends the uniform 400 every route-slug rejection below uses. */
+function respondInvalidRouteSlug(res: ServerResponse): void {
+  respondJson(res, 400, { error: "invalid route slug" });
+}
 
 export function regenApiPlugin(projectRoot: string): Plugin {
   const root = resolve(projectRoot);
@@ -51,11 +92,15 @@ export function regenApiPlugin(projectRoot: string): Plugin {
           void readBody(req).then(async (body) => {
             try {
               const { section, instruction } = body as { section: string; instruction: string };
+              if (!isValidRouteSlug(routeSlugOfSection(section))) {
+                respondInvalidRouteSlug(res);
+                return;
+              }
               snapshotSection(root, section);
               const result =
                 process.env.WG_REGEN_MOCK === "1"
                   ? await mockRegen(root, section, instruction)
-                  : await realRegen(root, section, instruction);
+                  : await realRegen(root, section, instruction, usageEnvFor(req));
               // the editor reloads the frame immediately on response; the
               // watcher's async invalidation would race it and serve stale
               // transforms from the module cache
@@ -71,12 +116,16 @@ export function regenApiPlugin(projectRoot: string): Plugin {
           void readBody(req).then(async (body) => {
             try {
               const { route, instruction } = body as { route: string; instruction: string };
+              if (!isValidRouteSlug(route)) {
+                respondInvalidRouteSlug(res);
+                return;
+              }
               // once, before any section runs — see the header comment
               snapshotRoute(root, route);
               const result =
                 process.env.WG_REGEN_MOCK === "1"
                   ? await mockRegenPage(root, route, instruction)
-                  : await realRegenPage(root, route, instruction);
+                  : await realRegenPage(root, route, instruction, usageEnvFor(req));
               server.moduleGraph.invalidateAll();
               respondJson(res, 200, { ...result, canRevert: true });
             } catch (error) {
@@ -99,6 +148,10 @@ export function regenApiPlugin(projectRoot: string): Plugin {
                 archetype: string;
                 instruction: string;
               };
+              if (!isValidRouteSlug(route)) {
+                respondInvalidRouteSlug(res);
+                return;
+              }
               // Same route-wide snapshot as a regen, so an added section is
               // revertable by the same one step — adding one is as much a
               // change to the page as regenerating it (PRD 4.4).
@@ -106,7 +159,7 @@ export function regenApiPlugin(projectRoot: string): Plugin {
               const result =
                 process.env.WG_REGEN_MOCK === "1"
                   ? await mockAddSection(root, route, archetype, instruction)
-                  : await realAddSection(root, route, archetype, instruction);
+                  : await realAddSection(root, route, archetype, instruction, usageEnvFor(req));
               server.moduleGraph.invalidateAll();
               respondJson(res, 200, { ...result, canRevert: true });
             } catch (error) {
@@ -123,13 +176,17 @@ export function regenApiPlugin(projectRoot: string): Plugin {
                 instruction: string;
                 selection?: string;
               };
+              if (!isValidRouteSlug(route)) {
+                respondInvalidRouteSlug(res);
+                return;
+              }
               // No snapshot here, unlike regen: this endpoint changes nothing on
               // disk. It returns operations; the editor applies them as ordinary
               // overrides, which the existing undo stack already covers.
               const result =
                 process.env.WG_REGEN_MOCK === "1"
                   ? mockEditOperations(instruction, route)
-                  : await realEditPrompt(root, route, instruction, selection);
+                  : await realEditPrompt(root, route, instruction, selection, usageEnvFor(req));
               respondJson(res, 200, result);
             } catch (error) {
               respondJson(res, 500, { error: String(error) });
@@ -140,7 +197,12 @@ export function regenApiPlugin(projectRoot: string): Plugin {
         if (req.method === "POST" && url === "/__regen-revert") {
           void readBody(req).then((body) => {
             try {
-              restoreSnapshot(root, (body as { section: string }).section);
+              const { section } = body as { section: string };
+              if (!isValidRouteSlug(routeSlugOfSection(section))) {
+                respondInvalidRouteSlug(res);
+                return;
+              }
+              restoreSnapshot(root, section);
               server.moduleGraph.invalidateAll();
               respondJson(res, 200, { ok: true });
             } catch (error) {
@@ -200,16 +262,37 @@ interface PageRegenOutcome extends RegenOutcome {
   perSection: Record<string, boolean>;
 }
 
-function realRegen(root: string, section: string, instruction: string): Promise<RegenOutcome> {
-  return runRegenCli(root, ["--section", section], instruction);
+function realRegen(
+  root: string,
+  section: string,
+  instruction: string,
+  env?: NodeJS.ProcessEnv,
+): Promise<RegenOutcome> {
+  return runRegenCli(root, ["--section", section], instruction, env);
 }
 
-function realRegenPage(root: string, route: string, instruction: string): Promise<PageRegenOutcome> {
-  return runRegenCli(root, ["--route", route], instruction) as Promise<PageRegenOutcome>;
+function realRegenPage(
+  root: string,
+  route: string,
+  instruction: string,
+  env?: NodeJS.ProcessEnv,
+): Promise<PageRegenOutcome> {
+  return runRegenCli(root, ["--route", route], instruction, env) as Promise<PageRegenOutcome>;
 }
 
-function runRegenCli(root: string, scopeArgs: string[], instruction: string): Promise<RegenOutcome> {
-  return runCli<RegenOutcome>(root, ["orchestrator.regenerate", ...scopeArgs], instruction, "REGEN_RESULT ");
+function runRegenCli(
+  root: string,
+  scopeArgs: string[],
+  instruction: string,
+  env?: NodeJS.ProcessEnv,
+): Promise<RegenOutcome> {
+  return runCli<RegenOutcome>(
+    root,
+    ["orchestrator.regenerate", ...scopeArgs],
+    instruction,
+    "REGEN_RESULT ",
+    env,
+  );
 }
 
 /**
@@ -233,9 +316,15 @@ export function runProcess(
   command: string,
   args: string[],
   cwd: string,
+  extraEnv?: NodeJS.ProcessEnv,
 ): Promise<{ stdout: string; stderr: string; code: number | null }> {
   return new Promise((resolvePromise, rejectPromise) => {
-    const child = spawn(command, args, { cwd });
+    // Merged over the inherited environment rather than replacing it: the
+    // orchestrator needs PATH, and under the hosted server it needs the
+    // ANTHROPIC_API_KEY the preview pool put in this process's environment
+    // for its owner. Only the caller's additions are new.
+    const env = extraEnv === undefined ? undefined : { ...process.env, ...extraEnv };
+    const child = spawn(command, args, env === undefined ? { cwd } : { cwd, env });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
@@ -247,6 +336,25 @@ export function runProcess(
   });
 }
 
+/**
+ * The env addition for a request that may spend money. Absent header → no
+ * addition, so the local unauthenticated preview behaves exactly as before
+ * and keeps writing to the orchestrator's own shared runlog.
+ *
+ * Exported (though not part of the plugin's public surface) so it can be
+ * tested directly rather than only through a live orchestrator spawn — the
+ * header-to-env translation is the actual new logic here; `runProcess`'s
+ * merge behavior is already covered on its own.
+ */
+export function usageEnvFor(req: IncomingMessage): NodeJS.ProcessEnv | undefined {
+  const raw = req.headers[USAGE_ID_HEADER];
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  if (!isValidUsageId(value)) return undefined;
+  const path = usageLogPathFor(value);
+  mkdirSync(dirname(path), { recursive: true });
+  return { WEBGEN_USAGE_LOG: path };
+}
+
 /** Spawns an orchestrator CLI and reads its single machine-readable result
  *  line. `moduleAndArgs` starts with the module name; --run-id (the project
  *  directory's own name) and --instruction are added here. */
@@ -255,6 +363,7 @@ async function runCli<T>(
   moduleAndArgs: string[],
   instruction: string,
   marker: string,
+  env?: NodeJS.ProcessEnv,
 ): Promise<T> {
   const orchestratorDir = resolve(root, "..", "..", "orchestrator");
   const runId = basename(root);
@@ -263,6 +372,7 @@ async function runCli<T>(
     "uv",
     ["run", "python", "-m", moduleName!, "--run-id", runId, ...args, "--instruction", instruction],
     orchestratorDir,
+    env,
   );
   const resultLine = stdout.split("\n").find((line) => line.startsWith(marker));
   if (resultLine === undefined) {
@@ -282,12 +392,14 @@ function realAddSection(
   route: string,
   archetype: string,
   instruction: string,
+  env?: NodeJS.ProcessEnv,
 ): Promise<AddSectionOutcome> {
   return runCli<AddSectionOutcome>(
     root,
     ["orchestrator.add_section", "--route", route, "--archetype", archetype],
     instruction,
     "ADD_SECTION_RESULT ",
+    env,
   );
 }
 
@@ -296,10 +408,11 @@ function realEditPrompt(
   route: string,
   instruction: string,
   selection: string | undefined,
+  env?: NodeJS.ProcessEnv,
 ): Promise<EditAgentResult> {
   const scope = ["orchestrator.edit_agent", "--route", route];
   if (selection !== undefined) scope.push("--selection", selection);
-  return runCli<EditAgentResult>(root, scope, instruction, "EDIT_RESULT ");
+  return runCli<EditAgentResult>(root, scope, instruction, "EDIT_RESULT ", env);
 }
 
 /**

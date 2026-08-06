@@ -38,17 +38,24 @@
  */
 import { request as httpRequest, type IncomingMessage, type ServerResponse } from "node:http";
 import type { Duplex } from "node:stream";
+import { USAGE_ID_HEADER } from "../../compiler/src/usage-log-path.ts";
 import { sendJson } from "./router.ts";
 
 /**
  * The headers to send upstream: `req.headers` verbatim (see the module
  * comment — hop-by-hop headers survive on purpose), except `host` (rewritten
  * to the upstream's own loopback address, same reasoning as before), and
- * `cookie`/`authorization`, dropped rather than forwarded. The child never
- * needs either — it serves one project's own static/dev-server assets, not
- * anything session-aware — and forwarding either hands the browser's session
- * id (or a bearer credential) to a subprocess running the project's own
- * unvalidated `vite.config.ts` and plugin chain. Applied identically for
+ * `cookie`/`authorization`/`USAGE_ID_HEADER`, dropped rather than forwarded.
+ * The child never needs `cookie` or `authorization` — it serves one
+ * project's own static/dev-server assets, not anything session-aware — and
+ * forwarding either hands the browser's session id (or a bearer credential)
+ * to a subprocess running the project's own unvalidated `vite.config.ts` and
+ * plugin chain. `USAGE_ID_HEADER` is dropped for a different reason: it
+ * selects where a billable request's model-usage log gets written
+ * (compiler/src/usage-log-path.ts), so a client-supplied value would choose
+ * that path for a subprocess it does not own. A later caller re-adds the
+ * server's OWN value deliberately (compiler-routes.ts) — what must never
+ * happen is a client's value surviving the trip. Applied identically for
  * both protocols this module forwards (`proxyHttp`'s ordinary request/
  * response and `proxyUpgrade`'s WebSocket handshake): Vite's HMR upgrade
  * carries the same session cookie an ordinary request does.
@@ -57,6 +64,7 @@ function upstreamHeaders(req: IncomingMessage, port: number): IncomingMessage["h
   const headers = { ...req.headers };
   delete headers.cookie;
   delete headers.authorization;
+  delete headers[USAGE_ID_HEADER];
   headers.host = `localhost:${port}`;
   return headers;
 }
@@ -106,21 +114,63 @@ function safeEnd(res: ServerResponse): void {
  *
  * Resolves once the exchange is over — success, upstream error, or timeout —
  * and NEVER rejects: every exit path is funnelled through `settle()` below.
+ *
+ * Resolves with `{ completed }`, not bare `void` — added for FIX 3 (a
+ * whole-branch review): a client abort (the top-level `res.on("close", ...)`
+ * below), `PREVIEW_PROXY_TIMEOUT_MS`, and an unreachable upstream all resolve
+ * this promise WITHOUT ever genuinely relaying an upstream response, while
+ * the orchestrator subprocess behind `port` may still be running and still
+ * appending to its usage log. A caller that treats "this promise settled" as
+ * "the run is over" (`preview-forward.ts` used to) ingests that log while it
+ * is still partial, then deletes it — every line the subprocess writes
+ * afterward lands in a file nobody will ever read again.
+ *
+ * `completed` is `true` in EXACTLY one place below: once the upstream's own
+ * response has fully finished being written to the client (`res`'s `finish`
+ * event, inside the `upstreamReq.on("response", ...)` handler). It stays
+ * `false` for every other settle path — an abort before the upstream ever
+ * answered, a timeout, a dead upstream (502), or a `writeHead` throw — even
+ * though several of those ALSO end up writing a complete, well-formed error
+ * response of their own (a small 502/504 JSON body, written and finished
+ * synchronously via `safeSendJson`). That is deliberate, not an oversight: a
+ * plain `res.writableFinished` check right after one of those synchronous
+ * writes reads back `true` regardless (confirmed empirically — Node marks a
+ * small, unbuffered write finished before this function's own next
+ * statement runs), which would call an upstream nobody ever actually reached
+ * "completed." The only thing this signal is FOR is deciding whether it is
+ * safe to ingest-and-delete the usage log; none of those short-circuit paths
+ * represent the upstream (and whatever it may have spawned) genuinely
+ * finishing its work, so they must all read `false`.
  */
 export function proxyHttp(args: {
   req: IncomingMessage;
   res: ServerResponse;
   port: number;
   path: string;
-}): Promise<void> {
-  const { req, res, port, path } = args;
+  /**
+   * Extra headers applied AFTER `upstreamHeaders`' own strip — so a value set
+   * here always reaches the upstream, regardless of what the inbound request
+   * carried (a client's own copy of the same header name is already deleted
+   * by that point, never merely overwritten by something that could race
+   * it). The only caller today (`compiler-routes.ts`, via
+   * `preview-forward.ts`) uses this to set the server's own, freshly
+   * generated `x-webgen-usage-id` on a billable request — never the
+   * client's, which `upstreamHeaders` deletes unconditionally before this is
+   * even applied.
+   */
+  setHeaders?: Record<string, string> | undefined;
+}): Promise<{ completed: boolean }> {
+  const { req, res, port, path, setHeaders } = args;
 
-  return new Promise<void>((resolve) => {
+  return new Promise<{ completed: boolean }>((resolve) => {
     let settled = false;
+    // Flipped to `true` in exactly one place — see the function comment —
+    // and read at whichever `settle()` call actually wins.
+    let completed = false;
     const settle = (): void => {
       if (settled) return;
       settled = true;
-      resolve();
+      resolve({ completed });
     };
 
     // A response the client has already walked away from must not keep this
@@ -180,7 +230,10 @@ export function proxyHttp(args: {
         // straight to the one Vite dev server this proxy exists to reach
         // over loopback, never through a further proxy hop where that would
         // actually matter.
-        headers: upstreamHeaders(req, port),
+        // `setHeaders` is spread LAST, after the strip above already ran —
+        // see this function's own arg doc for why the ordering is the whole
+        // point.
+        headers: { ...upstreamHeaders(req, port), ...setHeaders },
       });
     } catch (err) {
       safeSendJson(res, 502, { error: `could not construct upstream request: ${String(err)}` });
@@ -231,8 +284,18 @@ export function proxyHttp(args: {
         safeEnd(res);
         settle();
       });
+      // `close` can ALSO fire on a normal completion (confirmed empirically
+      // against a real Vite child — see the historical note this comment
+      // used to carry) — harmless for settling (`settled` coalesces either
+      // way), but it must never be the thing that sets `completed`: unlike
+      // `finish`, `close` fires just as readily when the client vanishes
+      // mid-body, and that case is exactly what `completed` must read as
+      // `false`.
       res.on("close", settle);
-      res.on("finish", settle);
+      res.on("finish", () => {
+        completed = true;
+        settle();
+      });
       upstreamRes.pipe(res);
     });
 

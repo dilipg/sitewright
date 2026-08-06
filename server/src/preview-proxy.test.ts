@@ -25,6 +25,7 @@ import { connect } from "node:net";
 import { once } from "node:events";
 import type { Duplex } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { USAGE_ID_HEADER } from "../../compiler/src/usage-log-path.ts";
 import { PREVIEW_PROXY_TIMEOUT_MS, proxyHttp, proxyUpgrade } from "./preview-proxy.ts";
 
 /** Polls `predicate` until it is true, or throws after `timeoutMs`. Used instead of a fixed sleep to avoid flakiness while still bounding a hang. */
@@ -106,13 +107,23 @@ function rewritePath(url: string): string {
  */
 function startProxyServer(
   targetPort: number,
-  options?: { onRequest?: (req: import("node:http").IncomingMessage, res: import("node:http").ServerResponse) => void },
-): Promise<{ server: Server; origin: string; port: number; close: () => Promise<void> }> {
+  options?: {
+    onRequest?: (req: import("node:http").IncomingMessage, res: import("node:http").ServerResponse) => void;
+    /** Forwarded verbatim as `proxyHttp`'s own `setHeaders` — lets a test stand in for compiler-routes.ts's server-generated usage id. */
+    setHeaders?: Record<string, string>;
+  },
+): Promise<{ server: Server; origin: string; port: number; close: () => Promise<void>; results: Array<{ completed: boolean }> }> {
   return new Promise((resolve) => {
     const upgradedSockets = new Set<Duplex>();
+    // Every `proxyHttp` resolution for a request through THIS server, in
+    // order — lets a test read back `completed` (FIX 3) the same way
+    // `compiler-routes.ts`'s `after()` gate does, without needing its own
+    // route/handler machinery.
+    const results: Array<{ completed: boolean }> = [];
     const server = createServer((req, res) => {
       options?.onRequest?.(req, res);
-      void proxyHttp({ req, res, port: targetPort, path: rewritePath(req.url ?? "/") });
+      void proxyHttp({ req, res, port: targetPort, path: rewritePath(req.url ?? "/"), setHeaders: options?.setHeaders })
+        .then((result) => { results.push(result); });
     });
     server.on("upgrade", (req, socket, head) => {
       upgradedSockets.add(socket);
@@ -126,7 +137,7 @@ function startProxyServer(
     };
     server.listen(0, "127.0.0.1", () => {
       const address = server.address() as { port: number };
-      resolve({ server, origin: `http://127.0.0.1:${address.port}`, port: address.port, close });
+      resolve({ server, origin: `http://127.0.0.1:${address.port}`, port: address.port, close, results });
     });
   });
 }
@@ -183,6 +194,50 @@ describe("proxyHttp", () => {
       });
       expect(seen[0]?.headers.cookie).toBeUndefined();
       expect(seen[0]?.headers.authorization).toBeUndefined();
+    } finally {
+      await close();
+    }
+  });
+
+  it("does not forward a client-supplied x-webgen-usage-id header to the upstream child", async () => {
+    // That header selects where a billable request's model-usage log gets
+    // written (compiler/src/usage-log-path.ts) — a client-supplied value
+    // would choose the write path for a subprocess it does not own. Task 3
+    // (compiler-routes.ts) re-adds the SERVER's own value deliberately, after
+    // this deletion runs; what must never happen is a client's own value
+    // surviving the trip, which is what this test pins.
+    const { origin, close } = await startProxyServer(upstreamPort);
+    try {
+      await fetch(`${origin}/`, {
+        headers: { [USAGE_ID_HEADER]: "0123456789abcdef0123456789abcdef" },
+      });
+      expect(seen[0]?.headers[USAGE_ID_HEADER]).toBeUndefined();
+    } finally {
+      await close();
+    }
+  });
+
+  it("applies the server's own x-webgen-usage-id over a client-supplied value on the same header name", async () => {
+    // The previous test only proves a client-supplied id is DELETED — it says
+    // nothing about what happens once compiler-routes.ts's real caller also
+    // supplies its OWN value via `setHeaders` (task 3). This is the test that
+    // can actually fail if a regression reintroduces client control: it
+    // proves the server's value is what reaches upstream, and that the
+    // client's original value is not merely overwritten in appearance but
+    // genuinely absent anywhere in what the upstream received.
+    const serverUsageId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const clientUsageId = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const { origin, close } = await startProxyServer(upstreamPort, {
+      setHeaders: { [USAGE_ID_HEADER]: serverUsageId },
+    });
+    try {
+      await fetch(`${origin}/`, {
+        headers: { [USAGE_ID_HEADER]: clientUsageId },
+      });
+      expect(seen[0]?.headers[USAGE_ID_HEADER]).toBe(serverUsageId);
+      // Not just "the header we checked" -- the client's value must not have
+      // leaked into any OTHER header the upstream received either.
+      expect(Object.values(seen[0]?.headers ?? {})).not.toContain(clientUsageId);
     } finally {
       await close();
     }
@@ -325,6 +380,109 @@ describe("proxyHttp", () => {
   });
 });
 
+/**
+ * FIX 3 (whole-branch review): `proxyHttp` used to resolve with bare `void`,
+ * which `preview-forward.ts` treated as "the exchange is over, ingest the
+ * usage log" regardless of WHY it settled. A client abort or
+ * `PREVIEW_PROXY_TIMEOUT_MS` both resolve this promise while the upstream
+ * (and the orchestrator subprocess behind it) may still be running, so
+ * ingesting then would read and delete a PARTIAL log. These tests pin the
+ * new `{ completed }` signal directly against `proxyHttp`, independent of
+ * `compiler-routes.ts`'s own gate on it.
+ */
+describe("proxyHttp: reporting whether the exchange actually completed", () => {
+  it("reports completed: true once a normal response has fully flushed", async () => {
+    const { origin, close, results } = await startProxyServer(upstreamPort);
+    try {
+      await fetch(`${origin}/`);
+      expect(results).toEqual([{ completed: true }]);
+    } finally {
+      await close();
+    }
+  });
+
+  it("reports completed: true for an upstream error status passed through — the exchange still finished normally", async () => {
+    // Distinguishes "completed" from "succeeded": a 500 the upstream sent
+    // and fully finished sending is a COMPLETE exchange, unlike an abort or
+    // a dead upstream where nothing ever finishes.
+    const { origin, close, results } = await startProxyServer(upstreamPort);
+    try {
+      const response = await fetch(`${origin}/boom`);
+      expect(response.status).toBe(500);
+      expect(results).toEqual([{ completed: true }]);
+    } finally {
+      await close();
+    }
+  });
+
+  it("reports completed: false when the client disconnects before the upstream ever answers", async () => {
+    let upstreamRequestReceived = false;
+    const holdingUpstream = createServer((req) => {
+      upstreamRequestReceived = true;
+      req.on("close", () => {});
+      // No response written — the client's own abort must tear this down.
+    });
+    holdingUpstream.listen(0);
+    await once(holdingUpstream, "listening");
+    const holdingPort = (holdingUpstream.address() as { port: number }).port;
+
+    const { origin, close, results } = await startProxyServer(holdingPort);
+    try {
+      const controller = new AbortController();
+      const fetchPromise = fetch(`${origin}/`, { signal: controller.signal });
+      await waitUntil(() => upstreamRequestReceived);
+      controller.abort();
+      await expect(fetchPromise).rejects.toBeTruthy();
+      await waitUntil(() => results.length > 0);
+      expect(results).toEqual([{ completed: false }]);
+    } finally {
+      await close();
+      holdingUpstream.closeAllConnections();
+      holdingUpstream.close();
+      await once(holdingUpstream, "close");
+    }
+  });
+
+  it("reports completed: false when the upstream is not reachable (502)", async () => {
+    const probe = createServer();
+    probe.listen(0);
+    await once(probe, "listening");
+    const deadPort = (probe.address() as { port: number }).port;
+    probe.close();
+    await once(probe, "close");
+
+    const { origin, close, results } = await startProxyServer(deadPort);
+    try {
+      const response = await fetch(`${origin}/`);
+      expect(response.status).toBe(502);
+      expect(results).toEqual([{ completed: false }]);
+    } finally {
+      await close();
+    }
+  });
+
+  it("reports completed: false when relaying the upstream's response headers throws", async () => {
+    const { origin, close, results } = await startProxyServer(upstreamPort, {
+      onRequest: (_req, res) => {
+        const originalWriteHead = res.writeHead.bind(res);
+        let calls = 0;
+        res.writeHead = ((...writeHeadArgs: Parameters<typeof res.writeHead>) => {
+          calls += 1;
+          if (calls === 1) throw new Error("simulated header relay failure");
+          return originalWriteHead(...writeHeadArgs);
+        }) as typeof res.writeHead;
+      },
+    });
+    try {
+      const response = await fetch(`${origin}/`);
+      expect(response.status).toBe(502);
+      expect(results).toEqual([{ completed: false }]);
+    } finally {
+      await close();
+    }
+  });
+});
+
 /** Accumulates 'data' chunks until the buffer contains `marker`, or rejects after `timeoutMs`. */
 function readUntil(socket: import("node:net").Socket, marker: string, timeoutMs = 5000): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -426,6 +584,46 @@ describe("proxyUpgrade", () => {
         await readUntil(client, "101");
         expect(seenHeaders.cookie).toBeUndefined();
         expect(seenHeaders.authorization).toBeUndefined();
+      } finally {
+        client.destroy();
+      }
+    } finally {
+      await close();
+    }
+  });
+
+  it("does not forward a client-supplied x-webgen-usage-id header on a WebSocket upgrade", async () => {
+    // upstreamHeaders is the one function both proxyHttp and proxyUpgrade
+    // build their outbound headers from — this pins that the deletion
+    // added for the HTTP path is not, in fact, HTTP-only.
+    let seenHeaders: Record<string, unknown> = {};
+    upstream.on("upgrade", (req, socket) => {
+      seenHeaders = req.headers as Record<string, unknown>;
+      socket.write(
+        "HTTP/1.1 101 Switching Protocols\r\n"
+        + "Upgrade: websocket\r\n"
+        + "Connection: Upgrade\r\n"
+        + "\r\n",
+      );
+    });
+
+    const { port, close } = await startProxyServer(upstreamPort);
+    try {
+      const client = connect(port, "127.0.0.1");
+      await once(client, "connect");
+      client.write(
+        "GET /preview/abc/ws HTTP/1.1\r\n"
+        + "Host: localhost\r\n"
+        + "Connection: Upgrade\r\n"
+        + "Upgrade: websocket\r\n"
+        + "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+        + "Sec-WebSocket-Version: 13\r\n"
+        + `${USAGE_ID_HEADER}: 0123456789abcdef0123456789abcdef\r\n`
+        + "\r\n",
+      );
+      try {
+        await readUntil(client, "101");
+        expect(seenHeaders[USAGE_ID_HEADER]).toBeUndefined();
       } finally {
         client.destroy();
       }

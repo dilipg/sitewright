@@ -6,7 +6,7 @@
  * shim code (see docs/decisions.md).
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { join, resolve } from "node:path";
 import type { Plugin, ViteDevServer } from "vite";
@@ -33,6 +33,49 @@ export interface PreviewOptions {
    * `npm run preview` wants.
    */
   base?: string;
+}
+
+/**
+ * Vite's own default `server.fs.allow` is `searchForWorkspaceRoot(root)`,
+ * which walks up looking for a workspace marker (`package-lock.json`,
+ * `pnpm-workspace.yaml`, ...) and, in this monorepo, lands on the REPO ROOT
+ * — meaning by default every project's dev server can serve, via Vite's
+ * `/@fs/<absolute-path>` endpoint, every OTHER project's files, and every
+ * other repo file (the identity database included), to anyone who can reach
+ * IT AT ALL. Under the hosted server the ownership check only bounds WHICH
+ * project's child answers a request — it says nothing about which files
+ * that child is willing to serve once reached. Found live: authenticated as
+ * the owner of exactly one project, through the real proxy, another
+ * project's `overrides/*.json`, another project's `src/main.tsx`, and an
+ * arbitrary repo file were all readable byte-for-byte (task 4's manual
+ * verification, follow-up review).
+ *
+ * Narrowed to exactly the project directory, plus — if `node_modules` is a
+ * symlink/junction rather than a real directory — the real location it
+ * resolves to. This codebase junctions every generated project's
+ * `node_modules` to one shared install (`orchestrator`'s
+ * `ensure_node_modules`, used by every real generation path, not just
+ * soak/testing) to avoid an `npm install` per project; that real location is
+ * a genuine, load-bearing external dependency every project needs to
+ * resolve modules from (confirmed empirically: a project's own
+ * `node_modules/.vite/deps/react.js` request resolves through this exact
+ * junction). Nothing broader is added — a real, non-symlinked
+ * `node_modules` contributes nothing extra here, since it is already inside
+ * `root`.
+ */
+export function resolveFsAllow(root: string): string[] {
+  const allow = [root];
+  const projectNodeModules = join(root, "node_modules");
+  if (existsSync(projectNodeModules)) {
+    try {
+      const real = realpathSync(projectNodeModules);
+      if (real !== projectNodeModules) allow.push(real);
+    } catch {
+      // Unreadable node_modules is not this function's problem — nothing to
+      // add, and the project directory itself is still allowed.
+    }
+  }
+  return allow;
 }
 
 export async function startPreviewServer(
@@ -77,6 +120,27 @@ export async function startPreviewServer(
       strictPort: true,
       cors: true,
       watch: { ignored: ["**/overrides/**", "**/.regen-backup/**"] },
+      fs: {
+        allow: resolveFsAllow(root),
+        // Vite resolves an OMITTED `deny` to its own defaults, but an
+        // explicit array here is taken as-is, not merged with them — so
+        // Vite's own defaults (env files, cert/key files, .npmrc, .git) are
+        // repeated verbatim rather than silently dropped, alongside the two
+        // new entries this fix adds. `*.db`/`*.db-{wal,shm}` are NOT in
+        // Vite's own default deny list, and the documented deployment
+        // (CLAUDE.md) puts the identity store — session ids, argon2 hashes —
+        // at `server/data/identity.db`, inside the repo root `fs.allow` used
+        // to default to. Explicit defence in depth even though the narrowed
+        // `allow` above should already put every one of these out of reach:
+        // per Vite's own docs, "plugins can potentially access files through
+        // alternative paths or symlinks," which is exactly the class of bug
+        // this whole fix responds to.
+        deny: [
+          ".env", ".env.*", "*.{crt,pem,key,p12,pfx,cer,der}",
+          ".npmrc", ".yarnrc.yml", "**/.git/**",
+          "**/*.db", "**/*.db-{wal,shm}",
+        ],
+      },
     },
   });
   await server.listen();

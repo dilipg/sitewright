@@ -15,10 +15,9 @@ import { buildRoutes } from "../src/compose.ts";
 import { openDatabase } from "../src/db.ts";
 import { loadMasterKey, MASTER_KEY_ENV_VAR } from "../src/master-key.ts";
 import { PreviewPool } from "../src/preview-pool.ts";
-import { proxyUpgrade } from "../src/preview-proxy.ts";
-import { findProjectById } from "../src/projects.ts";
-import { createRequestListener, parseCookies } from "../src/router.ts";
-import { deleteExpiredSessions, resolveSession, SESSION_COOKIE } from "../src/sessions.ts";
+import { createPreviewUpgradeListener } from "../src/preview-upgrade.ts";
+import { createRequestListener } from "../src/router.ts";
+import { deleteExpiredSessions } from "../src/sessions.ts";
 import { findUserByEmail } from "../src/users.ts";
 // Reuses the flag() already fixed twice (server/src/user-cli.ts, applied to
 // scripts/user.ts in commit 72dd44b) rather than keeping this script's own
@@ -175,93 +174,13 @@ server.on("error", (error) => {
   process.exit(1);
 });
 
-/**
- * A WebSocket upgrade (Vite's HMR client) never reaches the route table:
- * node:http fires 'upgrade' for it, never 'request', so
- * createRequestListener — and with it, requireProject/requireSession — never
- * runs. That makes this the ONE authorization path outside the table, and
- * therefore the one that has to be re-derived BY HAND rather than trusted
- * because "the table is the allowlist" covers everything else. It carries the
- * same session cookie an ordinary request does; skipping this check and
- * proxying straight through would be an ownership hole no route-table test
- * could ever see, because an upgrade never touches that table at all.
- *
- * `pool.acquire` (not a plain lookup) deliberately: in the normal flow the
- * page's own GET request already spawned the preview before the browser's
- * Vite client ever opens this socket, so this almost always reuses that
- * entry — but treating the upgrade as capable of spawning its own, exactly
- * like the GET route does, means a client that somehow opens the socket
- * first still gets a correctly-authorized preview instead of a confusing
- * refusal.
- *
- * The forwarded path is `req.url` UNMODIFIED, `/preview/<projectId>` prefix
- * and all — never a stripped tail. See preview-routes.ts's module comment
- * for why: the child's Vite dev server is spawned with a matching `--base`
- * and expects requests to arrive WITH that prefix, not without it. Only the
- * project id segment is decoded here, and only to look the project up —
- * the path handed to `proxyUpgrade` is the original bytes.
- */
-server.on("upgrade", (req, socket, head) => {
-  socket.on("error", () => { /* see preview-proxy.ts's module comment: an unlistened 'error' event throws and can crash the process */ });
-  void (async () => {
-    let url: URL;
-    try {
-      url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
-    } catch {
-      socket.destroy();
-      return;
-    }
-    // "/preview/<projectId>/..." parsed by hand — the router's own wildcard
-    // matcher is not reachable from here (see the comment above). Only the
-    // project id segment is extracted; the rest of the path is never
-    // inspected or reconstructed, since it is forwarded verbatim below.
-    const segments = url.pathname.split("/");
-    if (segments.length < 3 || segments[1] !== "preview" || segments[2] === "") {
-      socket.destroy();
-      return;
-    }
-    let projectId: string;
-    try {
-      projectId = decodeURIComponent(segments[2]!);
-    } catch {
-      // A malformed percent-escape is a malformed path — refuse it, the same
-      // answer router.ts's matcher gives a request with one.
-      socket.destroy();
-      return;
-    }
-
-    const sid = parseCookies(req.headers.cookie)[SESSION_COOKIE];
-    const user = sid === undefined ? null : resolveSession(db, sid);
-    if (user === null) {
-      socket.destroy();
-      return;
-    }
-    const project = findProjectById(db, projectId);
-    // Same one-message-for-both-failures shape require-project.ts uses, for
-    // the same reason: a raw socket destroy carries no message at all, so
-    // there is nothing here that could distinguish the two even accidentally.
-    if (project === null || project.ownerId !== user.id) {
-      socket.destroy();
-      return;
-    }
-
-    let preview: { port: number };
-    try {
-      preview = await pool.acquire(project, user.id);
-    } catch {
-      socket.destroy();
-      return;
-    }
-    proxyUpgrade({ req, socket, head, port: preview.port, path: req.url ?? "/" });
-  })().catch(() => {
-    // Every fallible step above is already guarded, but node:http installs no
-    // handler for a rejected 'upgrade' listener any more than it does for a
-    // rejected request listener (see router.ts) — this is defence in depth,
-    // not the primary fix, against a future change inside the block above
-    // forgetting its own guard.
-    try { socket.destroy(); } catch { /* already gone */ }
-  });
-});
+// See preview-upgrade.ts's module comment for the full account: a WebSocket
+// upgrade never reaches the route table, so this is the ONE authorization
+// path that has to be re-derived by hand rather than trusted via the table.
+// Extracted to its own module specifically so it has real tests
+// (preview-upgrade.test.ts) — this file's own module body cannot be
+// imported for a unit test (see compose.test.ts's comment on exactly why).
+server.on("upgrade", createPreviewUpgradeListener({ db, pool }));
 
 server.listen(port, () => {
   console.log(`server listening on http://localhost:${port} (db: ${dbPath})`);

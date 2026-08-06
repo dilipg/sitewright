@@ -17,7 +17,15 @@ function pageComponent(slug: string): ComponentType | undefined {
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    <BrowserRouter>
+    {/* basename from Vite's resolved base, not hardcoded: it is "/" for local
+        preview and export, and "/preview/<projectId>/" under the hosted
+        server's pool (server/src/preview-pool.ts spawns each child with
+        --base to match). Without this, react-router's <Routes> matches
+        against the FULL pathname including that prefix, matches nothing, and
+        silently renders null — the shell (nav/footer) still renders, so a
+        200 status and a loaded page look like success while the actual
+        route content is empty. Found live: server/task-4-report.md. */}
+    <BrowserRouter basename={import.meta.env.BASE_URL}>
       <AppShell>
         <Routes>
           {routes.flatMap((route) => {

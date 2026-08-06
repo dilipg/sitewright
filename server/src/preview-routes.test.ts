@@ -138,6 +138,20 @@ describe("GET /preview/:projectId/*", () => {
     expect(proxyMocks.calls).toEqual([{ port: 7777, path: `/preview/${project.id}/src/main.tsx` }]);
   });
 
+  it("forwards the query string verbatim", async () => {
+    // Load-bearing for HMR, not cosmetic: Vite's own HMR client opens its
+    // socket with a token in the query (`?token=<...>`), so a version of this
+    // that rebuilt the path from `ctx.params["*"]` or from `url.pathname`
+    // would drop it, break the handshake, and leave every other test green.
+    const pool = fakePool(async () => ({ port: 7777, base: "/preview/x/" }));
+    const { call, project, aliceCookie } = harness(pool);
+    const result = await call("GET", `/preview/${project.id}/src/main.tsx?t=1720000000&token=abc`, aliceCookie);
+    expect(result.status).toBe(200);
+    expect(proxyMocks.calls).toEqual([
+      { port: 7777, path: `/preview/${project.id}/src/main.tsx?t=1720000000&token=abc` },
+    ]);
+  });
+
   it("acquires with the caller's project and owner id", async () => {
     const pool = fakePool();
     const { call, project, alice, aliceCookie } = harness(pool);

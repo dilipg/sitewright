@@ -15,6 +15,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import type { DatabaseSync } from "node:sqlite";
 import { openDatabase } from "./db.ts";
 import { buildRoutes } from "./compose.ts";
+import { PreviewPool } from "./preview-pool.ts";
 import { createProject } from "./projects.ts";
 import { createRequestListener } from "./router.ts";
 import { createSession, SESSION_COOKIE } from "./sessions.ts";
@@ -44,12 +45,20 @@ const EXPECTED_ROUTES: Array<[string, string]> = [
   ["DELETE", "/api/key"],
   ["GET", "/api/projects"],
   ["GET", "/api/projects/:id"],
+  ["GET", "/preview/:projectId/*"],
 ];
 
 describe("buildRoutes", () => {
   it("registers exactly the expected (method, path) pairs — no more, no fewer", () => {
     const db = fresh();
-    const routes = buildRoutes({ db, masterKey: randomBytes(32), secureCookies: true });
+    // A pool is passed, because scripts/serve.ts always passes one: without
+    // it `buildRoutes` omits the preview route, and this — the one test whose
+    // title claims to pin the COMPLETE route set — would pin a table
+    // production never builds. Constructing a pool spawns nothing; nothing
+    // starts until acquire(). Same reasoning as project-registry.test.ts.
+    const masterKey = randomBytes(32);
+    const pool = new PreviewPool({ db, masterKey, projectsRoot: mkdtempSync(join(tmpdir(), "compose-pool-")) });
+    const routes = buildRoutes({ db, masterKey, secureCookies: true, pool });
     const actual = routes.map((r): [string, string] => [r.method, r.path]);
     const sortKey = (pair: [string, string]) => pair.join(" ");
     expect([...actual].sort((a, b) => sortKey(a).localeCompare(sortKey(b)))).toEqual(
@@ -213,5 +222,26 @@ describe("scripts/serve.ts — master-key handling (item 1)", () => {
     const exitIndex = serveSource.indexOf("process.exit(1)", errorHandlerIndex);
     expect(errorHandlerIndex).toBeGreaterThan(-1);
     expect(exitIndex).toBeGreaterThan(errorHandlerIndex);
+  });
+
+  it("shuts the preview pool down on both termination signals", () => {
+    // Every preview is a child process. Without this, Ctrl-C leaves a Vite
+    // server per open project holding its port — the exact failure the pool's
+    // cap exists to bound, reintroduced at exit. preview-pool.test.ts covers
+    // `pool.shutdown()` itself; nothing else covers that serve.ts CALLS it,
+    // and deleting these two lines leaves the whole suite green.
+    expect(serveSource).toContain('process.on("SIGINT"');
+    expect(serveSource).toContain('process.on("SIGTERM"');
+    expect(serveSource).toContain("pool.shutdown()");
+  });
+
+  it("mounts the preview upgrade listener, the one authorization path outside the route table", () => {
+    // A WebSocket upgrade fires 'upgrade', never 'request', so
+    // createRequestListener — and with it requireProject — never runs for it.
+    // preview-upgrade.test.ts covers the listener's own authorization; this
+    // pins that serve.ts actually attaches it, which no other test can see.
+    const upgradeIndex = serveSource.indexOf('server.on("upgrade"');
+    expect(upgradeIndex).toBeGreaterThan(-1);
+    expect(serveSource.indexOf("createPreviewUpgradeListener", upgradeIndex)).toBeGreaterThan(upgradeIndex);
   });
 });

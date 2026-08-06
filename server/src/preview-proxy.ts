@@ -72,8 +72,16 @@ function safeEnd(res: ServerResponse): void {
 
 /**
  * Forwards one HTTP request/response pair to the preview child listening on
- * `port`, using `path` (already rewritten past the Vite `base` prefix) in
- * place of the inbound request's own URL.
+ * `port`, sending `path` in place of the inbound request's own URL.
+ *
+ * `path` is the caller's business, but note what the caller actually passes
+ * (preview-routes.ts, preview-upgrade.ts): the request's ORIGINAL `req.url`,
+ * `/preview/<projectId>/` prefix and query string intact — NOT a path
+ * rewritten past the Vite `base` prefix, which is what this comment claimed
+ * before task 4's manual verification disproved it. The child is spawned with
+ * a matching `--base`, so Vite expects the prefix present; strip it and Vite
+ * redirects to the very prefix just removed, looping the client against its
+ * own original URL.
  *
  * Resolves once the exchange is over — success, upstream error, or timeout —
  * and NEVER rejects: every exit path is funnelled through `settle()` below.

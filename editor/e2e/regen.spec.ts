@@ -159,6 +159,16 @@ test("page regen: every section regenerated, all overrides re-applied, one rever
 test("add-a-section: pick an archetype, generate, and it lands at the clicked position", async ({
   page,
 }) => {
+  // This test's own budget, because the assertion below waits up to 60s and
+  // the suite-wide budget is 30s (playwright.config.ts) — so that 60s was
+  // never reachable. The visible symptom was a bare "Test timeout of 30000ms
+  // exceeded" that names neither the step nor the expectation, which sends
+  // you looking for a hang in the add-section flow rather than at the
+  // arithmetic. The generous wait is deliberate (the mock delay is only
+  // 1.5s, but this step also reloads the preview iframe and re-indexes the
+  // shim); what was wrong was declaring it inside a budget a third its size.
+  test.setTimeout(90_000);
+
   // An override on a NEIGHBOUR of the insertion point: adding a section must
   // not disturb the sections already on the page.
   await styleOverrideHeadline(page);

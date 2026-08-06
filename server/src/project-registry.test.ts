@@ -170,6 +170,9 @@ describe("registry vs. the live route table", () => {
   });
 });
 
+type ProjectScopedEntry = (typeof PROJECT_SCOPED_ENDPOINTS)[number];
+type SessionOnlyEntry = (typeof SESSION_ONLY_ENDPOINTS)[number];
+
 describe("billable endpoints", () => {
   const all = [...PROJECT_SCOPED_ENDPOINTS, ...SESSION_ONLY_ENDPOINTS];
 
@@ -199,17 +202,29 @@ describe("billable endpoints", () => {
    * whether a handler is wrapped in `requireBudget`, so that test could not
    * tell a gated billable route from an ungated one — it was a tripwire
    * whose whole job was to fail once mounting became real, forcing this test
-   * to be written. Table-driven over the registry's own billable entries
-   * (not a separate hardcoded list), against the LIVE, composed route table,
-   * so a future billable endpoint added without a `requireBudget` wrapper
-   * fails this instead of shipping unguarded.
+   * to be written. Table-driven over BOTH billable lists (`all`, not just
+   * `PROJECT_SCOPED_ENDPOINTS`) against the LIVE, composed route table, so a
+   * future billable endpoint added to EITHER list without a `requireBudget`
+   * wrapper fails this instead of shipping unguarded. `requireBudget`'s own
+   * doc comment names two composition shapes it exists to serve —
+   * `requireProject(db, source, requireBudget(db, handler))` and
+   * `requireSession(db, requireBudget(db, handler))` — and a table that only
+   * ever iterated the first would silently stop covering the second the
+   * moment one existed. That is not hypothetical: slice 5's web-triggered
+   * generation is a session-only billable endpoint, since no project id
+   * exists yet when a generation starts.
    */
-  it.each(PROJECT_SCOPED_ENDPOINTS.filter((e) => e.billable))(
+  it.each(all.filter((e) => e.billable))(
     "refuses $method $path with 402 over the cap, and never touches the pool",
-    async (entry) => {
+    async (rawEntry) => {
+      // it.each's own typings merge the table's element type for its
+      // `$key`-interpolation feature, which erases `idFrom` to `unknown`
+      // rather than preserving the PROJECT_SCOPED_ENDPOINTS |
+      // SESSION_ONLY_ENDPOINTS union `all` actually has — recovered here so
+      // the "in" check below narrows correctly.
+      const entry = rawEntry as unknown as ProjectScopedEntry | SessionOnlyEntry;
       const { db, pool, listener } = freshHarness();
       const owner = createUser(db, `${randomBytes(4).toString("hex")}@example.com`, "h");
-      const project = createProject(db, owner.id, `run-${randomBytes(4).toString("hex")}`, "Over Cap");
       const cookie = `${SESSION_COOKIE}=${createSession(db, owner.id).id}`;
       // Default cap is $10; one event alone puts this user over it, the same
       // way require-budget.test.ts proves the wrapper in isolation.
@@ -220,7 +235,16 @@ describe("billable endpoints", () => {
       });
       const acquireSpy = vi.spyOn(pool, "acquire");
 
-      const result = await call(listener, entry.method, pathFor(entry, project.id), cookie);
+      // A project-scoped entry needs a real project to name; a session-only
+      // one (the "in" check is false for every SESSION_ONLY_ENDPOINTS entry,
+      // since that list's type carries no `idFrom` field at all — see
+      // project-registry.ts) has no project id to supply in the first
+      // place, so the bare path is the whole request.
+      const path = "idFrom" in entry
+        ? pathFor(entry, createProject(db, owner.id, `run-${randomBytes(4).toString("hex")}`, "Over Cap").id)
+        : entry.path;
+
+      const result = await call(listener, entry.method, path, cookie);
 
       expect(result.status).toBe(402);
       const body = JSON.parse(result.body) as { capUsd: number; spentUsd: number; resetAt: number | null };
@@ -230,6 +254,57 @@ describe("billable endpoints", () => {
       // The authorization-before-capacity ordering matters here too: refusing
       // on the way past requireBudget must never have touched the pool
       // first — a spy, not merely the status code, is what proves that.
+      expect(acquireSpy).not.toHaveBeenCalled();
+    },
+  );
+
+  // No session-only billable endpoint exists today, so the "idFrom" absent
+  // branch above never actually runs — it.each only ever iterates the 4
+  // project-scoped ones. That gap is easy to miss because a describe block
+  // running zero cases for a category looks IDENTICAL, from the outside, to
+  // one with full coverage: nothing fails either way. Skipped (visible in
+  // the run, not silently absent) rather than omitted, so the gap stays on
+  // record until SESSION_ONLY_ENDPOINTS actually gains a `billable: true`
+  // entry — at which point it.each above starts covering it for real, and
+  // this placeholder can be deleted.
+  const sessionOnlyBillable = SESSION_ONLY_ENDPOINTS.filter((e) => e.billable);
+  it.skipIf(sessionOnlyBillable.length === 0)(
+    "the it.each table above also exercises a session-only billable endpoint, not only project-scoped ones",
+    () => {
+      expect(sessionOnlyBillable.length).toBeGreaterThan(0);
+    },
+  );
+
+  /**
+   * FIX for the enumeration-oracle ordering: the composition is
+   * `requireProject(db, idFrom, requireBudget(db, forward))`, so a foreign
+   * project must 404 BEFORE the cap is ever consulted. The existing 404 test
+   * (`registry vs. the live route table` above, and preview/compiler-routes'
+   * own suites) all use a requester who is UNDER the cap, so none of them
+   * would notice the order reversed — a 402 would satisfy "not 200" just as
+   * well as a 404 does. This drives an OVER-cap requester at ANOTHER user's
+   * project specifically, so that reversing the order (checking budget
+   * first) would answer 402 instead of 404 — which would leak which project
+   * ids exist to anyone willing to spend past their own cap first.
+   */
+  it.each(PROJECT_SCOPED_ENDPOINTS.filter((e) => e.billable))(
+    "404s another user's project on $method $path even when the requester is over the cap — never 402",
+    async (entry) => {
+      const { db, pool, listener } = freshHarness();
+      const owner = createUser(db, `${randomBytes(4).toString("hex")}@example.com`, "h");
+      const requester = createUser(db, `${randomBytes(4).toString("hex")}@example.com`, "h");
+      const project = createProject(db, owner.id, `run-${randomBytes(4).toString("hex")}`, "Owner's");
+      const cookie = `${SESSION_COOKIE}=${createSession(db, requester.id).id}`;
+      recordUsageEvent(db, {
+        userId: requester.id, projectId: null, role: "section", model: "claude-sonnet-5",
+        inputTokens: 0, outputTokens: 0, cacheCreationInputTokens: 0, cacheReadInputTokens: 0,
+        costUsd: 11, at: Date.now(),
+      });
+      const acquireSpy = vi.spyOn(pool, "acquire");
+
+      const result = await call(listener, entry.method, pathFor(entry, project.id), cookie);
+
+      expect(result.status).toBe(404);
       expect(acquireSpy).not.toHaveBeenCalled();
     },
   );

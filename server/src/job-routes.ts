@@ -35,15 +35,61 @@
  * `GET /api/jobs?project=<id>` IS project-scoped (a project's own recent
  * activity), so it goes through `requireProject` like any other project-owned
  * resource.
+ *
+ * `POST /api/generate`'s enqueue bound (task-3-review round 2): a plain
+ * `countActiveBillableJobsForUser` read followed by separate `createProject`/
+ * `createJob` writes — this module's round-1 shape — is not atomic: a burst
+ * of concurrent requests can all read the same pre-insert count before any
+ * of them writes (proven empirically, 10 concurrent requests for one user
+ * all producing 202 against a bound of 2). `compiler-routes.ts`'s five
+ * proxied kinds close this with one atomic `INSERT ... SELECT ... WHERE`
+ * (`jobs.ts`'s `createBillableJobIfUnderBound`), but that alone is too late
+ * here: `POST /api/generate` also creates a PROJECT row and a directory, and
+ * both precede the job insert, so a request that is refused at the job
+ * insert would already have created a project and a directory nobody's
+ * account should keep. This module instead wraps the count check AND both
+ * inserts in one real `BEGIN IMMEDIATE` transaction (the idiom already used
+ * by `db.test.ts`'s cross-connection lock test, so it is proven to work with
+ * `node:sqlite`): `mkdirSync` runs OUTSIDE the transaction and first (a
+ * throw there must leave no rows at all, preserving the mkdir-then-row
+ * ordering fixed in an earlier review round), then the transaction opens,
+ * reads the count, and EITHER rolls back and best-effort removes the
+ * directory (over the bound) OR inserts both rows and commits (under it) —
+ * never partially. `BEGIN IMMEDIATE` takes SQLite's write lock up front, so
+ * a second real connection attempting a write while this transaction is open
+ * waits on `busy_timeout` rather than interleaving.
+ *
+ * An honest note on WHERE the concurrent-request race this fixes actually
+ * gets closed, checked by experiment rather than assumed: this server runs
+ * one process holding one `DatabaseSync` connection shared by every request,
+ * and `node:sqlite`'s calls are fully synchronous — so, in THIS architecture,
+ * the property that actually stops N concurrently-fired requests from all
+ * reading the same pre-insert count is that there is no `await` anywhere
+ * between the count check and `COMMIT` (JS cannot preempt a synchronous
+ * stack to run a second request's continuation in the middle of one). Undoing
+ * only `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK` (turning them into no-ops, and
+ * nothing else) while leaving that synchronous count-check-then-insert shape
+ * intact was tried, and the concurrent test below still passed — so
+ * `BEGIN IMMEDIATE` is not, by itself, why the test in THIS process passes.
+ * It is kept anyway, deliberately, for two reasons this experiment does not
+ * touch: it gives the count-check-and-two-inserts sequence real transactional
+ * atomicity against an unanticipated mid-sequence error (the `catch` block
+ * below), and it is what would actually serialize a SECOND real connection
+ * (a future second server process, a migration script run concurrently) —
+ * exactly the property `db.test.ts`'s own cross-connection lock test proves,
+ * which this single-process test suite structurally cannot exercise for this
+ * code path.
  */
 import { randomUUID } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, rmSync } from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
-import { createJob, findJobById, listJobsByProject, type Job } from "./jobs.ts";
+import {
+  countActiveBillableJobsForUser, createJob, ENQUEUE_BOUND_REFUSED,
+  findJobById, listJobsByProject, MAX_ENQUEUED_BILLABLE_JOBS_PER_USER, type Job,
+} from "./jobs.ts";
 import { BY_QUERY } from "./project-registry.ts";
 import { createProject, resolveProjectDirectory } from "./projects.ts";
 import { requireBudget } from "./require-budget.ts";
-import { requireEnqueueSlot } from "./require-enqueue-slot.ts";
 import { NOT_FOUND, requireProject } from "./require-project.ts";
 import { requireSession } from "./require-session.ts";
 import { readJsonBody, sendJson, type Route } from "./router.ts";
@@ -117,12 +163,10 @@ export function jobRoutes(deps: { db: DatabaseSync; projectsRoot: string }): Rou
       // created — an over-cap request is refused with no side effect at all,
       // matching the binding constraint that the spend cap gates enqueue and
       // an over-cap request creates no job row (and, here, no project row
-      // either). requireEnqueueSlot sits between requireSession and
-      // requireBudget — the same relative position `compiler-routes.ts` puts
-      // it in for its own billable entries (see that module's own comment):
-      // a precondition with no side effect of its own runs before the cap
-      // check, which runs before anything is created.
-      handler: requireSession(db, requireEnqueueSlot(db, requireBudget(db, async (req, res, ctx) => {
+      // either). The enqueue-time CONCURRENCY bound (as opposed to the spend
+      // cap) is enforced further down, inside the transaction — see this
+      // module's own top comment for why it can no longer be a wrapper here.
+      handler: requireSession(db, requireBudget(db, async (req, res, ctx) => {
         let parsed: unknown;
         try {
           parsed = await readJsonBody(req);
@@ -140,33 +184,76 @@ export function jobRoutes(deps: { db: DatabaseSync; projectsRoot: string }): Rou
         }
         const trimmedBrief = brief.trim();
 
-        // Project row AND directory, created together, before the job is
-        // ever queued — see this module's own top comment for why. The name
-        // is the brief itself (truncated): the only user-facing label
-        // available at this point, and the same thing adopt.ts falls back to
-        // when nothing better exists.
-        //
-        // Directory FIRST, row SECOND: if mkdirSync throws (ENOSPC, EACCES,
-        // ...) there must be no row left pointing at a directory that was
-        // never actually created. The reverse order's failure mode is worse
-        // than this one's — a harmless orphan directory with no owning row,
-        // vs. an owned row whose directory silently does not exist, which
-        // every later reader of `project.directory` would have to guard
-        // against instead of just this one call site.
+        // Directory FIRST, OUTSIDE the transaction: if mkdirSync throws
+        // (ENOSPC, EACCES, ...) there must be no row left pointing at a
+        // directory that was never actually created, and there is nothing
+        // yet to roll back (no transaction has opened). The reverse order's
+        // failure mode is worse than this one's — a harmless orphan
+        // directory with no owning row, vs. an owned row whose directory
+        // silently does not exist.
         const directory = freshProjectDirectory();
-        mkdirSync(resolveProjectDirectory(projectsRoot, directory), { recursive: true });
-        const project = createProject(db, ctx.user.id, directory, trimmedBrief.slice(0, 200));
+        const resolvedDir = resolveProjectDirectory(projectsRoot, directory);
+        mkdirSync(resolvedDir, { recursive: true });
 
-        const job = createJob(db, {
-          userId: ctx.user.id,
-          projectId: project.id,
-          kind: "generate",
-          requestJson: JSON.stringify({ brief: trimmedBrief }),
-          now: Date.now(),
-        });
+        // ONE real transaction from here on: the count check and BOTH
+        // inserts (project, then job) happen inside it, so a concurrent
+        // burst of requests cannot all read the same pre-insert count the
+        // way task-3-review round 2 proved a plain read-then-write could.
+        // `BEGIN IMMEDIATE` (not the bare `BEGIN` SQLite defaults to) takes
+        // the write lock up front rather than on the transaction's first
+        // write, so a second real connection's own transaction waits on
+        // `busy_timeout` instead of interleaving with this one.
+        db.exec("BEGIN IMMEDIATE");
+        try {
+          if (countActiveBillableJobsForUser(db, ctx.user.id) >= MAX_ENQUEUED_BILLABLE_JOBS_PER_USER) {
+            db.exec("ROLLBACK");
+            try {
+              rmSync(resolvedDir, { recursive: true, force: true });
+            } catch {
+              // Best-effort only: an orphan directory with no owning row is
+              // the same harmless leftover mkdirSync's own ordering comment
+              // above already accepts, not a correctness problem.
+            }
+            sendJson(res, 429, ENQUEUE_BOUND_REFUSED);
+            return;
+          }
 
-        sendJson(res, 202, { jobId: job.id, projectId: project.id });
-      }))),
+          // Project row AND directory together, before the job is ever
+          // queued — see this module's own top comment for why. The name is
+          // the brief itself (truncated): the only user-facing label
+          // available at this point, and the same thing adopt.ts falls back
+          // to when nothing better exists.
+          const project = createProject(db, ctx.user.id, directory, trimmedBrief.slice(0, 200));
+          const job = createJob(db, {
+            userId: ctx.user.id,
+            projectId: project.id,
+            kind: "generate",
+            requestJson: JSON.stringify({ brief: trimmedBrief }),
+            now: Date.now(),
+          });
+          db.exec("COMMIT");
+          sendJson(res, 202, { jobId: job.id, projectId: project.id });
+        } catch (err) {
+          // Defence in depth against an error this handler did not
+          // anticipate (e.g. a UNIQUE collision): `db` is ONE connection
+          // shared by every request this process serves, so leaving a
+          // transaction open here would corrupt every OTHER request's
+          // writes, not just this one's. Roll back, best-effort clean up the
+          // directory, then rethrow — the router's own top-level catch maps
+          // this to a generic 500, same as any other unanticipated failure.
+          try {
+            db.exec("ROLLBACK");
+          } catch {
+            // Nothing open (already rolled back or never began) — fine.
+          }
+          try {
+            rmSync(resolvedDir, { recursive: true, force: true });
+          } catch {
+            // Best-effort only.
+          }
+          throw err;
+        }
+      })),
     },
     {
       method: "GET",

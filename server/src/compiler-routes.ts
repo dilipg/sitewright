@@ -108,14 +108,36 @@
  * NOT this bound's replacement — it caps concurrently RUNNING jobs per user
  * (a scheduling fairness bound, applies to all six kinds including the
  * non-billable `export`), not how much billable work a user may COMMIT by
- * enqueuing. The real replacement is `require-enqueue-slot.ts`'s
- * `requireEnqueueSlot`, wrapped around every billable entry below in the
- * position `requireBillableSlot` used to occupy: a live COUNT of that user's
- * `queued`+`running` BILLABLE job rows (`jobs.ts`'s
- * `countActiveBillableJobsForUser`), refused with 429 past
- * `MAX_ENQUEUED_BILLABLE_JOBS_PER_USER` — see that module's own comment for
- * the full account, including why a live COUNT needs no separate "release"
- * call the way the old in-memory reservation did.
+ * enqueuing.
+ *
+ * ROUND 1's actual replacement — a decorator, `require-enqueue-slot.ts`'s
+ * `requireEnqueueSlot`, wrapped around every billable entry — was ALSO
+ * wrong, and a task-3-review ROUND 2 caught it empirically (10 concurrent
+ * `POST /api/generate` for one user, fired via `Promise.all`, produced
+ * 10/10 202s against a bound of 2): the decorator's read
+ * (`countActiveBillableJobsForUser`) and the eventual write (`createJob`,
+ * inside `enqueueHandler` below) were two SEPARATE statements, separated by
+ * `enqueueHandler`'s own `await readJsonBody(req)` — so N requests fired at
+ * once all ran their synchronous prefix (session, ownership, key check, the
+ * COUNT, the cap check) before any of them reached the write, and all read
+ * the identical pre-insert count. `require-enqueue-slot.ts` has been
+ * DELETED, not patched: once the insert itself is made authoritative (below),
+ * a decorator that reads first and lets a separate write happen later is
+ * either redundant with it or, if the two ever drift, actively misleading —
+ * "two checks that both read as authoritative" is worse than one. There is
+ * now exactly ONE enforcement point.
+ *
+ * The REAL fix is `jobs.ts`'s `createBillableJobIfUnderBound`: a single
+ * `INSERT ... SELECT ... WHERE (<active billable count>) < <bound>`
+ * statement — the check and the write are literally the same SQL statement,
+ * so there is no `await` for a second request to interleave inside. This is
+ * the identical technique `claimNextJob` already uses for its own per-user
+ * bound (see that function's own comment: "This MUST be a single statement,
+ * not a SELECT followed by an UPDATE"), applied here to a conditional INSERT
+ * instead of a conditional UPDATE. Zero rows inserted means the user was at
+ * the bound; `enqueueHandler` below maps that to 429
+ * (`jobs.ts`'s `ENQUEUE_BOUND_REFUSED`, shared verbatim with
+ * `job-routes.ts` so the two 429 bodies cannot drift in wording).
  * `PreviewPool.reserveBillableSlot`/`releaseBillableSlot` themselves are
  * untouched and still directly unit-tested (preview-pool.test.ts) — only
  * this file's WIRING of them is gone, because nothing here holds an
@@ -137,12 +159,13 @@
 import type { DatabaseSync } from "node:sqlite";
 import { DisabledUserError, MissingApiKeyError, UnknownUserError } from "./agent-env.ts";
 import { UndecryptableApiKeyError } from "./api-keys.ts";
-import { createJob, type JobKind } from "./jobs.ts";
+import {
+  createBillableJobIfUnderBound, createJob, ENQUEUE_BOUND_REFUSED, type CreateJobInput, type JobKind,
+} from "./jobs.ts";
 import { forwardToPreview } from "./preview-forward.ts";
 import type { PreviewPool } from "./preview-pool.ts";
 import { PROJECT_SCOPED_ENDPOINTS } from "./project-registry.ts";
 import { requireBudget } from "./require-budget.ts";
-import { requireEnqueueSlot } from "./require-enqueue-slot.ts";
 import { requireProject, type ProjectHandler } from "./require-project.ts";
 import { readJsonBody, sendJson, type Route } from "./router.ts";
 
@@ -208,8 +231,17 @@ const BAD_JSON_BODY = { error: "request body must be valid JSON within the size 
  * the body-size limit" happens here: that is unchanged from today (the CHILD
  * has always been the one that validates a `/__regen`-shaped body, and still
  * is — this endpoint only decides whether to run it now or later).
+ *
+ * `billable` selects which INSERT primitive runs: `createBillableJobIfUnderBound`
+ * (`jobs.ts`) for a billable kind — one atomic statement that inserts zero
+ * rows and returns `null` when the user is at `MAX_ENQUEUED_BILLABLE_JOBS_PER_USER`,
+ * mapped here to 429 — or the plain, unconditional `createJob` for a
+ * non-billable one (`/__export` is the only async-but-non-billable entry
+ * today). Deciding this from `entry.billable` at ROUTE-TABLE construction
+ * time, not by re-deriving "is this kind billable" per request, mirrors
+ * `jobKindForAsyncPath`'s own "fail at construction, not per-request" bias.
  */
-function enqueueHandler(db: DatabaseSync, kind: JobKind): ProjectHandler {
+function enqueueHandler(db: DatabaseSync, kind: JobKind, billable: boolean): ProjectHandler {
   return async (req, res, ctx) => {
     let parsed: unknown;
     try {
@@ -218,13 +250,18 @@ function enqueueHandler(db: DatabaseSync, kind: JobKind): ProjectHandler {
       sendJson(res, 400, BAD_JSON_BODY);
       return;
     }
-    const job = createJob(db, {
+    const input: CreateJobInput = {
       userId: ctx.user.id,
       projectId: ctx.project.id,
       kind,
       requestJson: JSON.stringify(parsed),
       now: Date.now(),
-    });
+    };
+    const job = billable ? createBillableJobIfUnderBound(db, input) : createJob(db, input);
+    if (job === null) {
+      sendJson(res, 429, ENQUEUE_BOUND_REFUSED);
+      return;
+    }
     sendJson(res, 202, { jobId: job.id });
   };
 }
@@ -235,29 +272,27 @@ export function compilerRoutes(deps: { db: DatabaseSync; pool: PreviewPool }): R
 
   return COMPILER_ENDPOINTS.map((entry) => {
     const inner: ProjectHandler = entry.async
-      ? enqueueHandler(db, jobKindForAsyncPath(entry.path))
+      ? enqueueHandler(db, jobKindForAsyncPath(entry.path), entry.billable)
       : forward;
     return {
       method: entry.method,
       path: entry.path,
       // requireProject runs first (session + ownership), so an
       // unauthenticated or non-owner request never reaches requireApiKey,
-      // requireEnqueueSlot, requireBudget, the job table, or the pool. Only a
-      // `billable` entry gets the key check + concurrency bound + spend cap
-      // wrapped around it — a non-billable one (notably /__export, async but
-      // not billable, and /__export-download: the exporter is deterministic,
-      // and refusing an export over the cap would strand a user's finished
-      // work behind a bill) reaches `inner` directly, ungated, never checked
-      // for a key, and never counted against the enqueue bound. Order among
-      // the three billable-only wrappers matches the deleted
-      // `requireBillableSlot`'s own: the key check first (a precondition
-      // with no side effect — no point counting a slot or consulting the cap
-      // for a request that cannot succeed anyway), then the enqueue-time
-      // concurrency bound, then the spend cap, then `inner` itself.
+      // requireBudget, the job table, or the pool. Only a `billable` entry
+      // gets the key check + spend cap wrapped around it — a non-billable
+      // one (notably /__export, async but not billable, and
+      // /__export-download: the exporter is deterministic, and refusing an
+      // export over the cap would strand a user's finished work behind a
+      // bill) reaches `inner` directly, ungated, never checked for a key.
+      // The enqueue-time concurrency bound is NOT a wrapper here at all any
+      // more (see this module's own top comment) — it is enforced inside
+      // `inner` itself, by the INSERT `enqueueHandler` runs, so there is
+      // nothing to add to this chain for it.
       handler: requireProject(
         db,
         entry.idFrom,
-        entry.billable ? requireApiKey(pool, requireEnqueueSlot(db, requireBudget(db, inner))) : inner,
+        entry.billable ? requireApiKey(pool, requireBudget(db, inner)) : inner,
       ),
     };
   });

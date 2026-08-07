@@ -332,19 +332,57 @@ describe("compilerRoutes", () => {
 });
 
 /**
- * Task-3-review finding 1: the deleted `requireBillableSlot` bounded "the
- * concurrent-start multiplier on the spend cap" — N billable requests in
- * flight for one user all evaluating `checkSpendCap` against the same
- * pre-run total, since spend lands in `usage_event` only at ingest, after a
- * run finishes. Enqueuing being a single fast INSERT made that gap WORSE,
- * not moot: without a replacement, a user under the cap could enqueue an
- * unbounded number of billable jobs in one burst. `requireEnqueueSlot`
- * (server/src/require-enqueue-slot.ts) is that replacement, wired at the
- * same position `requireBillableSlot` used to occupy — see
- * compiler-routes.ts's own module comment.
+ * Task-3-review finding 1 / round 2: the deleted `requireBillableSlot`
+ * bounded "the concurrent-start multiplier on the spend cap" — N billable
+ * requests in flight for one user all evaluating `checkSpendCap` against the
+ * same pre-run total, since spend lands in `usage_event` only at ingest,
+ * after a run finishes. Round 1's replacement, a decorator
+ * (`requireEnqueueSlot`, `server/src/require-enqueue-slot.ts`, since
+ * DELETED), read `countActiveBillableJobsForUser` and let a separate
+ * `createJob` write happen later — an `await` apart — which is not atomic:
+ * every test in this block used to fire requests SEQUENTIALLY (`await
+ * call(...)` per loop iteration, each request fully resolving before the
+ * next begins), and a sequential loop cannot observe two requests'
+ * synchronous prefixes in flight at once, so all of them passed while the
+ * bug shipped. Proven empirically (10 concurrent `POST /api/generate` for
+ * one user via `Promise.all` produced 10/10 202s against a bound of 2 —
+ * job-routes.test.ts has the equivalent live test for that endpoint). The
+ * fix moved the check INTO the write itself: `jobs.ts`'s
+ * `createBillableJobIfUnderBound` is one atomic `INSERT ... SELECT ...
+ * WHERE` — the same technique `claimNextJob` already uses for its own
+ * per-user bound (see that function's own comment: "This MUST be a single
+ * statement, not a SELECT followed by an UPDATE").
+ *
+ * The sequential tests below are KEPT — they cover a real, different
+ * property (the bound survives across separate, COMPLETED requests, and
+ * frees correctly) — with a concurrent test ADDED first, firing with
+ * `Promise.all` and no `await` between requests: the one shape of test that
+ * can actually catch the class of bug that shipped in round 1.
  */
-describe("compilerRoutes: per-user billable enqueue bound (requireEnqueueSlot)", () => {
-  it(`refuses the ${String(MAX_ENQUEUED_BILLABLE_JOBS_PER_USER + 1)}th concurrent billable enqueue for one user with 429, creating no job row for it`, async () => {
+describe("compilerRoutes: per-user billable enqueue bound (atomic INSERT — jobs.ts's createBillableJobIfUnderBound)", () => {
+  it(`allows exactly ${String(MAX_ENQUEUED_BILLABLE_JOBS_PER_USER)} of ${String(MAX_ENQUEUED_BILLABLE_JOBS_PER_USER * 5)} TRULY CONCURRENT billable enqueues for one user (Promise.all, no await between requests), refusing the rest with 429 and creating no job row for any refused one`, async () => {
+    const pool = fakePool();
+    const { db, call, project, aliceCookie } = harness(pool);
+    const entry = BILLABLE_ENTRIES[0]!;
+    const burst = MAX_ENQUEUED_BILLABLE_JOBS_PER_USER * 5;
+    // No `await` between these dispatches — every one of the `burst`
+    // requests is in flight before any of them completes, reproducing the
+    // exact shape that let round 1's decorator pass every sequential test
+    // while remaining exploitable for real.
+    const results = await Promise.all(
+      Array.from({ length: burst }, () => call(entry.method, pathFor(entry, project.id), aliceCookie, {})),
+    );
+    const statuses = results.map((r) => r.status);
+    expect(statuses.filter((s) => s === 202)).toHaveLength(MAX_ENQUEUED_BILLABLE_JOBS_PER_USER);
+    expect(statuses.filter((s) => s === 429)).toHaveLength(burst - MAX_ENQUEUED_BILLABLE_JOBS_PER_USER);
+    expect(statuses.every((s) => s === 202 || s === 429)).toBe(true);
+    // The load-bearing assertion: the JOB ROW COUNT matches the number of
+    // 202s exactly — a race that let extra rows through would inflate this
+    // independently of whatever the HTTP responses themselves claimed.
+    expect(listJobsByProject(db, project.id, burst + 10)).toHaveLength(MAX_ENQUEUED_BILLABLE_JOBS_PER_USER);
+  });
+
+  it(`refuses the ${String(MAX_ENQUEUED_BILLABLE_JOBS_PER_USER + 1)}th SEQUENTIAL billable enqueue for one user with 429, creating no job row for it`, async () => {
     const pool = fakePool();
     const { db, call, project, aliceCookie } = harness(pool);
     const entry = BILLABLE_ENTRIES[0]!;

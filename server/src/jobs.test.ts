@@ -13,7 +13,9 @@ import {
   claimNextJob,
   countActiveBillableJobsForUser,
   countActiveJobsForUser,
+  createBillableJobIfUnderBound,
   createJob,
+  ENQUEUE_BOUND_REFUSED,
   findJobById,
   finishJob,
   listJobsByProject,
@@ -177,6 +179,124 @@ describe("countActiveBillableJobsForUser", () => {
 
   it("MAX_ENQUEUED_BILLABLE_JOBS_PER_USER matches preview-pool.ts's MAX_BILLABLE_IN_FLIGHT_PER_USER — same value, same meaning, two independent definitions", () => {
     expect(MAX_ENQUEUED_BILLABLE_JOBS_PER_USER).toBe(MAX_BILLABLE_IN_FLIGHT_PER_USER);
+  });
+});
+
+/**
+ * Task-3-review round 2: THIS is the actual enforcement point — a single
+ * `INSERT ... SELECT ... WHERE`, not the deleted `requireEnqueueSlot`
+ * decorator's separate read-then-write. `countActiveBillableJobsForUser`
+ * above stays a plain, non-atomic read; these tests are about the ONE
+ * function whose own statement is what makes the bound race-proof.
+ */
+describe("createBillableJobIfUnderBound", () => {
+  it("inserts and returns a queued job when the user is under the bound", () => {
+    const job = createBillableJobIfUnderBound(db, {
+      userId, projectId: null, kind: "regen", requestJson: '{"route":"/"}', now: 1_000,
+    });
+    expect(job).not.toBeNull();
+    expect(job?.status).toBe("queued");
+    expect(job?.kind).toBe("regen");
+    expect(findJobById(db, job!.id)).toEqual(job);
+  });
+
+  it("returns null and inserts NO row once the user is at MAX_ENQUEUED_BILLABLE_JOBS_PER_USER", () => {
+    for (let i = 0; i < MAX_ENQUEUED_BILLABLE_JOBS_PER_USER; i += 1) {
+      const job = createBillableJobIfUnderBound(db, {
+        userId, projectId: null, kind: "regen", requestJson: "{}", now: 1_000 + i,
+      });
+      expect(job).not.toBeNull();
+    }
+    const before = (db.prepare("SELECT COUNT(*) AS c FROM job").get() as { c: number }).c;
+    const refused = createBillableJobIfUnderBound(db, {
+      userId, projectId: null, kind: "regen", requestJson: "{}", now: 9_999,
+    });
+    expect(refused).toBeNull();
+    // The load-bearing assertion for this whole review round: a refusal
+    // means ZERO rows changed, verified against the table directly rather
+    // than trusting the function's own return value alone.
+    const after = (db.prepare("SELECT COUNT(*) AS c FROM job").get() as { c: number }).c;
+    expect(after).toBe(before);
+  });
+
+  it("does not count export against the bound, and export itself is never refused by this function", () => {
+    for (let i = 0; i < 10; i += 1) {
+      seed({ kind: "export", now: 1_000 + i });
+    }
+    const job = createBillableJobIfUnderBound(db, {
+      userId, projectId: null, kind: "regen", requestJson: "{}", now: 2_000,
+    });
+    expect(job).not.toBeNull();
+  });
+
+  it("is scoped per user — another user at the bound does not block this one", () => {
+    const otherUserId = createUser(db, "b@example.com", "hash").id;
+    for (let i = 0; i < MAX_ENQUEUED_BILLABLE_JOBS_PER_USER; i += 1) {
+      createJob(db, { userId: otherUserId, projectId: null, kind: "regen", requestJson: "{}", now: 1_000 + i });
+    }
+    const job = createBillableJobIfUnderBound(db, {
+      userId, projectId: null, kind: "regen", requestJson: "{}", now: 2_000,
+    });
+    expect(job).not.toBeNull();
+  });
+
+  it("a slot frees itself once a job reaches a terminal status, with no separate release call", () => {
+    const first = createBillableJobIfUnderBound(db, {
+      userId, projectId: null, kind: "regen", requestJson: "{}", now: 1_000,
+    });
+    for (let i = 1; i < MAX_ENQUEUED_BILLABLE_JOBS_PER_USER; i += 1) {
+      createBillableJobIfUnderBound(db, { userId, projectId: null, kind: "regen", requestJson: "{}", now: 1_000 + i });
+    }
+    expect(createBillableJobIfUnderBound(db, {
+      userId, projectId: null, kind: "regen", requestJson: "{}", now: 9_999,
+    })).toBeNull();
+
+    finishJob(db, first!.id, { status: "succeeded", now: 9_998 });
+
+    const afterFinish = createBillableJobIfUnderBound(db, {
+      userId, projectId: null, kind: "regen", requestJson: "{}", now: 10_000,
+    });
+    expect(afterFinish).not.toBeNull();
+  });
+
+  it("throws (a programmer error, not a user-facing failure) when called with the non-billable kind 'export'", () => {
+    expect(() => createBillableJobIfUnderBound(db, {
+      userId, projectId: null, kind: "export", requestJson: "{}", now: 1_000,
+    })).toThrow(/non-billable kind "export"/);
+    // Nothing was inserted despite the throw.
+    expect((db.prepare("SELECT COUNT(*) AS c FROM job").get() as { c: number }).c).toBe(0);
+  });
+
+  it(
+    `TRULY CONCURRENT: firing ${String(MAX_ENQUEUED_BILLABLE_JOBS_PER_USER * 5)} calls via Promise.all lets through exactly ${String(MAX_ENQUEUED_BILLABLE_JOBS_PER_USER)}`,
+    async () => {
+      // node:sqlite's DatabaseSync is fully synchronous, so this doesn't
+      // reproduce the HTTP-layer race by itself (there is no `await` inside
+      // this function for another call to interleave with) — it instead
+      // pins the property the atomic statement is SUPPOSED to guarantee
+      // regardless of caller shape, as a second, lower-level layer of
+      // coverage alongside compiler-routes.test.ts's and job-routes.test.ts's
+      // own real concurrent HTTP tests (which DO have `await` boundaries
+      // between a request's session/ownership/key checks and this call, and
+      // are what actually caught the round-1 bug).
+      const burst = MAX_ENQUEUED_BILLABLE_JOBS_PER_USER * 5;
+      const jobs = await Promise.all(
+        Array.from({ length: burst }, (_unused, i) =>
+          Promise.resolve(createBillableJobIfUnderBound(db, {
+            userId, projectId: null, kind: "regen", requestJson: "{}", now: 1_000 + i,
+          }))),
+      );
+      expect(jobs.filter((j) => j !== null)).toHaveLength(MAX_ENQUEUED_BILLABLE_JOBS_PER_USER);
+      expect(jobs.filter((j) => j === null)).toHaveLength(burst - MAX_ENQUEUED_BILLABLE_JOBS_PER_USER);
+      expect((db.prepare("SELECT COUNT(*) AS c FROM job").get() as { c: number }).c)
+        .toBe(MAX_ENQUEUED_BILLABLE_JOBS_PER_USER);
+    },
+  );
+});
+
+describe("ENQUEUE_BOUND_REFUSED", () => {
+  it("names MAX_ENQUEUED_BILLABLE_JOBS_PER_USER in its message, so the two cannot silently drift apart", () => {
+    expect(ENQUEUE_BOUND_REFUSED.error).toContain(String(MAX_ENQUEUED_BILLABLE_JOBS_PER_USER));
   });
 });
 

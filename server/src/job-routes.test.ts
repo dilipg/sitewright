@@ -4,7 +4,7 @@
  * — no fake pool needed, since none of these three endpoints ever touches
  * one (job-routes.ts's own module comment).
  */
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
@@ -227,15 +227,59 @@ describe("POST /api/generate", () => {
   });
 
   /**
-   * Task-3-review finding 1: `POST /api/generate` starts the most expensive
-   * of all six job kinds and is session-only (no project exists yet), so it
-   * is the one call site `requireEnqueueSlot` guards outside
-   * compiler-routes.ts entirely — see that module's own comment for the full
-   * "why enqueuing being fast made the old bound's absence worse, not moot"
-   * account.
+   * Task-3-review finding 1 / round 2: `POST /api/generate` starts the most
+   * expensive of all six job kinds and is session-only (no project exists
+   * yet), so it is the one call site that ALSO creates a project row and a
+   * directory — a plain `countActiveBillableJobsForUser` read followed by
+   * separate `createProject`/`createJob` writes (round 1's shape, via the
+   * since-deleted `requireEnqueueSlot` decorator) is not atomic, and every
+   * test in this block used to fire SEQUENTIALLY, which cannot observe that:
+   * proven empirically by the re-reviewer (10 concurrent requests for one
+   * user via `Promise.all` produced 10/10 202s against a bound of 2, plus 10
+   * project rows and 10 directories). The fix wraps the count check and BOTH
+   * inserts in one real `BEGIN IMMEDIATE` transaction — see job-routes.ts's
+   * own module comment for the full account, including why the atomic
+   * `INSERT ... SELECT ... WHERE` `compiler-routes.ts` uses for its five
+   * proxied kinds is not sufficient here on its own (the project row and
+   * directory precede the job insert, so gating only the job insert would
+   * still leave both behind for a refused request).
+   *
+   * The sequential tests below are KEPT — a different, still-real property
+   * (the bound survives across separate, COMPLETED requests) — with a
+   * concurrent test ADDED first.
    */
-  describe("per-user billable enqueue bound (requireEnqueueSlot)", () => {
-    it(`refuses the ${String(MAX_ENQUEUED_BILLABLE_JOBS_PER_USER + 1)}th concurrent generate request with 429, creating NEITHER a project NOR a job row for it`, async () => {
+  describe("per-user billable enqueue bound (BEGIN IMMEDIATE transaction, job-routes.ts's own)", () => {
+    it(`allows exactly ${String(MAX_ENQUEUED_BILLABLE_JOBS_PER_USER)} of ${String(MAX_ENQUEUED_BILLABLE_JOBS_PER_USER * 5)} TRULY CONCURRENT generate requests for one user (Promise.all, no await between requests) — matching project-row, directory, and job-row counts, not merely matching HTTP statuses`, async () => {
+      const { db, projectsRoot, call, aliceCookie } = harness();
+      const burst = MAX_ENQUEUED_BILLABLE_JOBS_PER_USER * 5;
+      const results = await Promise.all(
+        Array.from({ length: burst }, (_unused, i) =>
+          call("POST", "/api/generate", aliceCookie, { brief: `concurrent site ${String(i)}` })),
+      );
+      const statuses = results.map((r) => r.status);
+      expect(statuses.filter((s) => s === 202)).toHaveLength(MAX_ENQUEUED_BILLABLE_JOBS_PER_USER);
+      expect(statuses.filter((s) => s === 429)).toHaveLength(burst - MAX_ENQUEUED_BILLABLE_JOBS_PER_USER);
+      expect(statuses.every((s) => s === 202 || s === 429)).toBe(true);
+
+      // The load-bearing assertions: every row count matches the bound
+      // exactly, independent of what the HTTP responses themselves claimed.
+      // A race that let extra rows through would inflate these even if (by
+      // coincidence) the status codes still looked right.
+      expect((db.prepare("SELECT COUNT(*) AS c FROM project").get() as { c: number }).c)
+        .toBe(MAX_ENQUEUED_BILLABLE_JOBS_PER_USER);
+      expect((db.prepare("SELECT COUNT(*) AS c FROM job").get() as { c: number }).c)
+        .toBe(MAX_ENQUEUED_BILLABLE_JOBS_PER_USER);
+
+      // Directories on disk: exactly the accepted requests' worth, not the
+      // burst's worth and not the refused requests' worth — a refused
+      // request's directory (created before the bound check, per
+      // job-routes.ts's own ordering) must be cleaned up, not merely have no
+      // row pointing at it.
+      const dirs = readdirSync(projectsRoot).filter((name) => name.startsWith("web-"));
+      expect(dirs).toHaveLength(MAX_ENQUEUED_BILLABLE_JOBS_PER_USER);
+    });
+
+    it(`refuses the ${String(MAX_ENQUEUED_BILLABLE_JOBS_PER_USER + 1)}th SEQUENTIAL generate request with 429, creating NEITHER a project NOR a job row for it`, async () => {
       const { db, call, aliceCookie } = harness();
       const results: number[] = [];
       for (let i = 0; i < MAX_ENQUEUED_BILLABLE_JOBS_PER_USER + 1; i += 1) {

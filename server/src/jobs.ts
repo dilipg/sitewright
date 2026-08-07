@@ -160,44 +160,61 @@ export function countActiveJobsForUser(db: DatabaseSync, userId: string): number
  * The `JobKind`s that spend model money — every kind except `export` (a
  * production build is deterministic and spends nothing, the same reasoning
  * `project-registry.ts`'s `billable: false` on `/__export` and
- * `/__export-download` already uses). Exported so `require-enqueue-slot.ts`
- * — the enqueue-time concurrency bound on billable work, not this file's own
- * concern — can filter by it without either module re-deriving "which kinds
- * are billable" from scratch or `jobs.ts` importing anything billable-shaped
- * from `project-registry.ts` (that registry is about HTTP endpoints, not job
- * rows, and importing it here would be the wrong direction for the same
- * layering reason `MAX_ACTIVE_JOBS_PER_USER`'s own comment gives for not
- * importing `preview-pool.ts`).
+ * `/__export-download` already uses). Exported so callers gating enqueue on
+ * billable work — `createBillableJobIfUnderBound` below, and `job-routes.ts`'s
+ * `POST /api/generate` transaction — can filter by it without either module
+ * re-deriving "which kinds are billable" from scratch or `jobs.ts` importing
+ * anything billable-shaped from `project-registry.ts` (that registry is
+ * about HTTP endpoints, not job rows, and importing it here would be the
+ * wrong direction for the same layering reason `MAX_ACTIVE_JOBS_PER_USER`'s
+ * own comment gives for not importing `preview-pool.ts`).
  */
 export const BILLABLE_JOB_KINDS: readonly JobKind[] = ["generate", "regen", "regen-page", "add-section", "edit-prompt"];
 
+const BILLABLE_KIND_PLACEHOLDERS = BILLABLE_JOB_KINDS.map(() => "?").join(", ");
+
 /**
- * `queued` + `running` billable jobs only — the metric `require-enqueue-slot.ts`
- * gates enqueue on. Distinct from `countActiveJobsForUser` in TWO ways, not
- * one: it excludes `export` (spends nothing, must never be refused or
- * counted — see `BILLABLE_JOB_KINDS`), and its counterpart bound is
- * evaluated at ENQUEUE time, before a job row even exists yet, rather than at
- * claim time the way `claimNextJob`'s own running-only bound is. Because this
- * is a live COUNT against `queued`+`running` rows rather than an in-memory
- * reservation, a slot frees itself the instant `finishJob` moves a row to a
- * terminal status — there is no separate "release" call to remember, unlike
- * the old `PreviewPool.reserveBillableSlot`/`releaseBillableSlot` pair this
- * replaces (see `require-enqueue-slot.ts`'s own module comment for the full
- * account of why that in-memory mechanism stopped bounding anything once
- * enqueuing became a single fast INSERT).
+ * The WHERE-clause-shaped fragment counting one user's active
+ * (`queued`+`running`) BILLABLE jobs — a single, scalar-subquery-ready
+ * expression (`?` for the user id, then one `?` per `BILLABLE_JOB_KINDS`
+ * entry, in that order), shared VERBATIM between `countActiveBillableJobsForUser`
+ * below (a plain read) and `createBillableJobIfUnderBound` below (the atomic
+ * gate). Defined exactly once so the two can never drift apart — a task-3-
+ * review-round-2 requirement, after round 1 shipped a decorator
+ * (`requireEnqueueSlot`, since deleted — see this module's own top comment)
+ * whose read and whose write were two separate statements separated by an
+ * `await`, which a concurrent burst of requests could all pass identically.
+ */
+const ACTIVE_BILLABLE_COUNT_EXPR =
+  `(SELECT COUNT(*) FROM job WHERE user_id = ? AND status IN ('queued', 'running') AND kind IN (${BILLABLE_KIND_PLACEHOLDERS}))`;
+
+/**
+ * `queued` + `running` billable jobs only. NOT an authoritative gate on its
+ * own — see `createBillableJobIfUnderBound` below for the one that is. This
+ * is a plain read: useful for a status display, a test assertion, or (inside
+ * `job-routes.ts`'s `POST /api/generate`) a count taken INSIDE an already-open
+ * `BEGIN IMMEDIATE` transaction, where the surrounding transaction — not this
+ * function — is what makes the read-then-write atomic. Called with no
+ * transaction of its own around it, this function's result can be stale by
+ * the time a caller acts on it; that is exactly the bug task-3-review round 2
+ * found in the deleted `requireEnqueueSlot`, which called this, then
+ * `createJob`, with an `await` in between.
+ *
+ * Distinct from `countActiveJobsForUser` in TWO ways, not one: it excludes
+ * `export` (spends nothing, must never be refused or counted — see
+ * `BILLABLE_JOB_KINDS`), and its counterpart bound is evaluated at ENQUEUE
+ * time, before a job row even exists yet, rather than at claim time the way
+ * `claimNextJob`'s own running-only bound is.
  */
 export function countActiveBillableJobsForUser(db: DatabaseSync, userId: string): number {
-  const placeholders = BILLABLE_JOB_KINDS.map(() => "?").join(", ");
-  const row = db.prepare(
-    `SELECT COUNT(*) AS count FROM job
-      WHERE user_id = ? AND status IN ('queued', 'running') AND kind IN (${placeholders})`,
-  ).get(userId, ...BILLABLE_JOB_KINDS) as { count: number };
+  const row = db.prepare(`SELECT ${ACTIVE_BILLABLE_COUNT_EXPR} AS count`)
+    .get(userId, ...BILLABLE_JOB_KINDS) as { count: number };
   return row.count;
 }
 
 /**
- * The enqueue-time bound `require-enqueue-slot.ts` refuses past — "Per user:
- * 2 concurrent — today's in-flight reservation, unchanged in value and
+ * The enqueue-time bound on committed BILLABLE work — "Per user: 2
+ * concurrent — today's in-flight reservation, unchanged in value and
  * meaning" (spec, job-model design doc). Defined here, independently of
  * `MAX_ACTIVE_JOBS_PER_USER` above (a different bound: running-only, every
  * kind, enforced at claim time) and of `preview-pool.ts`'s
@@ -207,6 +224,80 @@ export function countActiveBillableJobsForUser(db: DatabaseSync, userId: string)
  * test in jobs.test.ts.
  */
 export const MAX_ENQUEUED_BILLABLE_JOBS_PER_USER = 2;
+
+/**
+ * The 429 body every enqueue-bound refusal sends — `compiler-routes.ts`'s
+ * `enqueueHandler` and `job-routes.ts`'s `POST /api/generate` transaction
+ * both import this rather than each writing their own copy of a message that
+ * NAMES `MAX_ENQUEUED_BILLABLE_JOBS_PER_USER`, so the wording and the number
+ * cannot drift apart between the two call sites. 429, not 402: retrying
+ * genuinely helps here once an in-flight job finishes, unlike the spend
+ * cap's 402 where no amount of retrying helps until the window rolls.
+ */
+export const ENQUEUE_BOUND_REFUSED = {
+  error: `at most ${String(MAX_ENQUEUED_BILLABLE_JOBS_PER_USER)} billable jobs may be queued or running at once for this account; wait for one to finish and retry`,
+};
+
+/**
+ * Atomically inserts a `queued` job for a BILLABLE kind, but ONLY if doing so
+ * would not push the user's `queued`+`running` billable job count to or past
+ * `MAX_ENQUEUED_BILLABLE_JOBS_PER_USER` — one `INSERT ... SELECT ... WHERE`
+ * statement, not a `countActiveBillableJobsForUser` read followed by a
+ * separate `createJob` write. Returns `null` (zero rows inserted, verified
+ * via `result.changes`) when the user is at the bound; the caller maps that
+ * to 429. Returns the inserted `Job` otherwise.
+ *
+ * THIS is task-3-review round 2's actual fix, not a decoration around it:
+ * `claimNextJob`'s own doc comment states the rule this function follows —
+ * "This MUST be a single statement, not a SELECT followed by an UPDATE: a
+ * second caller could observe the same row between those two steps." A
+ * single `INSERT ... SELECT ... WHERE` is what SQLite executes as one
+ * atomic operation; a second concurrent caller's insert simply matches zero
+ * rows (the `WHERE` re-evaluates against the NEW count including the first
+ * caller's row) once the first has already landed, no transaction or
+ * app-level lock needed — the exact pattern `claimNextJob` already uses for
+ * its own per-user bound, applied here to a conditional INSERT instead of a
+ * conditional UPDATE.
+ *
+ * Deliberately throws (a programmer error, not a user-facing failure) if
+ * `input.kind` is not one of `BILLABLE_JOB_KINDS` — calling this for
+ * `export` would incorrectly gate a job that must never be refused or
+ * counted (see `BILLABLE_JOB_KINDS`'s own comment); a caller that wants an
+ * unconditional insert for a non-billable kind should call `createJob`
+ * directly, exactly as `compiler-routes.ts`'s `enqueueHandler` does.
+ */
+export function createBillableJobIfUnderBound(db: DatabaseSync, input: CreateJobInput): Job | null {
+  if (!BILLABLE_JOB_KINDS.includes(input.kind)) {
+    throw new Error(`jobs.ts: createBillableJobIfUnderBound called with non-billable kind "${input.kind}"`);
+  }
+  const id = randomUUID();
+  const result = db.prepare(
+    `INSERT INTO job (
+       id, user_id, project_id, kind, status,
+       request_json, result_json, error,
+       created_at, started_at, finished_at
+     )
+     SELECT ?, ?, ?, ?, 'queued', ?, NULL, NULL, ?, NULL, NULL
+     WHERE ${ACTIVE_BILLABLE_COUNT_EXPR} < ?`,
+  ).run(
+    id, input.userId, input.projectId, input.kind, input.requestJson, input.now,
+    input.userId, ...BILLABLE_JOB_KINDS, MAX_ENQUEUED_BILLABLE_JOBS_PER_USER,
+  );
+  if (Number(result.changes) === 0) return null;
+  return {
+    id,
+    userId: input.userId,
+    projectId: input.projectId,
+    kind: input.kind,
+    status: "queued",
+    requestJson: input.requestJson,
+    resultJson: null,
+    error: null,
+    createdAt: input.now,
+    startedAt: null,
+    finishedAt: null,
+  };
+}
 
 /**
  * Atomically claims the oldest ELIGIBLE `queued` job and flips it to

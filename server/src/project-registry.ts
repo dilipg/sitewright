@@ -49,7 +49,20 @@
 import type { ProjectIdSource } from "./require-project.ts";
 import type { Route } from "./router.ts";
 
-const BY_QUERY: ProjectIdSource = { from: "query", name: "project" };
+/**
+ * Exported (not module-private) so a hand-declared route that is not itself
+ * derived from this registry's own loop — `job-routes.ts`'s `GET /api/jobs`,
+ * which is `SESSION_ONLY_ENDPOINTS`-shaped rather than looped over
+ * `PROJECT_SCOPED_ENDPOINTS` the way `compiler-routes.ts`'s entries are —
+ * can still use the SAME id-source object the registry's own `GET /api/jobs`
+ * entry below declares, rather than a second, hand-copied literal. Two
+ * copies of `{ from: "query", name: "project" }` would type-check
+ * identically while drifting silently on the query param's NAME (a typo in
+ * one, not the other) — this registry is meant to be the single source of
+ * authorization truth, and the partition test only compares method+path, so
+ * a param-name drift between the two would go untested.
+ */
+export const BY_QUERY: ProjectIdSource = { from: "query", name: "project" };
 
 export const PROJECT_SCOPED_ENDPOINTS: ReadonlyArray<{
   method: Route["method"];

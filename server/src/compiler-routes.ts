@@ -90,18 +90,37 @@
  * this slice implements: "`retain`/`release`, the usage-log id, and ingest
  * move unchanged in shape into the worker"). The five async entries never
  * touch `pool.acquire` at all from THIS layer any more — there is nothing
- * left here to hold a preview slot, generate a usage id, or ingest a log for
- * — so `requireBillableSlot` (the old concurrent-start-multiplier bound,
- * `MAX_BILLABLE_IN_FLIGHT_PER_USER`) is gone too: enqueuing is a single fast
- * INSERT, not a held connection, so there is nothing left for that reservation
- * to bound. Its replacement lives in the job layer instead —
- * `jobs.ts`'s `claimNextJob` refuses to hand a user more than
- * `MAX_ACTIVE_JOBS_PER_USER` (2) concurrently RUNNING jobs, "today's in-flight
- * reservation, same value, same meaning" per that constant's own comment.
+ * left here to hold a preview slot, generate a usage id, or ingest a log for.
+ *
+ * The old `requireBillableSlot` (an in-memory, per-process reservation held
+ * only across THIS handler's own `await`) is gone, but NOT because there is
+ * nothing left for it to bound — a task-3 review corrected an earlier,
+ * mistaken version of this comment that claimed exactly that. What it
+ * bounded — "spend lands in `usage_event` only at ingest (after a run
+ * finishes), so N billable requests in flight at once for one user all
+ * evaluate `checkSpendCap` against the same pre-run total" (the deleted
+ * guard's own doc comment, `git show 995e851`) — still needs bounding, and
+ * enqueuing being fast makes the UNGATED version of this gap WORSE, not
+ * moot: a user under the cap could `POST /__regen` a hundred times in a
+ * second, every one passing `requireBudget` against the identical
+ * pre-run spend total, every one enqueued, before a single one finishes to
+ * move the total. `jobs.ts`'s `claimNextJob`/`MAX_ACTIVE_JOBS_PER_USER` is
+ * NOT this bound's replacement — it caps concurrently RUNNING jobs per user
+ * (a scheduling fairness bound, applies to all six kinds including the
+ * non-billable `export`), not how much billable work a user may COMMIT by
+ * enqueuing. The real replacement is `require-enqueue-slot.ts`'s
+ * `requireEnqueueSlot`, wrapped around every billable entry below in the
+ * position `requireBillableSlot` used to occupy: a live COUNT of that user's
+ * `queued`+`running` BILLABLE job rows (`jobs.ts`'s
+ * `countActiveBillableJobsForUser`), refused with 429 past
+ * `MAX_ENQUEUED_BILLABLE_JOBS_PER_USER` — see that module's own comment for
+ * the full account, including why a live COUNT needs no separate "release"
+ * call the way the old in-memory reservation did.
  * `PreviewPool.reserveBillableSlot`/`releaseBillableSlot` themselves are
- * untouched and still directly unit-tested (preview-pool.test.ts) — only this
- * file's WIRING of them is gone, because nothing here holds a slot across an
- * `await` boundary any more.
+ * untouched and still directly unit-tested (preview-pool.test.ts) — only
+ * this file's WIRING of them is gone, because nothing here holds an
+ * in-memory slot across an `await` boundary any more; the bound they used to
+ * enforce is enforced differently now, not left unenforced.
  *
  * `kind` for each async entry is resolved by `jobKindForAsyncPath`, an
  * EXHAUSTIVE switch rather than a `Record<string, JobKind>` lookup. Task 1's
@@ -123,6 +142,7 @@ import { forwardToPreview } from "./preview-forward.ts";
 import type { PreviewPool } from "./preview-pool.ts";
 import { PROJECT_SCOPED_ENDPOINTS } from "./project-registry.ts";
 import { requireBudget } from "./require-budget.ts";
+import { requireEnqueueSlot } from "./require-enqueue-slot.ts";
 import { requireProject, type ProjectHandler } from "./require-project.ts";
 import { readJsonBody, sendJson, type Route } from "./router.ts";
 
@@ -222,16 +242,22 @@ export function compilerRoutes(deps: { db: DatabaseSync; pool: PreviewPool }): R
       path: entry.path,
       // requireProject runs first (session + ownership), so an
       // unauthenticated or non-owner request never reaches requireApiKey,
-      // requireBudget, the job table, or the pool. Only a `billable` entry
-      // gets the key check + spend cap wrapped around it — a non-billable
-      // one (notably /__export, async but not billable, and
-      // /__export-download: the exporter is deterministic, and refusing an
-      // export over the cap would strand a user's finished work behind a
-      // bill) reaches `inner` directly, ungated, never checked for a key.
+      // requireEnqueueSlot, requireBudget, the job table, or the pool. Only a
+      // `billable` entry gets the key check + concurrency bound + spend cap
+      // wrapped around it — a non-billable one (notably /__export, async but
+      // not billable, and /__export-download: the exporter is deterministic,
+      // and refusing an export over the cap would strand a user's finished
+      // work behind a bill) reaches `inner` directly, ungated, never checked
+      // for a key, and never counted against the enqueue bound. Order among
+      // the three billable-only wrappers matches the deleted
+      // `requireBillableSlot`'s own: the key check first (a precondition
+      // with no side effect — no point counting a slot or consulting the cap
+      // for a request that cannot succeed anyway), then the enqueue-time
+      // concurrency bound, then the spend cap, then `inner` itself.
       handler: requireProject(
         db,
         entry.idFrom,
-        entry.billable ? requireApiKey(pool, requireBudget(db, inner)) : inner,
+        entry.billable ? requireApiKey(pool, requireEnqueueSlot(db, requireBudget(db, inner))) : inner,
       ),
     };
   });

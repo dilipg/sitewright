@@ -11,9 +11,17 @@
  * immediately. The usage-id-header / ingest-on-completion machinery this
  * file used to test here (a `billableForward` built on `forwardToPreview`'s
  * own `billable` hook) moved, unchanged in shape, into job-worker.ts's
- * `runProxiedJob` — see job-worker.test.ts for that coverage, including the
- * "still ingests when the exchange fails" and "skips ingest on an incomplete
- * exchange" properties. Likewise "releases the preview even when the proxy
+ * `runProxiedJob` — see job-worker.test.ts for that coverage: "ingests the
+ * usage log for a completed exchange, and deletes it", "generates a
+ * DIFFERENT usage id per job" (task-3-review finding 3 — the original single-
+ * job test only proved one id's SHAPE, never that two jobs get two different
+ * ones), the `skipped`/`unreadable` warning-logging pair and their two
+ * "logs nothing" negative counterparts (finding 4 — the negatives were
+ * dropped with no replacement the first time this moved), "still ingests the
+ * usage log ... when the proxy exchange itself fails" (finding 2 — a task-3
+ * comment claimed this property had already moved here, but no test anywhere
+ * actually exercised it until this fix), and "skips ingest ... on an
+ * incomplete exchange". Likewise "releases the preview even when the proxy
  * call rejects" no longer has anything to prove for an async entry (there is
  * no proxy call at this layer for one any more) — that test below now uses
  * two SYNCHRONOUS entries instead.
@@ -35,7 +43,7 @@ import { openDatabase } from "./db.ts";
 import { createUser } from "./users.ts";
 import { createSession, SESSION_COOKIE } from "./sessions.ts";
 import { createProject, type Project } from "./projects.ts";
-import { findJobById, listJobsByProject } from "./jobs.ts";
+import { findJobById, finishJob, listJobsByProject, MAX_ENQUEUED_BILLABLE_JOBS_PER_USER } from "./jobs.ts";
 import { recordUsageEvent } from "./usage.ts";
 import { createRequestListener } from "./router.ts";
 import { MAX_PREVIEWS, PreviewCapacityError, type PreviewPool } from "./preview-pool.ts";
@@ -320,6 +328,96 @@ describe("compilerRoutes", () => {
     expect(result.status).toBe(503);
     expect(result.body).toContain(String(MAX_PREVIEWS));
     expect(proxyMocks.calls).toEqual([]);
+  });
+});
+
+/**
+ * Task-3-review finding 1: the deleted `requireBillableSlot` bounded "the
+ * concurrent-start multiplier on the spend cap" — N billable requests in
+ * flight for one user all evaluating `checkSpendCap` against the same
+ * pre-run total, since spend lands in `usage_event` only at ingest, after a
+ * run finishes. Enqueuing being a single fast INSERT made that gap WORSE,
+ * not moot: without a replacement, a user under the cap could enqueue an
+ * unbounded number of billable jobs in one burst. `requireEnqueueSlot`
+ * (server/src/require-enqueue-slot.ts) is that replacement, wired at the
+ * same position `requireBillableSlot` used to occupy — see
+ * compiler-routes.ts's own module comment.
+ */
+describe("compilerRoutes: per-user billable enqueue bound (requireEnqueueSlot)", () => {
+  it(`refuses the ${String(MAX_ENQUEUED_BILLABLE_JOBS_PER_USER + 1)}th concurrent billable enqueue for one user with 429, creating no job row for it`, async () => {
+    const pool = fakePool();
+    const { db, call, project, aliceCookie } = harness(pool);
+    const entry = BILLABLE_ENTRIES[0]!;
+    const results: number[] = [];
+    for (let i = 0; i < MAX_ENQUEUED_BILLABLE_JOBS_PER_USER + 1; i += 1) {
+      const result = await call(entry.method, pathFor(entry, project.id), aliceCookie, {});
+      results.push(result.status);
+    }
+    expect(results.slice(0, MAX_ENQUEUED_BILLABLE_JOBS_PER_USER)).toEqual(
+      Array(MAX_ENQUEUED_BILLABLE_JOBS_PER_USER).fill(202),
+    );
+    expect(results[MAX_ENQUEUED_BILLABLE_JOBS_PER_USER]).toBe(429);
+    // Exactly the bound's worth of job rows — the refused Nth+1 request
+    // created none.
+    expect(listJobsByProject(db, project.id, 10)).toHaveLength(MAX_ENQUEUED_BILLABLE_JOBS_PER_USER);
+  });
+
+  it("does not gate /__export on the bound, and an /__export enqueue does not itself count against it", async () => {
+    const pool = fakePool();
+    const { call, project, aliceCookie } = harness(pool);
+    const billableEntry = BILLABLE_ENTRIES[0]!;
+    // Fill the bound entirely with the billable entry.
+    for (let i = 0; i < MAX_ENQUEUED_BILLABLE_JOBS_PER_USER; i += 1) {
+      const result = await call(billableEntry.method, pathFor(billableEntry, project.id), aliceCookie, {});
+      expect(result.status).toBe(202);
+    }
+    // /__export is async but not billable — must still enqueue even though
+    // the user is at the billable bound.
+    const exportEntry = ASYNC_ENTRIES.find((e) => e.path === "/__export")!;
+    const exportResult = await call(exportEntry.method, pathFor(exportEntry, project.id), aliceCookie);
+    expect(exportResult.status).toBe(202);
+    // And the export enqueue itself must not have consumed a billable slot:
+    // the user is still exactly at the bound, no more, no less — a further
+    // billable enqueue is still refused, proving /__export was never counted.
+    const stillBlocked = await call(billableEntry.method, pathFor(billableEntry, project.id), aliceCookie, {});
+    expect(stillBlocked.status).toBe(429);
+  });
+
+  it("is scoped per user -- a second user at their own bound does not affect a fresh user with none active", async () => {
+    const pool = fakePool();
+    const { db, call, project, aliceCookie } = harness(pool);
+    const entry = BILLABLE_ENTRIES[0]!;
+    for (let i = 0; i < MAX_ENQUEUED_BILLABLE_JOBS_PER_USER; i += 1) {
+      await call(entry.method, pathFor(entry, project.id), aliceCookie, {});
+    }
+    const blocked = await call(entry.method, pathFor(entry, project.id), aliceCookie, {});
+    expect(blocked.status).toBe(429);
+
+    // A different user, owning their own project, is unaffected.
+    const carol = createUser(db, "c@example.com", "h");
+    const carolCookie = `${SESSION_COOKIE}=${createSession(db, carol.id).id}`;
+    const carolProject = createProject(db, carol.id, "carol-run", "Carol");
+    const carolResult = await call(entry.method, pathFor(entry, carolProject.id), carolCookie, {});
+    expect(carolResult.status).toBe(202);
+  });
+
+  it("frees a slot as soon as a job reaches a terminal status", async () => {
+    const pool = fakePool();
+    const { db, call, project, aliceCookie } = harness(pool);
+    const entry = BILLABLE_ENTRIES[0]!;
+    const jobIds: string[] = [];
+    for (let i = 0; i < MAX_ENQUEUED_BILLABLE_JOBS_PER_USER; i += 1) {
+      const result = await call(entry.method, pathFor(entry, project.id), aliceCookie, {});
+      jobIds.push((JSON.parse(result.body) as { jobId: string }).jobId);
+    }
+    const blocked = await call(entry.method, pathFor(entry, project.id), aliceCookie, {});
+    expect(blocked.status).toBe(429);
+
+    // One of the two active jobs finishes.
+    finishJob(db, jobIds[0]!, { status: "succeeded", now: Date.now() });
+
+    const afterFinish = await call(entry.method, pathFor(entry, project.id), aliceCookie, {});
+    expect(afterFinish.status).toBe(202);
   });
 });
 

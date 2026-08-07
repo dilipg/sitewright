@@ -9,7 +9,9 @@ import { createUser } from "./users.ts";
 import { createProject } from "./projects.ts";
 import { MAX_BILLABLE_IN_FLIGHT_PER_USER } from "./preview-pool.ts";
 import {
+  BILLABLE_JOB_KINDS,
   claimNextJob,
+  countActiveBillableJobsForUser,
   countActiveJobsForUser,
   createJob,
   findJobById,
@@ -17,6 +19,7 @@ import {
   listJobsByProject,
   markRunningJobsInterrupted,
   MAX_ACTIVE_JOBS_PER_USER,
+  MAX_ENQUEUED_BILLABLE_JOBS_PER_USER,
   requeueJob,
 } from "./jobs.ts";
 
@@ -138,6 +141,42 @@ describe("countActiveJobsForUser", () => {
     expect(countActiveJobsForUser(db, userId)).toBe(2);
     expect(findJobById(db, willStayQueued.id)?.status).toBe("queued");
     expect(findJobById(db, willStayRunning.id)?.status).toBe("running");
+  });
+});
+
+describe("countActiveBillableJobsForUser", () => {
+  it("counts queued+running BILLABLE jobs, excluding export and excluding terminal statuses", () => {
+    // One of each billable kind, plus one export -- export must never count
+    // (project-registry.ts's own billable:false reasoning: a build spends no
+    // model money).
+    for (const kind of BILLABLE_JOB_KINDS) seed({ kind, now: 1_000 });
+    seed({ kind: "export", now: 1_001 });
+    expect(countActiveBillableJobsForUser(db, userId)).toBe(BILLABLE_JOB_KINDS.length);
+
+    // Finish one billable job -- the count drops with no separate "release"
+    // call, since this is a live COUNT, not an in-memory reservation.
+    const claimed = claimNextJob(db, 2_000);
+    finishJob(db, claimed!.id, { status: "succeeded", now: 3_000 });
+    expect(countActiveBillableJobsForUser(db, userId)).toBe(BILLABLE_JOB_KINDS.length - 1);
+  });
+
+  it("is scoped per user -- another user's billable jobs are never counted", () => {
+    const otherUserId = createUser(db, "b@example.com", "hash").id;
+    seed({ kind: "regen", now: 1_000 });
+    createJob(db, { userId: otherUserId, projectId: null, kind: "regen", requestJson: "{}", now: 1_001 });
+    createJob(db, { userId: otherUserId, projectId: null, kind: "regen", requestJson: "{}", now: 1_002 });
+    expect(countActiveBillableJobsForUser(db, userId)).toBe(1);
+    expect(countActiveBillableJobsForUser(db, otherUserId)).toBe(2);
+  });
+
+  it("returns 0 for a user with only export jobs, however many", () => {
+    seed({ kind: "export", now: 1_000 });
+    seed({ kind: "export", now: 1_001 });
+    expect(countActiveBillableJobsForUser(db, userId)).toBe(0);
+  });
+
+  it("MAX_ENQUEUED_BILLABLE_JOBS_PER_USER matches preview-pool.ts's MAX_BILLABLE_IN_FLIGHT_PER_USER — same value, same meaning, two independent definitions", () => {
+    expect(MAX_ENQUEUED_BILLABLE_JOBS_PER_USER).toBe(MAX_BILLABLE_IN_FLIGHT_PER_USER);
   });
 });
 

@@ -7,10 +7,10 @@
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import type { DatabaseSync } from "node:sqlite";
 import { openDatabase } from "./db.ts";
-import { createJob, finishJob, findJobById } from "./jobs.ts";
+import { createJob, finishJob, findJobById, MAX_ENQUEUED_BILLABLE_JOBS_PER_USER } from "./jobs.ts";
 import { jobRoutes } from "./job-routes.ts";
 import { createProject, resolveProjectDirectory } from "./projects.ts";
 import { NOT_FOUND } from "./require-project.ts";
@@ -18,6 +18,25 @@ import { createRequestListener } from "./router.ts";
 import { createSession, SESSION_COOKIE } from "./sessions.ts";
 import { recordUsageEvent } from "./usage.ts";
 import { createUser } from "./users.ts";
+
+/**
+ * Task-3-review finding 5: `mkdirSync` toggled to throw on demand, real
+ * otherwise — proves job-routes.ts creates the project's directory BEFORE
+ * inserting its row, not after. `vi.mock` is per-test-file (vitest's default
+ * isolation), so this affects only this file's own module graph, not any
+ * other test file's real filesystem calls.
+ */
+const mkdirControl = vi.hoisted(() => ({ shouldThrow: false }));
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...actual,
+    mkdirSync: (...args: Parameters<typeof actual.mkdirSync>) => {
+      if (mkdirControl.shouldThrow) throw new Error("ENOSPC: no space left on device (simulated)");
+      return actual.mkdirSync(...args);
+    },
+  };
+});
 
 const dirs: string[] = [];
 const dbs: DatabaseSync[] = [];
@@ -177,6 +196,88 @@ describe("POST /api/generate", () => {
     const firstDir = (db.prepare("SELECT directory FROM project WHERE id = ?").get(first.projectId) as { directory: string }).directory;
     const secondDir = (db.prepare("SELECT directory FROM project WHERE id = ?").get(second.projectId) as { directory: string }).directory;
     expect(firstDir).not.toBe(secondDir);
+  });
+
+  /**
+   * Task-3-review finding 5: directory creation must happen BEFORE the
+   * project row is inserted, so a failure leaves at worst a harmless orphan
+   * directory and no row pointing nowhere. Perturbing the fix (swapping the
+   * order back) makes this fail — see this task's own report.
+   */
+  it("creates NO project row when mkdirSync throws (directory-then-row ordering)", async () => {
+    const { db, call, aliceCookie } = harness();
+    mkdirControl.shouldThrow = true;
+    try {
+      const result = await call("POST", "/api/generate", aliceCookie, { brief: "a bakery landing page" });
+      expect(result.status).toBe(500);
+      expect((db.prepare("SELECT COUNT(*) AS c FROM project").get() as { c: number }).c).toBe(0);
+      expect((db.prepare("SELECT COUNT(*) AS c FROM job").get() as { c: number }).c).toBe(0);
+    } finally {
+      mkdirControl.shouldThrow = false;
+    }
+  });
+
+  it("rejects a malformed JSON body with the SAME message enqueueHandler's BAD_JSON_BODY uses, not the missing-brief message", async () => {
+    const { call, aliceCookie } = harness();
+    const result = await call("POST", "/api/generate", aliceCookie, undefined, Buffer.from("{not json"));
+    expect(result.status).toBe(400);
+    expect((result.json as { error: string }).error).toBe(
+      "request body must be valid JSON within the size limit",
+    );
+  });
+
+  /**
+   * Task-3-review finding 1: `POST /api/generate` starts the most expensive
+   * of all six job kinds and is session-only (no project exists yet), so it
+   * is the one call site `requireEnqueueSlot` guards outside
+   * compiler-routes.ts entirely — see that module's own comment for the full
+   * "why enqueuing being fast made the old bound's absence worse, not moot"
+   * account.
+   */
+  describe("per-user billable enqueue bound (requireEnqueueSlot)", () => {
+    it(`refuses the ${String(MAX_ENQUEUED_BILLABLE_JOBS_PER_USER + 1)}th concurrent generate request with 429, creating NEITHER a project NOR a job row for it`, async () => {
+      const { db, call, aliceCookie } = harness();
+      const results: number[] = [];
+      for (let i = 0; i < MAX_ENQUEUED_BILLABLE_JOBS_PER_USER + 1; i += 1) {
+        const result = await call("POST", "/api/generate", aliceCookie, { brief: `site ${String(i)}` });
+        results.push(result.status);
+      }
+      expect(results.slice(0, MAX_ENQUEUED_BILLABLE_JOBS_PER_USER)).toEqual(
+        Array(MAX_ENQUEUED_BILLABLE_JOBS_PER_USER).fill(202),
+      );
+      expect(results[MAX_ENQUEUED_BILLABLE_JOBS_PER_USER]).toBe(429);
+      expect((db.prepare("SELECT COUNT(*) AS c FROM project").get() as { c: number }).c)
+        .toBe(MAX_ENQUEUED_BILLABLE_JOBS_PER_USER);
+      expect((db.prepare("SELECT COUNT(*) AS c FROM job").get() as { c: number }).c)
+        .toBe(MAX_ENQUEUED_BILLABLE_JOBS_PER_USER);
+    });
+
+    it("is scoped per user -- bob is unaffected by alice being at the bound", async () => {
+      const { call, aliceCookie, bobCookie } = harness();
+      for (let i = 0; i < MAX_ENQUEUED_BILLABLE_JOBS_PER_USER; i += 1) {
+        await call("POST", "/api/generate", aliceCookie, { brief: `site ${String(i)}` });
+      }
+      const aliceBlocked = await call("POST", "/api/generate", aliceCookie, { brief: "one too many" });
+      expect(aliceBlocked.status).toBe(429);
+      const bobResult = await call("POST", "/api/generate", bobCookie, { brief: "bob's first" });
+      expect(bobResult.status).toBe(202);
+    });
+
+    it("frees a slot as soon as a generate job reaches a terminal status", async () => {
+      const { db, call, aliceCookie } = harness();
+      const jobIds: string[] = [];
+      for (let i = 0; i < MAX_ENQUEUED_BILLABLE_JOBS_PER_USER; i += 1) {
+        const result = await call("POST", "/api/generate", aliceCookie, { brief: `site ${String(i)}` });
+        jobIds.push((result.json as { jobId: string }).jobId);
+      }
+      const blocked = await call("POST", "/api/generate", aliceCookie, { brief: "one too many" });
+      expect(blocked.status).toBe(429);
+
+      finishJob(db, jobIds[0]!, { status: "failed", error: "boom", now: Date.now() });
+
+      const afterFinish = await call("POST", "/api/generate", aliceCookie, { brief: "now it fits" });
+      expect(afterFinish.status).toBe(202);
+    });
   });
 });
 

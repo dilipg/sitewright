@@ -157,6 +157,58 @@ export function countActiveJobsForUser(db: DatabaseSync, userId: string): number
 }
 
 /**
+ * The `JobKind`s that spend model money — every kind except `export` (a
+ * production build is deterministic and spends nothing, the same reasoning
+ * `project-registry.ts`'s `billable: false` on `/__export` and
+ * `/__export-download` already uses). Exported so `require-enqueue-slot.ts`
+ * — the enqueue-time concurrency bound on billable work, not this file's own
+ * concern — can filter by it without either module re-deriving "which kinds
+ * are billable" from scratch or `jobs.ts` importing anything billable-shaped
+ * from `project-registry.ts` (that registry is about HTTP endpoints, not job
+ * rows, and importing it here would be the wrong direction for the same
+ * layering reason `MAX_ACTIVE_JOBS_PER_USER`'s own comment gives for not
+ * importing `preview-pool.ts`).
+ */
+export const BILLABLE_JOB_KINDS: readonly JobKind[] = ["generate", "regen", "regen-page", "add-section", "edit-prompt"];
+
+/**
+ * `queued` + `running` billable jobs only — the metric `require-enqueue-slot.ts`
+ * gates enqueue on. Distinct from `countActiveJobsForUser` in TWO ways, not
+ * one: it excludes `export` (spends nothing, must never be refused or
+ * counted — see `BILLABLE_JOB_KINDS`), and its counterpart bound is
+ * evaluated at ENQUEUE time, before a job row even exists yet, rather than at
+ * claim time the way `claimNextJob`'s own running-only bound is. Because this
+ * is a live COUNT against `queued`+`running` rows rather than an in-memory
+ * reservation, a slot frees itself the instant `finishJob` moves a row to a
+ * terminal status — there is no separate "release" call to remember, unlike
+ * the old `PreviewPool.reserveBillableSlot`/`releaseBillableSlot` pair this
+ * replaces (see `require-enqueue-slot.ts`'s own module comment for the full
+ * account of why that in-memory mechanism stopped bounding anything once
+ * enqueuing became a single fast INSERT).
+ */
+export function countActiveBillableJobsForUser(db: DatabaseSync, userId: string): number {
+  const placeholders = BILLABLE_JOB_KINDS.map(() => "?").join(", ");
+  const row = db.prepare(
+    `SELECT COUNT(*) AS count FROM job
+      WHERE user_id = ? AND status IN ('queued', 'running') AND kind IN (${placeholders})`,
+  ).get(userId, ...BILLABLE_JOB_KINDS) as { count: number };
+  return row.count;
+}
+
+/**
+ * The enqueue-time bound `require-enqueue-slot.ts` refuses past — "Per user:
+ * 2 concurrent — today's in-flight reservation, unchanged in value and
+ * meaning" (spec, job-model design doc). Defined here, independently of
+ * `MAX_ACTIVE_JOBS_PER_USER` above (a different bound: running-only, every
+ * kind, enforced at claim time) and of `preview-pool.ts`'s
+ * `MAX_BILLABLE_IN_FLIGHT_PER_USER` (an in-memory, per-process reservation
+ * this bound replaces), for the identical layering reason
+ * `MAX_ACTIVE_JOBS_PER_USER`'s own comment gives. Pinned equal to both by a
+ * test in jobs.test.ts.
+ */
+export const MAX_ENQUEUED_BILLABLE_JOBS_PER_USER = 2;
+
+/**
  * Atomically claims the oldest ELIGIBLE `queued` job and flips it to
  * `running`, or returns null if none is eligible. Eligible means: `queued`,
  * AND its user does not already have `MAX_ACTIVE_JOBS_PER_USER` jobs

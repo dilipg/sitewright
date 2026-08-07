@@ -40,19 +40,20 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
 import { createJob, findJobById, listJobsByProject, type Job } from "./jobs.ts";
+import { BY_QUERY } from "./project-registry.ts";
 import { createProject, resolveProjectDirectory } from "./projects.ts";
 import { requireBudget } from "./require-budget.ts";
+import { requireEnqueueSlot } from "./require-enqueue-slot.ts";
 import { NOT_FOUND, requireProject } from "./require-project.ts";
 import { requireSession } from "./require-session.ts";
 import { readJsonBody, sendJson, type Route } from "./router.ts";
-
-/** Same shape as project-registry.ts's own private BY_QUERY — this route is not derived from the registry loop the way compiler-routes.ts's are, so it is declared directly here, matching the registry's OWN entry for `GET /api/jobs`. */
-const PROJECT_ID_FROM_QUERY = { from: "query" as const, name: "project" };
 
 /** Most recent jobs shown for one project's activity — bounded so a project with a long history is not a full-table read on every poll. */
 const PROJECT_JOB_LIST_LIMIT = 50;
 
 const BAD_BRIEF = { error: "a brief is required" };
+/** Same shape router.ts's own readJsonBody-failure responses use elsewhere (compiler-routes.ts's enqueueHandler) — a malformed body is a body problem, not a missing-field problem, and deserves its own message rather than being folded into BAD_BRIEF. */
+const BAD_JSON_BODY = { error: "request body must be valid JSON within the size limit" };
 
 /**
  * A directory name unique enough that `createProject`'s own UNIQUE
@@ -116,13 +117,17 @@ export function jobRoutes(deps: { db: DatabaseSync; projectsRoot: string }): Rou
       // created — an over-cap request is refused with no side effect at all,
       // matching the binding constraint that the spend cap gates enqueue and
       // an over-cap request creates no job row (and, here, no project row
-      // either).
-      handler: requireSession(db, requireBudget(db, async (req, res, ctx) => {
+      // either). requireEnqueueSlot sits between requireSession and
+      // requireBudget — the same relative position `compiler-routes.ts` puts
+      // it in for its own billable entries (see that module's own comment):
+      // a precondition with no side effect of its own runs before the cap
+      // check, which runs before anything is created.
+      handler: requireSession(db, requireEnqueueSlot(db, requireBudget(db, async (req, res, ctx) => {
         let parsed: unknown;
         try {
           parsed = await readJsonBody(req);
         } catch {
-          sendJson(res, 400, BAD_BRIEF);
+          sendJson(res, 400, BAD_JSON_BODY);
           return;
         }
         const brief =
@@ -140,8 +145,17 @@ export function jobRoutes(deps: { db: DatabaseSync; projectsRoot: string }): Rou
         // is the brief itself (truncated): the only user-facing label
         // available at this point, and the same thing adopt.ts falls back to
         // when nothing better exists.
-        const project = createProject(db, ctx.user.id, freshProjectDirectory(), trimmedBrief.slice(0, 200));
-        mkdirSync(resolveProjectDirectory(projectsRoot, project.directory), { recursive: true });
+        //
+        // Directory FIRST, row SECOND: if mkdirSync throws (ENOSPC, EACCES,
+        // ...) there must be no row left pointing at a directory that was
+        // never actually created. The reverse order's failure mode is worse
+        // than this one's — a harmless orphan directory with no owning row,
+        // vs. an owned row whose directory silently does not exist, which
+        // every later reader of `project.directory` would have to guard
+        // against instead of just this one call site.
+        const directory = freshProjectDirectory();
+        mkdirSync(resolveProjectDirectory(projectsRoot, directory), { recursive: true });
+        const project = createProject(db, ctx.user.id, directory, trimmedBrief.slice(0, 200));
 
         const job = createJob(db, {
           userId: ctx.user.id,
@@ -152,7 +166,7 @@ export function jobRoutes(deps: { db: DatabaseSync; projectsRoot: string }): Rou
         });
 
         sendJson(res, 202, { jobId: job.id, projectId: project.id });
-      })),
+      }))),
     },
     {
       method: "GET",
@@ -172,7 +186,7 @@ export function jobRoutes(deps: { db: DatabaseSync; projectsRoot: string }): Rou
     {
       method: "GET",
       path: "/api/jobs",
-      handler: requireProject(db, PROJECT_ID_FROM_QUERY, (_req, res, ctx) => {
+      handler: requireProject(db, BY_QUERY, (_req, res, ctx) => {
         const jobs = listJobsByProject(db, ctx.project.id, PROJECT_JOB_LIST_LIMIT);
         sendJson(res, 200, { jobs: jobs.map(publicJobView) });
       }),

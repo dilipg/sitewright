@@ -184,6 +184,62 @@ describe("JobWorker: proxied kinds", () => {
     }
   });
 
+  /**
+   * Task-3-review finding 2: task 3's own report claimed this property
+   * ("a failed run is still billed" -- binding constraint 5's most important
+   * half) moved into this file, but it never actually did — the test above
+   * ("marks a failed proxy exchange...") asserts status/redaction/release
+   * only, and writes no usage log, so `ingestUsageLog` runs against nothing
+   * and the assertion that would catch a regression here (a `usage_event`
+   * row existing) was simply absent. This is that missing assertion, ported
+   * for real: the upstream writes a usage log BEFORE answering with a
+   * failure status, exactly like a run that spent real money on the stages
+   * it got through before failing partway through the next one.
+   * `forwardToPreview`'s own `completed` gate (preview-forward.ts) is about
+   * whether the exchange itself finished, never about the HTTP status code
+   * it finished with — a clean error response is just as "completed" as a
+   * clean success one, so ingest must still run.
+   */
+  it("still ingests the usage log — and bills the user — when the proxy exchange itself fails, not merely when it succeeds", async () => {
+    let capturedUsageId: string | undefined;
+    const upstream = await startUpstream((req, res) => {
+      const raw = req.headers[USAGE_ID_HEADER];
+      capturedUsageId = Array.isArray(raw) ? raw[0] : raw;
+      writeFileSync(
+        usageLogPathFor(capturedUsageId!),
+        JSON.stringify({
+          timestamp: new Date(NOW).toISOString(), role: "section", model: "claude-sonnet-5",
+          input_tokens: 40, output_tokens: 80, cache_creation_input_tokens: 0, cache_read_input_tokens: 0,
+          cost_usd: 0.34,
+        }),
+        "utf8",
+      );
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "gate 4 failed partway through" }));
+    });
+    const pool = fakePool({
+      acquire: vi.fn(async (): Promise<PreviewProcess> => ({
+        projectId: project.id, port: upstream.port, base: "/", inFlight: 0, lastUsedAt: Date.now(),
+      })),
+    });
+    const job = createJob(db, { userId: user.id, projectId: project.id, kind: "regen", requestJson: "{}", now: NOW });
+    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, now: () => NOW });
+
+    try {
+      const ran = await worker.runOnce();
+      expect(ran).toBe(true);
+      expect(findJobById(db, job.id)?.status).toBe("failed");
+
+      // The load-bearing assertion this finding exists for: spend survives
+      // the failure.
+      const row = db.prepare("SELECT COUNT(*) AS c FROM usage_event WHERE user_id = ?").get(user.id) as { c: number };
+      expect(row.c).toBe(1);
+      expect(existsSync(usageLogPathFor(capturedUsageId!))).toBe(false);
+    } finally {
+      await upstream.close();
+    }
+  });
+
   it("requeues (does not fail) a job when the pool answers 503 (capacity)", async () => {
     const upstream = await startUpstream((_req, res) => {
       res.writeHead(503, { "Content-Type": "application/json" });
@@ -240,6 +296,47 @@ describe("JobWorker: proxied kinds", () => {
       const row = db.prepare("SELECT COUNT(*) AS c FROM usage_event WHERE user_id = ?").get(user.id) as { c: number };
       expect(row.c).toBe(1);
       expect(existsSync(usageLogPathFor(capturedUsageId!))).toBe(false);
+    } finally {
+      await upstream.close();
+    }
+  });
+
+  /**
+   * Task-3-review finding 3: the deleted "...a different one per request"
+   * asserted `id1 !== id2` across two requests. The single-job test above
+   * only proves the SHAPE of one id (`/^[0-9a-f]{32}$/`), which a constant
+   * string or a reused id would satisfy just as well — this drives two
+   * separate jobs and compares. A constant or reused id would make two
+   * concurrent jobs share one usage-log PATH: the second job's write would
+   * land in (or delete) the first's file, so one user's spend event gets
+   * double-counted while the other's silently vanishes, and nothing else
+   * here would catch it.
+   */
+  it("generates a DIFFERENT usage id per job — not a constant or reused one", async () => {
+    const capturedIds: string[] = [];
+    const upstream = await startUpstream((req, res) => {
+      const raw = req.headers[USAGE_ID_HEADER];
+      const id = Array.isArray(raw) ? raw[0] : raw;
+      if (id !== undefined) capturedIds.push(id);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ passed: true }));
+    });
+    const pool = fakePool({
+      acquire: vi.fn(async (): Promise<PreviewProcess> => ({
+        projectId: project.id, port: upstream.port, base: "/", inFlight: 0, lastUsedAt: Date.now(),
+      })),
+    });
+    createJob(db, { userId: user.id, projectId: project.id, kind: "regen", requestJson: "{}", now: NOW });
+    createJob(db, { userId: user.id, projectId: project.id, kind: "regen", requestJson: "{}", now: NOW + 1 });
+    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, now: () => NOW });
+
+    try {
+      expect(await worker.runOnce()).toBe(true); // first job, claimed+run+finished
+      expect(await worker.runOnce()).toBe(true); // second job, likewise
+      expect(capturedIds).toHaveLength(2);
+      expect(capturedIds[0]).toMatch(/^[0-9a-f]{32}$/);
+      expect(capturedIds[1]).toMatch(/^[0-9a-f]{32}$/);
+      expect(capturedIds[0]).not.toBe(capturedIds[1]);
     } finally {
       await upstream.close();
     }
@@ -335,6 +432,88 @@ describe("JobWorker: proxied kinds", () => {
     } finally {
       errorSpy.mockRestore();
       if (dirPath !== undefined) rmSync(dirPath, { recursive: true, force: true });
+      await upstream.close();
+    }
+  });
+
+  /**
+   * Task-3-review finding 4: these two negative tests were deleted from
+   * compiler-routes.test.ts with no replacement anywhere — only the two
+   * POSITIVE (`skipped`/`unreadable`) cases above were ported. Operator log
+   * noise on every successful billable job is the stated reason
+   * `runProxiedJob`'s own `after` hook stays silent on a clean ingest (see
+   * job-worker.ts's module comment quoting ingest-usage.ts's docstring) —
+   * without these, a future change that logged unconditionally (or on any
+   * ingest at all, not just a lossy one) would pass every other test in this
+   * file, since none of them assert the ABSENCE of a log line on the happy
+   * path.
+   */
+  it("logs nothing when the ingest is clean (rows recorded, nothing lost)", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const upstream = await startUpstream((req, res) => {
+      const raw = req.headers[USAGE_ID_HEADER];
+      const usageId = Array.isArray(raw) ? raw[0] : raw;
+      writeFileSync(
+        usageLogPathFor(usageId!),
+        [
+          JSON.stringify({
+            timestamp: new Date(NOW).toISOString(), role: "section", model: "claude-sonnet-5",
+            input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0,
+            cost_usd: 1,
+          }),
+          JSON.stringify({
+            timestamp: new Date(NOW).toISOString(), role: "section", model: "claude-sonnet-5",
+            input_tokens: 2, output_tokens: 2, cache_creation_input_tokens: 0, cache_read_input_tokens: 0,
+            cost_usd: 2,
+          }),
+        ].join("\n"),
+        "utf8",
+      );
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ passed: true }));
+    });
+    const pool = fakePool({
+      acquire: vi.fn(async (): Promise<PreviewProcess> => ({
+        projectId: project.id, port: upstream.port, base: "/", inFlight: 0, lastUsedAt: Date.now(),
+      })),
+    });
+    const job = createJob(db, { userId: user.id, projectId: project.id, kind: "regen", requestJson: "{}", now: NOW });
+    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, now: () => NOW });
+
+    try {
+      const ran = await worker.runOnce();
+      expect(ran).toBe(true);
+      expect(findJobById(db, job.id)?.status).toBe("succeeded");
+      expect(errorSpy).not.toHaveBeenCalled();
+    } finally {
+      errorSpy.mockRestore();
+      await upstream.close();
+    }
+  });
+
+  it("logs nothing when the child wrote no usage log at all (the legitimate no-op)", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const upstream = await startUpstream((_req, res) => {
+      // Deliberately writes no usage log for any id -- the legitimate
+      // "this request made no model calls" case.
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ passed: true }));
+    });
+    const pool = fakePool({
+      acquire: vi.fn(async (): Promise<PreviewProcess> => ({
+        projectId: project.id, port: upstream.port, base: "/", inFlight: 0, lastUsedAt: Date.now(),
+      })),
+    });
+    const job = createJob(db, { userId: user.id, projectId: project.id, kind: "add-section", requestJson: "{}", now: NOW });
+    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, now: () => NOW });
+
+    try {
+      const ran = await worker.runOnce();
+      expect(ran).toBe(true);
+      expect(findJobById(db, job.id)?.status).toBe("succeeded");
+      expect(errorSpy).not.toHaveBeenCalled();
+    } finally {
+      errorSpy.mockRestore();
       await upstream.close();
     }
   });

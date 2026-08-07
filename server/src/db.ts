@@ -65,6 +65,28 @@ const MIGRATIONS = [
   // Every cap check is "this user, this window" — without the index that is a
   // full scan of every user's history on each request that starts work.
   `CREATE INDEX IF NOT EXISTS usage_event_user_at_idx ON usage_event(user_id, at)`,
+  // Long-running work (slice 5): a job outlives the request that created it,
+  // so it is tracked here rather than held in memory, and a disconnect never
+  // loses it. project_id is SET NULL like usage_event — deleting a project
+  // must not erase the record that work was paid for. user_id cascades,
+  // matching the rest of the schema.
+  `CREATE TABLE IF NOT EXISTS job (
+     id           TEXT PRIMARY KEY,
+     user_id      TEXT NOT NULL REFERENCES user(id) ON DELETE CASCADE,
+     project_id   TEXT REFERENCES project(id) ON DELETE SET NULL,
+     kind         TEXT NOT NULL,
+     status       TEXT NOT NULL,
+     request_json TEXT NOT NULL,
+     result_json  TEXT,
+     error        TEXT,
+     created_at   INTEGER NOT NULL,
+     started_at   INTEGER,
+     finished_at  INTEGER
+   )`,
+  // Every active-job check and every project job list is "this user/project,
+  // this status" — without the index that is a full scan of every job ever
+  // recorded on each request.
+  `CREATE INDEX IF NOT EXISTS job_user_status_idx ON job(user_id, status)`,
 ];
 
 export function openDatabase(path: string): DatabaseSync {

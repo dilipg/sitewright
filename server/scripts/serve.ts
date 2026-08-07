@@ -13,6 +13,8 @@ import { resolve } from "node:path";
 import { adoptExistingProjects } from "../src/adopt.ts";
 import { buildRoutes } from "../src/compose.ts";
 import { openDatabase } from "../src/db.ts";
+import { JobWorker } from "../src/job-worker.ts";
+import { markRunningJobsInterrupted } from "../src/jobs.ts";
 import { loadMasterKey, MASTER_KEY_ENV_VAR } from "../src/master-key.ts";
 import { PreviewPool } from "../src/preview-pool.ts";
 import { createPreviewUpgradeListener } from "../src/preview-upgrade.ts";
@@ -145,6 +147,27 @@ if (bootstrapEmail !== undefined) {
 // that enforces.
 const pool = new PreviewPool({ db, masterKey, projectsRoot });
 
+// Boot recovery (slice 5, the job model): a job left `running` when the
+// process last died (crash, deploy, kill -9) is not actually running any
+// more, and nothing will ever claim or finish it again — converting it to
+// `interrupted` is what lets a poller stop waiting on it instead of hanging
+// forever. Runs AFTER the database is open and adoption has run (so a
+// project a job references is already owned), and BEFORE the worker starts
+// (a job must never be found `running` by a fresh worker that did not claim
+// it itself).
+const interruptedCount = markRunningJobsInterrupted(db, Date.now());
+if (interruptedCount > 0) {
+  console.log(`marked ${interruptedCount} running job(s) interrupted after restart`);
+}
+
+// One in-process worker loop draining the `job` table — see job-worker.ts's
+// own module comment for the two execution strategies behind it. Constructed
+// from the same `pool` and `masterKey` already in hand; started immediately
+// so a job queued by a request that arrives right after boot is not left
+// waiting a full poll interval for nothing.
+const jobWorker = new JobWorker({ db, pool, masterKey });
+jobWorker.start();
+
 // A truly idle preview gets killed and forgotten so MAX_PREVIEWS reflects
 // real usage, not history. Interval itself is unref()'d — it must never be
 // the reason this process stays alive — which is unrelated to (and does not
@@ -168,7 +191,13 @@ function shutdown(signal: NodeJS.Signals): void {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log(`received ${signal}, killing preview processes...`);
-  pool.shutdown()
+  // The worker stops FIRST, awaiting whatever tick is currently in flight
+  // (JobWorker.stop()'s own contract — spec decision 13, a job mid-run must
+  // not be killed partway) — only once that settles is it safe to kill
+  // preview children, since an in-flight proxied job's own exchange may
+  // still be depending on one of them.
+  jobWorker.stop()
+    .then(() => pool.shutdown())
     .then(() => process.exit(0))
     .catch((error: unknown) => {
       console.error("error while shutting down preview processes:", error);
@@ -179,7 +208,7 @@ process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 const server = createServer(
-  createRequestListener(buildRoutes({ db, masterKey, secureCookies, pool })),
+  createRequestListener(buildRoutes({ db, masterKey, secureCookies, pool, projectsRoot })),
 );
 
 // A failure to bind (EADDRINUSE, EACCES on a privileged port) is a failed boot,

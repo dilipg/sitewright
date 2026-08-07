@@ -52,7 +52,13 @@ function freshHarness() {
   registryDbs.push(db);
   const masterKey = randomBytes(32);
   const pool = new PreviewPool({ db, masterKey, projectsRoot: dir });
-  const routes = buildRoutes({ db, masterKey, secureCookies: true, pool });
+  // projectsRoot: reuses the SAME directory the pool itself resolves project
+  // directories under — job-routes.ts's POST /api/generate creates a fresh
+  // project's directory here, and without this argument buildRoutes leaves
+  // job-routes unmounted entirely (mirrors `pool`'s own "declared but not
+  // mounted" gate), which would make this the one route category the
+  // billable-enforcement table below could never actually reach.
+  const routes = buildRoutes({ db, masterKey, secureCookies: true, pool, projectsRoot: dir });
   return { db, masterKey, pool, routes, listener: createRequestListener(routes) };
 }
 afterAll(() => {
@@ -182,18 +188,32 @@ describe("billable endpoints", () => {
       .filter((entry) => entry.billable)
       .map((entry) => `${entry.method} ${entry.path}`)
       .sort();
+    // Slice 5 adds a fifth: POST /api/generate spawns the orchestrator
+    // directly (the most expensive of all six job kinds) and is
+    // session-only, since no project exists until this handler creates one.
     expect(billable).toEqual([
       "POST /__add-section",
       "POST /__edit-prompt",
       "POST /__regen",
       "POST /__regen-page",
+      "POST /api/generate",
     ]);
   });
 
-  it("marks no identity endpoint billable", () => {
+  it("marks no identity-management endpoint billable (login/key/project lookup) — POST /api/generate is the one deliberate /api/ exception", () => {
+    // Before slice 5, EVERY /api/* endpoint was identity management (login,
+    // key storage, project listing) and none of it started a model call, so
+    // this test could assert the blanket rule directly. POST /api/generate
+    // breaks that blanket rule on purpose (it is genuinely billable), so the
+    // exclusion is now explicit and named rather than the rule silently
+    // becoming false — a future SECOND billable /api/ endpoint still fails
+    // this unless it, too, is added to the exception list by name.
     for (const entry of all) {
-      if (entry.path.startsWith("/api/")) expect(entry.billable).toBe(false);
+      if (entry.path.startsWith("/api/") && entry.path !== "/api/generate") {
+        expect(entry.billable).toBe(false);
+      }
     }
+    expect(all.find((e) => e.path === "/api/generate")?.billable).toBe(true);
   });
 
   /**
@@ -264,22 +284,22 @@ describe("billable endpoints", () => {
     },
   );
 
-  // No session-only billable endpoint exists today, so the "idFrom" absent
-  // branch above never actually runs — it.each only ever iterates the 4
-  // project-scoped ones. That gap is easy to miss because a describe block
-  // running zero cases for a category looks IDENTICAL, from the outside, to
-  // one with full coverage: nothing fails either way. Skipped (visible in
-  // the run, not silently absent) rather than omitted, so the gap stays on
-  // record until SESSION_ONLY_ENDPOINTS actually gains a `billable: true`
-  // entry — at which point it.each above starts covering it for real, and
-  // this placeholder can be deleted.
-  const sessionOnlyBillable = SESSION_ONLY_ENDPOINTS.filter((e) => e.billable);
-  it.skipIf(sessionOnlyBillable.length === 0)(
-    "the it.each table above also exercises a session-only billable endpoint, not only project-scoped ones",
-    () => {
-      expect(sessionOnlyBillable.length).toBeGreaterThan(0);
-    },
-  );
+  /**
+   * Was a `it.skipIf(...)` placeholder: "no session-only billable endpoint
+   * exists today, so the `idFrom` absent branch above never actually runs."
+   * `POST /api/generate` (slice 5) is exactly the endpoint that skip was left
+   * for — it is session-only (no project exists until the handler creates
+   * one) and `billable: true`, so it now flows through the it.each table
+   * above for real. This is the replacement: a positive assertion that the
+   * table's "idFrom absent" branch is genuinely exercised, not a vacuous
+   * pass — if a future change ever left SESSION_ONLY_ENDPOINTS with no
+   * billable entry again, THIS fails loudly instead of the coverage gap
+   * silently reopening unnoticed.
+   */
+  it("the it.each table above also exercises a session-only billable endpoint, not only project-scoped ones", () => {
+    const sessionOnlyBillable = SESSION_ONLY_ENDPOINTS.filter((e) => e.billable);
+    expect(sessionOnlyBillable.map((e) => `${e.method} ${e.path}`)).toEqual(["POST /api/generate"]);
+  });
 
   /**
    * FIX for the enumeration-oracle ordering: the composition is

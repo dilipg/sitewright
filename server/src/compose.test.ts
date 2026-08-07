@@ -53,6 +53,10 @@ const EXPECTED_ROUTES: Array<[string, string]> = [
   ["DELETE", "/api/key"],
   ["GET", "/api/projects"],
   ["GET", "/api/projects/:id"],
+  // Slice 5, the job model: job-routes.ts.
+  ["POST", "/api/generate"],
+  ["GET", "/api/jobs/:id"],
+  ["GET", "/api/jobs"],
   ["GET", "/preview/:projectId/*"],
   ...PROJECT_SCOPED_ENDPOINTS
     .filter((e) => e.path.startsWith("/__"))
@@ -68,8 +72,15 @@ describe("buildRoutes", () => {
     // production never builds. Constructing a pool spawns nothing; nothing
     // starts until acquire(). Same reasoning as project-registry.test.ts.
     const masterKey = randomBytes(32);
-    const pool = new PreviewPool({ db, masterKey, projectsRoot: mkdtempSync(join(tmpdir(), "compose-pool-")) });
-    const routes = buildRoutes({ db, masterKey, secureCookies: true, pool });
+    const projectsRoot = mkdtempSync(join(tmpdir(), "compose-pool-"));
+    const pool = new PreviewPool({ db, masterKey, projectsRoot });
+    // projectsRoot passed alongside pool: scripts/serve.ts always supplies
+    // both together (job-routes.ts's POST /api/generate creates a project
+    // directory under it), and this is the one test whose title claims to
+    // pin the COMPLETE route set — omitting it would pin a table production
+    // never builds, the same reasoning EXPECTED_ROUTES's own pool comment
+    // already gives for `pool`.
+    const routes = buildRoutes({ db, masterKey, secureCookies: true, pool, projectsRoot });
     const actual = routes.map((r): [string, string] => [r.method, r.path]);
     const sortKey = (pair: [string, string]) => pair.join(" ");
     expect([...actual].sort((a, b) => sortKey(a).localeCompare(sortKey(b)))).toEqual(
@@ -254,5 +265,66 @@ describe("scripts/serve.ts — master-key handling (item 1)", () => {
     const upgradeIndex = serveSource.indexOf('server.on("upgrade"');
     expect(upgradeIndex).toBeGreaterThan(-1);
     expect(serveSource.indexOf("createPreviewUpgradeListener", upgradeIndex)).toBeGreaterThan(upgradeIndex);
+  });
+});
+
+/**
+ * Slice 5, the job model — a second source-position suite, deliberately
+ * separate from the master-key one above rather than folded into it: the two
+ * pin unrelated properties, and a failure in one should not read as if it
+ * were about the other. Same technique and the same reason (scripts/serve.ts
+ * cannot be imported for a unit test — see the comment above) with its own
+ * copy of `serveSource`, since vitest does not guarantee describe blocks in
+ * one file share module-scope const initialization order with each other in
+ * a way worth depending on.
+ */
+describe("scripts/serve.ts — job worker wiring (task 3)", () => {
+  const serveSource = readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), "..", "scripts", "serve.ts"),
+    "utf8",
+  );
+
+  it("marks running jobs interrupted after openDatabase and adoption have both run, and logs the count", () => {
+    // Boot recovery must see the database AND a fully-adopted set of
+    // projects before it runs — a job created by (or referencing) a project
+    // adopted on THIS boot must not be missed just because this ran first.
+    const openIndex = serveSource.indexOf("openDatabase(");
+    const adoptIndex = serveSource.indexOf("adoptExistingProjects(");
+    const interruptedIndex = serveSource.indexOf("markRunningJobsInterrupted(");
+    expect(openIndex).toBeGreaterThan(-1);
+    expect(adoptIndex).toBeGreaterThan(-1);
+    expect(interruptedIndex).toBeGreaterThan(-1);
+    expect(interruptedIndex).toBeGreaterThan(openIndex);
+    expect(interruptedIndex).toBeGreaterThan(adoptIndex);
+    // "logs the count" — not merely calls the function and discards the
+    // result: an operator restarting the server has no other way to learn a
+    // job was left running mid-crash.
+    expect(serveSource).toContain("console.log(`marked ${interruptedCount}");
+  });
+
+  it("constructs and starts the job worker after markRunningJobsInterrupted has run", () => {
+    const interruptedIndex = serveSource.indexOf("markRunningJobsInterrupted(");
+    const constructIndex = serveSource.indexOf("new JobWorker(");
+    const startIndex = serveSource.indexOf("jobWorker.start()");
+    expect(interruptedIndex).toBeGreaterThan(-1);
+    expect(constructIndex).toBeGreaterThan(-1);
+    expect(startIndex).toBeGreaterThan(-1);
+    expect(constructIndex).toBeGreaterThan(interruptedIndex);
+    expect(startIndex).toBeGreaterThan(constructIndex);
+  });
+
+  it("stops the job worker on both termination signals, before shutting the preview pool down", () => {
+    // A job mid-run at shutdown must not be killed partway (spec decision
+    // 13) — JobWorker.stop() itself awaits any in-flight tick, but that
+    // guarantee is useless here if serve.ts kills the preview pool (and with
+    // it, whatever child a proxied job's own in-flight exchange depends on)
+    // BEFORE the worker has actually stopped.
+    expect(serveSource).toContain('process.on("SIGINT"');
+    expect(serveSource).toContain('process.on("SIGTERM"');
+    expect(serveSource).toContain("jobWorker.stop()");
+    const stopIndex = serveSource.indexOf("jobWorker.stop()");
+    const poolShutdownIndex = serveSource.indexOf("pool.shutdown()", stopIndex);
+    expect(stopIndex).toBeGreaterThan(-1);
+    expect(poolShutdownIndex).toBeGreaterThan(stopIndex);
   });
 });

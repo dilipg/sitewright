@@ -10,7 +10,7 @@ import * as http from "node:http";
 import { createServer, type Server } from "node:http";
 import { once } from "node:events";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -241,6 +241,100 @@ describe("JobWorker: proxied kinds", () => {
       expect(row.c).toBe(1);
       expect(existsSync(usageLogPathFor(capturedUsageId!))).toBe(false);
     } finally {
+      await upstream.close();
+    }
+  });
+
+  /**
+   * Ported from compiler-routes.test.ts (pre-slice-5): that file used to
+   * test this directly against `billableForward`'s wiring, which moved,
+   * unchanged in shape, into THIS module's own `after` hook (see this
+   * module's top comment). Deleting the old test without this replacement
+   * would have been a real coverage regression — `ingestUsageLog`'s own
+   * docstring says `skipped`/`unreadable` exist "precisely so the caller can
+   * log them," and this is the only place left that could catch a caller
+   * that stopped doing so.
+   */
+  it("logs a warning naming the user and project when the ingest loses spend (skipped > 0)", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    let capturedUsageId: string | undefined;
+    const upstream = await startUpstream((req, res) => {
+      const raw = req.headers[USAGE_ID_HEADER];
+      capturedUsageId = Array.isArray(raw) ? raw[0] : raw;
+      // One valid row and one row missing model/role: ingest-usage.ts counts
+      // the second as `skipped`, not a throw — exactly the "lost spend, but
+      // silently" shape this warning exists to surface.
+      writeFileSync(
+        usageLogPathFor(capturedUsageId!),
+        [
+          JSON.stringify({
+            timestamp: new Date(NOW).toISOString(), role: "section", model: "claude-sonnet-5",
+            input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0,
+            cost_usd: 1,
+          }),
+          JSON.stringify({ bogus: true }),
+        ].join("\n"),
+        "utf8",
+      );
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ passed: true }));
+    });
+    const pool = fakePool({
+      acquire: vi.fn(async (): Promise<PreviewProcess> => ({
+        projectId: project.id, port: upstream.port, base: "/", inFlight: 0, lastUsedAt: Date.now(),
+      })),
+    });
+    const job = createJob(db, { userId: user.id, projectId: project.id, kind: "regen", requestJson: "{}", now: NOW });
+    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, now: () => NOW });
+
+    try {
+      const ran = await worker.runOnce();
+      expect(ran).toBe(true);
+      expect(findJobById(db, job.id)?.status).toBe("succeeded");
+      expect(errorSpy).toHaveBeenCalled();
+      const logged = errorSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+      expect(logged).toContain(user.id);
+      expect(logged).toContain(project.id);
+      expect(logged).toMatch(/skipped/i);
+    } finally {
+      errorSpy.mockRestore();
+      await upstream.close();
+    }
+  });
+
+  it("logs a warning naming the user and project when the usage log is unreadable", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    let dirPath: string | undefined;
+    const upstream = await startUpstream((req, res) => {
+      const raw = req.headers[USAGE_ID_HEADER];
+      const usageId = Array.isArray(raw) ? raw[0] : raw;
+      // A directory at the log's path: exists, but unreadable as a file --
+      // the same trick ingest-usage.test.ts uses for this exact case.
+      dirPath = usageLogPathFor(usageId!);
+      mkdirSync(dirPath, { recursive: true });
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ passed: true }));
+    });
+    const pool = fakePool({
+      acquire: vi.fn(async (): Promise<PreviewProcess> => ({
+        projectId: project.id, port: upstream.port, base: "/", inFlight: 0, lastUsedAt: Date.now(),
+      })),
+    });
+    const job = createJob(db, { userId: user.id, projectId: project.id, kind: "add-section", requestJson: "{}", now: NOW });
+    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, now: () => NOW });
+
+    try {
+      const ran = await worker.runOnce();
+      expect(ran).toBe(true);
+      expect(findJobById(db, job.id)?.status).toBe("succeeded");
+      expect(errorSpy).toHaveBeenCalled();
+      const logged = errorSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+      expect(logged).toContain(user.id);
+      expect(logged).toContain(project.id);
+      expect(logged).toMatch(/unreadable/i);
+    } finally {
+      errorSpy.mockRestore();
+      if (dirPath !== undefined) rmSync(dirPath, { recursive: true, force: true });
       await upstream.close();
     }
   });

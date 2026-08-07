@@ -12,14 +12,22 @@
  * generator cannot build the moment the two drift.
  */
 
+import { formatElapsedSeconds } from "../lib/jobs";
+
 export interface Archetype {
   name: string;
   description: string;
 }
 
+/**
+ * `/__add-section` is one of the job-model's five converted endpoints
+ * (slice 5): against the hosted server the request is a job, opaque until
+ * it finishes, so `running` carries `elapsedMs` — real information, not a
+ * fabricated percentage.
+ */
 export type AddSectionState =
   | { phase: "picking"; route: string; afterSection: string | undefined; archetype?: string; instruction: string }
-  | { phase: "running"; route: string }
+  | { phase: "running"; route: string; elapsedMs: number }
   | { phase: "failed"; route: string; report: string };
 
 export interface AddSectionPanelProps {
@@ -105,7 +113,9 @@ export function AddSectionPanel({
   if (state.phase === "running") {
     return (
       <div className="add-section-panel" data-testid="add-section-running">
-        <h3 className="inspector-subheading">Generating a new section…</h3>
+        <h3 className="inspector-subheading">
+          Generating a new section… {formatElapsedSeconds(state.elapsedMs)}
+        </h3>
         <p className="inspector-note">
           The rest of the page stays live and editable while this runs (PRD 4.1).
         </p>

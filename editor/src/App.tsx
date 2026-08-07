@@ -34,6 +34,7 @@ import {
 import { applyEditOperations, interpretEditResult, validateEditOperations } from "./lib/edit-ops";
 import type { EditPromptResponse } from "./lib/edit-ops";
 import { expandStyleValue } from "./lib/inventory";
+import { enqueueAndPoll, formatElapsedSeconds } from "./lib/jobs";
 import { breadcrumbFor, humanizeSegment, parentNodeId } from "./lib/labels";
 import type { History, OverridesMap } from "./lib/store";
 import {
@@ -77,6 +78,19 @@ const CANNED_SECTION_BRIEF =
  * iframe scrolling to reach their footer. */
 const FRAME_HEIGHT = 2000;
 const ZOOM_WHEEL_SENSITIVITY = 0.002;
+
+/**
+ * Shown for any job that reaches `interrupted` (slice 5, job model): the
+ * server restarted mid-run and genuinely cannot tell whether the work
+ * finished — a subprocess mid-`write_section_only` may have left a
+ * half-written page (job-model design doc's own "Crash recovery" section).
+ * Reporting this as "failed" would be a lie a user could act on (e.g.
+ * resubmitting and paying twice for work that already landed), so it gets
+ * its own honest message rather than being folded into any flow's existing
+ * failure phase.
+ */
+const JOB_INTERRUPTED_MESSAGE =
+  "The server restarted while this was running, so the outcome is unknown. Check the page to see whether the change went through before trying again.";
 
 /** Nearest active manifest node at or above the given ID. */
 function selectableId(nodeId: string, manifest: Manifest | null): string | undefined {
@@ -174,6 +188,22 @@ export default function App() {
   const [exportOutcome, setExportOutcome] = useState<ExportOutcome | null>(null);
   const [editPrompt, setEditPrompt] = useState<EditPromptState>({ phase: "idle" });
   const [editDraft, setEditDraft] = useState("");
+  // Elapsed time for the two job-backed operations whose progress display
+  // lives entirely in App.tsx (regen's in-canvas overlay, the export
+  // button's own label) — a job is opaque until it finishes, so this is the
+  // only honest thing to show while one is in flight (slice 5, job model).
+  // editPrompt's and addSection's own elapsedMs live inside their phase
+  // objects instead, since their "running" text is rendered by their own
+  // components.
+  const [regenElapsedMs, setRegenElapsedMs] = useState(0);
+  const [exportElapsedMs, setExportElapsedMs] = useState(0);
+  // A job that comes back `interrupted` (server restarted mid-run) is not a
+  // failure and must not be reported as one (JOB_INTERRUPTED_MESSAGE) — this
+  // banner is the one honest surface for it, shared by all five flows
+  // rather than overloading each flow's own "failed" phase, which every
+  // component already renders with failure-specific language ("Regeneration
+  // failed", "Export failed — nothing was shipped") that would be untrue here.
+  const [jobNotice, setJobNotice] = useState<string | undefined>(undefined);
 
   const manifestRef = useRef<Manifest | null>(null);
   const historyRef = useRef<History | null>(null);
@@ -398,6 +428,46 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [history]);
 
+  /* ---------- elapsed-time ticking for job-backed operations (slice 5, job model) ----------
+   * A job is opaque until it finishes (design doc's "Accepted losses": no
+   * fabricated percentage, no synthetic step count) — elapsed time is the
+   * only honest thing left to show. Ticks once a second locally, which is
+   * finer-grained than enqueueAndPoll's own ~2s poll cadence against the
+   * hosted server, and is the ONLY source of movement at all against the
+   * local/unauthenticated preview server (compiler/scripts/preview.ts),
+   * which never enqueues a job and so never calls `onStatus`. */
+  useEffect(() => {
+    if (regen.phase !== "running") return;
+    const interval = window.setInterval(() => setRegenElapsedMs((ms) => ms + 1000), 1000);
+    return () => window.clearInterval(interval);
+  }, [regen.phase]);
+
+  useEffect(() => {
+    if (exportState !== "running") return;
+    const interval = window.setInterval(() => setExportElapsedMs((ms) => ms + 1000), 1000);
+    return () => window.clearInterval(interval);
+  }, [exportState]);
+
+  useEffect(() => {
+    if (editPrompt.phase !== "running") return;
+    const interval = window.setInterval(() => {
+      setEditPrompt((current) =>
+        current.phase === "running" ? { ...current, elapsedMs: current.elapsedMs + 1000 } : current,
+      );
+    }, 1000);
+    return () => window.clearInterval(interval);
+  }, [editPrompt.phase]);
+
+  useEffect(() => {
+    if (addSection?.phase !== "running") return;
+    const interval = window.setInterval(() => {
+      setAddSection((current) =>
+        current?.phase === "running" ? { ...current, elapsedMs: current.elapsedMs + 1000 } : current,
+      );
+    }, 1000);
+    return () => window.clearInterval(interval);
+  }, [addSection?.phase]);
+
   /** Writes the current override + history state through the preview server's
    * persistence endpoints. Shared by the debounced autosave above and
    * runExport's pre-export flush — the exporter reads overrides from DISK,
@@ -461,14 +531,31 @@ export default function App() {
     // reported, nothing applied.
     if (route === undefined || manifest === null || tokens === null || history === null) return;
     const instruction = editDraft;
-    setEditPrompt({ phase: "running" });
+    setEditPrompt({ phase: "running", elapsedMs: 0 });
     try {
-      const response = await fetch(`${PREVIEW_URL}/__edit-prompt`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ route, instruction, selection: selectedId }),
-      });
-      const outcome = interpretEditResult((await response.json()) as EditPromptResponse);
+      const job = await enqueueAndPoll(
+        `${PREVIEW_URL}/__edit-prompt`,
+        { route, instruction, selection: selectedId },
+        {
+          onStatus: (update) =>
+            setEditPrompt((current) =>
+              current.phase === "running"
+                ? { ...current, elapsedMs: Math.max(current.elapsedMs, update.elapsedMs) }
+                : current,
+            ),
+        },
+      );
+      if (job.status === "interrupted") {
+        setJobNotice(JOB_INTERRUPTED_MESSAGE);
+        setEditPrompt({ phase: "idle" });
+        return;
+      }
+      if (job.status === "failed") throw new Error(job.error ?? "unknown failure");
+      // THE TRAP (jobs.ts's own header comment): "succeeded" means the
+      // request completed, not that the edit was accepted — job.result is
+      // verbatim the same body /__edit-prompt always returned, so it is
+      // read exactly as it was before enqueueAndPoll existed.
+      const outcome = interpretEditResult(job.result as EditPromptResponse);
       if (outcome.kind === "error") throw new Error(outcome.message);
       if (outcome.kind === "structural") {
         setEditPrompt({ phase: "structural", kind: outcome.structuralKind, reason: outcome.reason });
@@ -772,14 +859,31 @@ export default function App() {
   async function confirmAddSection() {
     if (addSection?.phase !== "picking" || addSection.archetype === undefined) return;
     const { route, afterSection, archetype, instruction } = addSection;
-    setAddSection({ phase: "running", route });
+    setAddSection({ phase: "running", route, elapsedMs: 0 });
     try {
-      const response = await fetch(`${PREVIEW_URL}/__add-section`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ route, archetype, instruction }),
-      });
-      const outcome = (await response.json()) as {
+      const job = await enqueueAndPoll(
+        `${PREVIEW_URL}/__add-section`,
+        { route, archetype, instruction },
+        {
+          onStatus: (update) =>
+            setAddSection((current) =>
+              current?.phase === "running"
+                ? { ...current, elapsedMs: Math.max(current.elapsedMs, update.elapsedMs) }
+                : current,
+            ),
+        },
+      );
+      if (job.status === "interrupted") {
+        setJobNotice(JOB_INTERRUPTED_MESSAGE);
+        setAddSection(null);
+        return;
+      }
+      if (job.status === "failed") throw new Error(job.error ?? "unknown failure");
+      // THE TRAP: "succeeded" means the request completed, not that the
+      // section passed validation — job.result is verbatim the same body
+      // /__add-section always returned (passed/sectionId/failureReport),
+      // read exactly as before.
+      const outcome = job.result as {
         passed?: boolean;
         sectionId?: string;
         failureReport?: string;
@@ -833,18 +937,24 @@ export default function App() {
     if (regen.phase !== "prompt") return;
     const { section, instruction, scope } = regen;
     setRegen({ phase: "running", section, scope });
+    setRegenElapsedMs(0);
     try {
-      const response = await fetch(
+      const job = await enqueueAndPoll(
         `${PREVIEW_URL}${scope === "page" ? "/__regen-page" : "/__regen"}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(
-            scope === "page" ? { route: section, instruction } : { section, instruction },
-          ),
-        },
+        scope === "page" ? { route: section, instruction } : { section, instruction },
+        { onStatus: (update) => setRegenElapsedMs((ms) => Math.max(ms, update.elapsedMs)) },
       );
-      const outcome = (await response.json()) as {
+      if (job.status === "interrupted") {
+        setJobNotice(JOB_INTERRUPTED_MESSAGE);
+        setRegen({ phase: "idle" });
+        return;
+      }
+      if (job.status === "failed") throw new Error(job.error ?? "unknown failure");
+      // THE TRAP: "succeeded" means the request completed, not that the
+      // regen passed validation — job.result is verbatim the same body
+      // /__regen(-page) always returned (passed/orphanedOverrides/
+      // failureReport), read exactly as before.
+      const outcome = job.result as {
         passed?: boolean;
         orphanedOverrides?: string[];
         failureReport?: string;
@@ -920,13 +1030,26 @@ export default function App() {
   async function runExport() {
     setExportOutcome(null);
     setExportState("running");
+    setExportElapsedMs(0);
     try {
       if (history !== null && routes.length > 0) {
         await writeOverrides(splitOverridesByRoute(map, routes), routes, history);
         setSaveStatus("Saved");
       }
-      const response = await fetch(`${PREVIEW_URL}/__export`, { method: "POST" });
-      setExportOutcome((await response.json()) as ExportOutcome);
+      const job = await enqueueAndPoll(
+        `${PREVIEW_URL}/__export`,
+        {},
+        { onStatus: (update) => setExportElapsedMs((ms) => Math.max(ms, update.elapsedMs)) },
+      );
+      if (job.status === "interrupted") {
+        setJobNotice(JOB_INTERRUPTED_MESSAGE);
+        return;
+      }
+      if (job.status === "failed") throw new Error(job.error ?? "unknown failure");
+      // THE TRAP: "succeeded" means the request completed, not that the
+      // export shipped — job.result is verbatim the same body /__export
+      // always returned (ok: true|false), read exactly as before.
+      setExportOutcome(job.result as ExportOutcome);
     } catch (error) {
       setExportOutcome({ ok: false, message: `Export request failed: ${String(error)}` });
     } finally {
@@ -1091,7 +1214,7 @@ export default function App() {
             disabled={exportState === "running"}
             onClick={() => void runExport()}
           >
-            {exportState === "running" ? "Exporting…" : "Export"}
+            {exportState === "running" ? `Exporting… ${formatElapsedSeconds(exportElapsedMs)}` : "Export"}
           </button>
           <span data-testid="save-status" className="save-status">
             {saveStatus}
@@ -1200,7 +1323,10 @@ export default function App() {
                           height: regenGeom.rect.height,
                         }}
                       >
-                        <span>Regenerating…</span>
+                        {/* A job is opaque until it finishes (design doc's
+                            "Accepted losses") -- elapsed time, not a
+                            fabricated percentage, is what stays honest. */}
+                        <span>Running… {formatElapsedSeconds(regenElapsedMs)}</span>
                       </div>
                     )}
                     {selectedGeom !== undefined && selectedId !== undefined && routeOf(selectedId) === route.slug && (
@@ -1426,6 +1552,19 @@ export default function App() {
       {gestureToast !== undefined && (
         <div data-testid="gesture-toast" className="gesture-toast">
           {gestureToast}
+        </div>
+      )}
+
+      {/* A job coming back `interrupted` (server restarted mid-run) is not
+          a failure -- shared by all five job-backed flows rather than
+          reusing any one flow's own "failed" phase, whose language ("...
+          failed") would be untrue here (JOB_INTERRUPTED_MESSAGE). */}
+      {jobNotice !== undefined && (
+        <div data-testid="job-interrupted-banner" className="gesture-toast">
+          <span>{jobNotice}</span>
+          <button type="button" data-testid="job-interrupted-dismiss" onClick={() => setJobNotice(undefined)}>
+            Dismiss
+          </button>
         </div>
       )}
     </div>

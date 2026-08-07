@@ -126,12 +126,16 @@ Polling is what makes spec decision 13 fall out for free: *work in flight surviv
 
 ---
 
-## Open question for the human
+## Resolved: the project row is created at enqueue
 
-**Should `POST /api/generate` create the `project` row at enqueue, or on success?**
+**Decided by the human, 2026-08-06.** `POST /api/generate` creates the `project` row and its directory before the job is queued, so the job carries a `project_id` throughout.
 
-At enqueue: the job has a `project_id` throughout, `GET /api/jobs?project=` works immediately, and the preview can be opened while generation runs. But a failed generation leaves an empty project row and a directory of partial output, which the user then has to delete.
+A failed generation therefore leaves a project the user can see and delete, rather than a partially-generated directory owned by nobody — which is exactly the orphaned-acceptance-run problem slice 4a had to write an adoption pass to clean up once already. An owned failure beats an unowned one.
 
-On success: no orphan rows, but the job carries `project_id = NULL` while running, so the UI has nothing to link to and a partially-generated directory exists on disk with no owner — which is exactly the orphaned-acceptance-run problem slice 4a's adoption pass had to clean up once already.
+Consequence to build for: **a project can exist with an empty or partial directory.** Anything that assumes a project row implies a servable site must tolerate it — in particular the preview pool, which will be asked to spawn a Vite child for a directory that has no `vite.config.ts` yet, and must fail with something legible rather than a spawn timeout.
 
-**Recommendation: create at enqueue**, and let a failed generation leave a project the user can see and delete. An owned failure is better than an unowned one, and 4a already proved that unowned directories are the state nobody cleans up.
+## One asymmetry this design does not paper over
+
+Five of the six job kinds are wrappers around a proxied request to the project's preview child. **`generate` is not**, and cannot be: there is no site for a Vite dev server to serve until generation has run. The server spawns the orchestrator directly for that kind, using the `buildAgentEnv` / usage-log / `redactSecrets` machinery the preview pool already uses for its children.
+
+So the worker has two execution strategies behind one job table, not one. That is honest and small — but it is not the uniformity "convert everything" might imply, and pretending otherwise would mislead whoever implements it.

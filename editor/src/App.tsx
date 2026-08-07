@@ -212,6 +212,19 @@ export default function App() {
   const stageRef = useRef<HTMLDivElement | null>(null);
   const hydratedRef = useRef(false);
   const widthEditableRef = useRef(true);
+  // Real wall-clock baselines for the elapsed-time displays below (task-4
+  // review): a tick that just adds 1000ms to the last displayed value drifts
+  // under background-tab throttling, where the browser can clamp
+  // `setInterval` to well over 1s per fire — so ONE tick that fired late
+  // silently makes every number after it wrong, forever, for that run. Each
+  // ref is stamped with `Date.now()` at the exact moment its flow enters
+  // `running`; every tick recomputes fresh from it (`Date.now() -
+  // ref.current`), so a late-firing interval only delays the NEXT update,
+  // it never compounds an error into the ones already shown.
+  const regenStartedAtRef = useRef<number | undefined>(undefined);
+  const exportStartedAtRef = useRef<number | undefined>(undefined);
+  const editPromptStartedAtRef = useRef<number | undefined>(undefined);
+  const addSectionStartedAtRef = useRef<number | undefined>(undefined);
   // Bootstrap's own setHistory(persisted) is itself a `history` change, so
   // it would otherwise trigger the persistence effect below to immediately
   // write the just-loaded data straight back — a redundant "startup save"
@@ -435,16 +448,23 @@ export default function App() {
    * finer-grained than enqueueAndPoll's own ~2s poll cadence against the
    * hosted server, and is the ONLY source of movement at all against the
    * local/unauthenticated preview server (compiler/scripts/preview.ts),
-   * which never enqueues a job and so never calls `onStatus`. */
+   * which never enqueues a job and so never calls `onStatus`. Each tick
+   * RECOMPUTES from its flow's own `Date.now()` baseline ref rather than
+   * adding a fixed 1000ms — see the refs' own comment above for why an
+   * additive tick drifts under background-tab throttling. */
   useEffect(() => {
     if (regen.phase !== "running") return;
-    const interval = window.setInterval(() => setRegenElapsedMs((ms) => ms + 1000), 1000);
+    const interval = window.setInterval(() => {
+      if (regenStartedAtRef.current !== undefined) setRegenElapsedMs(Date.now() - regenStartedAtRef.current);
+    }, 1000);
     return () => window.clearInterval(interval);
   }, [regen.phase]);
 
   useEffect(() => {
     if (exportState !== "running") return;
-    const interval = window.setInterval(() => setExportElapsedMs((ms) => ms + 1000), 1000);
+    const interval = window.setInterval(() => {
+      if (exportStartedAtRef.current !== undefined) setExportElapsedMs(Date.now() - exportStartedAtRef.current);
+    }, 1000);
     return () => window.clearInterval(interval);
   }, [exportState]);
 
@@ -452,7 +472,9 @@ export default function App() {
     if (editPrompt.phase !== "running") return;
     const interval = window.setInterval(() => {
       setEditPrompt((current) =>
-        current.phase === "running" ? { ...current, elapsedMs: current.elapsedMs + 1000 } : current,
+        current.phase === "running" && editPromptStartedAtRef.current !== undefined
+          ? { ...current, elapsedMs: Date.now() - editPromptStartedAtRef.current }
+          : current,
       );
     }, 1000);
     return () => window.clearInterval(interval);
@@ -462,7 +484,9 @@ export default function App() {
     if (addSection?.phase !== "running") return;
     const interval = window.setInterval(() => {
       setAddSection((current) =>
-        current?.phase === "running" ? { ...current, elapsedMs: current.elapsedMs + 1000 } : current,
+        current?.phase === "running" && addSectionStartedAtRef.current !== undefined
+          ? { ...current, elapsedMs: Date.now() - addSectionStartedAtRef.current }
+          : current,
       );
     }, 1000);
     return () => window.clearInterval(interval);
@@ -531,6 +555,10 @@ export default function App() {
     // reported, nothing applied.
     if (route === undefined || manifest === null || tokens === null || history === null) return;
     const instruction = editDraft;
+    editPromptStartedAtRef.current = Date.now();
+    // A stale interrupted-banner from an earlier run must not linger once
+    // the user is visibly acting on this flow again (task-4 review).
+    setJobNotice(undefined);
     setEditPrompt({ phase: "running", elapsedMs: 0 });
     try {
       const job = await enqueueAndPoll(
@@ -859,6 +887,8 @@ export default function App() {
   async function confirmAddSection() {
     if (addSection?.phase !== "picking" || addSection.archetype === undefined) return;
     const { route, afterSection, archetype, instruction } = addSection;
+    addSectionStartedAtRef.current = Date.now();
+    setJobNotice(undefined);
     setAddSection({ phase: "running", route, elapsedMs: 0 });
     try {
       const job = await enqueueAndPoll(
@@ -936,6 +966,8 @@ export default function App() {
   async function confirmRegen() {
     if (regen.phase !== "prompt") return;
     const { section, instruction, scope } = regen;
+    regenStartedAtRef.current = Date.now();
+    setJobNotice(undefined);
     setRegen({ phase: "running", section, scope });
     setRegenElapsedMs(0);
     try {
@@ -1030,6 +1062,8 @@ export default function App() {
   async function runExport() {
     setExportOutcome(null);
     setExportState("running");
+    exportStartedAtRef.current = Date.now();
+    setJobNotice(undefined);
     setExportElapsedMs(0);
     try {
       if (history !== null && routes.length > 0) {
@@ -1049,7 +1083,31 @@ export default function App() {
       // THE TRAP: "succeeded" means the request completed, not that the
       // export shipped — job.result is verbatim the same body /__export
       // always returned (ok: true|false), read exactly as before.
-      setExportOutcome(job.result as ExportOutcome);
+      const result = job.result as { ok?: boolean; message?: string; error?: string } | undefined;
+      if (result === undefined) {
+        // Belt-and-braces (task-4 review): enqueueAndPoll's own poll-loop
+        // validation should make this unreachable in practice, and the
+        // ternary below is itself evaluated inside this function's own
+        // try/catch (unlike the original bug, which crashed inside
+        // ExportPanel's render — outside any try/catch this function
+        // controls) — so even without this guard, a `result === undefined`
+        // no longer reaches the DOM as a raw TypeError. This guard exists
+        // for the clear, specific diagnostic message rather than to be the
+        // only thing standing between this and a crash.
+        throw new Error("job succeeded but returned no result");
+      }
+      // A hosted-server refusal answered BEFORE a job was ever created
+      // (e.g. a session expiring between opening the editor and clicking
+      // Export) reaches here as `{error: "..."}` with no `ok` field —
+      // enqueueAndPoll's non-202 branch hands back exactly that body, since
+      // it has no way to know this endpoint's outcome is export-shaped.
+      // Mapped into a real ExportFailure rather than rendering a blank
+      // "Export failed" with no message.
+      setExportOutcome(
+        result.ok === undefined && typeof result.error === "string"
+          ? { ok: false, message: result.error }
+          : (result as ExportOutcome),
+      );
     } catch (error) {
       setExportOutcome({ ok: false, message: `Export request failed: ${String(error)}` });
     } finally {
@@ -1558,9 +1616,13 @@ export default function App() {
       {/* A job coming back `interrupted` (server restarted mid-run) is not
           a failure -- shared by all five job-backed flows rather than
           reusing any one flow's own "failed" phase, whose language ("...
-          failed") would be untrue here (JOB_INTERRUPTED_MESSAGE). */}
+          failed") would be untrue here (JOB_INTERRUPTED_MESSAGE). Its own
+          class, not `gesture-toast` (task-4 review): that class is styled
+          as a transient, self-clearing toast at the bottom of the stage,
+          while this banner is persistent and dismiss-only -- reusing it put
+          the two directly on top of each other whenever both were active. */}
       {jobNotice !== undefined && (
-        <div data-testid="job-interrupted-banner" className="gesture-toast">
+        <div data-testid="job-interrupted-banner" className="job-interrupted-banner">
           <span>{jobNotice}</span>
           <button type="button" data-testid="job-interrupted-dismiss" onClick={() => setJobNotice(undefined)}>
             Dismiss

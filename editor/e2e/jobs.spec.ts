@@ -71,22 +71,42 @@ test("a 202 enqueue is polled (queued -> running -> succeeded) and the terminal 
 test("elapsed time visibly ticks upward while a job runs -- honest progress, not a fabricated percentage", async ({
   page,
 }) => {
-  // Isolates the LOCAL 1s ticker (App.tsx) from enqueueAndPoll's own
-  // onStatus, which only fires once every `pollIntervalMs` (2000ms in
-  // production): the fake job answers "running" on poll 1 (fired almost
-  // immediately after the 202), so onStatus's own next update does not
-  // land until ~2000ms out. A window well under that (1500ms) can only be
-  // satisfied by the ticker itself -- if onStatus alone were the only thing
-  // moving this number, this assertion would still be waiting at "0s".
-  await fakeJob(page, "/__regen", "job-ticking", (n) =>
-    n < 4 ? { status: "running" } : { status: "succeeded", result: { passed: true } },
+  // Structural isolation, not a timing margin (task-4 review: the previous
+  // version isolated the local ticker from enqueueAndPoll's own onStatus
+  // only by a thin margin between this test's own preamble cost and the
+  // ~2000ms poll interval -- correct, but fragile on a slower machine).
+  // Poll #1 answers "running" immediately (t~0), so onStatus fires exactly
+  // once at t~0. Poll #2's response is deliberately HELD for several
+  // seconds before answering, so onStatus's own next call cannot possibly
+  // land until long after the assertion below has had time to observe the
+  // ticker move on its own -- this holds regardless of how long
+  // openRegenPrompt happens to take on a given run.
+  const POLL_TWO_DELAY_MS = 4_000;
+  await page.route("**/__regen", (route) =>
+    route.fulfill({ status: 202, contentType: "application/json", body: JSON.stringify({ jobId: "job-ticking" }) }),
   );
+  let pollNumber = 0;
+  await page.route("**/api/jobs/job-ticking", async (route) => {
+    pollNumber += 1;
+    if (pollNumber === 1) {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "running" }) });
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, POLL_TWO_DELAY_MS));
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ status: "succeeded", result: { passed: true } }),
+    });
+  });
   await openRegenPrompt(page);
 
   const progress = page.getByTestId("regen-progress");
   await expect(progress).toBeVisible();
   await expect(progress).toContainText("0s");
-  await expect(progress).toContainText(/[1-9]\d*s/, { timeout: 1_500 });
+  // Comfortably inside the ~2000ms-to-6000ms dead zone where onStatus
+  // cannot fire again -- only the local ticker can satisfy this.
+  await expect(progress).toContainText(/[1-9]\d*s/, { timeout: 3_000 });
 });
 
 /* ---------- THE TRAP: "succeeded" means the request completed, not that the work passed ---------- */
@@ -176,6 +196,64 @@ test("a job-level 'failed' status (e.g. the preview child could not start) surfa
   await expect(failure).toContainText("could not start the preview");
 });
 
+/* ---------- a poll response is validated, not trusted (task-4 review Important) ---------- */
+
+test("a mid-flight 404 while polling (the job row is gone or foreign) surfaces as a legible failure, never a fabricated success", async ({
+  page,
+}) => {
+  await page.route("**/__regen", (route) =>
+    route.fulfill({ status: 202, contentType: "application/json", body: JSON.stringify({ jobId: "job-gone" }) }),
+  );
+  await page.route("**/api/jobs/job-gone", (route) =>
+    route.fulfill({ status: 404, contentType: "application/json", body: JSON.stringify({ error: "not found" }) }),
+  );
+  await openRegenPrompt(page);
+
+  await expect(page.getByTestId("regen-failure")).toBeVisible({ timeout: 15_000 });
+  // and NOT the interrupted banner, and NOT a silent success
+  await expect(page.getByTestId("job-interrupted-banner")).toHaveCount(0);
+  await expect(page.getByTestId("revert-regen-button")).toHaveCount(0);
+});
+
+test("a 200 poll response carrying an unrecognised status is a legible failure, never returned as a fabricated terminal outcome", async ({
+  page,
+}) => {
+  await page.route("**/__regen", (route) =>
+    route.fulfill({ status: 202, contentType: "application/json", body: JSON.stringify({ jobId: "job-weird" }) }),
+  );
+  await page.route("**/api/jobs/job-weird", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "cancelled" }) }),
+  );
+  await openRegenPrompt(page);
+
+  await expect(page.getByTestId("regen-failure")).toBeVisible({ timeout: 15_000 });
+});
+
+test("runExport guards a succeeded job with no result at all -- a legible failure, not the ExportPanel crash the review caught", async ({
+  page,
+}) => {
+  await fakeJob(page, "/__export", "job-export-no-result", () => ({ status: "succeeded" }));
+  await openEditor(page);
+  await page.getByTestId("export-button").click();
+
+  await expect(page.getByTestId("export-failed-title")).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByTestId("export-failure-message")).toContainText(/no result/i);
+});
+
+test("runExport maps a result with no 'ok' field (a hosted-server refusal answered before enqueue, e.g. a session expiring) into a real failure with a message, not a blank one", async ({
+  page,
+}) => {
+  await fakeJob(page, "/__export", "job-export-error-body", () => ({
+    status: "succeeded",
+    result: { error: "session expired" },
+  }));
+  await openEditor(page);
+  await page.getByTestId("export-button").click();
+
+  await expect(page.getByTestId("export-failed-title")).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByTestId("export-failure-message")).toContainText("session expired");
+});
+
 /* ---------- 'interrupted' is not a synonym for 'failed' ---------- */
 
 test("an interrupted regen shows the honest 'outcome unknown' banner, never the 'Regeneration failed' panel", async ({
@@ -194,6 +272,28 @@ test("an interrupted regen shows the honest 'outcome unknown' banner, never the 
 
   await page.getByTestId("job-interrupted-dismiss").click();
   await expect(banner).toBeHidden();
+});
+
+test("the interrupted banner clears on its own once the SAME flow is retried and succeeds -- it does not linger indefinitely (task-4 review)", async ({
+  page,
+}) => {
+  await fakeJob(page, "/__regen", "job-retry-1", () => ({ status: "interrupted" }));
+  await openRegenPrompt(page);
+
+  const banner = page.getByTestId("job-interrupted-banner");
+  await expect(banner).toBeVisible({ timeout: 15_000 });
+
+  // Retry the SAME flow without touching the dismiss button -- the stale
+  // notice from the first attempt must not still be on screen once a new
+  // attempt is visibly under way, regardless of whether the user dismissed it.
+  await page.unroute("**/__regen");
+  await page.unroute("**/api/jobs/job-retry-1");
+  await fakeJob(page, "/__regen", "job-retry-2", () => ({ status: "succeeded", result: { passed: true } }));
+  await selectNode(page, "home.hero");
+  await page.getByTestId("regen-button").click();
+  await page.getByTestId("regen-confirm").click();
+
+  await expect(banner).toBeHidden({ timeout: 15_000 });
 });
 
 test("an interrupted add-a-section shows the honest banner, not the 'Could not add the section' panel", async ({

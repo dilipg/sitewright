@@ -149,6 +149,80 @@ describe("enqueueAndPoll: the hosted server (202 + job polling)", () => {
 
     expect(waits).toEqual([2000]);
   });
+
+  it("rejects rather than fabricating a terminal outcome when a mid-flight poll answers 404 (the job row is gone or foreign)", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(202, { jobId: "job-5" }))
+      .mockResolvedValueOnce(jsonResponse(404, { error: "not found" }));
+
+    await expect(
+      enqueueAndPoll("http://localhost:5273/__regen", {}, { fetchImpl, wait: async () => {} }),
+    ).rejects.toThrow(/404/);
+  });
+
+  it("the ok-check is independently load-bearing: an ERROR STATUS whose body happens to still look like a valid job (contrived, but isolates the check) is still rejected, not returned as terminal", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(202, { jobId: "job-5b" }))
+      // A body that would pass the status-shape check on its own -- the ONLY
+      // thing that can catch this is checking jobResponse.ok itself.
+      .mockResolvedValueOnce(jsonResponse(404, { status: "succeeded", result: { passed: true } }));
+
+    await expect(
+      enqueueAndPoll("http://localhost:5273/__regen", {}, { fetchImpl, wait: async () => {} }),
+    ).rejects.toThrow(/404/);
+  });
+
+  it("rejects rather than fabricating a terminal outcome when a mid-flight poll answers 401 (a session expiring mid-run)", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(202, { jobId: "job-6" }))
+      .mockResolvedValueOnce(jsonResponse(401, { error: "not authenticated" }));
+
+    await expect(
+      enqueueAndPoll("http://localhost:5273/__regen", {}, { fetchImpl, wait: async () => {} }),
+    ).rejects.toThrow(/401/);
+  });
+
+  it("rejects rather than treating a 200 with no recognised status as terminal", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(202, { jobId: "job-7" }))
+      .mockResolvedValueOnce(jsonResponse(200, { error: "not found" })); // no `status` field at all
+
+    await expect(
+      enqueueAndPoll("http://localhost:5273/__regen", {}, { fetchImpl, wait: async () => {} }),
+    ).rejects.toThrow(/unrecognised status/);
+  });
+
+  it("rejects a 200 carrying a status this build does not know about, rather than returning it as terminal", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(202, { jobId: "job-8" }))
+      .mockResolvedValueOnce(jsonResponse(200, { status: "cancelled" }));
+
+    await expect(
+      enqueueAndPoll("http://localhost:5273/__regen", {}, { fetchImpl, wait: async () => {} }),
+    ).rejects.toThrow(/unrecognised status/);
+  });
+
+  it("still polls normally through several non-terminal statuses once the response shape is valid (the fix doesn't break the happy path)", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(202, { jobId: "job-9" }))
+      .mockResolvedValueOnce(jsonResponse(200, { status: "queued" }))
+      .mockResolvedValueOnce(jsonResponse(200, { status: "running" }))
+      .mockResolvedValueOnce(jsonResponse(200, { status: "succeeded", result: { passed: true } }));
+
+    const outcome = await enqueueAndPoll(
+      "http://localhost:5273/__regen",
+      {},
+      { fetchImpl, wait: async () => {} },
+    );
+
+    expect(outcome).toEqual({ status: "succeeded", result: { passed: true }, error: undefined });
+  });
 });
 
 describe("formatElapsedSeconds", () => {

@@ -44,6 +44,27 @@
  * interpret `result` itself — that would require knowing five different
  * response shapes, one per endpoint, and getting even one wrong would hide
  * a real gate failure behind a false "succeeded".
+ *
+ * A SECOND, RELATED TRAP lives in the POLL LOOP itself, not just at the
+ * call sites: a poll response was previously trusted by an `as` cast rather
+ * than checked. A five-minute job outlives plenty of things that can go
+ * wrong mid-poll and have nothing to do with the job itself — the job row
+ * disappearing (a 404, `job-routes.ts`'s uniform "gone or never yours"
+ * response), a session expiring (a 401), a transient 500. None of those
+ * bodies carry a `status` field, so an unchecked cast made `job.status`
+ * `undefined`, which is neither a known non-terminal value nor a valid
+ * terminal one — and the old code fell straight out of the polling loop and
+ * returned it as a TERMINAL outcome anyway, with `result: undefined`. Every
+ * call site then either read `.error` off `undefined` (a `TypeError`,
+ * rendering a flow's own "failed" UI while the job could still be running —
+ * exactly the lie `interrupted`-handling exists to prevent, arrived at by a
+ * different route) or, for `runExport`, handed `undefined` straight to
+ * `setExportOutcome`, which passed the `!== null` JSX guard and crashed the
+ * app reading `.ok` off `undefined`. The fix: reject on `!response.ok`, and
+ * reject on any `status` outside the five known values, rather than ever
+ * returning either as a fabricated terminal `JobOutcome`. A rejection here
+ * lands in the exact same `catch` block every call site already had for a
+ * network failure — no new failure surface, no fabricated success.
  */
 
 /** The two non-terminal states a job can be polled in. */
@@ -99,6 +120,21 @@ export interface EnqueueAndPollOptions {
 
 const DEFAULT_POLL_INTERVAL_MS = 2000;
 
+/** The only five values a job's `status` is ever allowed to hold — anything
+ *  else means the response wasn't actually a job status at all (a 404's
+ *  `{error: "not found"}`, a 401's `{error: "..."}`, a bare 500 body). */
+const KNOWN_JOB_STATUSES: ReadonlySet<string> = new Set([
+  "queued",
+  "running",
+  "succeeded",
+  "failed",
+  "interrupted",
+]);
+
+function isKnownJobStatus(value: unknown): value is PollingJobStatus | TerminalJobStatus {
+  return typeof value === "string" && KNOWN_JOB_STATUSES.has(value);
+}
+
 function defaultWait(ms: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
@@ -144,11 +180,27 @@ export async function enqueueAndPoll(
 
   for (;;) {
     const jobResponse = await doFetch(pollUrl);
+    // A mid-poll 404 (the job row is gone or was never this session's --
+    // job-routes.ts answers both uniformly), a 401 (a session expiring
+    // during a run that can genuinely run several minutes), or a 500 all
+    // carry a JSON body with no `status` field. Rejecting here, rather than
+    // trying to interpret the body, is what stops that body from being
+    // read as a fabricated terminal outcome below.
+    if (!jobResponse.ok) {
+      throw new Error(`job status poll failed: HTTP ${String(jobResponse.status)}`);
+    }
     const job = (await jobResponse.json()) as {
-      status: PollingJobStatus | TerminalJobStatus;
+      status?: unknown;
       result?: unknown;
       error?: string;
     };
+    // The `as` cast above asserts a shape; this checks one. An `ok` 200
+    // whose body simply isn't a job (or whose `status` is some future value
+    // this build doesn't know about yet) is exactly as dangerous as a 404 --
+    // it must not fall out of the loop and be returned as terminal.
+    if (!isKnownJobStatus(job.status)) {
+      throw new Error(`job status poll returned an unrecognised status: ${JSON.stringify(job.status)}`);
+    }
     if (job.status === "queued" || job.status === "running") {
       options.onStatus?.({ status: job.status, elapsedMs: now() - startedAt });
       await wait(pollIntervalMs);

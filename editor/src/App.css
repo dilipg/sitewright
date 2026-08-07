@@ -220,6 +220,41 @@ body {
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
 }
 
+/* Persistent, dismiss-only -- deliberately NOT `.gesture-toast` (task-4
+   review), which is a transient self-clearing toast anchored to the bottom
+   of the stage. This sits at the top instead so it never overlaps one, and
+   above every other overlay (z-index) since it is reporting on the run the
+   user just submitted. */
+.job-interrupted-banner {
+  position: absolute;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  max-width: 640px;
+  background: #4a3b12;
+  color: #ffd580;
+  border: 1px solid #caa153;
+  padding: 10px 16px;
+  border-radius: 6px;
+  font-size: 13px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+  z-index: 30;
+}
+
+.job-interrupted-banner button {
+  flex-shrink: 0;
+  background: transparent;
+  color: inherit;
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  padding: 3px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
 .text-edit-overlay {
   position: absolute;
   pointer-events: auto;

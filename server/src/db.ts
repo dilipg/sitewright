@@ -83,9 +83,12 @@ const MIGRATIONS = [
      started_at   INTEGER,
      finished_at  INTEGER
    )`,
-  // Every active-job check and every project job list is "this user/project,
-  // this status" — without the index that is a full scan of every job ever
-  // recorded on each request.
+  // Serves `countActiveJobsForUser` ("this user, these statuses") and
+  // `claimNextJob`'s own per-user-running-count subquery, both "this user,
+  // this status" lookups that would otherwise scan every job ever recorded.
+  // Does NOT serve `listJobsByProject`, which filters on `project_id` (a
+  // column this index does not cover) and full-scans regardless — nothing
+  // needs an index for that yet, so none is added here.
   `CREATE INDEX IF NOT EXISTS job_user_status_idx ON job(user_id, status)`,
 ];
 

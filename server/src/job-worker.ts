@@ -48,47 +48,65 @@
  *
  * BOUNDS, enforced at claim time (not at enqueue — that is a later task's
  * concern for the spend cap specifically; this module only ever runs after a
- * job already exists):
+ * job already exists). REVISED from this task's first pass: the per-user
+ * bound now lives INSIDE `jobs.ts`'s `claimNextJob` itself, not here — see
+ * that function's own comment for the full account of why (in short: a
+ * chronically-blocked user's oldest job was being claimed and immediately
+ * requeued on every single tick, and since a requeue does not change
+ * `created_at`, that same job was always the next one claimed too — starving
+ * every OTHER user's queued work behind it, forever, in FIFO order. Pushing
+ * the bound into the claim's own SQL selection means a blocked user's job is
+ * simply never selected in the first place, so eligible jobs — including
+ * every other user's — remain reachable the whole time).
  *
- *   - At most `MAX_BILLABLE_IN_FLIGHT_PER_USER` (today's value: 2) jobs
- *     running at once for one user. Reused, not re-derived: this worker
- *     calls the SAME `PreviewPool.reserveBillableSlot` /
- *     `releaseBillableSlot` pair `compiler-routes.ts`'s `requireBillableSlot`
- *     already uses for the same purpose against live requests — "today's
- *     in-flight reservation, same value, same meaning" is not a coincidence,
- *     it is the same counter. Applied uniformly to all six kinds (including
- *     `export`, which spends nothing, and `generate`, which is the most
- *     expensive of all of them): the bound is about how much CONCURRENT work
- *     one user may have the server doing on their behalf, not narrowly about
- *     billing.
+ *   - At most `MAX_ACTIVE_JOBS_PER_USER` (today's value: 2, defined in and
+ *     owned by `jobs.ts`, pinned equal to `preview-pool.ts`'s
+ *     `MAX_BILLABLE_IN_FLIGHT_PER_USER` by a test in jobs.test.ts — "today's
+ *     in-flight reservation, same value, same meaning") jobs `running` at once for one
+ *     user. Enforced by `claimNextJob`'s own query: a user already at the
+ *     limit simply has none of their `queued` jobs selected, atomically, in
+ *     the same statement that claims someone else's. This worker does not
+ *     call `PreviewPool.reserveBillableSlot`/`releaseBillableSlot` at all —
+ *     an earlier version of this file did, as a claim-time gate that
+ *     requeued a blocked job after already claiming it, which is exactly the
+ *     starvation bug above. Applied uniformly to all six kinds via the same
+ *     `job.user_id` column (including `export`, which spends nothing, and
+ *     `generate`, which is the most expensive of all of them): the bound is
+ *     about how much CONCURRENT work one user may have the server doing on
+ *     their behalf, not narrowly about billing.
  *   - The preview pool's own cap of `MAX_PREVIEWS` (6) globally, shared with
- *     every OTHER project's live preview traffic. Nothing new needed here
- *     either: `pool.acquire()` already refuses over that cap
- *     (`PreviewCapacityError`), `forwardToPreview` already maps that to a
- *     503, and this module reads that 503 back off the loopback exchange
- *     (see `runProxiedJob`). `generate` does not touch the pool at all
- *     (it has no project preview child to acquire), so this specific bound
- *     does not apply to it — the asymmetry is real, not an oversight.
+ *     every OTHER project's live preview traffic. This ONE bound
+ *     `claimNextJob` cannot see in advance (it has no visibility into the
+ *     in-memory pool at all) — `pool.acquire()` already refuses over that
+ *     cap (`PreviewCapacityError`), `forwardToPreview` already maps that to
+ *     a 503, and this module reads that 503 back off the loopback exchange
+ *     (see `runProxiedJob`) and calls `jobs.ts`'s `requeueJob` — the ONE
+ *     remaining requeue-after-claim path, and the reason `requeueJob` exists
+ *     rather than being fully subsumed by the claim-time fix above.
+ *     `generate` does not touch the pool at all (it has no project preview
+ *     child to acquire), so this specific bound does not apply to it — the
+ *     asymmetry is real, not an oversight.
  *
  * In both cases, "cannot run yet" is NOT a failure: the job is put back to
  * `queued` (never `failed`) so a later claim can try again — "better than
- * today's 503" per the brief. `finishJob`'s own shape stamps `finished_at`
- * unconditionally, which is slightly wrong for a job going BACK to `queued`
- * (it hasn't finished) — `jobs.ts` has no dedicated "requeue" primitive and
- * this task's own file list does not include modifying it, so `requeue()`
- * below accepts that wart rather than reaching past the given interface.
- * Flagged, not hidden: see this file's own `requeue` doc comment.
+ * today's 503" per the brief. Unlike this task's first pass, this no longer
+ * risks stamping `finished_at` on a requeued job: `jobs.ts`'s `requeueJob`
+ * clears `started_at` and never touches `finished_at`, and `finishJob`'s own
+ * `status` parameter is now typed `TerminalJobStatus` — `queued`/`running`
+ * are not assignable to it at all, so passing either to `finishJob` is a
+ * compile error, not merely a discouraged call.
  *
  * `countActiveJobsForUser` (queued + running) is DELIBERATELY not used for
- * this bound, even though it is one of task 1's listed interfaces: it counts
- * a user's whole pipeline, not their concurrently RUNNING work, so gating a
- * claim on it would block a user's very FIRST job the moment they have two
- * or more OTHERS merely sitting in the queue behind it — a real deadlock,
- * not a false alarm (worked through by hand while designing this module; see
- * the task report for the exact scenario). Its own doc comment says it is
- * for "the spend cap's in-flight reservation" — that is an ENQUEUE-time
- * concern for whichever endpoint creates jobs, not a claim-time concern for
- * this worker.
+ * either bound, even though it is one of task 1's listed interfaces: it
+ * counts a user's whole pipeline, not their concurrently RUNNING work, so
+ * gating a claim on it would block a user's very FIRST job the moment they
+ * have two or more OTHERS merely sitting in the queue behind it — a real
+ * deadlock, not a false alarm (worked through by hand while designing this
+ * module; see the task report for the exact scenario). Its own doc comment
+ * says it is for "the spend cap's in-flight reservation" — that is an
+ * ENQUEUE-time concern for whichever endpoint creates jobs, not a claim-time
+ * concern for this worker. `claimNextJob`'s own subquery counts `running`
+ * only, for the identical reason.
  */
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -101,7 +119,7 @@ import { fileURLToPath } from "node:url";
 import { USAGE_ID_HEADER, usageLogPathFor } from "../../compiler/src/usage-log-path.ts";
 import { buildAgentEnv } from "./agent-env.ts";
 import { ingestUsageLog } from "./ingest-usage.ts";
-import { claimNextJob, finishJob, type Job, type JobKind } from "./jobs.ts";
+import { claimNextJob, finishJob, requeueJob, type Job, type JobKind } from "./jobs.ts";
 import { findProjectById } from "./projects.ts";
 import { forwardToPreview } from "./preview-forward.ts";
 import { type PreviewPool } from "./preview-pool.ts";
@@ -381,30 +399,25 @@ export class JobWorker {
    * for both "nothing queued" and "claimed something but had to requeue it,"
    * since a caller polling this in a loop reacts to both the same way: wait
    * and try again.
+   *
+   * No per-user gate here: `claimNextJob` itself already refuses to hand
+   * back a job whose user is at `MAX_ACTIVE_JOBS_PER_USER` — see this
+   * module's own top comment and `jobs.ts`'s `claimNextJob` for why that
+   * moved out of the worker.
    */
   async runOnce(): Promise<boolean> {
     const job = claimNextJob(this.db, this.now());
     if (job === null) return false;
 
-    // The per-user concurrency bound — see this module's own comment on why
-    // `reserveBillableSlot`/`releaseBillableSlot` (not `countActiveJobsForUser`)
-    // is the right mechanism here.
-    if (!this.pool.reserveBillableSlot(job.userId)) {
-      this.requeue(job);
-      return false;
-    }
-
-    let outcome: JobOutcome;
-    try {
-      outcome = isProxiedKind(job.kind)
-        ? await this.runProxiedJob(job, job.kind)
-        : await this.runGenerateJob(job);
-    } finally {
-      this.pool.releaseBillableSlot(job.userId);
-    }
+    const outcome: JobOutcome = isProxiedKind(job.kind)
+      ? await this.runProxiedJob(job, job.kind)
+      : await this.runGenerateJob(job);
 
     if (outcome.kind === "requeue") {
-      this.requeue(job);
+      // The ONE bound `claimNextJob` cannot see in advance — preview pool
+      // capacity, shared with non-job traffic. See this module's own top
+      // comment for why this is the sole remaining requeue-after-claim path.
+      requeueJob(this.db, job.id);
       return false;
     }
     finishJob(this.db, job.id, {
@@ -414,21 +427,6 @@ export class JobWorker {
       now: this.now(),
     });
     return true;
-  }
-
-  /**
-   * Puts a claimed job back to `queued` rather than failing it — "a job that
-   * cannot run yet stays queued, never fail it for being early." `finishJob`
-   * is the only status-writing primitive `jobs.ts` exports, and it always
-   * stamps `finished_at`, which is not quite right for a job going back to
-   * `queued` (it has not finished). Accepted rather than reached past this
-   * task's given interface (`jobs.ts` is not in this task's file list) — see
-   * this module's own top comment. A later task adding a dedicated
-   * `requeueJob(db, id)` that leaves `finished_at` null would close this
-   * cleanly.
-   */
-  private requeue(job: Job): void {
-    finishJob(this.db, job.id, { status: "queued", now: this.now() });
   }
 
   /**

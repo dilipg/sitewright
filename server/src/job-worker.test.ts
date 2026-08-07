@@ -22,7 +22,7 @@ import { JobWorker } from "./job-worker.ts";
 import { claimNextJob, createJob, findJobById } from "./jobs.ts";
 import { MASTER_KEY_ENV_VAR } from "./master-key.ts";
 import { createProject, type Project } from "./projects.ts";
-import { MAX_BILLABLE_IN_FLIGHT_PER_USER, PreviewPool, type PreviewProcess } from "./preview-pool.ts";
+import type { PreviewPool, PreviewProcess } from "./preview-pool.ts";
 import { createUser, type User } from "./users.ts";
 
 const MASTER_KEY = Buffer.alloc(32, 9);
@@ -54,13 +54,18 @@ async function waitUntil(predicate: () => boolean, timeoutMs = 2000): Promise<vo
   }
 }
 
-/** Just enough of PreviewPool's surface for job-worker.ts to call — same idiom preview-forward.test.ts's own fakePool uses, extended with the two billable-slot methods this module also calls directly. */
+/**
+ * Just enough of PreviewPool's surface for job-worker.ts to call — same
+ * idiom preview-forward.test.ts's own fakePool uses. No `reserveBillableSlot`/
+ * `releaseBillableSlot` here: job-worker.ts no longer calls either (the
+ * per-user bound moved into `jobs.ts`'s `claimNextJob` itself — see that
+ * function's own comment), so a fake that still offered them would be
+ * testing a mechanism this module doesn't use.
+ */
 function fakePool(overrides: Record<string, unknown> = {}): PreviewPool & {
   acquire: ReturnType<typeof vi.fn>;
   retain: ReturnType<typeof vi.fn>;
   release: ReturnType<typeof vi.fn>;
-  reserveBillableSlot: ReturnType<typeof vi.fn>;
-  releaseBillableSlot: ReturnType<typeof vi.fn>;
 } {
   return {
     acquire: vi.fn(async (): Promise<PreviewProcess> => ({
@@ -68,15 +73,11 @@ function fakePool(overrides: Record<string, unknown> = {}): PreviewPool & {
     })),
     retain: vi.fn(),
     release: vi.fn(),
-    reserveBillableSlot: vi.fn(() => true),
-    releaseBillableSlot: vi.fn(),
     ...overrides,
   } as unknown as PreviewPool & {
     acquire: ReturnType<typeof vi.fn>;
     retain: ReturnType<typeof vi.fn>;
     release: ReturnType<typeof vi.fn>;
-    reserveBillableSlot: ReturnType<typeof vi.fn>;
-    releaseBillableSlot: ReturnType<typeof vi.fn>;
   };
 }
 
@@ -178,7 +179,6 @@ describe("JobWorker: proxied kinds", () => {
       // Released even though the exchange failed -- a leaked pool slot on
       // every failure would starve capacity fast.
       expect(pool.release).toHaveBeenCalledWith(project.id);
-      expect(pool.releaseBillableSlot).toHaveBeenCalledWith(user.id);
     } finally {
       await upstream.close();
     }
@@ -307,37 +307,52 @@ describe("JobWorker: proxied kinds", () => {
   });
 });
 
-describe("JobWorker: per-user bound", () => {
-  it("leaves a third job queued when the user already has two active", async () => {
-    const projectsRoot = mkdtempSync(join(tmpdir(), "job-worker-pool-"));
-    const pool = new PreviewPool({ db, masterKey: MASTER_KEY, projectsRoot });
-    // Simulate two already-active jobs for this user without ever touching
-    // the DB — reserveBillableSlot is exactly the in-memory counter
-    // job-worker.ts itself calls, so this reproduces the real bound.
-    expect(pool.reserveBillableSlot(user.id)).toBe(true);
-    expect(pool.reserveBillableSlot(user.id)).toBe(true);
+describe("JobWorker: per-user bound (enforced by claimNextJob, not this module)", () => {
+  it("does not run a job for a user already at the running limit; runs a different, eligible user's job instead", async () => {
+    // The exact scenario the coordinator's fix asked to be proven at the
+    // worker level, not only inside jobs.test.ts's unit tests: two users,
+    // one at their limit, and the OTHER user's job is what actually runs.
+    const otherUser = createUser(db, "e@example.com", "hash");
+    const otherProject = createProject(db, otherUser.id, "run-other", "Run Other");
 
-    const job3 = createJob(db, { userId: user.id, projectId: null, kind: "regen", requestJson: "{}", now: NOW });
-    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, now: () => NOW });
+    createJob(db, { userId: user.id, projectId: project.id, kind: "regen", requestJson: "{}", now: NOW });
+    createJob(db, { userId: user.id, projectId: project.id, kind: "regen", requestJson: "{}", now: NOW + 1 });
+    claimNextJob(db, NOW + 10); // -> running #1 for `user`
+    claimNextJob(db, NOW + 11); // -> running #2 for `user`, now at the limit
 
-    const ran = await worker.runOnce();
-    expect(ran).toBe(false);
-    expect(findJobById(db, job3.id)?.status).toBe("queued");
+    // Oldest QUEUED job overall -- would win under plain FIFO, but `user` is
+    // at the limit, so it must be skipped.
+    const blockedThird = createJob(db, {
+      userId: user.id, projectId: project.id, kind: "regen", requestJson: "{}", now: NOW + 5,
+    });
+    // Newer, but belongs to a user with nothing running.
+    const eligible = createJob(db, {
+      userId: otherUser.id, projectId: otherProject.id, kind: "regen", requestJson: "{}", now: NOW + 20,
+    });
 
-    // Perturbation-proof: freeing a slot lets the SAME job proceed on the
-    // next claim (it will fail for a different, unrelated reason —
-    // projectId is null — which itself proves it actually ran this time
-    // rather than being blocked again).
-    pool.releaseBillableSlot(user.id);
-    const ranAgain = await worker.runOnce();
-    expect(ranAgain).toBe(true);
-    expect(findJobById(db, job3.id)?.status).toBe("failed");
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ passed: true }));
+    });
+    const pool = fakePool({
+      acquire: vi.fn(async (): Promise<PreviewProcess> => ({
+        projectId: otherProject.id, port: upstream.port, base: "/", inFlight: 0, lastUsedAt: Date.now(),
+      })),
+    });
+    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, now: () => NOW + 30 });
 
-    rmSync(projectsRoot, { recursive: true, force: true });
-  });
-
-  it("MAX_BILLABLE_IN_FLIGHT_PER_USER is 2 — the bound this test exercises", () => {
-    expect(MAX_BILLABLE_IN_FLIGHT_PER_USER).toBe(2);
+    try {
+      const ran = await worker.runOnce();
+      expect(ran).toBe(true);
+      expect(findJobById(db, eligible.id)?.status).toBe("succeeded");
+      // The load-bearing assertion: still exactly `queued`, never
+      // claimed-and-requeued (the old, starvation-prone behavior).
+      const found = findJobById(db, blockedThird.id);
+      expect(found?.status).toBe("queued");
+      expect(found?.startedAt).toBe(null);
+    } finally {
+      await upstream.close();
+    }
   });
 });
 

@@ -7,6 +7,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { openDatabase } from "./db.ts";
 import { createUser } from "./users.ts";
 import { createProject } from "./projects.ts";
+import { MAX_BILLABLE_IN_FLIGHT_PER_USER } from "./preview-pool.ts";
 import {
   claimNextJob,
   countActiveJobsForUser,
@@ -15,6 +16,8 @@ import {
   finishJob,
   listJobsByProject,
   markRunningJobsInterrupted,
+  MAX_ACTIVE_JOBS_PER_USER,
+  requeueJob,
 } from "./jobs.ts";
 
 let dir: string;
@@ -167,6 +170,136 @@ describe("claimNextJob", () => {
     expect(claim2?.id).toBe(second.id);
     expect(claim2?.id).not.toBe(claim1?.id);
     expect(claim3).toBe(null);
+  });
+});
+
+describe("claimNextJob: per-user bound (MAX_ACTIVE_JOBS_PER_USER)", () => {
+  it("skips a queued job whose user already has MAX_ACTIVE_JOBS_PER_USER running, and claims a different, eligible user's job instead", () => {
+    const otherUserId = createUser(db, "b@example.com", "hash").id;
+
+    // userId ends up with 2 RUNNING jobs (the bound) plus a third still
+    // queued -- the oldest queued job overall, which would win under the
+    // old "claim unconditionally oldest" rule.
+    seed({ now: 1_000 }); // -> claimed below, becomes running #1
+    seed({ now: 1_001 }); // -> claimed below, becomes running #2
+    claimNextJob(db, 2_000);
+    claimNextJob(db, 2_001);
+    const blockedThird = seed({ now: 1_500 });
+
+    // A different user's job, NEWER than blockedThird, but that user is not
+    // blocked at all.
+    const eligible = createJob(db, {
+      userId: otherUserId, projectId: null, kind: "generate", requestJson: "{}", now: 3_000,
+    });
+
+    const claimed = claimNextJob(db, 4_000);
+    expect(claimed?.id).toBe(eligible.id);
+    // The load-bearing assertion: blockedThird was NOT claimed-and-requeued
+    // (the old, starvation-prone behavior) -- it was simply never selected,
+    // so it is still exactly as it was, `started_at` untouched.
+    const found = findJobById(db, blockedThird.id);
+    expect(found?.status).toBe("queued");
+    expect(found?.startedAt).toBe(null);
+  });
+
+  it("returns null when the only queued job belongs to a user already at the limit, even though something IS queued", () => {
+    seed({ now: 1_000 });
+    seed({ now: 1_001 });
+    claimNextJob(db, 2_000);
+    claimNextJob(db, 2_001);
+    seed({ now: 1_500 }); // the only queued job, but userId is at the limit
+
+    expect(claimNextJob(db, 3_000)).toBe(null);
+  });
+
+  it("a blocked user's job becomes claimable again as soon as one of their running jobs finishes", () => {
+    const running1 = seed({ now: 1_000 });
+    seed({ now: 1_001 });
+    claimNextJob(db, 2_000); // -> running1
+    claimNextJob(db, 2_001); // -> running2
+    const blocked = seed({ now: 1_500 });
+
+    expect(claimNextJob(db, 3_000)).toBe(null); // still blocked
+
+    finishJob(db, running1.id, { status: "succeeded", now: 3_500 });
+
+    const claimed = claimNextJob(db, 4_000);
+    expect(claimed?.id).toBe(blocked.id);
+    expect(claimed?.status).toBe("running");
+  });
+
+  it("does NOT block a user merely because they have several jobs queued (not yet running) — countActiveJobsForUser would be the wrong metric here", () => {
+    // 3 jobs queued for one user, none running. countActiveJobsForUser
+    // (queued+running) is already 3 at this point -- gating a claim on THAT
+    // count would refuse this user's very first job forever. Gating on
+    // RUNNING count only (what claimNextJob actually does) correctly allows
+    // the first claim.
+    const first = seed({ now: 1_000 });
+    seed({ now: 1_001 });
+    seed({ now: 1_002 });
+    expect(countActiveJobsForUser(db, userId)).toBe(3);
+
+    const claimed = claimNextJob(db, 2_000);
+    expect(claimed?.id).toBe(first.id);
+    expect(claimed?.status).toBe("running");
+  });
+
+  it("still claims strictly oldest-first among eligible jobs once nobody is blocked", () => {
+    const otherUserId = createUser(db, "d@example.com", "hash").id;
+    const olderOther = createJob(db, {
+      userId: otherUserId, projectId: null, kind: "generate", requestJson: "{}", now: 1_000,
+    });
+    const newerMine = seed({ now: 2_000 });
+
+    const claimed = claimNextJob(db, 3_000);
+    expect(claimed?.id).toBe(olderOther.id);
+    expect(findJobById(db, newerMine.id)?.status).toBe("queued");
+  });
+
+  it("MAX_ACTIVE_JOBS_PER_USER matches preview-pool.ts's MAX_BILLABLE_IN_FLIGHT_PER_USER — same value, same meaning, two independent definitions", () => {
+    expect(MAX_ACTIVE_JOBS_PER_USER).toBe(MAX_BILLABLE_IN_FLIGHT_PER_USER);
+  });
+});
+
+describe("requeueJob", () => {
+  it("returns a running job to queued, clears started_at, and never sets finished_at", () => {
+    const job = seed({ now: 1_000 });
+    const claimed = claimNextJob(db, 2_000);
+    expect(claimed?.status).toBe("running");
+    expect(claimed?.startedAt).toBe(2_000);
+
+    requeueJob(db, job.id);
+
+    const found = findJobById(db, job.id);
+    expect(found?.status).toBe("queued");
+    expect(found?.startedAt).toBe(null);
+    expect(found?.finishedAt).toBe(null);
+    expect(found?.resultJson).toBe(null);
+    expect(found?.error).toBe(null);
+  });
+
+  it("makes the job claimable again by a later claimNextJob call", () => {
+    const job = seed({ now: 1_000 });
+    claimNextJob(db, 2_000);
+    requeueJob(db, job.id);
+
+    const reclaimed = claimNextJob(db, 3_000);
+    expect(reclaimed?.id).toBe(job.id);
+    expect(reclaimed?.status).toBe("running");
+    expect(reclaimed?.startedAt).toBe(3_000);
+  });
+});
+
+describe("FinishJobInput's status type", () => {
+  it("refuses a non-terminal status ('queued') at compile time", () => {
+    const job = seed();
+    // @ts-expect-error -- 'queued' is not assignable to TerminalJobStatus;
+    // finishJob must never be callable with a status that has not actually
+    // finished (see requeueJob for the correct "back to queued" primitive).
+    // If this narrowing is ever loosened back to plain JobStatus, this
+    // directive stops being necessary and `tsc --noEmit` (part of
+    // `npm test -w server`) fails on the now-unnecessary `@ts-expect-error`.
+    finishJob(db, job.id, { status: "queued", now: 1 });
   });
 });
 

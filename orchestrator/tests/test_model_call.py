@@ -158,10 +158,10 @@ def _patch_anthropic_transport(
 # ---------- anthropic: the SDK's own retry loop, configured not wrapped ----------
 
 
-def test_anthropic_client_caps_total_attempts_at_two(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_anthropic_client_caps_total_attempts_at_two(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     _use_real_anthropic(monkeypatch)
-    client = _anthropic_client(role="page", call="messages.create", log_path=Path("unused.jsonl"))
+    client = _anthropic_client(role="page", call="messages.create", log_path=tmp_path / "unused.jsonl")
     # max_retries=1 -> the SDK's own loop runs range(max_retries + 1) == 2
     # attempts total (anthropic/_base_client.py). Pinned as a literal, not
     # compared against TOTAL_ATTEMPTS -- so a change to that constant's
@@ -171,10 +171,12 @@ def test_anthropic_client_caps_total_attempts_at_two(monkeypatch: pytest.MonkeyP
     assert TOTAL_ATTEMPTS == 2
 
 
-def test_anthropic_client_installs_retry_logging_middleware(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_anthropic_client_installs_retry_logging_middleware(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     _use_real_anthropic(monkeypatch)
-    client = _anthropic_client(role="page", call="messages.create", log_path=Path("unused.jsonl"))
+    client = _anthropic_client(role="page", call="messages.create", log_path=tmp_path / "unused.jsonl")
     assert len(client.middleware) == 1
     assert isinstance(client.middleware[0], model_call._RetryLogger)
 
@@ -394,6 +396,10 @@ def _gemini_api_error(code: int, *, headers: dict | None = None):
         (lambda: httpx.ReadTimeout("boom"), True),
         (lambda: httpx.ReadError("connection reset while reading"), True),
         (lambda: httpx.RemoteProtocolError("peer closed connection unexpectedly"), True),
+        (lambda: httpx.WriteError("connection reset while writing the request body"), True),
+        (lambda: httpx.ProxyError("could not negotiate with the proxy"), True),
+        (lambda: httpx.CloseError("failed during teardown"), False),
+        (lambda: httpx.UnsupportedProtocol("ftp:// is not a supported protocol"), False),
         (lambda: ValueError("not a transport failure at all"), False),
     ],
 )
@@ -595,7 +601,9 @@ def test_default_retry_log_path_lives_under_the_runlog_dir(monkeypatch: pytest.M
 # ---------- conftest.py's suite-wide offline guard ----------
 
 
-def test_suite_wide_guard_blocks_a_live_anthropic_client(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_suite_wide_guard_blocks_a_live_anthropic_client(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """Proves conftest.py's autouse fixture is actually active -- not
     merely coincidentally satisfied because every other test happens to
     fake its own client. No local override here at all: a bare
@@ -603,10 +611,10 @@ def test_suite_wide_guard_blocks_a_live_anthropic_client(monkeypatch: pytest.Mon
     `call_model` do internally) must be blocked by default."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     with pytest.raises(AssertionError, match="pytest must stay offline"):
-        _anthropic_client(role="page", call="messages.create", log_path=Path("unused.jsonl"))
+        _anthropic_client(role="page", call="messages.create", log_path=tmp_path / "unused.jsonl")
 
 
-def test_suite_wide_guard_blocks_a_live_gemini_client(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_suite_wide_guard_blocks_a_live_gemini_client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
     with pytest.raises(AssertionError, match="pytest must stay offline"):
         model_call._call_gemini_structured(
@@ -616,5 +624,38 @@ def test_suite_wide_guard_blocks_a_live_gemini_client(monkeypatch: pytest.Monkey
             tool_name="emit",
             tool_schema={"type": "object"},
             max_tokens=100,
-            log_path=Path("unused.jsonl"),
+            log_path=tmp_path / "unused.jsonl",
         )
+
+
+def _root_cause(exc: BaseException) -> BaseException:
+    while exc.__cause__ is not None:
+        exc = exc.__cause__
+    return exc
+
+
+def test_transport_layer_guard_blocks_a_real_http_request_even_past_the_constructor_guard(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Layer 2 (conftest.py): a client that got PAST layer 1 -- here, by
+    genuinely, deliberately opting out of the constructor poison, standing
+    in for a future construction path layer 1 doesn't happen to enumerate
+    -- still cannot send a real HTTP request. No opt-out exists for this
+    layer; the real transport itself raises unconditionally, so this test
+    needs no MockTransport at all to prove the block."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    _use_real_anthropic(monkeypatch)
+    client = _anthropic_client(role="page", call="messages.create", log_path=tmp_path / "unused.jsonl")
+
+    with pytest.raises(Exception) as exc_info:
+        client.messages.create(model="claude-sonnet-5", max_tokens=10, messages=[{"role": "user", "content": "hi"}])
+
+    # The SDK wraps the transport-level raise (its own `except Exception as
+    # err: raise APIConnectionError(...) from err`) -- walk __cause__ back
+    # to confirm THIS guard fired (not some unrelated failure) without
+    # importing conftest.py's class directly, which would depend on
+    # pytest's rootdir import mode rather than a documented contract.
+    root = _root_cause(exc_info.value)
+    assert type(root).__name__ == "LiveModelClientBlocked"
+    assert "pytest must stay offline" in str(root)
+    assert "handle_request" in str(root)

@@ -252,6 +252,45 @@ def _call_anthropic_structured(
     return {"data": tool_use.input, "model": model, "usage": usage}
 
 
+#: The httpx exception types this file treats as a Gemini transport
+#: failure: every one of them means no tokens were produced (the request
+#: either never reached the server intact, or no usable response came
+#: back), so retrying is free. Chosen against the brief's PRINCIPLE ("no
+#: tokens produced and nothing was billed"), not just its wording, and
+#: each inclusion/exclusion is justified individually rather than taken
+#: as a fixed list off httpx's hierarchy:
+#: - `TimeoutException` / `ConnectError`: the original pair -- a read
+#:   timeout and a failure to establish a connection.
+#: - `ReadError`: the canonical ECONNRESET-during-read; a sibling of
+#:   `ConnectError`, not a subclass of it.
+#: - `RemoteProtocolError`: the peer closing/violating the protocol
+#:   mid-transfer (e.g. an incomplete chunked body) -- same failure
+#:   family as `ReadError`, reached a different way.
+#: - `WriteError`: fires while sending the REQUEST body, strictly BEFORE
+#:   any server-side generation can have happened -- by the brief's own
+#:   test this is an even clearer case than `ReadError`, and omitting it
+#:   while retrying `ReadError` would be inconsistent.
+#: - `ProxyError`: a connection-establishment-level failure (the proxy
+#:   itself couldn't be reached/negotiated with), before the request
+#:   ever reaches the model -- same category as `ConnectError`.
+#: Deliberately EXCLUDED, both checked against the same principle:
+#: - `CloseError`: can fire during teardown AFTER a response was already
+#:   read successfully -- not squarely "no tokens produced", so retrying
+#:   it is not obviously free. Left out rather than assumed safe.
+#: - `UnsupportedProtocol`: a static configuration error (e.g. a bad URL
+#:   scheme) that will fail identically on every retry forever -- exactly
+#:   the class of failure the brief excludes outright (its 400/401
+#:   examples are the same shape: retrying cannot help).
+_GEMINI_TRANSPORT_FAILURE_TYPES = (
+    httpx.TimeoutException,
+    httpx.ConnectError,
+    httpx.ReadError,
+    httpx.RemoteProtocolError,
+    httpx.WriteError,
+    httpx.ProxyError,
+)
+
+
 def _is_gemini_transport_failure(exc: BaseException) -> bool:
     """Connection errors, timeouts, 429, and any 5xx — never a non-429
     4xx (a 400 is malformed and will fail identically forever; a 401 is a
@@ -259,20 +298,16 @@ def _is_gemini_transport_failure(exc: BaseException) -> bool:
     OPT-IN retry option would use by default (which includes 408) — this
     project's decision names exactly connection/timeout/429/5xx.
 
-    "Connection reset" is its own httpx exception family, a SIBLING of
-    `ConnectError`/`TimeoutException`, not a subclass of either --
-    `ConnectError` covers only failure to ESTABLISH a connection.
-    `httpx.ReadError` is the canonical ECONNRESET-during-read;
-    `httpx.RemoteProtocolError` covers the peer closing/violating the
-    protocol mid-transfer (e.g. an incomplete chunked body) — the same
-    "connection reset" failure family the brief names, empirically
-    checked against this Gemini (non-streaming) call: `httpx.ReadError`/
-    `httpx.RemoteProtocolError` and `httpx.ConnectError`/
-    `httpx.TimeoutException` are ALL siblings under `httpx.TransportError`,
-    confirmed via each class's own `__mro__`."""
+    The httpx-exception half of the check is `_GEMINI_TRANSPORT_FAILURE_TYPES`
+    (see its own comment for why each type is in or out) rather than the
+    two types this function originally checked — all of "connection
+    reset", "read timeout", a mid-request-body write failure, and a
+    proxy-level connection failure are siblings under
+    `httpx.TransportError`, not subclasses of `ConnectError`/
+    `TimeoutException`, confirmed via each class's own `__mro__`."""
     from google.genai import errors as genai_errors
 
-    if isinstance(exc, (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError)):
+    if isinstance(exc, _GEMINI_TRANSPORT_FAILURE_TYPES):
         return True
     if isinstance(exc, genai_errors.APIError):
         code = exc.code

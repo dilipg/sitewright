@@ -121,10 +121,29 @@ const MIGRATIONS = [
  *    delete path today, but nothing here should assume there never will be
  *    one, and a deleted job must not corrupt an unrelated row's history.
  */
+/**
+ * Task-7-review finding 4: the check-then-ALTER above is idempotent within
+ * ONE process's lifetime, but not across two processes racing their FIRST
+ * boot on the same file — the server and `user-cli.ts` are exactly such a
+ * pair. Both can run the `PRAGMA table_info` read, both see the column
+ * absent (neither has committed yet), and both then attempt the `ALTER`;
+ * `busy_timeout` serialises the two writes but does not make the LOSER's
+ * write succeed — it still throws `duplicate column name`, now as a boot
+ * crash rather than a silent no-op. The column exists either way (the
+ * winner just added it moments earlier), which is exactly the postcondition
+ * this function promises — so the loser's failure is caught and swallowed
+ * SPECIFICALLY when it is this one, named, expected race, never any other
+ * `ALTER TABLE` failure (a genuinely malformed `columnDdl`, a disk error,
+ * ...), which must still surface.
+ */
 function ensureColumn(db: DatabaseSync, table: string, column: string, columnDdl: string): void {
   const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
-  if (!columns.some((c) => c.name === column)) {
+  if (columns.some((c) => c.name === column)) return;
+  try {
     db.exec(`ALTER TABLE ${table} ADD COLUMN ${columnDdl}`);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (!message.includes("duplicate column name")) throw err;
   }
 }
 

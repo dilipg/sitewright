@@ -83,10 +83,11 @@
 import { randomUUID } from "node:crypto";
 import { mkdirSync, rmSync } from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
-import { resolveCodeVersion } from "./code-version.ts";
+import { codeVersionsIncompatible, resolveCodeVersion } from "./code-version.ts";
 import {
   BILLABLE_JOB_KINDS, countActiveBillableJobsForUser, createBillableJobIfUnderBound, createJob,
-  ENQUEUE_BOUND_REFUSED, findJobById, listJobsByProject, MAX_ENQUEUED_BILLABLE_JOBS_PER_USER, type Job,
+  ENQUEUE_BOUND_REFUSED, findJobById, hasActiveResumeFor, listJobsByProject,
+  MAX_ENQUEUED_BILLABLE_JOBS_PER_USER, type Job,
 } from "./jobs.ts";
 import { BY_QUERY } from "./project-registry.ts";
 import { createProject, resolveProjectDirectory } from "./projects.ts";
@@ -171,6 +172,19 @@ const NOT_FAILED = { error: "only a failed job can be resumed" };
 const CODE_VERSION_MISMATCH = {
   error: "the server code has changed since this job ran; it cannot be resumed — start a fresh job instead",
 };
+
+/**
+ * Task-7-review finding 8: nothing else stops a user resuming the SAME
+ * failed job twice in a row — the original stays `failed` (resuming does
+ * not change it), so a second `POST .../resume` before the first resume
+ * finishes passes every other check identically and enqueues a SECOND job
+ * against the identical `run_id`. Unlike Kitaru's own checkpoint cache
+ * (built for a SEQUENTIAL resume, one attempt at a time), two orchestrator
+ * invocations running CONCURRENTLY against one project directory can race
+ * writing the same manifest/generated files — a correctness hazard worse
+ * than the double-spend the enqueue bound alone protects against.
+ */
+const ALREADY_RESUMING = { error: "this job already has a resume queued or running" };
 
 export function jobRoutes(deps: { db: DatabaseSync; projectsRoot: string; codeVersion?: string }): Route[] {
   const { db, projectsRoot } = deps;
@@ -324,14 +338,35 @@ export function jobRoutes(deps: { db: DatabaseSync; projectsRoot: string; codeVe
           sendJson(res, 409, NOT_FAILED);
           return;
         }
-        // The safety rule. A null code_version means the original job never
-        // reached job-worker.ts's recordJobRun at all (it failed before any
-        // real execution began — a malformed payload, a since-deleted
-        // project, ...) — nothing ran, so there is no stale-checkpoint risk
-        // to guard against, and resuming is exactly equivalent to a fresh
-        // attempt either way.
-        if (original.codeVersion !== null && original.codeVersion !== codeVersion) {
+        // The safety rule. codeVersionsIncompatible (code-version.ts) is the
+        // ONE comparison point — never a bare `!==` here, since two
+        // DIFFERENT boots that both fail to determine a version produce the
+        // identical `UNKNOWN_CODE_VERSION` string (task-7-review finding 1;
+        // see that function's own comment for the full account). A null
+        // `original.codeVersion` means the original job never reached
+        // job-worker.ts's recordJobRun at all (it failed before any real
+        // execution began — a malformed payload, a since-deleted project,
+        // ...) — nothing ran, so there is no stale-checkpoint risk to guard
+        // against, and resuming is exactly equivalent to a fresh attempt
+        // either way; `codeVersionsIncompatible` returns `false` for that
+        // case regardless of the server's own current value.
+        if (codeVersionsIncompatible(original.codeVersion, codeVersion)) {
           sendJson(res, 409, CODE_VERSION_MISMATCH);
+          return;
+        }
+
+        // Task-7-review finding 8: refuse a SECOND concurrent resume of the
+        // same original job — see ALREADY_RESUMING's own comment for why
+        // this is a data-integrity guard, not merely a spend one. A plain
+        // read (not folded into the atomic insert below): this handler has
+        // no internal `await` anywhere (same property finding 6's own
+        // comment on the enqueue bound documents), so in THIS single-process
+        // architecture a second concurrent request cannot observe a
+        // different answer from this query before the first request's own
+        // insert has already landed — the identical reasoning, applied here
+        // rather than re-derived.
+        if (hasActiveResumeFor(db, original.id)) {
+          sendJson(res, 409, ALREADY_RESUMING);
           return;
         }
 
@@ -371,13 +406,26 @@ export function jobRoutes(deps: { db: DatabaseSync; projectsRoot: string; codeVe
           // round-1 mistake this task's own brief calls out by name: a burst
           // of concurrent resumes for one user must never all pass the SAME
           // pre-insert count, on precisely the endpoint most likely to be
-          // hammered (a user retrying a failure). The actual proof this
-          // statement is race-proof lives in jobs.test.ts's own "TRULY
-          // CONCURRENT" test for `createBillableJobIfUnderBound` itself —
-          // job-routes.test.ts's own Promise.all test for THIS endpoint is
-          // real but weaker than it looks (see its own comment): this
-          // handler has no internal `await`, so nothing here actually
-          // interleaves within one test process either way.
+          // hammered (a user retrying a failure).
+          //
+          // What actually MAKES this atomic is SQLite itself: one
+          // `INSERT ... SELECT ... WHERE` is executed as a single indivisible
+          // operation against the database file — an engine guarantee that
+          // holds regardless of caller shape. Task-7-review finding 6
+          // (correcting an earlier, circular version of this comment): that
+          // guarantee is NOT proven by job-routes.test.ts's own concurrent
+          // test for this endpoint (this handler has no internal `await`, so
+          // nothing here interleaves within one test process either way —
+          // see that test's own comment), nor by jobs.test.ts's "TRULY
+          // CONCURRENT" test for `createBillableJobIfUnderBound` (its
+          // `Array.from` mapper runs synchronously too — see that test's own
+          // corrected comment). Both tests are real and worth keeping (they
+          // catch the bound being bypassed or reimplemented), just not a
+          // race-freedom proof by themselves. The one test in this codebase
+          // that DOES exercise genuine interleaving for a bound built on this
+          // same primitive is `POST /api/generate`'s own concurrent test,
+          // because that handler has a real `await readJsonBody(req)` before
+          // its own count-and-insert section.
           const created = createBillableJobIfUnderBound(db, input);
           if (created === null) {
             sendJson(res, 429, ENQUEUE_BOUND_REFUSED);

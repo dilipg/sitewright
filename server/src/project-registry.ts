@@ -177,3 +177,24 @@ export const UNAUTHENTICATED_ENDPOINTS: ReadonlyArray<{ method: Route["method"];
   { method: "POST", path: "/api/login" },
   { method: "POST", path: "/api/logout" },
 ];
+
+/**
+ * Every entry marked `billable: false` above whose OWN handler still starts
+ * a model call under some condition it checks by hand — the ONE meaning
+ * `billable: false` does NOT have for every other entry (which spend
+ * nothing, full stop). `POST /api/jobs/:id/resume` is the sole member today:
+ * whether resuming a job spends money depends on the RESUMED job's own kind,
+ * known only after `findJobById`, so it cannot be gated uniformly by
+ * `requireBudget` the way every genuinely `billable: true` entry is (see
+ * that entry's own comment above).
+ *
+ * Task-7-review finding 7: named here, and pinned exactly by a test in
+ * project-registry.test.ts, for the identical reason `/api/generate`'s own
+ * exception (the one `billable: true` `/api/` endpoint) is spelled out and
+ * pinned there — a SECOND conditionally-billable, `billable: false` endpoint
+ * must be a conscious addition to this list, never a silent one that quietly
+ * escapes the uniform `it.each` 402 test `billable: true` entries get.
+ */
+export const CONDITIONALLY_BILLABLE_ENDPOINTS: ReadonlyArray<{ method: Route["method"]; path: string }> = [
+  { method: "POST", path: "/api/jobs/:id/resume" },
+];

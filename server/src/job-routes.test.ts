@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
 import type { DatabaseSync } from "node:sqlite";
+import { UNKNOWN_CODE_VERSION } from "./code-version.ts";
 import { openDatabase } from "./db.ts";
 import {
   createJob, finishJob, findJobById, MAX_ENQUEUED_BILLABLE_JOBS_PER_USER, recordJobRun,
@@ -590,6 +591,106 @@ describe("POST /api/jobs/:id/resume", () => {
     expect(result.status).toBe(202);
   });
 
+  /**
+   * Task-7-review finding 1, the load-bearing case for the whole
+   * code-version safety rail: a job stamped "unknown" (git missing at that
+   * boot) resumed under a server ALSO currently reporting "unknown" must be
+   * refused, not silently treated as a match. Perturbing job-routes.ts's
+   * resume handler back to a bare `original.codeVersion !== codeVersion`
+   * (dropping `codeVersionsIncompatible`) makes this 202 instead of 409.
+   */
+  it("refuses with 409 when BOTH the job's recorded code_version and the server's current one are UNKNOWN_CODE_VERSION — two 'unknown's must never read as a match", async () => {
+    const { db, alice, call, aliceCookie } = harness({ codeVersion: UNKNOWN_CODE_VERSION });
+    const project = createProject(db, alice.id, "run-resume-unknown", "Run Resume Unknown");
+    const original = createJob(db, {
+      userId: alice.id, projectId: project.id, kind: "regen", requestJson: "{}", now: 1_000,
+    });
+    recordJobRun(db, original.id, { runId: "web-x", codeVersion: UNKNOWN_CODE_VERSION });
+    finishJob(db, original.id, { status: "failed", error: "boom", now: 2_000 });
+
+    const before = jobCount(db);
+    const result = await call("POST", `/api/jobs/${original.id}/resume`, aliceCookie);
+    expect(result.status).toBe(409);
+    expect(jobCount(db)).toBe(before);
+  });
+
+  /**
+   * Task-7-review finding 8: resuming the SAME failed job a second time,
+   * before the first resume reaches a terminal status, must be refused —
+   * two orchestrator invocations running concurrently against the identical
+   * `run_id` can race writing the same project files. Perturbing
+   * job-routes.ts's resume handler to remove the `hasActiveResumeFor` check
+   * makes the second call 202 instead of 409.
+   */
+  describe("repeat resume of the same job (finding 8)", () => {
+    it("refuses a SECOND resume of the same failed job while the first resume is still queued", async () => {
+      const { db, alice, call, aliceCookie } = harness();
+      const project = createProject(db, alice.id, "run-resume-repeat-a", "Run Resume Repeat A");
+      const original = createJob(db, {
+        userId: alice.id, projectId: project.id, kind: "regen", requestJson: "{}", now: 1_000,
+      });
+      finishJob(db, original.id, { status: "failed", error: "boom", now: 2_000 });
+
+      const first = await call("POST", `/api/jobs/${original.id}/resume`, aliceCookie);
+      expect(first.status).toBe(202);
+
+      const before = jobCount(db);
+      const second = await call("POST", `/api/jobs/${original.id}/resume`, aliceCookie);
+      expect(second.status).toBe(409);
+      expect(jobCount(db)).toBe(before);
+    });
+
+    it("still refuses while the earlier resume is RUNNING, not just queued", async () => {
+      const { db, alice, call, aliceCookie } = harness();
+      const project = createProject(db, alice.id, "run-resume-repeat-b", "Run Resume Repeat B");
+      const original = createJob(db, {
+        userId: alice.id, projectId: project.id, kind: "regen", requestJson: "{}", now: 1_000,
+      });
+      finishJob(db, original.id, { status: "failed", error: "boom", now: 2_000 });
+
+      const first = await call("POST", `/api/jobs/${original.id}/resume`, aliceCookie);
+      const firstJobId = (first.json as { jobId: string }).jobId;
+      db.prepare("UPDATE job SET status = 'running' WHERE id = ?").run(firstJobId);
+
+      const second = await call("POST", `/api/jobs/${original.id}/resume`, aliceCookie);
+      expect(second.status).toBe(409);
+    });
+
+    it("allows resuming again once the earlier resume reaches a terminal status", async () => {
+      const { db, alice, call, aliceCookie } = harness();
+      const project = createProject(db, alice.id, "run-resume-repeat-c", "Run Resume Repeat C");
+      const original = createJob(db, {
+        userId: alice.id, projectId: project.id, kind: "regen", requestJson: "{}", now: 1_000,
+      });
+      finishJob(db, original.id, { status: "failed", error: "boom", now: 2_000 });
+
+      const first = await call("POST", `/api/jobs/${original.id}/resume`, aliceCookie);
+      const firstJobId = (first.json as { jobId: string }).jobId;
+      finishJob(db, firstJobId, { status: "failed", error: "boom again", now: 3_000 });
+
+      const second = await call("POST", `/api/jobs/${original.id}/resume`, aliceCookie);
+      expect(second.status).toBe(202);
+    });
+
+    it("does not block resuming a DIFFERENT failed job for the same user", async () => {
+      const { db, alice, call, aliceCookie } = harness();
+      const project = createProject(db, alice.id, "run-resume-repeat-d", "Run Resume Repeat D");
+      const jobA = createJob(db, {
+        userId: alice.id, projectId: project.id, kind: "regen", requestJson: "{}", now: 1_000,
+      });
+      const jobB = createJob(db, {
+        userId: alice.id, projectId: project.id, kind: "regen", requestJson: "{}", now: 1_001,
+      });
+      finishJob(db, jobA.id, { status: "failed", error: "boom", now: 2_000 });
+      finishJob(db, jobB.id, { status: "failed", error: "boom", now: 2_001 });
+
+      const resumeA = await call("POST", `/api/jobs/${jobA.id}/resume`, aliceCookie);
+      expect(resumeA.status).toBe(202);
+      const resumeB = await call("POST", `/api/jobs/${jobB.id}/resume`, aliceCookie);
+      expect(resumeB.status).toBe(202);
+    });
+  });
+
   it("re-checks the spend cap for a BILLABLE kind, refusing with 402 and creating no new job", async () => {
     const { db, alice, call, aliceCookie } = harness();
     const project = createProject(db, alice.id, "run-resume-g", "Run Resume G");
@@ -641,18 +742,30 @@ describe("POST /api/jobs/:id/resume", () => {
    * /api/generate` ("there is no `await` anywhere between the count check
    * and COMMIT — JS cannot preempt a synchronous stack"), just more
    * emphatic here since there is no `await` in this handler at ALL. This
-   * test therefore does NOT, by itself, prove the bound race is closed —
-   * that proof is jobs.test.ts's own "TRULY CONCURRENT" test for
-   * `createBillableJobIfUnderBound`, which drives the SQL statement directly
-   * and is not subject to this caveat. What THIS test verifies instead: the
-   * resume endpoint actually calls that primitive (not a hand-rolled
-   * re-implementation) and wires it up correctly end to end — a real
-   * property, just not the race-freedom one its name might suggest on its
-   * own. Kept anyway, for the identical reasons job-routes.ts's own comment
-   * keeps `BEGIN IMMEDIATE` after the same finding: defense in depth against
-   * a future edit that adds an `await` to this handler, and correctness
-   * against a genuinely SEPARATE OS process (a second server instance)
-   * this single-process test cannot exercise.
+   * test therefore does NOT, by itself, prove the bound race is closed.
+   *
+   * CORRECTION (task-7-review finding 6): an earlier version of this comment
+   * pointed at jobs.test.ts's own "TRULY CONCURRENT" test for
+   * `createBillableJobIfUnderBound` as if THAT one were the missing proof —
+   * it is not, either. That test's own `Array.from` mapper runs
+   * synchronously too (see its own corrected comment), so no test in this
+   * codebase demonstrates genuine interleaving for this exact atomic-insert
+   * code path. The actual guarantee is structural, not test-proven: SQLite
+   * executes one `INSERT ... SELECT ... WHERE` as a single indivisible
+   * statement against the database file, regardless of caller shape. What
+   * THIS test verifies instead: the resume endpoint actually calls that
+   * primitive (not a hand-rolled re-implementation) and wires it up
+   * correctly end to end — a real property, just not the race-freedom one
+   * its name might suggest on its own. Kept anyway, for the identical
+   * reasons job-routes.ts's own comment keeps `BEGIN IMMEDIATE` after the
+   * same finding: defense in depth against a future edit that adds an
+   * `await` to this handler, and correctness against a genuinely SEPARATE OS
+   * process (a second server instance) this single-process test cannot
+   * exercise. The one test in this codebase that DOES exercise genuine
+   * interleaving for a bound built on this same primitive is `POST
+   * /api/generate`'s own concurrent test (job-routes.test.ts, above), because
+   * that handler has a real `await readJsonBody(req)` before its own
+   * count-and-insert.
    */
   it(
     `TRULY CONCURRENT (Promise.all): resuming ${String(MAX_ENQUEUED_BILLABLE_JOBS_PER_USER * 5)} distinct failed billable jobs for one user lets through exactly ${String(MAX_ENQUEUED_BILLABLE_JOBS_PER_USER)}`,

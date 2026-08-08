@@ -24,7 +24,7 @@ import { createSession, SESSION_COOKIE } from "./sessions.ts";
 import { recordUsageEvent } from "./usage.ts";
 import { createUser } from "./users.ts";
 import {
-  PROJECT_SCOPED_ENDPOINTS, SESSION_ONLY_ENDPOINTS, UNAUTHENTICATED_ENDPOINTS,
+  CONDITIONALLY_BILLABLE_ENDPOINTS, PROJECT_SCOPED_ENDPOINTS, SESSION_ONLY_ENDPOINTS, UNAUTHENTICATED_ENDPOINTS,
 } from "./project-registry.ts";
 
 // Shared by "registry vs. the live route table" and "billable endpoints"
@@ -214,6 +214,31 @@ describe("billable endpoints", () => {
       }
     }
     expect(all.find((e) => e.path === "/api/generate")?.billable).toBe(true);
+  });
+
+  /**
+   * Task-7-review finding 7: the house precedent set by the test above for
+   * `/api/generate` (name a `billable: true` exception so a second cannot
+   * silently join it) applies just as much in the OTHER direction — a
+   * `billable: false` entry that still conditionally spends. Without this,
+   * `POST /api/jobs/:id/resume` conditionally starting a model call is
+   * documented only in prose, and a future SECOND such endpoint could be
+   * added with `billable: false` and no cap check at all, invisibly, since
+   * nothing here would notice.
+   */
+  it("names POST /api/jobs/:id/resume as the ONLY billable:false entry whose own handler can still conditionally start a model call", () => {
+    expect(CONDITIONALLY_BILLABLE_ENDPOINTS.map((e) => `${e.method} ${e.path}`)).toEqual([
+      "POST /api/jobs/:id/resume",
+    ]);
+    // Consistency: every named entry must actually BE billable:false in the
+    // real registry — if one were billable:true, it would already be
+    // covered by the uniform it.each 402 test below and would not belong on
+    // this separately-named list at all.
+    for (const entry of CONDITIONALLY_BILLABLE_ENDPOINTS) {
+      const match = all.find((e) => e.method === entry.method && e.path === entry.path);
+      expect(match, `${entry.method} ${entry.path} must be a real registry entry`).toBeDefined();
+      expect(match?.billable, `${entry.method} ${entry.path} must be billable:false to belong on this list`).toBe(false);
+    }
   });
 
   /**

@@ -20,10 +20,19 @@
  * that is about to run for every developer/local-server invocation this
  * codebase has today. `git` missing, or this directory not being a repo
  * (a deployed image with `.git` stripped, matching MASTER_KEY_ENV_VAR's own
- * "must not silently degrade" instinct but with a softer failure mode here:
- * an unknown code version still lets FRESH jobs run, it just refuses every
- * resume) falls back to a fixed, clearly-named sentinel rather than crashing
- * boot over a resume feature nobody may ever use.
+ * "must not silently degrade" instinct, but with a softer failure mode here:
+ * an unknown code version still lets FRESH jobs run) falls back to a fixed,
+ * clearly-named sentinel rather than crashing boot over a resume feature
+ * nobody may ever use.
+ *
+ * Task-7-review finding 1 (fixed): the sentinel does NOT, on its own, keep
+ * every resume safe when it is in play. Two DIFFERENT boots that both fail
+ * to determine a version produce the IDENTICAL string, so a naive `!==`
+ * comparison would treat them as a match and permit resuming across
+ * arbitrarily many deploys -- exactly the case this whole mechanism exists
+ * to refuse. `codeVersionsIncompatible` below is the ONE place that
+ * comparison happens, specifically so this failure-open shape cannot recur
+ * by a caller writing its own `!==` — see that function's own comment.
  */
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -31,7 +40,17 @@ import { fileURLToPath } from "node:url";
 /** Operator override -- see this module's own top comment. Empty/whitespace-only counts as unset, the same convention `usage-log-path.ts`'s own env-override reads already use. */
 export const CODE_VERSION_ENV_VAR = "WEBGEN_CODE_VERSION";
 
-/** Returned when neither an override nor a real git HEAD is available. Distinct from any real SHA (which is 40 lowercase hex characters) so it can never coincidentally equal a stored value and mask the safety rail. */
+/**
+ * Returned when neither an override nor a real git HEAD is available.
+ * Distinguishable from any real SHA (which is 40 lowercase hex characters)
+ * at a glance -- but that is NOT, by itself, proof against a false match:
+ * two separate boots that both land on this sentinel produce the IDENTICAL
+ * string, so naively comparing `recorded !== current` would treat them as
+ * equal and permit a resume that is not actually safe. `codeVersionsIncompatible`
+ * below is what closes that hole (task-7-review finding 1): it treats a
+ * CURRENT value of this sentinel as unable to vouch for anything, regardless
+ * of what the recorded value says.
+ */
 export const UNKNOWN_CODE_VERSION = "unknown";
 
 // server/src/code-version.ts -> up two directories -> the repo root, the
@@ -86,4 +105,30 @@ export function resolveCodeVersion(deps: ResolveCodeVersionDeps = {}): string {
     // crash. Fall through to the sentinel.
   }
   return UNKNOWN_CODE_VERSION;
+}
+
+/**
+ * Whether a job recorded to have (partially) run under `recorded` code is
+ * UNSAFE to resume/continue under a server currently running `current`.
+ * THE single comparison point for this question — job-routes.ts's resume
+ * endpoint (an enqueue-time check) and job-worker.ts's `runOnce` (a
+ * claim-time re-check, for a job that sat `queued` across a deploy — task-7-
+ * review finding 3) both call this rather than each writing their own
+ * `!==`, so the two cannot independently drift on what "unsafe" means, and
+ * so the fix for finding 1 (below) lives in exactly one place.
+ *
+ * `recorded === null` means the job never reached `recordJobRun` at all (it
+ * failed before any real execution began) — nothing ran, so there is no
+ * stale-checkpoint risk to guard against regardless of `current`, and this
+ * always returns `false` for that case.
+ *
+ * Otherwise: a `current` of `UNKNOWN_CODE_VERSION` can never be trusted to
+ * match anything, INCLUDING another `UNKNOWN_CODE_VERSION` — see that
+ * constant's own comment for why two separate "cannot determine" boots are
+ * not evidence the code is actually the same. A plain string mismatch is
+ * unsafe by construction (docs/decisions.md, 2026-07-28 row).
+ */
+export function codeVersionsIncompatible(recorded: string | null, current: string): boolean {
+  if (recorded === null) return false;
+  return current === UNKNOWN_CODE_VERSION || recorded !== current;
 }

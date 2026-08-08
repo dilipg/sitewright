@@ -1,6 +1,6 @@
 // server/src/code-version.test.ts
 import { describe, expect, it } from "vitest";
-import { CODE_VERSION_ENV_VAR, resolveCodeVersion, UNKNOWN_CODE_VERSION } from "./code-version.ts";
+import { CODE_VERSION_ENV_VAR, codeVersionsIncompatible, resolveCodeVersion, UNKNOWN_CODE_VERSION } from "./code-version.ts";
 
 describe("resolveCodeVersion", () => {
   it("prefers the env override over git", () => {
@@ -68,5 +68,43 @@ describe("resolveCodeVersion", () => {
     // a light integration check that the real, non-injected path works too.
     const value = resolveCodeVersion();
     expect(value).toMatch(/^[0-9a-f]{40}$/);
+  });
+});
+
+describe("codeVersionsIncompatible", () => {
+  it("is compatible (false) when recorded is null — nothing ran, so there is nothing to compare", () => {
+    expect(codeVersionsIncompatible(null, "sha-1")).toBe(false);
+    expect(codeVersionsIncompatible(null, UNKNOWN_CODE_VERSION)).toBe(false);
+  });
+
+  it("is compatible (false) when recorded equals current, both real shas", () => {
+    expect(codeVersionsIncompatible("sha-1", "sha-1")).toBe(false);
+  });
+
+  it("is incompatible (true) when recorded differs from current, both real shas", () => {
+    expect(codeVersionsIncompatible("sha-1", "sha-2")).toBe(true);
+  });
+
+  /**
+   * Task-7-review finding 1, the load-bearing case: two DIFFERENT boots that
+   * both fail to determine a version produce the IDENTICAL sentinel string.
+   * A bare `recorded !== current` would read this as a MATCH and permit
+   * resuming a job across arbitrarily many deploys — precisely the case
+   * this whole mechanism exists to refuse. Perturbing this function back to
+   * `return recorded !== null && recorded !== current;` (dropping the
+   * `current === UNKNOWN_CODE_VERSION` clause) makes this fail.
+   */
+  it("is incompatible (true) when CURRENT is UNKNOWN_CODE_VERSION, even if recorded is the identical string", () => {
+    expect(codeVersionsIncompatible(UNKNOWN_CODE_VERSION, UNKNOWN_CODE_VERSION)).toBe(true);
+  });
+
+  it("is incompatible (true) when current is UNKNOWN_CODE_VERSION and recorded is a real sha", () => {
+    expect(codeVersionsIncompatible("sha-1", UNKNOWN_CODE_VERSION)).toBe(true);
+  });
+
+  it("is incompatible (true) when recorded is UNKNOWN_CODE_VERSION and current is a real, known sha", () => {
+    // Already covered by the plain-mismatch branch, but asserted explicitly
+    // so this direction is not accidentally assumed rather than checked.
+    expect(codeVersionsIncompatible(UNKNOWN_CODE_VERSION, "sha-1")).toBe(true);
   });
 });

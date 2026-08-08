@@ -204,6 +204,27 @@ export function listJobsByProject(db: DatabaseSync, projectId: string, limit: nu
   ).map(toJob);
 }
 
+/**
+ * Whether `jobId` already has an active (`queued` or `running`) resume
+ * pointing back at it via `resumed_from_job_id` — task-7-review finding 8.
+ * Without this, resuming the SAME failed job twice in a row (both attempts
+ * pass the enqueue bound independently, since each is a fresh row) can put
+ * two jobs running against the identical `run_id` at once: unlike Kitaru's
+ * own checkpoint cache (built for a SEQUENTIAL resume, one attempt at a
+ * time), two orchestrator invocations running CONCURRENTLY against one
+ * project directory can race writing the same manifest/generated files — a
+ * correctness hazard worse than the double-spend the enqueue bound alone
+ * protects against. `job-routes.ts`'s resume handler calls this as a plain
+ * read before its own bounded insert (see that call site's own comment for
+ * why a plain read is sufficient in this handler's specific shape).
+ */
+export function hasActiveResumeFor(db: DatabaseSync, jobId: string): boolean {
+  const row = db.prepare(
+    "SELECT 1 AS found FROM job WHERE resumed_from_job_id = ? AND status IN ('queued', 'running') LIMIT 1",
+  ).get(jobId) as { found: number } | undefined;
+  return row !== undefined;
+}
+
 /** `queued` + `running` — the spend cap's in-flight reservation reads this shape. */
 export function countActiveJobsForUser(db: DatabaseSync, userId: string): number {
   const row = db.prepare(
@@ -476,9 +497,46 @@ export function finishJob(db: DatabaseSync, id: string, input: FinishJobInput): 
  * so a resumed job's own already-correct value round-trips unchanged), which
  * keeps this function's contract simple ("this is what actually ran") rather
  * than conditional on whether a value was already present.
+ *
+ * Throws (a programmer error, not a user-facing failure) if `input.runId`
+ * fails `isSafeRunId` — task-7-review finding 5. Unreachable via any path
+ * that exists today (`job-worker.ts` pre-checks the identical shape before
+ * ever calling this, returning a normal failed `JobOutcome` instead of
+ * reaching this throw), but `run_id` flows into a filesystem path
+ * (`orchestrator.acceptance`'s `GENERATED_DIR / run_id`, `regen-api.ts`'s
+ * `basename(root)`) — the identical shape the 4c-2 review found already
+ * exploited once via an unvalidated `..`-bearing `route` field. This is the
+ * seam a future caller (a request body, a script) would have to go through
+ * instead of trusting one by convention.
  */
 export function recordJobRun(db: DatabaseSync, id: string, input: { runId: string; codeVersion: string }): void {
+  if (!isSafeRunId(input.runId)) {
+    throw new Error(`jobs.ts: recordJobRun called with a runId of unsafe shape: ${JSON.stringify(input.runId)}`);
+  }
   db.prepare("UPDATE job SET run_id = ?, code_version = ? WHERE id = ?").run(input.runId, input.codeVersion, id);
+}
+
+/**
+ * A `run_id` shape safe to interpolate into a filesystem path — see
+ * `recordJobRun`'s own comment for the concrete downstream call sites and
+ * the precedent this guards against. Exported so `job-worker.ts` can check
+ * BEFORE calling `recordJobRun`, turning an unsafe shape into a normal
+ * failed job rather than an uncaught throw that would leave the job stuck
+ * `running` forever (nothing downstream of a throw here would ever call
+ * `finishJob`/`requeueJob` for it).
+ *
+ * The character class alone is NOT sufficient: `.` and `..` are both
+ * spelled entirely out of allowed characters (dots), but as a WHOLE
+ * segment either one means "this directory" or "the PARENT directory" to
+ * `pathlib`'s `/` operator (`GENERATED_DIR / run_id`) and to `path.join`
+ * alike — no `/` needs to appear anywhere in the string for `..` alone to
+ * escape the intended directory. Caught by this module's own test suite
+ * during task-7-review finding 5's fix, not assumed correct on the first
+ * pass.
+ */
+export function isSafeRunId(id: string): boolean {
+  if (id === "." || id === "..") return false;
+  return /^[A-Za-z0-9._-]+$/.test(id);
 }
 
 /**

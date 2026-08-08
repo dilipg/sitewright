@@ -118,9 +118,11 @@ import type { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { USAGE_ID_HEADER, usageLogPathFor } from "../../compiler/src/usage-log-path.ts";
 import { buildAgentEnv } from "./agent-env.ts";
-import { resolveCodeVersion } from "./code-version.ts";
+import { codeVersionsIncompatible, resolveCodeVersion } from "./code-version.ts";
 import { ingestUsageLog } from "./ingest-usage.ts";
-import { claimNextJob, finishJob, recordJobRun, requeueJob, type Job, type JobKind } from "./jobs.ts";
+import {
+  claimNextJob, finishJob, findJobById, isSafeRunId, recordJobRun, requeueJob, type Job, type JobKind,
+} from "./jobs.ts";
 import { findProjectById } from "./projects.ts";
 import { forwardToPreview } from "./preview-forward.ts";
 import { type PreviewPool } from "./preview-pool.ts";
@@ -419,10 +421,39 @@ export class JobWorker {
    * back a job whose user is at `MAX_ACTIVE_JOBS_PER_USER` — see this
    * module's own top comment and `jobs.ts`'s `claimNextJob` for why that
    * moved out of the worker.
+   *
+   * Task-7-review finding 3: `job-routes.ts`'s resume endpoint only checks
+   * `codeVersionsIncompatible` at ENQUEUE time. A resumed job can then sit
+   * `queued` for minutes (the bound is 2 concurrent per user, and a
+   * `generate` run measures ~286s) — `markRunningJobsInterrupted` converts
+   * only `running` rows on restart, so a `queued` resume survives untouched.
+   * If a deploy changing a checkpoint's body lands while it waits, the
+   * enqueue-time check already passed and nothing re-runs it: the identical
+   * 2026-07-28 failure mode (a stale paired checkpoint silently skipping its
+   * side effect) through a different door. This re-checks at the ONE point
+   * guaranteed to run immediately before a resumed job's real checkpoints
+   * do, for EITHER execution strategy, rather than duplicating the guard
+   * inside both `runProxiedJob` and `runGenerateJob`.
    */
   async runOnce(): Promise<boolean> {
     const job = claimNextJob(this.db, this.now());
     if (job === null) return false;
+
+    if (job.resumedFromJobId !== null) {
+      const original = findJobById(this.db, job.resumedFromJobId);
+      // `original === null` is unreachable via any path that exists today
+      // (`resumed_from_job_id` is `ON DELETE SET NULL`, and nothing deletes
+      // a job row) — treated as nothing to compare against, not a failure,
+      // rather than refusing a job over evidence that does not exist.
+      if (original !== null && codeVersionsIncompatible(original.codeVersion, this.codeVersion)) {
+        finishJob(this.db, job.id, {
+          status: "failed",
+          error: "the server code changed since the resumed job last ran; refused before running — restart fresh instead",
+          now: this.now(),
+        });
+        return true;
+      }
+    }
 
     const outcome: JobOutcome = isProxiedKind(job.kind)
       ? await this.runProxiedJob(job, job.kind)
@@ -473,7 +504,18 @@ export class JobWorker {
     // derives it here from the project directory, exactly as
     // `compiler/src/regen-api.ts`'s own `basename(root)` already does deep
     // inside the child, so the two always agree.
-    recordJobRun(this.db, job.id, { runId: job.runId ?? project.directory, codeVersion: this.codeVersion });
+    const proxiedRunId = job.runId ?? project.directory;
+    // Task-7-review finding 5: checked here, BEFORE recordJobRun, so an
+    // unsafe shape becomes a normal failed job rather than an uncaught throw
+    // out of recordJobRun (which would leave this job stuck `running`
+    // forever — nothing past a throw here would ever call
+    // finishJob/requeueJob for it). See isSafeRunId's own comment for why
+    // this is checked at all despite being unreachable via any path that
+    // exists today.
+    if (!isSafeRunId(proxiedRunId)) {
+      return { kind: "failed", error: "job's run id has an unsafe shape" };
+    }
+    recordJobRun(this.db, job.id, { runId: proxiedRunId, codeVersion: this.codeVersion });
 
     const handler = forwardToPreview(this.pool, {
       billable: () => {
@@ -563,6 +605,13 @@ export class JobWorker {
     // copied from the job it resumes) passes Kitaru the SAME run id its
     // earlier, partial execution used.
     const runId = job.runId ?? project.directory;
+    // Task-7-review finding 5 — see runProxiedJob's own identical guard for
+    // the full reasoning (checked before recordJobRun, never after, so an
+    // unsafe shape becomes a normal failed job rather than a job stuck
+    // `running` forever behind an uncaught throw).
+    if (!isSafeRunId(runId)) {
+      return { kind: "failed", error: "job's run id has an unsafe shape" };
+    }
     recordJobRun(this.db, job.id, { runId, codeVersion: this.codeVersion });
 
     let env: NodeJS.ProcessEnv;

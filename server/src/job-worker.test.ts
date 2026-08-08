@@ -19,7 +19,7 @@ import { usageLogPathFor, USAGE_ID_HEADER } from "../../compiler/src/usage-log-p
 import { setApiKey } from "./api-keys.ts";
 import { openDatabase } from "./db.ts";
 import { JobWorker } from "./job-worker.ts";
-import { claimNextJob, createJob, finishJob, findJobById } from "./jobs.ts";
+import { claimNextJob, createJob, finishJob, findJobById, recordJobRun } from "./jobs.ts";
 import { MASTER_KEY_ENV_VAR } from "./master-key.ts";
 import { createProject, type Project } from "./projects.ts";
 import type { PreviewPool, PreviewProcess } from "./preview-pool.ts";
@@ -791,7 +791,12 @@ describe("JobWorker: generate", () => {
 
   it("passes a RESUMED job's already-set runId as --run-id, instead of re-deriving project.directory (task 7)", async () => {
     setApiKey(db, MASTER_KEY, user.id, "sk-ant-REALSECRETKEY0123456789");
-    const genProject = createProject(db, user.id, "run-gen-resume", "Run Gen Resume");
+    // Task-7-review finding 2: the project's OWN directory and the preset
+    // runId must be DIFFERENT values. When both happened to equal
+    // "run-gen-resume", reverting job-worker.ts's `"--run-id", runId` back
+    // to `"--run-id", project.directory` left this test green — checked by
+    // hand, and confirmed to fail correctly with these two now distinct.
+    const genProject = createProject(db, user.id, "run-gen-fresh-dir", "Run Gen Resume");
 
     let spawnedArgs: string[] | undefined;
     const child = fakeOrchestratorChild();
@@ -811,10 +816,11 @@ describe("JobWorker: generate", () => {
     finishJob(db, originalFailedJob.id, { status: "failed", error: "boom", now: NOW - 1 });
     // Simulates what job-routes.ts's resume handler does: a NEW job row
     // carrying the ORIGINAL failed job's own runId verbatim, which need not
-    // equal this (new) job's own project.directory-derived default.
+    // equal this (new) job's own project.directory-derived default — and
+    // here DELIBERATELY does not, so the two are distinguishable.
     const job = createJob(db, {
       userId: user.id, projectId: genProject.id, kind: "generate", requestJson, now: NOW,
-      runId: "run-gen-resume", resumedFromJobId: originalFailedJob.id,
+      runId: "run-gen-older-run", resumedFromJobId: originalFailedJob.id,
     });
     const pool = fakePool();
     const worker = new JobWorker({
@@ -827,10 +833,11 @@ describe("JobWorker: generate", () => {
     const ran = await worker.runOnce();
     expect(ran).toBe(true);
     expect(spawnedArgs).toContain("--run-id");
-    expect(spawnedArgs?.at(-1)).toBe("run-gen-resume");
+    expect(spawnedArgs?.at(-1)).toBe("run-gen-older-run");
+    expect(spawnedArgs?.at(-1)).not.toBe(genProject.directory);
 
     const finished = findJobById(db, job.id);
-    expect(finished?.runId).toBe("run-gen-resume");
+    expect(finished?.runId).toBe("run-gen-older-run");
     expect(finished?.codeVersion).toBe("sha-for-this-test");
     // recordJobRun's OWN job-run fields, not the (unrelated) resume link:
     // that link is set once, at enqueue, by job-routes.ts — job-worker.ts
@@ -881,6 +888,151 @@ describe("JobWorker: generate", () => {
     const finished = findJobById(db, job.id);
     expect(finished?.status).toBe("failed");
     expect(finished?.error).toBe("a brief is required");
+  });
+});
+
+describe("JobWorker: resumed job safety checks (task-7-review findings 3 and 5)", () => {
+  /**
+   * Finding 3: job-routes.ts's resume endpoint only checks code-version
+   * compatibility at ENQUEUE time. A resumed job can then sit `queued` for
+   * minutes (bound of 2 concurrent per user; a `generate` run measures
+   * ~286s), surviving a restart untouched (`markRunningJobsInterrupted`
+   * converts only `running` rows). If a deploy changing a checkpoint's body
+   * lands while it waits, nothing re-checks it — `runOnce` must, right after
+   * claiming, before either execution strategy runs.
+   */
+  it("fails a resumed PROXIED job immediately, without touching the pool, when the ORIGINAL job's code_version is incompatible with this worker's own", async () => {
+    const originalFailedJob = createJob(db, {
+      userId: user.id, projectId: project.id, kind: "regen", requestJson: "{}", now: NOW - 1,
+    });
+    recordJobRun(db, originalFailedJob.id, { runId: "web-x", codeVersion: "OLD-sha-before-a-deploy" });
+    finishJob(db, originalFailedJob.id, { status: "failed", error: "boom", now: NOW - 1 });
+
+    const job = createJob(db, {
+      userId: user.id, projectId: project.id, kind: "regen", requestJson: "{}", now: NOW,
+      runId: "web-x", resumedFromJobId: originalFailedJob.id,
+    });
+    const pool = fakePool();
+    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, now: () => NOW, codeVersion: "NEW-sha-after-a-deploy" });
+
+    const ran = await worker.runOnce();
+
+    expect(ran).toBe(true);
+    expect(pool.acquire).not.toHaveBeenCalled();
+    const finished = findJobById(db, job.id);
+    expect(finished?.status).toBe("failed");
+    expect(finished?.error).toContain("server code changed");
+    // Never actually ran, so recordJobRun never touched this job's own
+    // fields — runId stays exactly what it was pre-set to at creation, and
+    // codeVersion (which ONLY recordJobRun ever writes) stays null.
+    expect(finished?.runId).toBe("web-x");
+    expect(finished?.codeVersion).toBe(null);
+  });
+
+  it("fails a resumed GENERATE job immediately, without spawning the orchestrator, on the identical incompatibility", async () => {
+    const genProject = createProject(db, user.id, "run-gen-guard", "Run Gen Guard");
+    const requestJson = JSON.stringify({ brief: "a bakery landing page" });
+    const originalFailedJob = createJob(db, {
+      userId: user.id, projectId: genProject.id, kind: "generate", requestJson, now: NOW - 1,
+    });
+    recordJobRun(db, originalFailedJob.id, { runId: "run-gen-guard", codeVersion: "OLD-sha" });
+    finishJob(db, originalFailedJob.id, { status: "failed", error: "boom", now: NOW - 1 });
+
+    const job = createJob(db, {
+      userId: user.id, projectId: genProject.id, kind: "generate", requestJson, now: NOW,
+      runId: "run-gen-guard", resumedFromJobId: originalFailedJob.id,
+    });
+    const orchestratorSpawnFn = vi.fn();
+    const pool = fakePool();
+    const worker = new JobWorker({
+      db, pool, masterKey: MASTER_KEY, now: () => NOW, orchestratorSpawnFn, codeVersion: "NEW-sha",
+    });
+
+    const ran = await worker.runOnce();
+
+    expect(ran).toBe(true);
+    expect(orchestratorSpawnFn).not.toHaveBeenCalled();
+    const finished = findJobById(db, job.id);
+    expect(finished?.status).toBe("failed");
+    expect(finished?.error).toContain("server code changed");
+  });
+
+  it("runs normally when the ORIGINAL job's code_version matches this worker's own — the safe-resume path stays open", async () => {
+    const originalFailedJob = createJob(db, {
+      userId: user.id, projectId: project.id, kind: "regen", requestJson: "{}", now: NOW - 1,
+    });
+    recordJobRun(db, originalFailedJob.id, { runId: "web-x", codeVersion: "sha-1" });
+    finishJob(db, originalFailedJob.id, { status: "failed", error: "boom", now: NOW - 1 });
+
+    const job = createJob(db, {
+      userId: user.id, projectId: project.id, kind: "regen", requestJson: "{}", now: NOW,
+      runId: "web-x", resumedFromJobId: originalFailedJob.id,
+    });
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ passed: true }));
+    });
+    const pool = fakePool({
+      acquire: vi.fn(async (): Promise<PreviewProcess> => ({
+        projectId: project.id, port: upstream.port, base: "/", inFlight: 0, lastUsedAt: Date.now(),
+      })),
+    });
+    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, now: () => NOW, codeVersion: "sha-1" });
+
+    try {
+      const ran = await worker.runOnce();
+      expect(ran).toBe(true);
+      expect(pool.acquire).toHaveBeenCalled();
+      expect(findJobById(db, job.id)?.status).toBe("succeeded");
+    } finally {
+      await upstream.close();
+    }
+  });
+
+  /**
+   * Finding 5: `run_id` flows into a filesystem path downstream
+   * (`GENERATED_DIR / run_id`, `basename(root)`) — the identical shape the
+   * 4c-2 review found already exploited once via an unvalidated `..`-bearing
+   * field. Unreachable today (run_id is always a `web-<uuid>` this process
+   * generates, or copied from an earlier job that already passed this same
+   * check), but the guard must fail the job CLEANLY, not leave it stuck
+   * `running` behind an uncaught throw out of `recordJobRun`.
+   */
+  it("fails a job cleanly (not stuck 'running', no uncaught throw) when its runId has an unsafe shape", async () => {
+    const job = createJob(db, {
+      userId: user.id, projectId: project.id, kind: "regen", requestJson: "{}", now: NOW,
+      runId: "../../etc/passwd",
+    });
+    const pool = fakePool();
+    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, now: () => NOW });
+
+    const ran = await worker.runOnce();
+
+    expect(ran).toBe(true);
+    expect(pool.acquire).not.toHaveBeenCalled();
+    const finished = findJobById(db, job.id);
+    expect(finished?.status).toBe("failed");
+    expect(finished?.error).toContain("unsafe shape");
+  });
+
+  it("fails a GENERATE job cleanly on the identical unsafe runId shape, without spawning the orchestrator", async () => {
+    const genProject = createProject(db, user.id, "run-gen-unsafe", "Run Gen Unsafe");
+    const job = createJob(db, {
+      userId: user.id, projectId: genProject.id, kind: "generate",
+      requestJson: JSON.stringify({ brief: "a bakery landing page" }), now: NOW,
+      runId: "not/a/safe/run/id",
+    });
+    const orchestratorSpawnFn = vi.fn();
+    const pool = fakePool();
+    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, now: () => NOW, orchestratorSpawnFn });
+
+    const ran = await worker.runOnce();
+
+    expect(ran).toBe(true);
+    expect(orchestratorSpawnFn).not.toHaveBeenCalled();
+    const finished = findJobById(db, job.id);
+    expect(finished?.status).toBe("failed");
+    expect(finished?.error).toContain("unsafe shape");
   });
 });
 

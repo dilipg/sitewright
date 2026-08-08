@@ -83,9 +83,10 @@
 import { randomUUID } from "node:crypto";
 import { mkdirSync, rmSync } from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
+import { resolveCodeVersion } from "./code-version.ts";
 import {
-  countActiveBillableJobsForUser, createJob, ENQUEUE_BOUND_REFUSED,
-  findJobById, listJobsByProject, MAX_ENQUEUED_BILLABLE_JOBS_PER_USER, type Job,
+  BILLABLE_JOB_KINDS, countActiveBillableJobsForUser, createBillableJobIfUnderBound, createJob,
+  ENQUEUE_BOUND_REFUSED, findJobById, listJobsByProject, MAX_ENQUEUED_BILLABLE_JOBS_PER_USER, type Job,
 } from "./jobs.ts";
 import { BY_QUERY } from "./project-registry.ts";
 import { createProject, resolveProjectDirectory } from "./projects.ts";
@@ -93,6 +94,7 @@ import { requireBudget } from "./require-budget.ts";
 import { NOT_FOUND, requireProject } from "./require-project.ts";
 import { requireSession } from "./require-session.ts";
 import { readJsonBody, sendJson, type Route } from "./router.ts";
+import { checkSpendCap, describeSpendCap } from "./spend-cap.ts";
 
 /** Most recent jobs shown for one project's activity — bounded so a project with a long history is not a full-table read on every poll. */
 const PROJECT_JOB_LIST_LIMIT = 50;
@@ -152,8 +154,33 @@ function publicJobView(job: Job): Record<string, unknown> {
   };
 }
 
-export function jobRoutes(deps: { db: DatabaseSync; projectsRoot: string }): Route[] {
+/** "resume of a non-failed job is refused" (task-7 brief) — 409, the standard code for "this request conflicts with the resource's current state," the same reasoning `CODE_VERSION_MISMATCH` below uses for the other resume-specific conflict. */
+const NOT_FAILED = { error: "only a failed job can be resumed" };
+
+/**
+ * The safety rule (docs/decisions.md, 2026-07-28 row; task-7 brief): a job
+ * whose recorded `code_version` differs from the server's CURRENT one must
+ * never be resumed — the server may have edited a checkpoint's body since
+ * this job's own (partial) execution, and Kitaru's cache keys on function
+ * code plus args, so an unchanged-code checkpoint downstream would silently
+ * skip its side effect while the changed one re-executes. No SHA is echoed
+ * back: the client does not need one to act correctly (the fix is always
+ * "start a fresh job"), and there is no reason to hand out server build
+ * identifiers to a caller who does not need them.
+ */
+const CODE_VERSION_MISMATCH = {
+  error: "the server code has changed since this job ran; it cannot be resumed — start a fresh job instead",
+};
+
+export function jobRoutes(deps: { db: DatabaseSync; projectsRoot: string; codeVersion?: string }): Route[] {
   const { db, projectsRoot } = deps;
+  // Computed once per `jobRoutes()` call (itself normally called once at
+  // boot, from scripts/serve.ts) rather than per request — the whole point
+  // is ONE stable value compared against every job's own stamp
+  // (job-worker.ts's `recordJobRun` uses the SAME default when a caller
+  // omits its own `codeVersion`, so the common case — nobody threading an
+  // explicit value through — still agrees).
+  const codeVersion = deps.codeVersion ?? resolveCodeVersion();
 
   return [
     {
@@ -268,6 +295,105 @@ export function jobRoutes(deps: { db: DatabaseSync; projectsRoot: string }): Rou
           return;
         }
         sendJson(res, 200, publicJobView(job));
+      }),
+    },
+    {
+      method: "POST",
+      path: "/api/jobs/:id/resume",
+      // Session-only, exactly like GET /api/jobs/:id above and for the
+      // identical reason (ownership is on the job's own user_id, not via
+      // requireProject — a generation job's project_id can go NULL if its
+      // project is later deleted). NOT wrapped in requireBudget: whether
+      // this request spends anything at all depends on the LOOKED-UP job's
+      // own kind (export never does), which is not known until after the
+      // lookup — requireBudget's own composition shapes both assume the cap
+      // applies unconditionally to every request an entry receives. The cap
+      // is instead checked by hand, below, only for a billable kind — see
+      // project-registry.ts's own entry for why this is `billable: false`
+      // at the registry level despite conditionally gating a real charge.
+      handler: requireSession(db, (_req, res, ctx) => {
+        const id = ctx.params.id;
+        const original = id === undefined || id === "" ? null : findJobById(db, id);
+        // Same one comparison, same ordering, as GET /api/jobs/:id above —
+        // a foreign job and an absent one must answer byte-identically.
+        if (original === null || original.userId !== ctx.user.id) {
+          sendJson(res, 404, NOT_FOUND);
+          return;
+        }
+        if (original.status !== "failed") {
+          sendJson(res, 409, NOT_FAILED);
+          return;
+        }
+        // The safety rule. A null code_version means the original job never
+        // reached job-worker.ts's recordJobRun at all (it failed before any
+        // real execution began — a malformed payload, a since-deleted
+        // project, ...) — nothing ran, so there is no stale-checkpoint risk
+        // to guard against, and resuming is exactly equivalent to a fresh
+        // attempt either way.
+        if (original.codeVersion !== null && original.codeVersion !== codeVersion) {
+          sendJson(res, 409, CODE_VERSION_MISMATCH);
+          return;
+        }
+
+        const now = Date.now();
+        const input = {
+          userId: ctx.user.id,
+          projectId: original.projectId,
+          kind: original.kind,
+          requestJson: original.requestJson,
+          now,
+          // Carried forward verbatim, per the brief: "enqueues a new job row
+          // carrying the same run_id, linked to the original."
+          runId: original.runId,
+          resumedFromJobId: original.id,
+        };
+
+        if (BILLABLE_JOB_KINDS.includes(original.kind)) {
+          // Re-checked at enqueue, exactly as for a first attempt (task-7
+          // brief) — the same read requireBudget itself performs, just
+          // applied conditionally here since not every resumable kind is
+          // billable (export is not, and must never be capped — see
+          // project-registry.ts's own `/__export` reasoning).
+          const spend = checkSpendCap(db, ctx.user, now);
+          if (!spend.allowed) {
+            sendJson(res, 402, {
+              error: describeSpendCap(spend),
+              capUsd: spend.capUsd,
+              spentUsd: spend.spentUsd,
+              resetAt: spend.resetAt,
+            });
+            return;
+          }
+          // THE bounded insert — the same single atomic INSERT ... SELECT
+          // ... WHERE `POST /api/generate` and every proxied kind's own
+          // enqueueHandler use, never a separate count-then-insert. Skipping
+          // this in favour of plain `createJob` is exactly the task-3-review
+          // round-1 mistake this task's own brief calls out by name: a burst
+          // of concurrent resumes for one user must never all pass the SAME
+          // pre-insert count, on precisely the endpoint most likely to be
+          // hammered (a user retrying a failure). The actual proof this
+          // statement is race-proof lives in jobs.test.ts's own "TRULY
+          // CONCURRENT" test for `createBillableJobIfUnderBound` itself —
+          // job-routes.test.ts's own Promise.all test for THIS endpoint is
+          // real but weaker than it looks (see its own comment): this
+          // handler has no internal `await`, so nothing here actually
+          // interleaves within one test process either way.
+          const created = createBillableJobIfUnderBound(db, input);
+          if (created === null) {
+            sendJson(res, 429, ENQUEUE_BOUND_REFUSED);
+            return;
+          }
+          sendJson(res, 202, { jobId: created.id });
+          return;
+        }
+
+        // Non-billable (export): unconditional insert, no cap check at all —
+        // the same "never refuse over the cap" rule /__export's own registry
+        // entry states, for the same reason (a deterministic build spends no
+        // model money; refusing it would strand already-generated work
+        // behind a bill).
+        const created = createJob(db, input);
+        sendJson(res, 202, { jobId: created.id });
       }),
     },
     {

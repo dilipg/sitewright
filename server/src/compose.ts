@@ -42,13 +42,23 @@ export function buildRoutes(args: {
    * construct one just to keep compiling.
    */
   projectsRoot?: string;
+  /**
+   * Optional (task 7, resume): threaded through to jobRoutes' resume
+   * endpoint, which compares a job's own recorded `codeVersion` against
+   * this. scripts/serve.ts computes ONE value at boot and passes it here AND
+   * into `JobWorker` (the thing that stamps a job's `codeVersion` in the
+   * first place), so both sides read the identical string. Every test that
+   * does not care about resume's code-version safety rail is free to omit
+   * this — jobRoutes falls back to its own real, harmless default.
+   */
+  codeVersion?: string;
 }): Route[] {
-  const { db, masterKey, secureCookies, pool, projectsRoot } = args;
+  const { db, masterKey, secureCookies, pool, projectsRoot, codeVersion } = args;
   return [
     ...authRoutes({ db, secureCookies }),
     ...keyRoutes({ db, masterKey }),
     ...projectRoutes({ db }),
-    ...(projectsRoot === undefined ? [] : jobRoutes({ db, projectsRoot })),
+    ...(projectsRoot === undefined ? [] : jobRoutes({ db, projectsRoot, ...(codeVersion === undefined ? {} : { codeVersion }) })),
     ...(pool === undefined ? [] : previewRoutes({ db, pool })),
     ...(pool === undefined ? [] : compilerRoutes({ db, pool })),
   ];

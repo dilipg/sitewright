@@ -118,8 +118,9 @@ import type { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { USAGE_ID_HEADER, usageLogPathFor } from "../../compiler/src/usage-log-path.ts";
 import { buildAgentEnv } from "./agent-env.ts";
+import { resolveCodeVersion } from "./code-version.ts";
 import { ingestUsageLog } from "./ingest-usage.ts";
-import { claimNextJob, finishJob, requeueJob, type Job, type JobKind } from "./jobs.ts";
+import { claimNextJob, finishJob, recordJobRun, requeueJob, type Job, type JobKind } from "./jobs.ts";
 import { findProjectById } from "./projects.ts";
 import { forwardToPreview } from "./preview-forward.ts";
 import { type PreviewPool } from "./preview-pool.ts";
@@ -306,6 +307,18 @@ export interface JobWorkerDeps {
   /** Defaults to `DEFAULT_POLL_INTERVAL_MS`. */
   pollIntervalMs?: number;
   now?: () => number;
+  /**
+   * Task 7 (resume): stamped onto every job this worker actually runs (see
+   * `recordJobRun`), so `job-routes.ts`'s resume endpoint can refuse to
+   * resume across a deploy that edited a checkpoint's body. Defaults to
+   * `resolveCodeVersion()` — real production code (scripts/serve.ts) always
+   * passes its OWN single boot-time value explicitly instead, so this
+   * worker's stamp and the resume endpoint's comparison read the identical
+   * string; the default here exists only so the ~20 pre-task-7 tests in
+   * job-worker.test.ts that do not care about resume need not each supply
+   * one.
+   */
+  codeVersion?: string;
 }
 
 export class JobWorker {
@@ -316,6 +329,7 @@ export class JobWorker {
   private readonly orchestratorSpawnFn: OrchestratorSpawnFn;
   private readonly pollIntervalMs: number;
   private readonly now: () => number;
+  private readonly codeVersion: string;
 
   private timer: ReturnType<typeof setInterval> | undefined;
   /** The currently-dispatched tick's promise, tracked so `stop()` can await it — see `stop()`'s own comment. */
@@ -329,6 +343,7 @@ export class JobWorker {
     this.orchestratorSpawnFn = deps.orchestratorSpawnFn ?? defaultOrchestratorSpawnFn;
     this.pollIntervalMs = deps.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
     this.now = deps.now ?? (() => Date.now());
+    this.codeVersion = deps.codeVersion ?? resolveCodeVersion();
   }
 
   /**
@@ -450,6 +465,16 @@ export class JobWorker {
       return { kind: "failed", error: "user no longer exists" };
     }
 
+    // Task 7: recorded BEFORE the actual exchange runs, not after — a job
+    // that fails past this point must still carry the run id/code version
+    // that its (partially) real execution used, so a later resume can
+    // compare against them. `job.runId` is already set only for a job
+    // created by resume (copied from the job it resumes); every other job
+    // derives it here from the project directory, exactly as
+    // `compiler/src/regen-api.ts`'s own `basename(root)` already does deep
+    // inside the child, so the two always agree.
+    recordJobRun(this.db, job.id, { runId: job.runId ?? project.directory, codeVersion: this.codeVersion });
+
     const handler = forwardToPreview(this.pool, {
       billable: () => {
         const usageId = randomBytes(16).toString("hex");
@@ -532,6 +557,13 @@ export class JobWorker {
     if (project === null) {
       return { kind: "failed", error: "project no longer exists" };
     }
+    // Task 7: same rule as runProxiedJob's own — recorded before the
+    // subprocess spawns, and used (not `project.directory` directly) as the
+    // actual `--run-id` value below, so a resumed job (whose `job.runId` was
+    // copied from the job it resumes) passes Kitaru the SAME run id its
+    // earlier, partial execution used.
+    const runId = job.runId ?? project.directory;
+    recordJobRun(this.db, job.id, { runId, codeVersion: this.codeVersion });
 
     let env: NodeJS.ProcessEnv;
     try {
@@ -557,7 +589,7 @@ export class JobWorker {
       spawned = await this.runOrchestratorProcess(env, [
         "run", "python", "-m", "orchestrator.acceptance",
         "--brief", brief,
-        "--run-id", project.directory,
+        "--run-id", runId,
       ]);
     } catch (err) {
       // The process never started at all (e.g. `uv` missing from PATH) --

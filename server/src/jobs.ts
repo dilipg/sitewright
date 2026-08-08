@@ -43,6 +43,37 @@ export interface Job {
   createdAt: number;
   startedAt: number | null;
   finishedAt: number | null;
+  /**
+   * The Kitaru run id this job's own execution used. Null until
+   * `recordJobRun` stamps it, at the moment `job-worker.ts` actually starts
+   * running the job — NOT at enqueue, because the safety rail this exists
+   * for (see `codeVersion`) cares what code ACTUALLY ran, and nothing has
+   * run yet for a merely-queued job. Pre-populated at creation only for a
+   * job made by `POST /api/jobs/:id/resume` (job-routes.ts), copied verbatim
+   * from the job it resumes — every other creator leaves it null and lets
+   * the worker derive+stamp it.
+   */
+  runId: string | null;
+  /**
+   * The server's own code version (server/src/code-version.ts) at the
+   * moment THIS job started running — stamped by the same call as `runId`,
+   * for the same reason, and NEVER set at creation (not even by resume):
+   * this field records what code actually executed, and nothing has
+   * executed yet for a job that only just got a row. docs/decisions.md's
+   * 2026-07-28 row is why this exists: reusing a `runId` across a
+   * source-code edit to a checkpoint function can silently skip a paired,
+   * unchanged-code checkpoint's side effect — job-routes.ts's resume
+   * handler refuses to resume when this differs from the current code
+   * version.
+   */
+  codeVersion: string | null;
+  /**
+   * Set only on a job created by `POST /api/jobs/:id/resume` — the id of
+   * the failed job it resumes. Null for every other job. The durable half
+   * of "linked to the original, so the audit trail shows two attempts
+   * rather than one mutated row" (task-7 brief).
+   */
+  resumedFromJobId: string | null;
 }
 
 interface Row {
@@ -57,6 +88,9 @@ interface Row {
   created_at: number;
   started_at: number | null;
   finished_at: number | null;
+  run_id: string | null;
+  code_version: string | null;
+  resumed_from_job_id: string | null;
 }
 
 function toJob(row: Row): Job {
@@ -72,6 +106,9 @@ function toJob(row: Row): Job {
     createdAt: row.created_at,
     startedAt: row.started_at,
     finishedAt: row.finished_at,
+    runId: row.run_id,
+    codeVersion: row.code_version,
+    resumedFromJobId: row.resumed_from_job_id,
   };
 }
 
@@ -96,6 +133,18 @@ export interface CreateJobInput {
   kind: JobKind;
   requestJson: string;
   now: number;
+  /**
+   * ONLY ever set by `job-routes.ts`'s `POST /api/jobs/:id/resume`, copying
+   * the original failed job's own `runId` verbatim. Every other caller
+   * omits this and the new job starts with `runId: null` — exactly the
+   * pre-task-7 behaviour — and `job-worker.ts`'s `recordJobRun` fills it in
+   * once the worker actually runs the job. Never `codeVersion`: that field
+   * is never set at creation, by any caller, including resume — see `Job`'s
+   * own doc comment for why.
+   */
+  runId?: string | null;
+  /** ONLY ever set by the resume endpoint, naming the job being resumed. Every other caller omits it. */
+  resumedFromJobId?: string | null;
 }
 
 export function createJob(db: DatabaseSync, input: CreateJobInput): Job {
@@ -111,13 +160,17 @@ export function createJob(db: DatabaseSync, input: CreateJobInput): Job {
     createdAt: input.now,
     startedAt: null,
     finishedAt: null,
+    runId: input.runId ?? null,
+    codeVersion: null,
+    resumedFromJobId: input.resumedFromJobId ?? null,
   };
   db.prepare(
     `INSERT INTO job (
        id, user_id, project_id, kind, status,
        request_json, result_json, error,
-       created_at, started_at, finished_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       created_at, started_at, finished_at,
+       run_id, code_version, resumed_from_job_id
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     job.id,
     job.userId,
@@ -130,6 +183,9 @@ export function createJob(db: DatabaseSync, input: CreateJobInput): Job {
     job.createdAt,
     job.startedAt,
     job.finishedAt,
+    job.runId,
+    job.codeVersion,
+    job.resumedFromJobId,
   );
   return job;
 }
@@ -271,16 +327,19 @@ export function createBillableJobIfUnderBound(db: DatabaseSync, input: CreateJob
     throw new Error(`jobs.ts: createBillableJobIfUnderBound called with non-billable kind "${input.kind}"`);
   }
   const id = randomUUID();
+  const runId = input.runId ?? null;
+  const resumedFromJobId = input.resumedFromJobId ?? null;
   const result = db.prepare(
     `INSERT INTO job (
        id, user_id, project_id, kind, status,
        request_json, result_json, error,
-       created_at, started_at, finished_at
+       created_at, started_at, finished_at,
+       run_id, code_version, resumed_from_job_id
      )
-     SELECT ?, ?, ?, ?, 'queued', ?, NULL, NULL, ?, NULL, NULL
+     SELECT ?, ?, ?, ?, 'queued', ?, NULL, NULL, ?, NULL, NULL, ?, NULL, ?
      WHERE ${ACTIVE_BILLABLE_COUNT_EXPR} < ?`,
   ).run(
-    id, input.userId, input.projectId, input.kind, input.requestJson, input.now,
+    id, input.userId, input.projectId, input.kind, input.requestJson, input.now, runId, resumedFromJobId,
     input.userId, ...BILLABLE_JOB_KINDS, MAX_ENQUEUED_BILLABLE_JOBS_PER_USER,
   );
   if (Number(result.changes) === 0) return null;
@@ -296,6 +355,9 @@ export function createBillableJobIfUnderBound(db: DatabaseSync, input: CreateJob
     createdAt: input.now,
     startedAt: null,
     finishedAt: null,
+    runId,
+    codeVersion: null,
+    resumedFromJobId,
   };
 }
 
@@ -394,6 +456,29 @@ export function finishJob(db: DatabaseSync, id: string, input: FinishJobInput): 
   db.prepare(
     "UPDATE job SET status = ?, result_json = ?, error = ?, finished_at = ? WHERE id = ?",
   ).run(input.status, input.resultJson ?? null, input.error ?? null, input.now, id);
+}
+
+/**
+ * Stamps `run_id` + `code_version` on a job at the moment it actually starts
+ * executing — called by `job-worker.ts` right after it resolves the job's
+ * project, for BOTH execution strategies (`generate` and the five proxied
+ * kinds). This is the ONLY place `code_version` is ever written: a fresh
+ * (non-resume) job starts with it null (neither `createJob` nor
+ * `createBillableJobIfUnderBound` above ever set it), and it earns a value
+ * only once real work actually begins under it — matching the safety rule
+ * this exists for (docs/decisions.md, 2026-07-28): `code_version` records
+ * what code ACTUALLY RAN, never what code merely existed when the job was
+ * enqueued.
+ *
+ * `run_id` may already be set (a job created by resume carries one from
+ * creation, copied from the job it resumes) — this overwrites it with the
+ * SAME value regardless (job-worker.ts passes `job.runId ?? project.directory`,
+ * so a resumed job's own already-correct value round-trips unchanged), which
+ * keeps this function's contract simple ("this is what actually ran") rather
+ * than conditional on whether a value was already present.
+ */
+export function recordJobRun(db: DatabaseSync, id: string, input: { runId: string; codeVersion: string }): void {
+  db.prepare("UPDATE job SET run_id = ?, code_version = ? WHERE id = ?").run(input.runId, input.codeVersion, id);
 }
 
 /**

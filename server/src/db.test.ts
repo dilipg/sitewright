@@ -162,6 +162,29 @@ setTimeout(() => {
     8000,
   );
 
+  it("adds run_id, code_version and resumed_from_job_id to the job table (task 7)", () => {
+    const db = openDatabase(tempDbPath());
+    const columns = (db.prepare("PRAGMA table_info(job)").all() as Array<{ name: string }>)
+      .map((c) => c.name);
+    expect(columns).toEqual(expect.arrayContaining(["run_id", "code_version", "resumed_from_job_id"]));
+    db.close();
+  });
+
+  it(
+    "adding the task-7 job columns is idempotent — opening an existing database a second time does not throw 'duplicate column name'",
+    () => {
+      // SQLite's ALTER TABLE ADD COLUMN has no declarative IF NOT EXISTS, so
+      // this is the property db.ts's own ensureColumn() helper exists for —
+      // perturbing it back to a bare, unconditional ALTER TABLE (no
+      // PRAGMA table_info check first) makes THIS test fail on the second
+      // open with "duplicate column name: run_id", exactly the crash a real
+      // server restart would hit.
+      const path = tempDbPath();
+      openDatabase(path).close();
+      expect(() => openDatabase(path).close()).not.toThrow();
+    },
+  );
+
   it("defaults spend_cap_usd to 10 when the column is omitted", () => {
     // The $10/24h cap is a documented product decision (see the brief). A
     // future migration typo or copy-paste of the user DDL that drops or

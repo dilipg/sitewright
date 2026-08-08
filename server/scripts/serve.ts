@@ -11,6 +11,7 @@
 import { createServer } from "node:http";
 import { resolve } from "node:path";
 import { adoptExistingProjects } from "../src/adopt.ts";
+import { resolveCodeVersion } from "../src/code-version.ts";
 import { buildRoutes } from "../src/compose.ts";
 import { openDatabase } from "../src/db.ts";
 import { JobWorker } from "../src/job-worker.ts";
@@ -87,6 +88,17 @@ const masterKey = loadMasterKey();
 // model-generated page/section source — untrusted input either way. One
 // process.env read there would decrypt every user's stored key.
 delete process.env[MASTER_KEY_ENV_VAR];
+
+// Computed exactly once, here, and threaded into BOTH the job worker (which
+// stamps it onto every job it runs) and buildRoutes (whose resume endpoint
+// compares against it) — task 7's resume feature depends on both sides
+// reading the identical string for the WHOLE lifetime of this process, per
+// docs/decisions.md's 2026-07-28 row: resuming a job across a deploy that
+// edited a checkpoint's body risks silently skipping a paired checkpoint's
+// side effect, so this is the value that refuses that resume with a 409
+// instead.
+const codeVersion = resolveCodeVersion();
+console.log(`code version: ${codeVersion}`);
 
 const db = openDatabase(dbPath);
 const pruned = deleteExpiredSessions(db);
@@ -165,7 +177,7 @@ if (interruptedCount > 0) {
 // from the same `pool` and `masterKey` already in hand; started immediately
 // so a job queued by a request that arrives right after boot is not left
 // waiting a full poll interval for nothing.
-const jobWorker = new JobWorker({ db, pool, masterKey });
+const jobWorker = new JobWorker({ db, pool, masterKey, codeVersion });
 jobWorker.start();
 
 // A truly idle preview gets killed and forgotten so MAX_PREVIEWS reflects
@@ -208,7 +220,7 @@ process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 const server = createServer(
-  createRequestListener(buildRoutes({ db, masterKey, secureCookies, pool, projectsRoot })),
+  createRequestListener(buildRoutes({ db, masterKey, secureCookies, pool, projectsRoot, codeVersion })),
 );
 
 // A failure to bind (EADDRINUSE, EACCES on a privileged port) is a failed boot,

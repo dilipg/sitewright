@@ -139,6 +139,24 @@ export const SESSION_ONLY_ENDPOINTS: ReadonlyArray<{ method: Route["method"]; pa
   { method: "PUT", path: "/api/key", billable: false, async: false },
   { method: "DELETE", path: "/api/key", billable: false, async: false },
   { method: "GET", path: "/api/jobs/:id", billable: false, async: false },
+  // Task 7 (resume): session-only for the identical reason GET
+  // /api/jobs/:id above is — ownership is on the job's own user_id, checked
+  // by hand inside job-routes.ts, not via requireProject. `billable: false`
+  // here DESPITE this endpoint sometimes starting a model call: whether it
+  // does depends on the job it looks up (a resumed `export` never does, a
+  // resumed `regen`/`add-section`/etc. always does), which is not known
+  // until AFTER that lookup — this registry's `billable` flag exists to mark
+  // an endpoint requireBudget wraps UNCONDITIONALLY (every entry so marked
+  // today decides the cap before touching any per-resource state), and this
+  // endpoint structurally cannot be gated that way. The cap IS still
+  // re-checked, by hand, inside the handler, for exactly the kinds that
+  // actually spend — see job-routes.ts's own resume handler — but that
+  // conditional check has no representation in this table's single boolean,
+  // so it is covered by job-routes.test.ts's own dedicated tests instead of
+  // project-registry.test.ts's blanket it.each (which — correctly — does not
+  // iterate this entry, since it has no way to set up a real failed job of a
+  // chosen kind for a path it only knows how to build generically).
+  { method: "POST", path: "/api/jobs/:id/resume", billable: false, async: true },
   // Slice 5's first web-triggered generation, and the endpoint
   // project-registry.test.ts's session-only-billable placeholder existed
   // for: no project exists yet when a generation starts (the project row is

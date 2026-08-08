@@ -92,6 +92,42 @@ const MIGRATIONS = [
   `CREATE INDEX IF NOT EXISTS job_user_status_idx ON job(user_id, status)`,
 ];
 
+/**
+ * Task 7 (resume-from-failure): three nullable columns added to the
+ * ALREADY-SHIPPED `job` table, kept OUT of the `MIGRATIONS` array above on
+ * purpose. SQLite's `ALTER TABLE ... ADD COLUMN` has no declarative `IF NOT
+ * EXISTS` the way `CREATE TABLE`/`CREATE INDEX` do — a bare string re-run on
+ * every boot would throw "duplicate column name" the second time — so
+ * idempotency here is checked by hand via `PRAGMA table_info`, applied after
+ * the main migration loop runs. Same rule ("idempotent every boot") as
+ * `MIGRATIONS`'s own comment states, just expressed the only way this
+ * particular kind of schema change can be in SQLite.
+ *
+ *  - `run_id`: the Kitaru run id a job's own execution used — null until
+ *    `jobs.ts`'s `recordJobRun` stamps it, at the moment `job-worker.ts`
+ *    actually starts running the job (not at enqueue). Pre-populated at
+ *    CREATION only for a job made by `POST /api/jobs/:id/resume`, copied
+ *    verbatim from the job it resumes.
+ *  - `code_version`: the server's own code version at the moment a job
+ *    started running — recorded by the same call as `run_id`, for the same
+ *    reason. This is the safety rail against resuming across a deploy that
+ *    edited a checkpoint's body (docs/decisions.md, 2026-07-28 row); see
+ *    `job-routes.ts`'s resume handler for the 409 this enables.
+ *  - `resumed_from_job_id`: set only on a job created by `POST
+ *    /api/jobs/:id/resume`, naming the original failed job — the durable
+ *    half of "linked to the original, so the audit trail shows two attempts
+ *    rather than one mutated row" (task-7 brief). `ON DELETE SET NULL`,
+ *    the same convention `project_id` above already uses: there is no job
+ *    delete path today, but nothing here should assume there never will be
+ *    one, and a deleted job must not corrupt an unrelated row's history.
+ */
+function ensureColumn(db: DatabaseSync, table: string, column: string, columnDdl: string): void {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  if (!columns.some((c) => c.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${columnDdl}`);
+  }
+}
+
 export function openDatabase(path: string): DatabaseSync {
   mkdirSync(dirname(path), { recursive: true });
   const db = new DatabaseSync(path);
@@ -111,5 +147,8 @@ export function openDatabase(path: string): DatabaseSync {
   // longer than any single write transaction this schema ever holds open.
   db.exec("PRAGMA busy_timeout = 5000");
   for (const migration of MIGRATIONS) db.exec(migration);
+  ensureColumn(db, "job", "run_id", "run_id TEXT");
+  ensureColumn(db, "job", "code_version", "code_version TEXT");
+  ensureColumn(db, "job", "resumed_from_job_id", "resumed_from_job_id TEXT REFERENCES job(id) ON DELETE SET NULL");
   return db;
 }

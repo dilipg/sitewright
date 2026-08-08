@@ -19,7 +19,7 @@ import { usageLogPathFor, USAGE_ID_HEADER } from "../../compiler/src/usage-log-p
 import { setApiKey } from "./api-keys.ts";
 import { openDatabase } from "./db.ts";
 import { JobWorker } from "./job-worker.ts";
-import { claimNextJob, createJob, findJobById } from "./jobs.ts";
+import { claimNextJob, createJob, finishJob, findJobById } from "./jobs.ts";
 import { MASTER_KEY_ENV_VAR } from "./master-key.ts";
 import { createProject, type Project } from "./projects.ts";
 import type { PreviewPool, PreviewProcess } from "./preview-pool.ts";
@@ -146,6 +146,53 @@ describe("JobWorker: proxied kinds", () => {
       expect(finished?.status).toBe("succeeded");
       expect(finished?.resultJson).toBe(JSON.stringify({ passed: true, sectionId: "home.hero" }));
       expect(finished?.error).toBe(null);
+    } finally {
+      await upstream.close();
+    }
+  });
+
+  it("stamps run_id (the project's directory) and codeVersion on the job before the exchange runs (task 7, resume)", async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ passed: true }));
+    });
+    const pool = fakePool({
+      acquire: vi.fn(async (): Promise<PreviewProcess> => ({
+        projectId: project.id, port: upstream.port, base: "/", inFlight: 0, lastUsedAt: Date.now(),
+      })),
+    });
+    const job = createJob(db, { userId: user.id, projectId: project.id, kind: "regen", requestJson: "{}", now: NOW });
+
+    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, now: () => NOW, codeVersion: "sha-fixed-for-test" });
+    try {
+      await worker.runOnce();
+      const finished = findJobById(db, job.id);
+      expect(finished?.runId).toBe(project.directory);
+      expect(finished?.codeVersion).toBe("sha-fixed-for-test");
+    } finally {
+      await upstream.close();
+    }
+  });
+
+  it("uses the job's ALREADY-SET runId (a resumed job) instead of re-deriving it from project.directory, even though they are always equal in practice", async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ passed: true }));
+    });
+    const pool = fakePool({
+      acquire: vi.fn(async (): Promise<PreviewProcess> => ({
+        projectId: project.id, port: upstream.port, base: "/", inFlight: 0, lastUsedAt: Date.now(),
+      })),
+    });
+    const job = createJob(db, {
+      userId: user.id, projectId: project.id, kind: "regen", requestJson: "{}", now: NOW,
+      runId: "web-a-preset-run-id",
+    });
+
+    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, now: () => NOW });
+    try {
+      await worker.runOnce();
+      expect(findJobById(db, job.id)?.runId).toBe("web-a-preset-run-id");
     } finally {
       await upstream.close();
     }
@@ -735,6 +782,60 @@ describe("JobWorker: generate", () => {
     expect(finished?.status).toBe("succeeded");
     expect(finished?.resultJson).not.toContain("sk-ant-REALSECRETKEY0123456789");
     expect(finished?.resultJson).toContain("sk-ant-[redacted]");
+    // Task 7 (resume): stamped BEFORE the spawn, so a job that then fails
+    // still records what it actually ran under.
+    expect(finished?.runId).toBe("run-gen");
+    expect(finished?.codeVersion).toBeTypeOf("string");
+    expect(finished?.codeVersion).not.toBe(null);
+  });
+
+  it("passes a RESUMED job's already-set runId as --run-id, instead of re-deriving project.directory (task 7)", async () => {
+    setApiKey(db, MASTER_KEY, user.id, "sk-ant-REALSECRETKEY0123456789");
+    const genProject = createProject(db, user.id, "run-gen-resume", "Run Gen Resume");
+
+    let spawnedArgs: string[] | undefined;
+    const child = fakeOrchestratorChild();
+    const orchestratorSpawnFn = vi.fn((_command: string, args: string[]) => {
+      spawnedArgs = args;
+      setImmediate(() => child.emit("exit", 0));
+      return child;
+    });
+
+    const requestJson = JSON.stringify({ brief: "a bakery landing page" });
+    const originalFailedJob = createJob(db, {
+      userId: user.id, projectId: genProject.id, kind: "generate", requestJson, now: NOW - 1,
+    });
+    // Terminal, and OLDER than `job` below (claimNextJob claims oldest-queued
+    // first) — must not itself be eligible for claiming, or this test would
+    // exercise the wrong row entirely.
+    finishJob(db, originalFailedJob.id, { status: "failed", error: "boom", now: NOW - 1 });
+    // Simulates what job-routes.ts's resume handler does: a NEW job row
+    // carrying the ORIGINAL failed job's own runId verbatim, which need not
+    // equal this (new) job's own project.directory-derived default.
+    const job = createJob(db, {
+      userId: user.id, projectId: genProject.id, kind: "generate", requestJson, now: NOW,
+      runId: "run-gen-resume", resumedFromJobId: originalFailedJob.id,
+    });
+    const pool = fakePool();
+    const worker = new JobWorker({
+      db, pool, masterKey: MASTER_KEY, now: () => NOW,
+      orchestratorDir: "/fake/orchestrator/dir",
+      orchestratorSpawnFn,
+      codeVersion: "sha-for-this-test",
+    });
+
+    const ran = await worker.runOnce();
+    expect(ran).toBe(true);
+    expect(spawnedArgs).toContain("--run-id");
+    expect(spawnedArgs?.at(-1)).toBe("run-gen-resume");
+
+    const finished = findJobById(db, job.id);
+    expect(finished?.runId).toBe("run-gen-resume");
+    expect(finished?.codeVersion).toBe("sha-for-this-test");
+    // recordJobRun's OWN job-run fields, not the (unrelated) resume link:
+    // that link is set once, at enqueue, by job-routes.ts — job-worker.ts
+    // must never touch it.
+    expect(finished?.resumedFromJobId).toBe(originalFailedJob.id);
   });
 
   it("marks the job failed with a redacted, bounded message on a nonzero exit code", async () => {

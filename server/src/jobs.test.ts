@@ -22,6 +22,7 @@ import {
   markRunningJobsInterrupted,
   MAX_ACTIVE_JOBS_PER_USER,
   MAX_ENQUEUED_BILLABLE_JOBS_PER_USER,
+  recordJobRun,
   requeueJob,
 } from "./jobs.ts";
 
@@ -106,6 +107,23 @@ describe("createJob", () => {
     };
     expect(row.request_json).toBe(requestJson);
     expect(row.request_json).not.toMatch(/sk-ant-[A-Za-z0-9_-]+/);
+  });
+
+  it("defaults runId, codeVersion and resumedFromJobId to null when omitted (every pre-task-7 caller)", () => {
+    const job = seed();
+    expect(job.runId).toBe(null);
+    expect(job.codeVersion).toBe(null);
+    expect(job.resumedFromJobId).toBe(null);
+    expect(findJobById(db, job.id)).toEqual(job);
+  });
+
+  it("carries runId and resumedFromJobId verbatim when given (the shape job-routes.ts's resume handler uses), but NEVER codeVersion", () => {
+    const original = seed({ now: 1_000 });
+    const resumed = seed({ now: 2_000, runId: "web-abc123", resumedFromJobId: original.id });
+    expect(resumed.runId).toBe("web-abc123");
+    expect(resumed.resumedFromJobId).toBe(original.id);
+    expect(resumed.codeVersion).toBe(null);
+    expect(findJobById(db, resumed.id)).toEqual(resumed);
   });
 });
 
@@ -198,6 +216,21 @@ describe("createBillableJobIfUnderBound", () => {
     expect(job?.status).toBe("queued");
     expect(job?.kind).toBe("regen");
     expect(findJobById(db, job!.id)).toEqual(job);
+  });
+
+  it("carries runId and resumedFromJobId verbatim when given, but never codeVersion (the shape resume's atomic insert uses)", () => {
+    const original = createBillableJobIfUnderBound(db, {
+      userId, projectId: null, kind: "regen", requestJson: "{}", now: 1_000,
+    })!;
+    const resumed = createBillableJobIfUnderBound(db, {
+      userId, projectId: null, kind: "regen", requestJson: "{}", now: 2_000,
+      runId: "web-xyz789", resumedFromJobId: original.id,
+    });
+    expect(resumed).not.toBeNull();
+    expect(resumed?.runId).toBe("web-xyz789");
+    expect(resumed?.resumedFromJobId).toBe(original.id);
+    expect(resumed?.codeVersion).toBe(null);
+    expect(findJobById(db, resumed!.id)).toEqual(resumed);
   });
 
   it("returns null and inserts NO row once the user is at MAX_ENQUEUED_BILLABLE_JOBS_PER_USER", () => {
@@ -484,6 +517,33 @@ describe("finishJob", () => {
     expect(found?.error).toBe("gate 3 failed");
     expect(found?.finishedAt).toBe(2_000);
     expect(found?.resultJson).toBe(null);
+  });
+});
+
+describe("recordJobRun", () => {
+  it("stamps run_id and code_version, leaving every other field untouched", () => {
+    const job = seed({ kind: "regen", now: 1_000 });
+    claimNextJob(db, 1_500);
+
+    recordJobRun(db, job.id, { runId: "web-abc123", codeVersion: "deadbeef" });
+
+    const found = findJobById(db, job.id);
+    expect(found?.runId).toBe("web-abc123");
+    expect(found?.codeVersion).toBe("deadbeef");
+    // Untouched: recordJobRun's whole contract is "just these two columns."
+    expect(found?.status).toBe("running");
+    expect(found?.startedAt).toBe(1_500);
+    expect(found?.requestJson).toBe("{}");
+  });
+
+  it("overwrites an already-set run_id with the new value (a resumed job's runId round-trips unchanged in practice, but the function itself does not special-case 'already set')", () => {
+    const job = seed({ kind: "regen", now: 1_000, runId: "web-original" });
+    recordJobRun(db, job.id, { runId: "web-original", codeVersion: "sha-1" });
+    expect(findJobById(db, job.id)?.runId).toBe("web-original");
+
+    recordJobRun(db, job.id, { runId: "web-different", codeVersion: "sha-2" });
+    expect(findJobById(db, job.id)?.runId).toBe("web-different");
+    expect(findJobById(db, job.id)?.codeVersion).toBe("sha-2");
   });
 });
 

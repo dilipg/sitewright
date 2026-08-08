@@ -56,6 +56,8 @@ const EXPECTED_ROUTES: Array<[string, string]> = [
   // Slice 5, the job model: job-routes.ts.
   ["POST", "/api/generate"],
   ["GET", "/api/jobs/:id"],
+  // Task 7, resume.
+  ["POST", "/api/jobs/:id/resume"],
   ["GET", "/api/jobs"],
   ["GET", "/preview/:projectId/*"],
   ...PROJECT_SCOPED_ENDPOINTS

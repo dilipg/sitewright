@@ -10,7 +10,9 @@ import { join } from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
 import type { DatabaseSync } from "node:sqlite";
 import { openDatabase } from "./db.ts";
-import { createJob, finishJob, findJobById, MAX_ENQUEUED_BILLABLE_JOBS_PER_USER } from "./jobs.ts";
+import {
+  createJob, finishJob, findJobById, MAX_ENQUEUED_BILLABLE_JOBS_PER_USER, recordJobRun,
+} from "./jobs.ts";
 import { jobRoutes } from "./job-routes.ts";
 import { createProject, resolveProjectDirectory } from "./projects.ts";
 import { NOT_FOUND } from "./require-project.ts";
@@ -40,7 +42,7 @@ vi.mock("node:fs", async (importOriginal) => {
 
 const dirs: string[] = [];
 const dbs: DatabaseSync[] = [];
-function harness() {
+function harness(opts: { codeVersion?: string } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "server-jobroutes-"));
   dirs.push(dir);
   const db = openDatabase(join(dir, "identity.db"));
@@ -49,7 +51,7 @@ function harness() {
   dirs.push(projectsRoot);
   const alice = createUser(db, "a@example.com", "h");
   const bob = createUser(db, "b@example.com", "h");
-  const listener = createRequestListener(jobRoutes({ db, projectsRoot }));
+  const listener = createRequestListener(jobRoutes({ db, projectsRoot, ...opts }));
 
   async function call(method: string, path: string, cookie?: string, body?: unknown, raw?: Buffer) {
     const chunks: string[] = [];
@@ -451,4 +453,236 @@ describe("GET /api/jobs?project=<id>", () => {
     expect(foreign.status).toBe(404);
     expect(foreign.body).toBe(absent.body);
   });
+});
+
+describe("POST /api/jobs/:id/resume", () => {
+  function jobCount(db: DatabaseSync): number {
+    return (db.prepare("SELECT COUNT(*) AS c FROM job").get() as { c: number }).c;
+  }
+
+  it("creates a NEW job with the SAME run_id, linked to the original, and answers 202", async () => {
+    const { db, alice, call, aliceCookie } = harness({ codeVersion: "sha-original" });
+    const project = createProject(db, alice.id, "run-resume-a", "Run Resume A");
+    const original = createJob(db, {
+      userId: alice.id, projectId: project.id, kind: "regen",
+      requestJson: JSON.stringify({ section: "home.hero", instruction: "warm the tone" }), now: 1_000,
+    });
+    recordJobRun(db, original.id, { runId: "web-known-run-id", codeVersion: "sha-original" });
+    finishJob(db, original.id, { status: "failed", error: "gate 3 failed", now: 2_000 });
+
+    const result = await call("POST", `/api/jobs/${original.id}/resume`, aliceCookie);
+    expect(result.status).toBe(202);
+    const body = result.json as { jobId: string };
+    expect(body.jobId).not.toBe(original.id);
+
+    const resumed = findJobById(db, body.jobId);
+    expect(resumed).not.toBeNull();
+    expect(resumed?.runId).toBe("web-known-run-id");
+    expect(resumed?.resumedFromJobId).toBe(original.id);
+    expect(resumed?.kind).toBe("regen");
+    expect(resumed?.userId).toBe(alice.id);
+    expect(resumed?.projectId).toBe(project.id);
+    expect(resumed?.status).toBe("queued");
+    expect(resumed?.requestJson).toBe(original.requestJson);
+    // A resumed job has not run yet — it earns its own codeVersion only once
+    // job-worker.ts actually runs it, same as any fresh job.
+    expect(resumed?.codeVersion).toBe(null);
+
+    // Two rows, not one mutated row — the audit trail the brief asks for.
+    expect(jobCount(db)).toBe(2);
+    expect(findJobById(db, original.id)?.status).toBe("failed");
+  });
+
+  it("succeeds resuming a job whose run_id/code_version are both null (it never got far enough to record either)", async () => {
+    const { db, alice, call, aliceCookie } = harness();
+    const project = createProject(db, alice.id, "run-resume-nullrun", "Run Resume Null Run");
+    const original = createJob(db, {
+      userId: alice.id, projectId: project.id, kind: "regen", requestJson: "{}", now: 1_000,
+    });
+    finishJob(db, original.id, { status: "failed", error: "job has no project to run against", now: 2_000 });
+
+    const result = await call("POST", `/api/jobs/${original.id}/resume`, aliceCookie);
+    expect(result.status).toBe(202);
+    const resumed = findJobById(db, (result.json as { jobId: string }).jobId);
+    expect(resumed?.runId).toBe(null);
+  });
+
+  it("refuses with 409 when the job is not failed (queued/running/succeeded/interrupted), creating no new job", async () => {
+    const { db, alice, call, aliceCookie } = harness();
+    const project = createProject(db, alice.id, "run-resume-b", "Run Resume B");
+
+    function makeJobWithStatus(status: "queued" | "running" | "succeeded" | "interrupted") {
+      const job = createJob(db, {
+        userId: alice.id, projectId: project.id, kind: "regen", requestJson: "{}", now: 1_000,
+      });
+      if (status === "queued") return job; // already queued at creation
+      if (status === "running") {
+        // Not a TerminalJobStatus finishJob can set (jobs.ts's own compile-time
+        // guard) — set it directly, the same way a real claimNextJob would.
+        db.prepare("UPDATE job SET status = 'running' WHERE id = ?").run(job.id);
+        return job;
+      }
+      finishJob(db, job.id, { status, now: 2_000 });
+      return job;
+    }
+
+    for (const status of ["queued", "running", "succeeded", "interrupted"] as const) {
+      const job = makeJobWithStatus(status);
+      const before = jobCount(db);
+      const result = await call("POST", `/api/jobs/${job.id}/resume`, aliceCookie);
+      expect(result.status, `status=${status}`).toBe(409);
+      expect(jobCount(db), `status=${status}`).toBe(before);
+    }
+  });
+
+  it("404s a foreign job id byte-identically to an absent one — reuses require-project.ts's own NOT_FOUND", async () => {
+    const { db, alice, call, bobCookie } = harness();
+    const project = createProject(db, alice.id, "run-resume-c", "Run Resume C");
+    const job = createJob(db, {
+      userId: alice.id, projectId: project.id, kind: "regen", requestJson: "{}", now: 1_000,
+    });
+    finishJob(db, job.id, { status: "failed", error: "boom", now: 2_000 });
+
+    const foreign = await call("POST", `/api/jobs/${job.id}/resume`, bobCookie);
+    const absent = await call("POST", "/api/jobs/does-not-exist/resume", bobCookie);
+    expect(foreign.status).toBe(404);
+    expect(foreign.body).toBe(absent.body);
+    expect(foreign.json).toEqual(NOT_FOUND);
+    // No side effect from the foreign attempt.
+    expect(jobCount(db)).toBe(1);
+  });
+
+  it("401s without a session", async () => {
+    const { db, alice, call } = harness();
+    const project = createProject(db, alice.id, "run-resume-d", "Run Resume D");
+    const job = createJob(db, {
+      userId: alice.id, projectId: project.id, kind: "regen", requestJson: "{}", now: 1_000,
+    });
+    finishJob(db, job.id, { status: "failed", now: 2_000 });
+    expect((await call("POST", `/api/jobs/${job.id}/resume`)).status).toBe(401);
+  });
+
+  it("refuses with 409 when the job's recorded code_version differs from the server's current one, creating no new job", async () => {
+    const { db, alice, call, aliceCookie } = harness({ codeVersion: "current-sha" });
+    const project = createProject(db, alice.id, "run-resume-e", "Run Resume E");
+    const original = createJob(db, {
+      userId: alice.id, projectId: project.id, kind: "regen", requestJson: "{}", now: 1_000,
+    });
+    recordJobRun(db, original.id, { runId: "web-x", codeVersion: "OLD-sha-before-a-deploy" });
+    finishJob(db, original.id, { status: "failed", error: "boom", now: 2_000 });
+
+    const before = jobCount(db);
+    const result = await call("POST", `/api/jobs/${original.id}/resume`, aliceCookie);
+    expect(result.status).toBe(409);
+    expect(jobCount(db)).toBe(before);
+  });
+
+  it("succeeds resuming when the job's recorded code_version MATCHES the server's current one", async () => {
+    const { db, alice, call, aliceCookie } = harness({ codeVersion: "current-sha" });
+    const project = createProject(db, alice.id, "run-resume-f", "Run Resume F");
+    const original = createJob(db, {
+      userId: alice.id, projectId: project.id, kind: "regen", requestJson: "{}", now: 1_000,
+    });
+    recordJobRun(db, original.id, { runId: "web-x", codeVersion: "current-sha" });
+    finishJob(db, original.id, { status: "failed", error: "boom", now: 2_000 });
+
+    const result = await call("POST", `/api/jobs/${original.id}/resume`, aliceCookie);
+    expect(result.status).toBe(202);
+  });
+
+  it("re-checks the spend cap for a BILLABLE kind, refusing with 402 and creating no new job", async () => {
+    const { db, alice, call, aliceCookie } = harness();
+    const project = createProject(db, alice.id, "run-resume-g", "Run Resume G");
+    const original = createJob(db, {
+      userId: alice.id, projectId: project.id, kind: "regen", requestJson: "{}", now: 1_000,
+    });
+    finishJob(db, original.id, { status: "failed", error: "boom", now: 2_000 });
+    overCap(db, alice.id);
+
+    const before = jobCount(db);
+    const result = await call("POST", `/api/jobs/${original.id}/resume`, aliceCookie);
+    expect(result.status).toBe(402);
+    const body = result.json as { capUsd: number; spentUsd: number; resetAt: number | null };
+    expect(body.capUsd).toBe(10);
+    expect(body.spentUsd).toBe(11);
+    expect(typeof body.resetAt).toBe("number");
+    expect(jobCount(db)).toBe(before);
+  });
+
+  it("does NOT apply the spend cap to a non-billable kind (export) — resuming succeeds even over the cap", async () => {
+    const { db, alice, call, aliceCookie } = harness();
+    const project = createProject(db, alice.id, "run-resume-h", "Run Resume H");
+    const original = createJob(db, {
+      userId: alice.id, projectId: project.id, kind: "export", requestJson: "{}", now: 1_000,
+    });
+    finishJob(db, original.id, { status: "failed", error: "build failed", now: 2_000 });
+    overCap(db, alice.id);
+
+    const result = await call("POST", `/api/jobs/${original.id}/resume`, aliceCookie);
+    expect(result.status).toBe(202);
+  });
+
+  /**
+   * The trap named in this task's own brief: resume enqueues through
+   * `createBillableJobIfUnderBound` (the SAME atomic INSERT ... SELECT ...
+   * WHERE every first attempt uses), never a naive count-then-insert.
+   *
+   * An HONEST caveat, checked by hand rather than assumed: perturbing the
+   * resume handler back to the round-1 shape (a plain
+   * `countActiveBillableJobsForUser` read, then an unconditional `createJob`)
+   * does NOT fail THIS test. The resume handler has no internal `await`
+   * anywhere (no body to parse, unlike POST /api/generate's own
+   * `readJsonBody`), so — in this single-process, synchronous-`node:sqlite`
+   * architecture — each `Promise.all`-fired request's ENTIRE handling (job
+   * lookup through the insert and `sendJson`) runs to completion in one
+   * synchronous JS turn before `.map()` even DISPATCHES the next request;
+   * nothing ever interleaves for a naive check to race against, for the same
+   * reason job-routes.ts's own top comment documents for `POST
+   * /api/generate` ("there is no `await` anywhere between the count check
+   * and COMMIT — JS cannot preempt a synchronous stack"), just more
+   * emphatic here since there is no `await` in this handler at ALL. This
+   * test therefore does NOT, by itself, prove the bound race is closed —
+   * that proof is jobs.test.ts's own "TRULY CONCURRENT" test for
+   * `createBillableJobIfUnderBound`, which drives the SQL statement directly
+   * and is not subject to this caveat. What THIS test verifies instead: the
+   * resume endpoint actually calls that primitive (not a hand-rolled
+   * re-implementation) and wires it up correctly end to end — a real
+   * property, just not the race-freedom one its name might suggest on its
+   * own. Kept anyway, for the identical reasons job-routes.ts's own comment
+   * keeps `BEGIN IMMEDIATE` after the same finding: defense in depth against
+   * a future edit that adds an `await` to this handler, and correctness
+   * against a genuinely SEPARATE OS process (a second server instance)
+   * this single-process test cannot exercise.
+   */
+  it(
+    `TRULY CONCURRENT (Promise.all): resuming ${String(MAX_ENQUEUED_BILLABLE_JOBS_PER_USER * 5)} distinct failed billable jobs for one user lets through exactly ${String(MAX_ENQUEUED_BILLABLE_JOBS_PER_USER)}`,
+    async () => {
+      const { db, alice, call, aliceCookie } = harness();
+      const project = createProject(db, alice.id, "run-resume-concurrent", "Run Resume Concurrent");
+      const burst = MAX_ENQUEUED_BILLABLE_JOBS_PER_USER * 5;
+      const failedJobs = Array.from({ length: burst }, (_unused, i) => {
+        const job = createJob(db, {
+          userId: alice.id, projectId: project.id, kind: "regen",
+          requestJson: JSON.stringify({ i }), now: 1_000 + i,
+        });
+        finishJob(db, job.id, { status: "failed", error: "boom", now: 1_000 + i });
+        return job;
+      });
+      // None of these count against the enqueue bound (all terminal) — the
+      // user starts this burst with zero active billable jobs.
+
+      const results = await Promise.all(
+        failedJobs.map((job) => call("POST", `/api/jobs/${job.id}/resume`, aliceCookie)),
+      );
+      const statuses = results.map((r) => r.status);
+      expect(statuses.filter((s) => s === 202)).toHaveLength(MAX_ENQUEUED_BILLABLE_JOBS_PER_USER);
+      expect(statuses.filter((s) => s === 429)).toHaveLength(burst - MAX_ENQUEUED_BILLABLE_JOBS_PER_USER);
+      expect(statuses.every((s) => s === 202 || s === 429)).toBe(true);
+
+      // The load-bearing assertion: total row count is EXACTLY the original
+      // burst plus the bound's worth of resumes — independent of what the
+      // HTTP responses themselves claimed.
+      expect(jobCount(db)).toBe(burst + MAX_ENQUEUED_BILLABLE_JOBS_PER_USER);
+    },
+  );
 });

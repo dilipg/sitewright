@@ -33,6 +33,21 @@ against the installed packages rather than assumed:
   (`max_retries=1`) rather than wrapping it — wrapping an SDK that already
   retries would multiply into 2 outer x N inner attempts, exactly the
   unbounded behaviour this decision refuses.
+
+  One narrow, deliberate divergence from "never retry a non-429 4xx": the
+  SDK's built-in `_should_retry` (`_base_client.py`) also retries `408`
+  and `409`, and `_anthropic_client` does not override that. This is NOT
+  because overriding it would be "a form of wrapping" — subclassing
+  `Anthropic` to narrow `_should_retry`'s decision changes what the SAME
+  loop retries; it does not add a second loop, so it would not reproduce
+  the 2-outer-x-N-inner multiplication above. It is left alone for a
+  different, real reason: `_should_retry` is a private, undocumented
+  implementation detail (unlike `max_retries`/`middleware`, which the SDK
+  documents and versions as stable per-client configuration), so
+  overriding it would create a hidden coupling to library internals that
+  could silently stop taking effect on some future anthropic SDK upgrade —
+  accepted because the benefit is almost entirely theoretical: Anthropic's
+  Messages API is not documented to emit 408 or 409 at all.
 - google-genai (.venv/.../google/genai/_api_client.py: `retry_args(None)`
   returns `{'stop': tenacity.stop_after_attempt(1), 'reraise': True}`, and
   `HttpOptions.retry_options` defaults to `None`) does NOT retry anything
@@ -40,7 +55,34 @@ against the installed packages rather than assumed:
   support at all, so it cannot reach this file's contract by configuration
   either. `_call_gemini_with_retry` below is therefore a real wrapper —
   the one this file's docstring otherwise argues against — written because
-  the SDK leaves nothing to configure."""
+  the SDK leaves nothing to configure.
+
+IMPORTANT ASYMMETRY WITHIN THE ANTHROPIC PATH ITSELF, between `call_model`
+(`.messages.create`, non-streaming) and `_call_anthropic_structured`
+(`.messages.stream`, used by every real page/section/shell/design/plan/edit
+call): the SDK's retry loop only covers the request up to the point
+`_attempt_request` returns, and for a streaming request that is as soon as
+HTTP *headers* arrive (`_base_client.py:~1295`'s `self._client.send(request,
+stream=True, ...)` returns on headers, before the body is read). A 529,
+429, 4xx or 5xx status, and a connection failure while establishing the
+request, all surface at that point and ARE fully covered, on both paths —
+this includes the 529 "Overloaded" that motivated this task in the first
+place. But `get_final_message()` then iterates the SSE body via
+`MessageStream.__stream__` entirely AFTER `_request` has already returned
+successfully (200) and the retry loop has exited — so a connection reset or
+read timeout that happens mid-body, while SSE events are still arriving, is
+NOT retried by anything in this file or the SDK. This is deliberate, not an
+oversight: by the time body bytes are flowing, the model has already
+generated those tokens server-side, and Anthropic bills for generation
+regardless of whether the client received it (confirmed independently: a
+disconnected/interrupted Anthropic-family stream is billed for tokens
+generated up to the disconnect, not zero — see task-6-report.md's citations).
+Retrying at that point would regenerate and double-spend, which is exactly
+the same category of mistake this file's "never retry a completed call" rule
+already forbids for a gate-rejected section — it is just reached via a
+different door. `call_model`'s non-streaming `.messages.create()` has no
+such gap: httpx reads the whole response body inside `send()`, so that read
+is fully inside the retry loop end to end."""
 
 import json
 import os
@@ -215,10 +257,22 @@ def _is_gemini_transport_failure(exc: BaseException) -> bool:
     4xx (a 400 is malformed and will fail identically forever; a 401 is a
     bad key). Deliberately narrower than the codes google-genai's own
     OPT-IN retry option would use by default (which includes 408) — this
-    project's decision names exactly connection/timeout/429/5xx."""
+    project's decision names exactly connection/timeout/429/5xx.
+
+    "Connection reset" is its own httpx exception family, a SIBLING of
+    `ConnectError`/`TimeoutException`, not a subclass of either --
+    `ConnectError` covers only failure to ESTABLISH a connection.
+    `httpx.ReadError` is the canonical ECONNRESET-during-read;
+    `httpx.RemoteProtocolError` covers the peer closing/violating the
+    protocol mid-transfer (e.g. an incomplete chunked body) — the same
+    "connection reset" failure family the brief names, empirically
+    checked against this Gemini (non-streaming) call: `httpx.ReadError`/
+    `httpx.RemoteProtocolError` and `httpx.ConnectError`/
+    `httpx.TimeoutException` are ALL siblings under `httpx.TransportError`,
+    confirmed via each class's own `__mro__`."""
     from google.genai import errors as genai_errors
 
-    if isinstance(exc, (httpx.TimeoutException, httpx.ConnectError)):
+    if isinstance(exc, (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError)):
         return True
     if isinstance(exc, genai_errors.APIError):
         code = exc.code
@@ -226,10 +280,21 @@ def _is_gemini_transport_failure(exc: BaseException) -> bool:
     return False
 
 
+#: Anthropic's own SDK caps a `Retry-After` it honours at 60s
+#: (`_base_client.py:828`: `if retry_after is not None and 0 < retry_after
+#: <= 60`), precisely so a malformed, malicious, or proxy-mangled header
+#: can never make a client sleep for a wildly long time -- the opposite of
+#: "turn an outage into a slower success". Matched here for the same
+#: reason: an uncapped `Retry-After` fed into `time.sleep` would hang this
+#: process for practically its lifetime on a single bad header.
+MAX_HONOURED_RETRY_AFTER_S = 60.0
+
+
 def _gemini_retry_after_s(exc: BaseException) -> float | None:
     """Honours a `Retry-After` header when the failed response carries
-    one — seconds, or an HTTP-date, per RFC 9110. Returns None (fall back
-    to computed backoff) when absent, unparsable, or non-positive."""
+    one — seconds, or an HTTP-date, per RFC 9110 — but only within
+    `(0, MAX_HONOURED_RETRY_AFTER_S]`. Returns None (fall back to computed
+    backoff) when absent, unparsable, non-positive, or absurdly large."""
     response = getattr(exc, "response", None)
     headers = getattr(response, "headers", None)
     if headers is None:
@@ -237,22 +302,23 @@ def _gemini_retry_after_s(exc: BaseException) -> float | None:
     value = headers.get("retry-after")
     if not value:
         return None
+    seconds: float | None = None
     try:
         seconds = float(value)
-        return seconds if seconds > 0 else None
     except (TypeError, ValueError):
-        pass
-    try:
-        from datetime import datetime, timezone
-        from email.utils import parsedate_to_datetime
+        try:
+            from datetime import datetime, timezone
+            from email.utils import parsedate_to_datetime
 
-        when = parsedate_to_datetime(value)
-        if when.tzinfo is None:
-            when = when.replace(tzinfo=timezone.utc)
-        seconds = (when - datetime.now(timezone.utc)).total_seconds()
-        return seconds if seconds > 0 else None
-    except (TypeError, ValueError, IndexError):
+            when = parsedate_to_datetime(value)
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            seconds = (when - datetime.now(timezone.utc)).total_seconds()
+        except (TypeError, ValueError, IndexError):
+            return None
+    if seconds is None:
         return None
+    return seconds if 0 < seconds <= MAX_HONOURED_RETRY_AFTER_S else None
 
 
 def _gemini_backoff_s(attempt_index: int) -> float:

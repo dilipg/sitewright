@@ -69,6 +69,36 @@ def _error_response(status_code: int, *, headers: dict | None = None, error_type
     return httpx.Response(status_code, json=body, headers=headers or {})
 
 
+class _DropsMidStream(httpx.SyncByteStream):
+    """A response body that starts delivering SSE bytes -- so the retry
+    loop has already seen a 200 and exited -- then fails, simulating a
+    genuine connection reset once the model has already begun streaming
+    generated tokens out. Distinct from `_error_response`, which fails
+    BEFORE any body is sent (a status-code failure at headers, before any
+    generation has occurred)."""
+
+    def __init__(self, first_chunk: bytes):
+        self._first_chunk = first_chunk
+
+    def __iter__(self):
+        yield self._first_chunk
+        raise httpx.ReadError("simulated connection reset mid-body")
+
+    def close(self) -> None:
+        pass
+
+
+def _mid_stream_reset_response() -> httpx.Response:
+    message_start = (
+        b'event: message_start\n'
+        b'data: {"type":"message_start","message":{"id":"msg_1","type":"message",'
+        b'"role":"assistant","model":"claude-sonnet-5","content":[],'
+        b'"stop_reason":null,"stop_sequence":null,'
+        b'"usage":{"input_tokens":10,"output_tokens":0}}}\n\n'
+    )
+    return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=_DropsMidStream(message_start))
+
+
 def _queued_transport(responses: list[httpx.Response]) -> tuple[httpx.MockTransport, list[httpx.Request]]:
     """Hands back the given responses in order, one per HTTP attempt, so
     the real `anthropic.Anthropic` client's own retry loop runs unmodified
@@ -81,6 +111,17 @@ def _queued_transport(responses: list[httpx.Response]) -> tuple[httpx.MockTransp
         return queue.pop(0)
 
     return httpx.MockTransport(handler), calls
+
+
+def _use_real_anthropic(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Explicit, visible opt-out of conftest.py's suite-wide poison, for
+    the two tests below that construct a client only to inspect its own
+    config (`.max_retries`, `.middleware`) -- no network call ever
+    happens, since merely instantiating `Anthropic` doesn't connect to
+    anything, but the poisoned constructor would reject the call outright."""
+    import anthropic as anthropic_pkg
+
+    monkeypatch.setattr(model_call, "Anthropic", anthropic_pkg.Anthropic)
 
 
 def _fake_anthropic_factory(transport: httpx.MockTransport):
@@ -119,6 +160,7 @@ def _patch_anthropic_transport(
 
 def test_anthropic_client_caps_total_attempts_at_two(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    _use_real_anthropic(monkeypatch)
     client = _anthropic_client(role="page", call="messages.create", log_path=Path("unused.jsonl"))
     # max_retries=1 -> the SDK's own loop runs range(max_retries + 1) == 2
     # attempts total (anthropic/_base_client.py). Pinned as a literal, not
@@ -131,6 +173,7 @@ def test_anthropic_client_caps_total_attempts_at_two(monkeypatch: pytest.MonkeyP
 
 def test_anthropic_client_installs_retry_logging_middleware(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    _use_real_anthropic(monkeypatch)
     client = _anthropic_client(role="page", call="messages.create", log_path=Path("unused.jsonl"))
     assert len(client.middleware) == 1
     assert isinstance(client.middleware[0], model_call._RetryLogger)
@@ -254,14 +297,12 @@ def test_structured_path_uses_the_shared_anthropic_client_builder(
         captured["log_path"] = log_path
         return _FakeClient()
 
-    def _poisoned_anthropic(**kwargs):
-        raise AssertionError(
-            "orchestrator.model_call.Anthropic constructed directly -- "
-            "_call_anthropic_structured must go through _anthropic_client instead. "
-            "(Poisoned so a regression here fails fast/offline rather than making a real API call.)"
-        )
-
-    monkeypatch.setattr(model_call, "Anthropic", _poisoned_anthropic)
+    # No local poison of model_call.Anthropic needed here: conftest.py's
+    # suite-wide autouse fixture already poisons it before this test body
+    # runs, so a regression back to a bare `Anthropic()` in
+    # _call_anthropic_structured fails fast and offline (LiveModelClientBlocked)
+    # rather than reaching the network, exactly as this test used to arrange
+    # by hand before that fixture existed.
     monkeypatch.setattr(model_call, "_anthropic_client", fake_builder)
     monkeypatch.setattr(model_call, "record_usage", lambda **kw: None)
 
@@ -279,6 +320,39 @@ def test_structured_path_uses_the_shared_anthropic_client_builder(
     assert result["data"] == {"ok": True}
     assert captured["role"] == "page"
     assert captured["call"] == "messages.stream"
+
+
+def test_anthropic_streaming_body_failure_is_not_retried(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Documents the deliberate coverage gap (see model_call.py's module
+    docstring): the SDK's retry loop only covers a streaming request up to
+    response HEADERS -- `_attempt_request` returns as soon as `send(...,
+    stream=True)` does, before the SSE body is read. A connection reset
+    arriving mid-body, after 200 and after the model has already generated
+    (and Anthropic already bills for) those tokens server-side, is NOT
+    retried by the SDK or by this file -- retrying would double-spend. This
+    is the opposite of `_error_response`-driven tests, which fail at
+    headers, before any generation, and ARE retried."""
+    transport, calls = _queued_transport([_mid_stream_reset_response()])
+    monkeypatch.setattr(model_call, "Anthropic", _fake_anthropic_factory(transport))
+    monkeypatch.setattr(model_call, "record_usage", lambda **kw: None)
+
+    with pytest.raises(httpx.ReadError):
+        model_call._call_anthropic_structured(
+            role="page",
+            system="sys",
+            user="hi",
+            tool_name="emit",
+            tool_description="d",
+            tool_schema={"type": "object"},
+            max_tokens=100,
+            log_path=tmp_path / "retries.jsonl",
+        )
+
+    # Exactly 1 HTTP attempt: the retry loop had already exited (200 seen)
+    # by the time the body-read failure happened, so there is no second
+    # attempt -- unlike a status-code failure at the headers phase, which
+    # the sibling `test_529_then_success_...` tests prove IS retried.
+    assert len(calls) == 1
 
 
 # ---------- gemini: this file's own retry loop (the SDK does not retry by default) ----------
@@ -318,6 +392,8 @@ def _gemini_api_error(code: int, *, headers: dict | None = None):
         (lambda: _gemini_api_error(404), False),
         (lambda: httpx.ConnectError("boom"), True),
         (lambda: httpx.ReadTimeout("boom"), True),
+        (lambda: httpx.ReadError("connection reset while reading"), True),
+        (lambda: httpx.RemoteProtocolError("peer closed connection unexpectedly"), True),
         (lambda: ValueError("not a transport failure at all"), False),
     ],
 )
@@ -336,6 +412,43 @@ def test_gemini_retry_after_http_date_is_honoured() -> None:
     wait_s = _gemini_retry_after_s(exc)
     assert wait_s is not None
     assert 8.0 < wait_s <= 10.5
+
+
+def test_gemini_retry_after_absurd_value_is_not_honoured(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A malformed/malicious/proxy-mangled `Retry-After` must never hang
+    the process -- capped the same way anthropic's own SDK caps it
+    (0 < retry_after <= 60, `_base_client.py:828`)."""
+    exc = _gemini_api_error(503, headers={"retry-after": "999999999"})
+    assert _gemini_retry_after_s(exc) is None
+
+    # And the actual retry loop must fall back to computed backoff, not
+    # hang: prove the real sleep call this drives is nowhere near the
+    # absurd header value.
+    calls: list[int] = []
+
+    def fn():
+        calls.append(1)
+        if len(calls) == 1:
+            raise exc
+        return "ok"
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(model_call.time, "sleep", sleeps.append)
+
+    _call_gemini_with_retry(fn, role="page", log_path=tmp_path / "retries.jsonl")
+
+    assert len(sleeps) == 1
+    assert sleeps[0] < 10.0  # nowhere near the absurd 999999999s header
+
+
+def test_gemini_retry_after_exactly_at_the_cap_is_honoured() -> None:
+    exc = _gemini_api_error(503, headers={"retry-after": "60"})
+    assert _gemini_retry_after_s(exc) == pytest.approx(60.0)
+
+
+def test_gemini_retry_after_just_over_the_cap_is_not_honoured() -> None:
+    exc = _gemini_api_error(503, headers={"retry-after": "60.5"})
+    assert _gemini_retry_after_s(exc) is None
 
 
 def test_gemini_retry_after_absent_falls_back_to_none() -> None:
@@ -477,3 +590,31 @@ def test_gemini_structured_path_retries_once_and_records_usage_once(
 def test_default_retry_log_path_lives_under_the_runlog_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("ORCHESTRATOR_RUNLOG_DIR", str(tmp_path))
     assert model_call.default_retry_log_path() == tmp_path / model_call.DEFAULT_RETRY_LOG_FILENAME
+
+
+# ---------- conftest.py's suite-wide offline guard ----------
+
+
+def test_suite_wide_guard_blocks_a_live_anthropic_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Proves conftest.py's autouse fixture is actually active -- not
+    merely coincidentally satisfied because every other test happens to
+    fake its own client. No local override here at all: a bare
+    `_anthropic_client` call (what `_call_anthropic_structured`/
+    `call_model` do internally) must be blocked by default."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with pytest.raises(AssertionError, match="pytest must stay offline"):
+        _anthropic_client(role="page", call="messages.create", log_path=Path("unused.jsonl"))
+
+
+def test_suite_wide_guard_blocks_a_live_gemini_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    with pytest.raises(AssertionError, match="pytest must stay offline"):
+        model_call._call_gemini_structured(
+            role="page",
+            system="sys",
+            user="hi",
+            tool_name="emit",
+            tool_schema={"type": "object"},
+            max_tokens=100,
+            log_path=Path("unused.jsonl"),
+        )

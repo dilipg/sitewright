@@ -766,7 +766,7 @@ describe("JobWorker: per-user bound (enforced by claimNextJob, not this module)"
  */
 describe("JobWorker: concurrency", () => {
   /** Short shutdown bounds throughout: these tests assert scheduling, and must never sit through a production wait during cleanup. */
-  const FAST_SHUTDOWN = { shutdownWaitMs: 20, shutdownKillGraceMs: 20 } as const;
+  const FAST_SHUTDOWN = { shutdownWaitMs: 20, shutdownProxiedWaitMs: 20, shutdownKillGraceMs: 20 } as const;
 
   function poolOn(port: number): ReturnType<typeof fakePool> {
     return fakePool({
@@ -1676,7 +1676,11 @@ describe("JobWorker: stop() is bounded and terminates the orchestrator child", (
     const job = createJob(db, { userId: user.id, projectId: project.id, kind: "regen", requestJson: "{}", now: NOW });
     const worker = new JobWorker({
       db, pool, masterKey: MASTER_KEY, projectsRoot: PROJECTS_ROOT,
-      pollIntervalMs: 5, shutdownWaitMs: 40, shutdownKillGraceMs: 40, now: () => NOW,
+      // `shutdownProxiedWaitMs` is the wait this case actually takes (nothing
+      // with a process to kill is in flight — see stop()'s own comment); it is
+      // overridden here for the same reason `shutdownWaitMs` always was, so the
+      // bound can be proven without sitting through its production value.
+      pollIntervalMs: 5, shutdownWaitMs: 40, shutdownProxiedWaitMs: 40, shutdownKillGraceMs: 40, now: () => NOW,
     });
 
     try {
@@ -1728,7 +1732,7 @@ describe("JobWorker: stop() is bounded and terminates the orchestrator child", (
     }
     const worker = new JobWorker({
       db, pool: fakePool(), masterKey: MASTER_KEY, projectsRoot: PROJECTS_ROOT,
-      pollIntervalMs: 5, shutdownWaitMs: 40, shutdownKillGraceMs: 40, now: () => NOW,
+      pollIntervalMs: 5, shutdownWaitMs: 40, shutdownProxiedWaitMs: 40, shutdownKillGraceMs: 40, now: () => NOW,
       orchestratorSpawnFn,
     });
 
@@ -1740,5 +1744,102 @@ describe("JobWorker: stop() is bounded and terminates the orchestrator child", (
     expect(signalled).toContain("run-gen-two:SIGTERM");
     expect(signalled).toContain("run-gen-one:SIGKILL");
     expect(signalled).toContain("run-gen-two:SIGKILL");
+  });
+});
+
+/**
+ * `SHUTDOWN_WAIT_MS` (5s) is shorter than any proxied job's measured minimum
+ * (~27s for a section regen), so for the five proxied kinds the "let it finish
+ * on its own" window could essentially never succeed — `stop()` waited 5s,
+ * warned, returned, and `serve.ts`'s `pool.shutdown()` killed the child
+ * mid-`write_section_only`. Simply raising the constant would be a money bug:
+ * under a short supervisor grace, SIGKILL would land during the first wait,
+ * the SIGTERM step would never run, and an orphaned orchestrator's spend would
+ * be swept unread. Hence two waits, chosen by what is actually in flight.
+ */
+describe("JobWorker: stop() waits longer for proxied work, but never at a generate's expense", () => {
+  it("waits the LONG proxied window when nothing it could kill is in flight, and lets the job finish", async () => {
+    const upstream = await gatedUpstream();
+    const pool = fakePool({
+      acquire: vi.fn(async (): Promise<PreviewProcess> => ({
+        projectId: project.id, port: upstream.port, base: "/", inFlight: 0, lastUsedAt: Date.now(),
+      })),
+    });
+    const job = createJob(db, { userId: user.id, projectId: project.id, kind: "regen", requestJson: "{}", now: NOW });
+    const worker = new JobWorker({
+      db, pool, masterKey: MASTER_KEY, projectsRoot: PROJECTS_ROOT,
+      // Deliberately far apart: anything that resolves before ~3s can only
+      // have taken the short (orchestrator) wait.
+      pollIntervalMs: 5, shutdownWaitMs: 20, shutdownProxiedWaitMs: 3_000, shutdownKillGraceMs: 20, now: () => NOW,
+    });
+
+    try {
+      worker.start();
+      await waitUntil(() => upstream.bodies.length === 1);
+
+      let stopped = false;
+      const stopPromise = worker.stop().then(() => { stopped = true; });
+      // Well past the SHORT wait, nowhere near the LONG one. Taking the short
+      // wait here is exactly the regression this test exists for.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(stopped).toBe(false);
+
+      upstream.release();
+      await stopPromise;
+      expect(stopped).toBe(true);
+      // The point of waiting longer at all: the regen actually completed,
+      // rather than being abandoned `running` for the next boot to mark
+      // `interrupted`.
+      expect(findJobById(db, job.id)?.status).toBe("succeeded");
+    } finally {
+      upstream.release();
+      await upstream.close();
+    }
+  });
+
+  it("takes the SHORT wait when a tracked orchestrator run exists, even with a proxied job in flight too", async () => {
+    // Both kinds in flight at once — only reachable since MAX_CONCURRENT_JOBS,
+    // and the exact case where the two waits disagree. Money to recover wins.
+    setApiKey(db, MASTER_KEY, user.id, "sk-ant-key");
+    const genProject = createProject(db, user.id, "run-gen-wins", "Gen Wins");
+    const upstream = await gatedUpstream(); // never released: the regen never finishes
+    const pool = fakePool({
+      acquire: vi.fn(async (): Promise<PreviewProcess> => ({
+        projectId: project.id, port: upstream.port, base: "/", inFlight: 0, lastUsedAt: Date.now(),
+      })),
+    });
+    const kill = vi.fn((_signal?: NodeJS.Signals) => true);
+    let spawned = false;
+    const orchestratorSpawnFn = vi.fn(() => { spawned = true; return fakeChildWith(kill); });
+
+    createJob(db, { userId: user.id, projectId: project.id, kind: "regen", requestJson: "{}", now: NOW });
+    createJob(db, {
+      userId: user.id, projectId: genProject.id, kind: "generate",
+      requestJson: JSON.stringify({ brief: "a bakery" }), now: NOW + 1,
+    });
+    const worker = new JobWorker({
+      db, pool, masterKey: MASTER_KEY, projectsRoot: PROJECTS_ROOT,
+      pollIntervalMs: 5, shutdownWaitMs: 30, shutdownProxiedWaitMs: 10_000, shutdownKillGraceMs: 30, now: () => NOW,
+      orchestratorSpawnFn,
+    });
+
+    try {
+      worker.start();
+      await waitUntil(() => spawned && upstream.bodies.length === 1);
+
+      const startedAt = Date.now();
+      await worker.stop();
+      const elapsed = Date.now() - startedAt;
+
+      // The long wait is 10s; the short path is 30ms + a 30ms grace. Under two
+      // seconds can only be the short one — and SIGTERM/SIGKILL landing at all
+      // is what proves the spend-recovery branch was reached.
+      expect(elapsed).toBeLessThan(2_000);
+      expect(kill).toHaveBeenCalledWith("SIGTERM");
+      expect(kill).toHaveBeenCalledWith("SIGKILL");
+    } finally {
+      upstream.release();
+      await upstream.close();
+    }
   });
 });

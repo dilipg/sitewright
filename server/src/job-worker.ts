@@ -484,7 +484,9 @@ export const MAX_CONCURRENT_JOBS = 6;
 
 /**
  * WHOLE-BRANCH REVIEW, FINDING C — how long `stop()` waits for in-flight work
- * to finish ON ITS OWN before it starts terminating things.
+ * to finish ON ITS OWN before it starts terminating things, WHEN A TRACKED
+ * ORCHESTRATOR RUN EXISTS (see `SHUTDOWN_PROXIED_WAIT_MS` for the other case,
+ * and `stop()` for why an orchestrator run always wins the choice).
  *
  * `stop()` used to await that tick with no bound at all: up to ~400s for a
  * generate, or the full 15 minutes of `PREVIEW_PROXY_TIMEOUT_MS` for a
@@ -501,8 +503,56 @@ export const MAX_CONCURRENT_JOBS = 6;
  * spend into `usage_event` instead of leaving it for the sweeper. Total bound:
  * the two added together, chosen to sit comfortably inside a typical 10-30s
  * supervisor grace period.
+ *
+ * THIS VALUE MUST STAY SHORT, and raising it would be a money bug rather than
+ * a kindness — the reasoning is worth preserving, because "just make it
+ * longer" is the obvious wrong fix. The whole SIGTERM-plus-recovery sequence
+ * (`SHUTDOWN_WAIT_MS` + `SHUTDOWN_KILL_GRACE_MS`, ~7s) has to complete inside
+ * essentially any supervisor grace. Wait longer and, under a SHORT grace,
+ * SIGKILL lands during this FIRST wait: the SIGTERM step never runs, the
+ * orchestrator child is orphaned, and its usage log is swept unread at the
+ * next boot — reintroducing exactly the destroyed-spend bug this bound exists
+ * to fix.
  */
 const SHUTDOWN_WAIT_MS = 5_000;
+
+/**
+ * How long `stop()` waits when NOTHING it could kill is in flight — i.e. every
+ * in-flight job is one of the five PROXIED kinds.
+ *
+ * `SHUTDOWN_WAIT_MS` (5s) is shorter than any proxied job's measured minimum
+ * (~27s for a section regen, docs/reports/m7-wall-clock.md), so for those five
+ * kinds the "let the run finish on its own" window could essentially never
+ * succeed: `stop()` waited 5s, warned, returned, and `serve.ts`'s
+ * `pool.shutdown()` then killed the child mid-`write_section_only`. Before the
+ * job model, a Ctrl-C or a 30s supervisor grace usually let a regen finish;
+ * that regressed silently.
+ *
+ * The money argument on `SHUTDOWN_WAIT_MS` above does NOT apply on this path,
+ * which is the whole reason these are two numbers rather than one raised
+ * constant. Nothing here owns a process to kill (the preview child belongs to
+ * the pool, which `serve.ts` shuts down immediately after), so there is no
+ * SIGTERM step for a longer wait to push past a SIGKILL, and no usage log this
+ * process would otherwise have ingested from `stop()` — a proxied job's ingest
+ * runs inside its own run, via `forwardToPreview`, so a job that finishes
+ * inside this window bills itself, and one that does not leaves its log to
+ * `usage-log-sweep.ts` exactly as it does today.
+ *
+ * 25s and not 30: it has to sit INSIDE a typical 30s grace with room left for
+ * `pool.shutdown()` and process exit AFTER it, so the shutdown actually
+ * completes rather than being SIGKILLed one step from the end.
+ *
+ * Stated precisely rather than rounded up, because 25 < 27: this does NOT
+ * guarantee that a regen STARTING at the instant of shutdown finishes. What it
+ * buys is a regen already partway through — the common case, since a job in
+ * flight at shutdown is at a uniformly random point in its run. And it buys
+ * this only when the supervisor's grace is actually ~30s: under a SHORTER
+ * grace, SIGKILL now lands during this wait and `serve.ts` never reaches
+ * `pool.shutdown()`, so the preview children are orphaned rather than killed.
+ * That is the trade this value makes, chosen deliberately over the previous
+ * behaviour of never letting a proxied job finish at all.
+ */
+const SHUTDOWN_PROXIED_WAIT_MS = 25_000;
 
 /** How long `stop()` waits AFTER killing the orchestrator child, so the tick can ingest its spend and finish the job. */
 const SHUTDOWN_KILL_GRACE_MS = 2_000;
@@ -569,6 +619,8 @@ export interface JobWorkerDeps {
   pollIntervalMs?: number;
   /** Defaults to `SHUTDOWN_WAIT_MS`. Overridable so a test can prove the bound exists without waiting 5s for it. */
   shutdownWaitMs?: number;
+  /** Defaults to `SHUTDOWN_PROXIED_WAIT_MS`. Same reason — and so a test can tell the two waits apart. */
+  shutdownProxiedWaitMs?: number;
   /** Defaults to `SHUTDOWN_KILL_GRACE_MS`. Same reason. */
   shutdownKillGraceMs?: number;
   now?: () => number;
@@ -594,6 +646,7 @@ export class JobWorker {
   private readonly orchestratorSpawnFn: OrchestratorSpawnFn;
   private readonly pollIntervalMs: number;
   private readonly shutdownWaitMs: number;
+  private readonly shutdownProxiedWaitMs: number;
   private readonly shutdownKillGraceMs: number;
   private readonly now: () => number;
   private readonly codeVersion: string;
@@ -643,6 +696,7 @@ export class JobWorker {
     this.orchestratorSpawnFn = deps.orchestratorSpawnFn ?? defaultOrchestratorSpawnFn;
     this.pollIntervalMs = deps.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
     this.shutdownWaitMs = deps.shutdownWaitMs ?? SHUTDOWN_WAIT_MS;
+    this.shutdownProxiedWaitMs = deps.shutdownProxiedWaitMs ?? SHUTDOWN_PROXIED_WAIT_MS;
     this.shutdownKillGraceMs = deps.shutdownKillGraceMs ?? SHUTDOWN_KILL_GRACE_MS;
     this.now = deps.now ?? (() => Date.now());
     this.codeVersion = deps.codeVersion ?? resolveCodeVersion();
@@ -737,6 +791,23 @@ export class JobWorker {
    * was never called at all. Idempotent in the sense that matters: a second
    * call with nothing in flight is a no-op.
    *
+   * THE FIRST WAIT IS DIFFERENTIATED BY WHAT IS ACTUALLY IN FLIGHT, and an
+   * orchestrator run always wins the choice:
+   *
+   *   - Any tracked `generate` → `shutdownWaitMs` (5s), the SHORT one, so the
+   *     SIGTERM and the spend-recovery grace below are both reached well
+   *     inside a normal supervisor grace. Recovering ~$1-2 of real spend
+   *     outranks letting the run finish, and a longer first wait would push
+   *     SIGKILL onto the wait itself — see `SHUTDOWN_WAIT_MS`.
+   *   - Only proxied jobs → `shutdownProxiedWaitMs` (25s), the LONG one,
+   *     because nothing here owns a process to kill and a typical regen
+   *     (~27s) had no chance at all of finishing inside 5s — see
+   *     `SHUTDOWN_PROXIED_WAIT_MS`.
+   *
+   * With concurrency both can be in flight at once, which is exactly why the
+   * rule is stated as "an orchestrator run wins" rather than as a per-job
+   * choice: there is one wait, and it has to be the one with money to recover.
+   *
    * WHOLE-BRANCH REVIEW, FINDING C — that await is now BOUNDED, and the
    * orchestrator child is killed rather than orphaned.
    *
@@ -769,7 +840,12 @@ export class JobWorker {
     }
     if (this.inFlight.size === 0) return;
 
-    const waitMs = this.shutdownWaitMs;
+    // Read BEFORE the wait, because it selects the wait. A `generate`'s child
+    // is spawned synchronously inside its own dispatch (nothing in
+    // `runGenerateJob` awaits before `runOrchestratorProcess`), so a
+    // dispatched generate is already tracked here by the time anything can
+    // call `stop()`.
+    const waitMs = this.activeOrchestratorRuns.size > 0 ? this.shutdownWaitMs : this.shutdownProxiedWaitMs;
     if (await this.raceInFlight(waitMs)) return;
 
     // Re-read AFTER the wait: an entry clears itself the moment its child

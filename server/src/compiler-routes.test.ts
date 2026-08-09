@@ -43,7 +43,10 @@ import { openDatabase } from "./db.ts";
 import { createUser } from "./users.ts";
 import { createSession, SESSION_COOKIE } from "./sessions.ts";
 import { createProject, type Project } from "./projects.ts";
-import { findJobById, finishJob, listJobsByProject, MAX_ENQUEUED_BILLABLE_JOBS_PER_USER } from "./jobs.ts";
+import {
+  findJobById, finishJob, listJobsByProject, MAX_ENQUEUED_BILLABLE_JOBS_PER_USER,
+  MAX_ENQUEUED_NON_BILLABLE_JOBS_PER_USER, MAX_REQUEST_JSON_BYTES, NON_BILLABLE_ENQUEUE_BOUND_REFUSED,
+} from "./jobs.ts";
 import { recordUsageEvent } from "./usage.ts";
 import { createRequestListener } from "./router.ts";
 import { MAX_PREVIEWS, PreviewCapacityError, type PreviewPool } from "./preview-pool.ts";
@@ -562,4 +565,76 @@ describe("compilerRoutes: API key error mapping", () => {
       expect(pool.assertApiKeyUsable).not.toHaveBeenCalled();
     },
   );
+});
+
+/**
+ * WHOLE-BRANCH REVIEW, FINDING D — `/__export` stored unbounded rows forever.
+ *
+ * It is `async: true, billable: false`, so it took the plain `createJob`
+ * branch: no enqueue bound, no cap, and `enqueueHandler` persisting
+ * `JSON.stringify(parsed)` of a body up to `router.ts`'s 1,000,000-byte
+ * `MAX_BODY_BYTES` into a table with no retention or delete path. An invited
+ * user could loop `POST /__export?project=X` with 1 MB bodies and grow the
+ * identity database without limit — and, because claims are FIFO, have those
+ * queued exports served ahead of their own later regens.
+ */
+describe("compilerRoutes: async NON-billable enqueue is bounded too (finding D)", () => {
+  it(`allows exactly ${String(MAX_ENQUEUED_NON_BILLABLE_JOBS_PER_USER)} concurrent /__export enqueues, refusing the rest with 429 and creating no row for a refused one`, async () => {
+    const pool = fakePool();
+    const { db, call, project, aliceCookie } = harness(pool);
+    const entry = ASYNC_ENTRIES.find((e) => e.path === "/__export")!;
+    const burst = MAX_ENQUEUED_NON_BILLABLE_JOBS_PER_USER * 5;
+    const results = await Promise.all(
+      Array.from({ length: burst }, () => call(entry.method, pathFor(entry, project.id), aliceCookie, {})),
+    );
+    const statuses = results.map((r) => r.status);
+    expect(statuses.filter((s) => s === 202)).toHaveLength(MAX_ENQUEUED_NON_BILLABLE_JOBS_PER_USER);
+    expect(statuses.filter((s) => s === 429)).toHaveLength(burst - MAX_ENQUEUED_NON_BILLABLE_JOBS_PER_USER);
+    // The load-bearing assertion, as for the billable bound: the ROW COUNT
+    // matches the 202s exactly, independently of what the responses claimed.
+    expect(listJobsByProject(db, project.id, burst + 10)).toHaveLength(MAX_ENQUEUED_NON_BILLABLE_JOBS_PER_USER);
+  });
+
+  it("is a CONCURRENCY bound, not a spend one: an export at the bound refuses with 429 while a billable enqueue is unaffected", async () => {
+    const pool = fakePool();
+    const { call, project, aliceCookie } = harness(pool);
+    const exportEntry = ASYNC_ENTRIES.find((e) => e.path === "/__export")!;
+    for (let i = 0; i < MAX_ENQUEUED_NON_BILLABLE_JOBS_PER_USER; i += 1) {
+      expect((await call(exportEntry.method, pathFor(exportEntry, project.id), aliceCookie, {})).status).toBe(202);
+    }
+    const refused = await call(exportEntry.method, pathFor(exportEntry, project.id), aliceCookie, {});
+    expect(refused.status).toBe(429);
+    // 429, never 402: retrying genuinely helps once an export finishes, and
+    // an export must never be refused over a BILL (/__export's own registry
+    // entry). The message names exports, not "billable jobs".
+    expect(JSON.parse(refused.body)).toEqual(NON_BILLABLE_ENQUEUE_BOUND_REFUSED);
+    // Exports do not consume the billable allowance either — the two bounds
+    // count disjoint kind sets.
+    const billableEntry = BILLABLE_ENTRIES[0]!;
+    expect((await call(billableEntry.method, pathFor(billableEntry, project.id), aliceCookie, {})).status).toBe(202);
+  });
+
+  it("413s a request body past MAX_REQUEST_JSON_BYTES, storing no row — on a billable and a non-billable async entry alike", async () => {
+    const pool = fakePool();
+    const { db, call, project, aliceCookie } = harness(pool);
+    // Comfortably over the ceiling but well under router.ts's own
+    // MAX_BODY_BYTES, so this proves THIS bound rather than that one.
+    const oversized = { instruction: "x".repeat(MAX_REQUEST_JSON_BYTES + 1) };
+    for (const entry of [BILLABLE_ENTRIES[0]!, ASYNC_ENTRIES.find((e) => e.path === "/__export")!]) {
+      const result = await call(entry.method, pathFor(entry, project.id), aliceCookie, oversized);
+      expect(result.status).toBe(413);
+    }
+    expect(listJobsByProject(db, project.id, 10)).toHaveLength(0);
+  });
+
+  it("still accepts a body just under the ceiling, so the bound is not merely rejecting everything", async () => {
+    const pool = fakePool();
+    const { db, call, project, aliceCookie } = harness(pool);
+    const entry = ASYNC_ENTRIES.find((e) => e.path === "/__export")!;
+    // `{"instruction":"..."}` is 18 characters of framing around the value.
+    const justUnder = { instruction: "x".repeat(MAX_REQUEST_JSON_BYTES - 100) };
+    const result = await call(entry.method, pathFor(entry, project.id), aliceCookie, justUnder);
+    expect(result.status).toBe(202);
+    expect(listJobsByProject(db, project.id, 10)).toHaveLength(1);
+  });
 });

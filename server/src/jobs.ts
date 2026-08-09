@@ -248,22 +248,68 @@ export function countActiveJobsForUser(db: DatabaseSync, userId: string): number
  */
 export const BILLABLE_JOB_KINDS: readonly JobKind[] = ["generate", "regen", "regen-page", "add-section", "edit-prompt"];
 
-const BILLABLE_KIND_PLACEHOLDERS = BILLABLE_JOB_KINDS.map(() => "?").join(", ");
+/**
+ * The `JobKind`s that spend NO model money but still take minutes and still
+ * hold a preview slot — `export` is the only one today (a production build).
+ * Named as its own set rather than derived as "everything not billable"
+ * because `JobKind` also contains kinds that are neither: this list means
+ * specifically "async, non-billable, and therefore bounded by
+ * `MAX_ENQUEUED_NON_BILLABLE_JOBS_PER_USER` rather than by the spend cap."
+ */
+export const NON_BILLABLE_ASYNC_JOB_KINDS: readonly JobKind[] = ["export"];
 
 /**
  * The WHERE-clause-shaped fragment counting one user's active
- * (`queued`+`running`) BILLABLE jobs — a single, scalar-subquery-ready
- * expression (`?` for the user id, then one `?` per `BILLABLE_JOB_KINDS`
- * entry, in that order), shared VERBATIM between `countActiveBillableJobsForUser`
- * below (a plain read) and `createBillableJobIfUnderBound` below (the atomic
- * gate). Defined exactly once so the two can never drift apart — a task-3-
- * review-round-2 requirement, after round 1 shipped a decorator
+ * (`queued`+`running`) jobs of a given kind set — a single,
+ * scalar-subquery-ready expression (`?` for the user id, then one `?` per
+ * kind, in that order). Built by a function so the billable and the
+ * non-billable-async bounds are literally the same SQL shape rather than two
+ * hand-written near-copies; the billable one is shared VERBATIM between
+ * `countActiveBillableJobsForUser` below (a plain read) and
+ * `createBillableJobIfUnderBound` below (the atomic gate), which is a task-3-
+ * review-round-2 requirement after round 1 shipped a decorator
  * (`requireEnqueueSlot`, since deleted — see this module's own top comment)
  * whose read and whose write were two separate statements separated by an
  * `await`, which a concurrent burst of requests could all pass identically.
  */
-const ACTIVE_BILLABLE_COUNT_EXPR =
-  `(SELECT COUNT(*) FROM job WHERE user_id = ? AND status IN ('queued', 'running') AND kind IN (${BILLABLE_KIND_PLACEHOLDERS}))`;
+function activeCountExprFor(kinds: readonly JobKind[]): string {
+  const placeholders = kinds.map(() => "?").join(", ");
+  return `(SELECT COUNT(*) FROM job WHERE user_id = ? AND status IN ('queued', 'running') AND kind IN (${placeholders}))`;
+}
+
+const ACTIVE_BILLABLE_COUNT_EXPR = activeCountExprFor(BILLABLE_JOB_KINDS);
+const ACTIVE_NON_BILLABLE_ASYNC_COUNT_EXPR = activeCountExprFor(NON_BILLABLE_ASYNC_JOB_KINDS);
+
+/**
+ * WHOLE-BRANCH REVIEW, FINDING D — the largest `request_json` this table will
+ * store.
+ *
+ * `enqueueHandler` persists `JSON.stringify(parsed)` of the whole request
+ * body, and `router.ts`'s own `MAX_BODY_BYTES` allows 1,000,000 of them. That
+ * cap exists to bound what a request may PARSE; it says nothing about what a
+ * table may keep FOREVER, and `jobs.ts` has no retention or delete path at
+ * all. An invited user looping `POST /__export?project=X` with 1 MB bodies
+ * therefore grew the identity database without limit.
+ *
+ * 64 KiB is orders of magnitude above every real payload — `/__export` sends
+ * `{}`, `/__regen` sends `{section, instruction}`, `/api/generate` sends one
+ * brief — while being small enough that the growth rate is no longer the
+ * problem. Deliberately NOT equal to `MAX_BODY_BYTES`: these bound different
+ * things for different reasons, and pinning them equal (the way
+ * `compiler/src/max-body-bytes.ts` is pinned to `router.ts`'s) would assert a
+ * relationship that does not exist.
+ */
+export const MAX_REQUEST_JSON_BYTES = 64 * 1024;
+
+/** True when `requestJson` may not be stored — see `MAX_REQUEST_JSON_BYTES`. Byte length, not `.length`: a multi-byte payload costs bytes on disk, not code units. */
+export function requestJsonTooLarge(requestJson: string): boolean {
+  return Buffer.byteLength(requestJson, "utf8") > MAX_REQUEST_JSON_BYTES;
+}
+
+/** The 413 body both enqueue sites send, shared verbatim so the wording and the number cannot drift — same rule `ENQUEUE_BOUND_REFUSED` follows. */
+export const REQUEST_TOO_LARGE = {
+  error: `a job's request body may be at most ${String(MAX_REQUEST_JSON_BYTES)} bytes`,
+};
 
 /**
  * `queued` + `running` billable jobs only. NOT an authoritative gate on its
@@ -347,6 +393,69 @@ export function createBillableJobIfUnderBound(db: DatabaseSync, input: CreateJob
   if (!BILLABLE_JOB_KINDS.includes(input.kind)) {
     throw new Error(`jobs.ts: createBillableJobIfUnderBound called with non-billable kind "${input.kind}"`);
   }
+  return insertIfUnderBound(db, input, {
+    countExpr: ACTIVE_BILLABLE_COUNT_EXPR,
+    kinds: BILLABLE_JOB_KINDS,
+    bound: MAX_ENQUEUED_BILLABLE_JOBS_PER_USER,
+  });
+}
+
+/**
+ * At most this many of one user's async, NON-billable jobs (`export`) may be
+ * queued or running at once. Same value as the billable bound, for a
+ * different reason: not spend, but that an unbounded queue of minutes-long
+ * jobs is both a growth problem (`jobs.ts` has no retention path — see
+ * `MAX_REQUEST_JSON_BYTES`) and a fairness one. FIFO means a user's own
+ * hundred queued exports are claimed AHEAD of the regen they submit
+ * afterwards, so the bound protects that user from themselves as much as it
+ * protects the server.
+ */
+export const MAX_ENQUEUED_NON_BILLABLE_JOBS_PER_USER = 2;
+
+/** 429 for the same reason `ENQUEUE_BOUND_REFUSED` is: retrying genuinely helps once one finishes. Its own wording because it names a different bound over a different set of kinds. */
+export const NON_BILLABLE_ENQUEUE_BOUND_REFUSED = {
+  error: `at most ${String(MAX_ENQUEUED_NON_BILLABLE_JOBS_PER_USER)} export jobs may be queued or running at once for this account; wait for one to finish and retry`,
+};
+
+/**
+ * WHOLE-BRANCH REVIEW, FINDING D. `/__export` is `async: true, billable:
+ * false`, so it took the plain `createJob` branch: no enqueue bound and no
+ * cap. Combined with `enqueueHandler` persisting the whole request body and
+ * `jobs.ts` having no retention path, an invited user could loop
+ * `POST /__export?project=X` and grow the identity database without limit —
+ * and, because claims are FIFO, have those queued exports served ahead of
+ * their own later regens.
+ *
+ * The `billable: false` REASONING is untouched and must stay untouched: an
+ * export spends no model money, so it is never refused over the SPEND cap
+ * (`project-registry.ts`'s own comment — refusing an export over the cap
+ * would strand a user's finished work behind a bill). This is a concurrency
+ * bound, not a spend one; a user at it has two exports already in flight and
+ * needs only to wait, which is why it answers 429.
+ *
+ * Same single `INSERT ... SELECT ... WHERE` atomicity as the billable gate —
+ * literally the same helper — so a concurrent burst cannot all pass the same
+ * pre-insert count.
+ */
+export function createNonBillableAsyncJobIfUnderBound(db: DatabaseSync, input: CreateJobInput): Job | null {
+  if (!NON_BILLABLE_ASYNC_JOB_KINDS.includes(input.kind)) {
+    throw new Error(
+      `jobs.ts: createNonBillableAsyncJobIfUnderBound called with kind "${input.kind}", which is not an async non-billable kind`,
+    );
+  }
+  return insertIfUnderBound(db, input, {
+    countExpr: ACTIVE_NON_BILLABLE_ASYNC_COUNT_EXPR,
+    kinds: NON_BILLABLE_ASYNC_JOB_KINDS,
+    bound: MAX_ENQUEUED_NON_BILLABLE_JOBS_PER_USER,
+  });
+}
+
+/** The one conditional INSERT both bounded creators run. Not exported: a caller must go through one of the two kind-checked wrappers, so "which bound applies" is never a per-call-site decision. */
+function insertIfUnderBound(
+  db: DatabaseSync,
+  input: CreateJobInput,
+  gate: { countExpr: string; kinds: readonly JobKind[]; bound: number },
+): Job | null {
   const id = randomUUID();
   const runId = input.runId ?? null;
   const resumedFromJobId = input.resumedFromJobId ?? null;
@@ -358,10 +467,10 @@ export function createBillableJobIfUnderBound(db: DatabaseSync, input: CreateJob
        run_id, code_version, resumed_from_job_id
      )
      SELECT ?, ?, ?, ?, 'queued', ?, NULL, NULL, ?, NULL, NULL, ?, NULL, ?
-     WHERE ${ACTIVE_BILLABLE_COUNT_EXPR} < ?`,
+     WHERE ${gate.countExpr} < ?`,
   ).run(
     id, input.userId, input.projectId, input.kind, input.requestJson, input.now, runId, resumedFromJobId,
-    input.userId, ...BILLABLE_JOB_KINDS, MAX_ENQUEUED_BILLABLE_JOBS_PER_USER,
+    input.userId, ...gate.kinds, gate.bound,
   );
   if (Number(result.changes) === 0) return null;
   return {

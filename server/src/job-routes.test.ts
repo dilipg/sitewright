@@ -12,10 +12,11 @@ import type { DatabaseSync } from "node:sqlite";
 import { UNKNOWN_CODE_VERSION } from "./code-version.ts";
 import { openDatabase } from "./db.ts";
 import {
-  createJob, finishJob, findJobById, MAX_ENQUEUED_BILLABLE_JOBS_PER_USER, recordJobRun,
+  createJob, finishJob, findJobById, MAX_ENQUEUED_BILLABLE_JOBS_PER_USER,
+  MAX_ENQUEUED_NON_BILLABLE_JOBS_PER_USER, MAX_REQUEST_JSON_BYTES, recordJobRun,
 } from "./jobs.ts";
 import { jobRoutes } from "./job-routes.ts";
-import { createProject, resolveProjectDirectory } from "./projects.ts";
+import { createProject, listProjectsByOwner, resolveProjectDirectory } from "./projects.ts";
 import { NOT_FOUND } from "./require-project.ts";
 import { createRequestListener } from "./router.ts";
 import { createSession, SESSION_COOKIE } from "./sessions.ts";
@@ -798,4 +799,71 @@ describe("POST /api/jobs/:id/resume", () => {
       expect(jobCount(db)).toBe(burst + MAX_ENQUEUED_BILLABLE_JOBS_PER_USER);
     },
   );
+});
+
+/**
+ * WHOLE-BRANCH REVIEW, FINDING D — the two enqueue paths this module owns.
+ *
+ * `compiler-routes.ts`'s `/__export` was the headline case, but the resume
+ * endpoint's own non-billable branch was a plain, unconditional `createJob`,
+ * which would have left resume as a door straight through the new bound. And
+ * `POST /api/generate` builds its own `request_json` rather than going through
+ * `enqueueHandler`, so the size ceiling has to be applied here too.
+ */
+describe("finding D: enqueue bounds and the request-body ceiling on this module's own routes", () => {
+  it("413s POST /api/generate for a brief past MAX_REQUEST_JSON_BYTES, creating no project row and no directory", async () => {
+    const { db, projectsRoot, alice, call, aliceCookie } = harness();
+    const before = readdirSync(projectsRoot);
+    const result = await call("POST", "/api/generate", aliceCookie, {
+      brief: "x".repeat(MAX_REQUEST_JSON_BYTES + 1),
+    });
+    expect(result.status).toBe(413);
+    // Checked before the mkdir and before the transaction, so a refused
+    // request leaves nothing behind at all — the same rule the spend cap and
+    // the concurrency bound already follow on this endpoint.
+    expect(listProjectsByOwner(db, alice.id)).toHaveLength(0);
+    expect(readdirSync(projectsRoot)).toEqual(before);
+    expect((db.prepare("SELECT COUNT(*) AS c FROM job").get() as { c: number }).c).toBe(0);
+  });
+
+  it("bounds resume of an EXPORT job, so resume is not a way around the non-billable bound", async () => {
+    const { db, alice, call, aliceCookie } = harness();
+    const project = createProject(db, alice.id, "run-resume-export", "Run Resume Export");
+
+    // `MAX_ENQUEUED_NON_BILLABLE_JOBS_PER_USER` failed exports, each resumed
+    // once: the first N resumes fill the bound, the next is refused.
+    const originals = Array.from({ length: MAX_ENQUEUED_NON_BILLABLE_JOBS_PER_USER + 1 }, (_unused, i) => {
+      const job = createJob(db, {
+        userId: alice.id, projectId: project.id, kind: "export", requestJson: "{}", now: 1_000 + i,
+      });
+      finishJob(db, job.id, { status: "failed", error: "build failed", now: 2_000 + i });
+      return job;
+    });
+
+    const statuses: number[] = [];
+    for (const original of originals) {
+      statuses.push((await call("POST", `/api/jobs/${original.id}/resume`, aliceCookie)).status);
+    }
+    expect(statuses.slice(0, MAX_ENQUEUED_NON_BILLABLE_JOBS_PER_USER))
+      .toEqual(Array(MAX_ENQUEUED_NON_BILLABLE_JOBS_PER_USER).fill(202));
+    const last = statuses[MAX_ENQUEUED_NON_BILLABLE_JOBS_PER_USER];
+    expect(last).toBe(429);
+    // Rows: the originals plus exactly the bound's worth of resumes — the
+    // refused one created none.
+    expect((db.prepare("SELECT COUNT(*) AS c FROM job WHERE status = 'queued'").get() as { c: number }).c)
+      .toBe(MAX_ENQUEUED_NON_BILLABLE_JOBS_PER_USER);
+  });
+
+  it("still resumes an export for a user with none in flight — the bound is concurrency, never a bill", async () => {
+    const { db, alice, call, aliceCookie } = harness();
+    const project = createProject(db, alice.id, "run-resume-export-ok", "Run Resume Export OK");
+    // Well over the spend cap: an export must never be refused over money.
+    overCap(db, alice.id);
+    const original = createJob(db, {
+      userId: alice.id, projectId: project.id, kind: "export", requestJson: "{}", now: 1_000,
+    });
+    finishJob(db, original.id, { status: "failed", error: "build failed", now: 2_000 });
+    const result = await call("POST", `/api/jobs/${original.id}/resume`, aliceCookie);
+    expect(result.status).toBe(202);
+  });
 });

@@ -86,8 +86,9 @@ import type { DatabaseSync } from "node:sqlite";
 import { codeVersionsIncompatible, resolveCodeVersion } from "./code-version.ts";
 import {
   BILLABLE_JOB_KINDS, countActiveBillableJobsForUser, createBillableJobIfUnderBound, createJob,
-  ENQUEUE_BOUND_REFUSED, findJobById, hasActiveResumeFor, listJobsByProject,
-  MAX_ENQUEUED_BILLABLE_JOBS_PER_USER, type Job,
+  createNonBillableAsyncJobIfUnderBound, ENQUEUE_BOUND_REFUSED, findJobById, hasActiveResumeFor,
+  listJobsByProject, MAX_ENQUEUED_BILLABLE_JOBS_PER_USER, NON_BILLABLE_ENQUEUE_BOUND_REFUSED,
+  REQUEST_TOO_LARGE, requestJsonTooLarge, type Job,
 } from "./jobs.ts";
 import { BY_QUERY } from "./project-registry.ts";
 import { createProject, resolveProjectDirectory } from "./projects.ts";
@@ -224,6 +225,16 @@ export function jobRoutes(deps: { db: DatabaseSync; projectsRoot: string; codeVe
           return;
         }
         const trimmedBrief = brief.trim();
+        const requestJson = JSON.stringify({ brief: trimmedBrief });
+        // Whole-branch review, FINDING D: the same ceiling `enqueueHandler`
+        // applies, checked here too because this endpoint builds its own
+        // `request_json` rather than going through that handler. Before the
+        // directory is created and before the transaction opens, so an
+        // over-sized brief leaves no row and no directory.
+        if (requestJsonTooLarge(requestJson)) {
+          sendJson(res, 413, REQUEST_TOO_LARGE);
+          return;
+        }
 
         // Directory FIRST, OUTSIDE the transaction: if mkdirSync throws
         // (ENOSPC, EACCES, ...) there must be no row left pointing at a
@@ -269,7 +280,7 @@ export function jobRoutes(deps: { db: DatabaseSync; projectsRoot: string; codeVe
             userId: ctx.user.id,
             projectId: project.id,
             kind: "generate",
-            requestJson: JSON.stringify({ brief: trimmedBrief }),
+            requestJson,
             now: Date.now(),
           });
           db.exec("COMMIT");
@@ -435,12 +446,22 @@ export function jobRoutes(deps: { db: DatabaseSync; projectsRoot: string; codeVe
           return;
         }
 
-        // Non-billable (export): unconditional insert, no cap check at all —
-        // the same "never refuse over the cap" rule /__export's own registry
-        // entry states, for the same reason (a deterministic build spends no
-        // model money; refusing it would strand already-generated work
-        // behind a bill).
-        const created = createJob(db, input);
+        // Non-billable (export): no SPEND cap check at all — the same "never
+        // refuse over the cap" rule /__export's own registry entry states,
+        // for the same reason (a deterministic build spends no model money;
+        // refusing it would strand already-generated work behind a bill).
+        //
+        // It IS subject to the concurrency bound, though (whole-branch
+        // review, FINDING D): this used to be a plain, unconditional
+        // `createJob`, which made resume the one door through which an
+        // unbounded number of export rows could still be created after
+        // `compiler-routes.ts`'s own enqueue was bounded. A bound with a
+        // bypass is not a bound.
+        const created = createNonBillableAsyncJobIfUnderBound(db, input);
+        if (created === null) {
+          sendJson(res, 429, NON_BILLABLE_ENQUEUE_BOUND_REFUSED);
+          return;
+        }
         sendJson(res, 202, { jobId: created.id });
       }),
     },

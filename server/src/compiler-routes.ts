@@ -171,7 +171,9 @@ import type { DatabaseSync } from "node:sqlite";
 import { DisabledUserError, MissingApiKeyError, UnknownUserError } from "./agent-env.ts";
 import { UndecryptableApiKeyError } from "./api-keys.ts";
 import {
-  createBillableJobIfUnderBound, createJob, ENQUEUE_BOUND_REFUSED, type CreateJobInput, type JobKind,
+  createBillableJobIfUnderBound, createNonBillableAsyncJobIfUnderBound, ENQUEUE_BOUND_REFUSED,
+  NON_BILLABLE_ENQUEUE_BOUND_REFUSED, REQUEST_TOO_LARGE, requestJsonTooLarge,
+  type CreateJobInput, type JobKind,
 } from "./jobs.ts";
 import { forwardToPreview } from "./preview-forward.ts";
 import type { PreviewPool } from "./preview-pool.ts";
@@ -246,11 +248,23 @@ const BAD_JSON_BODY = { error: "request body must be valid JSON within the size 
  * `billable` selects which INSERT primitive runs: `createBillableJobIfUnderBound`
  * (`jobs.ts`) for a billable kind — one atomic statement that inserts zero
  * rows and returns `null` when the user is at `MAX_ENQUEUED_BILLABLE_JOBS_PER_USER`,
- * mapped here to 429 — or the plain, unconditional `createJob` for a
+ * mapped here to 429 — or `createNonBillableAsyncJobIfUnderBound` for a
  * non-billable one (`/__export` is the only async-but-non-billable entry
  * today). Deciding this from `entry.billable` at ROUTE-TABLE construction
  * time, not by re-deriving "is this kind billable" per request, mirrors
  * `jobKindForAsyncPath`'s own "fail at construction, not per-request" bias.
+ *
+ * WHOLE-BRANCH REVIEW, FINDING D: the non-billable branch used to be the
+ * plain, unconditional `createJob` with no bound of any kind, and this
+ * handler stored `JSON.stringify(parsed)` of a body up to `router.ts`'s
+ * 1,000,000-byte `MAX_BODY_BYTES` into a table with no retention or delete
+ * path. Looping `POST /__export?project=X` with 1 MB bodies therefore grew
+ * the identity database without limit — and, since claims are FIFO, served
+ * those queued exports ahead of the user's own later regens. Both halves are
+ * closed: a bounded insert for the non-billable kinds too (a CONCURRENCY
+ * bound answering 429, NOT the spend cap — an export must still never be
+ * refused over a bill, per `/__export`'s own registry entry), and a
+ * `MAX_REQUEST_JSON_BYTES` ceiling answering 413 before anything is stored.
  */
 function enqueueHandler(db: DatabaseSync, kind: JobKind, billable: boolean): ProjectHandler {
   return async (req, res, ctx) => {
@@ -261,16 +275,26 @@ function enqueueHandler(db: DatabaseSync, kind: JobKind, billable: boolean): Pro
       sendJson(res, 400, BAD_JSON_BODY);
       return;
     }
+    const requestJson = JSON.stringify(parsed);
+    // Checked BEFORE any insert: an over-sized body must leave no row at all,
+    // the same "refused requests create no side effect" rule the spend cap
+    // and the enqueue bound already follow.
+    if (requestJsonTooLarge(requestJson)) {
+      sendJson(res, 413, REQUEST_TOO_LARGE);
+      return;
+    }
     const input: CreateJobInput = {
       userId: ctx.user.id,
       projectId: ctx.project.id,
       kind,
-      requestJson: JSON.stringify(parsed),
+      requestJson,
       now: Date.now(),
     };
-    const job = billable ? createBillableJobIfUnderBound(db, input) : createJob(db, input);
+    const job = billable
+      ? createBillableJobIfUnderBound(db, input)
+      : createNonBillableAsyncJobIfUnderBound(db, input);
     if (job === null) {
-      sendJson(res, 429, ENQUEUE_BOUND_REFUSED);
+      sendJson(res, 429, billable ? ENQUEUE_BOUND_REFUSED : NON_BILLABLE_ENQUEUE_BOUND_REFUSED);
       return;
     }
     sendJson(res, 202, { jobId: job.id });

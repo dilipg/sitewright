@@ -16,6 +16,7 @@ import {
   countActiveJobsForUser,
   createBillableJobIfUnderBound,
   createJob,
+  createNonBillableAsyncJobIfUnderBound,
   ENQUEUE_BOUND_REFUSED,
   findJobById,
   finishJob,
@@ -25,7 +26,11 @@ import {
   markRunningJobsInterrupted,
   MAX_ACTIVE_JOBS_PER_USER,
   MAX_ENQUEUED_BILLABLE_JOBS_PER_USER,
+  MAX_ENQUEUED_NON_BILLABLE_JOBS_PER_USER,
+  MAX_REQUEST_JSON_BYTES,
+  NON_BILLABLE_ASYNC_JOB_KINDS,
   recordJobRun,
+  requestJsonTooLarge,
   requeueJob,
 } from "./jobs.ts";
 
@@ -721,5 +726,64 @@ describe("retention", () => {
     const job = seed();
     db.prepare("DELETE FROM user WHERE id = ?").run(userId);
     expect(findJobById(db, job.id)).toBe(null);
+  });
+});
+
+/**
+ * WHOLE-BRANCH REVIEW, FINDING D — the store-level primitives the two enqueue
+ * paths use. Behaviour through the routes is covered in compiler-routes.test.ts
+ * and job-routes.test.ts; these pin the primitives' own guards, which are what
+ * stop a future caller from picking the wrong one.
+ */
+describe("createNonBillableAsyncJobIfUnderBound", () => {
+  it("inserts up to the bound and then inserts nothing at all, returning null", () => {
+    const user = createUser(db, `${randomUUID()}@example.com`, "h");
+    const project = createProject(db, user.id, `dir-${randomUUID()}`, "P");
+    const input = { userId: user.id, projectId: project.id, kind: "export" as const, requestJson: "{}", now: 1 };
+    for (let i = 0; i < MAX_ENQUEUED_NON_BILLABLE_JOBS_PER_USER; i += 1) {
+      expect(createNonBillableAsyncJobIfUnderBound(db, input)).not.toBeNull();
+    }
+    expect(createNonBillableAsyncJobIfUnderBound(db, input)).toBeNull();
+    expect(listJobsByProject(db, project.id, 50)).toHaveLength(MAX_ENQUEUED_NON_BILLABLE_JOBS_PER_USER);
+  });
+
+  it("counts a DISJOINT set of kinds from the billable bound — neither consumes the other's allowance", () => {
+    const user = createUser(db, `${randomUUID()}@example.com`, "h");
+    const project = createProject(db, user.id, `dir-${randomUUID()}`, "P");
+    const base = { userId: user.id, projectId: project.id, requestJson: "{}", now: 1 };
+    for (let i = 0; i < MAX_ENQUEUED_NON_BILLABLE_JOBS_PER_USER; i += 1) {
+      expect(createNonBillableAsyncJobIfUnderBound(db, { ...base, kind: "export" })).not.toBeNull();
+    }
+    expect(createNonBillableAsyncJobIfUnderBound(db, { ...base, kind: "export" })).toBeNull();
+    // Fully blocked on exports, entirely free on billable work.
+    expect(createBillableJobIfUnderBound(db, { ...base, kind: "regen" })).not.toBeNull();
+  });
+
+  it("throws rather than silently applying the wrong bound when called with a billable kind", () => {
+    const user = createUser(db, `${randomUUID()}@example.com`, "h");
+    expect(() => createNonBillableAsyncJobIfUnderBound(db, {
+      userId: user.id, projectId: null, kind: "regen", requestJson: "{}", now: 1,
+    })).toThrow(/not an async non-billable kind/);
+  });
+
+  it("names a set disjoint from BILLABLE_JOB_KINDS, so no kind is bounded twice or missed", () => {
+    for (const kind of NON_BILLABLE_ASYNC_JOB_KINDS) {
+      expect(BILLABLE_JOB_KINDS).not.toContain(kind);
+    }
+  });
+});
+
+describe("requestJsonTooLarge", () => {
+  it("is false at exactly the ceiling and true one byte past it", () => {
+    expect(requestJsonTooLarge("x".repeat(MAX_REQUEST_JSON_BYTES))).toBe(false);
+    expect(requestJsonTooLarge("x".repeat(MAX_REQUEST_JSON_BYTES + 1))).toBe(true);
+  });
+
+  it("measures BYTES, not code units — a multi-byte payload costs what it actually costs on disk", () => {
+    // Every "é" is 2 UTF-8 bytes, so half the ceiling's worth of characters
+    // is exactly the ceiling in bytes; one more character is over it.
+    const halfChars = MAX_REQUEST_JSON_BYTES / 2;
+    expect(requestJsonTooLarge("é".repeat(halfChars))).toBe(false);
+    expect(requestJsonTooLarge("é".repeat(halfChars + 1))).toBe(true);
   });
 });

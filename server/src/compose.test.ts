@@ -334,18 +334,37 @@ describe("scripts/serve.ts — job worker wiring (task 3)", () => {
     expect(serveSource).toContain("adoptExistingProjects(db, projectsRoot, owner.id)");
   });
 
-  it("stops the job worker on both termination signals, before shutting the preview pool down", () => {
+  it("routes both termination signals through createShutdownSequence, handing it the worker and the pool", () => {
     // A job mid-run at shutdown must not be killed partway (spec decision
-    // 13) — JobWorker.stop() itself awaits any in-flight tick, but that
-    // guarantee is useless here if serve.ts kills the preview pool (and with
-    // it, whatever child a proxied job's own in-flight exchange depends on)
-    // BEFORE the worker has actually stopped.
+    // 13) — JobWorker.stop() awaits every run in flight, but that guarantee is
+    // useless here if serve.ts kills the preview pool (and with it, whatever
+    // child a proxied job's in-flight exchange depends on) BEFORE the worker
+    // has stopped. Equally, preview cleanup must not be HOSTAGE to that wait:
+    // chained behind stop()'s 25s proxied wait, a supervisor grace at the 10s
+    // floor SIGKILLed this process mid-wait and pool.shutdown() never ran, so
+    // the children outlived it.
+    //
+    // Both properties now live in shutdown.ts, which HAS real tests
+    // (shutdown.test.ts) — this file can only assert the composition, since
+    // scripts/serve.ts's own module body cannot be imported at all. So: both
+    // signals still reach the sequence, and the sequence is given the two
+    // callbacks, in the order that encodes "stop the worker, then kill the
+    // pool".
     expect(serveSource).toContain('process.on("SIGINT"');
     expect(serveSource).toContain('process.on("SIGTERM"');
-    expect(serveSource).toContain("jobWorker.stop()");
-    const stopIndex = serveSource.indexOf("jobWorker.stop()");
-    const poolShutdownIndex = serveSource.indexOf("pool.shutdown()", stopIndex);
+    expect(serveSource).toContain("createShutdownSequence({");
+    expect(serveSource).toContain("runShutdownSequence()");
+    const sequence = serveSource.slice(
+      serveSource.indexOf("createShutdownSequence({"),
+      serveSource.indexOf("});", serveSource.indexOf("createShutdownSequence({")) + 3,
+    );
+    const stopIndex = sequence.indexOf("stopWorker: () => jobWorker.stop()");
+    const poolShutdownIndex = sequence.indexOf("shutdownPool: () => pool.shutdown()");
     expect(stopIndex).toBeGreaterThan(-1);
     expect(poolShutdownIndex).toBeGreaterThan(stopIndex);
+    // The hand-written chain this replaced must not come back alongside it:
+    // a second, independent pool.shutdown() call site would bypass the
+    // sequence's own at-most-once guarantee entirely.
+    expect(serveSource).not.toContain(".then(() => pool.shutdown())");
   });
 });

@@ -514,7 +514,7 @@ export const MAX_CONCURRENT_JOBS = 6;
  * next boot — reintroducing exactly the destroyed-spend bug this bound exists
  * to fix.
  */
-const SHUTDOWN_WAIT_MS = 5_000;
+export const SHUTDOWN_WAIT_MS = 5_000;
 
 /**
  * How long `stop()` waits when NOTHING it could kill is in flight — i.e. every
@@ -552,10 +552,10 @@ const SHUTDOWN_WAIT_MS = 5_000;
  * That is the trade this value makes, chosen deliberately over the previous
  * behaviour of never letting a proxied job finish at all.
  */
-const SHUTDOWN_PROXIED_WAIT_MS = 25_000;
+export const SHUTDOWN_PROXIED_WAIT_MS = 25_000;
 
 /** How long `stop()` waits AFTER killing the orchestrator child, so the tick can ingest its spend and finish the job. */
-const SHUTDOWN_KILL_GRACE_MS = 2_000;
+export const SHUTDOWN_KILL_GRACE_MS = 2_000;
 
 /**
  * The subset of `runs` that can actually be signalled, each paired with its

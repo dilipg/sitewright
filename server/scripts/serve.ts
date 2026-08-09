@@ -21,6 +21,7 @@ import { PreviewPool } from "../src/preview-pool.ts";
 import { createPreviewUpgradeListener } from "../src/preview-upgrade.ts";
 import { createRequestListener } from "../src/router.ts";
 import { deleteExpiredSessions } from "../src/sessions.ts";
+import { createShutdownSequence } from "../src/shutdown.ts";
 import { sweepStaleUsageLogs } from "../src/usage-log-sweep.ts";
 import { findUserByEmail } from "../src/users.ts";
 // Reuses the flag() already fixed twice (server/src/user-cli.ts, applied to
@@ -205,22 +206,39 @@ setInterval(() => {
 
 // Every child must die with the server: an orphaned Vite process holding a
 // port open past this process's own lifetime is exactly the failure
-// preview-pool.ts exists to bound. `shuttingDown` makes this idempotent —
-// some shells deliver both SIGINT and SIGTERM for one Ctrl-C, and a second
-// signal arriving mid-shutdown must not race a second pool.shutdown() against
-// the first.
+// preview-pool.ts exists to bound.
+//
+// The worker stops FIRST, awaiting every run currently in flight
+// (JobWorker.stop()'s own contract — spec decision 13, a job mid-run must not
+// be killed partway; several ticks run concurrently since MAX_CONCURRENT_JOBS,
+// so this is "all of them", not "the one") — only once that settles is it safe
+// to kill preview children, since an in-flight proxied job's own exchange may
+// still depend on one of them.
+//
+// But that ordering must not make cleanup HOSTAGE to the wait, which is what
+// the hand-written chain here used to do — stop(), then the pool, one after
+// the other with no independent bound. stop()'s 25s proxied wait meant a
+// supervisor grace at the 10s floor documented above SIGKILLed this process
+// mid-wait, so the pool was never shut down at all and the children outlived
+// it. createShutdownSequence keeps the ordering and gives
+// cleanup its own independent bound — see shutdown.ts, where the whole
+// guarantee is tested (this file's module body cannot be imported by a unit
+// test at all).
+const runShutdownSequence = createShutdownSequence({
+  stopWorker: () => jobWorker.stop(),
+  shutdownPool: () => pool.shutdown(),
+});
+
+// `shuttingDown` makes this idempotent — some shells deliver both SIGINT and
+// SIGTERM for one Ctrl-C, and a second signal arriving mid-shutdown must not
+// race a second sequence against the first (createShutdownSequence is itself
+// idempotent about the pool, but the log line and the exit are this file's).
 let shuttingDown = false;
 function shutdown(signal: NodeJS.Signals): void {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log(`received ${signal}, killing preview processes...`);
-  // The worker stops FIRST, awaiting whatever tick is currently in flight
-  // (JobWorker.stop()'s own contract — spec decision 13, a job mid-run must
-  // not be killed partway) — only once that settles is it safe to kill
-  // preview children, since an in-flight proxied job's own exchange may
-  // still be depending on one of them.
-  jobWorker.stop()
-    .then(() => pool.shutdown())
+  runShutdownSequence()
     .then(() => process.exit(0))
     .catch((error: unknown) => {
       console.error("error while shutting down preview processes:", error);

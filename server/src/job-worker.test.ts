@@ -20,7 +20,7 @@ import { usageLogPathFor, USAGE_ID_HEADER } from "../../compiler/src/usage-log-p
 import { DisabledUserError, MissingApiKeyError } from "./agent-env.ts";
 import { setApiKey, UndecryptableApiKeyError } from "./api-keys.ts";
 import { openDatabase } from "./db.ts";
-import { JobWorker, orchestratorGeneratedDir } from "./job-worker.ts";
+import { exchangeOverLoopback, JobWorker, LOOPBACK_TOKEN_HEADER, orchestratorGeneratedDir } from "./job-worker.ts";
 import { claimNextJob, createJob, finishJob, findJobById, recordJobRun } from "./jobs.ts";
 import { MASTER_KEY_ENV_VAR } from "./master-key.ts";
 import { createProject, type Project } from "./projects.ts";
@@ -1260,6 +1260,236 @@ describe("JobWorker: re-checks the API key at claim time for billable kinds", ()
       expect(pool.assertApiKeyUsable).not.toHaveBeenCalled();
       expect(upstreamHits).toBe(1);
       expect(findJobById(db, job.id)?.status).toBe("succeeded");
+    } finally {
+      await upstream.close();
+    }
+  });
+});
+
+/**
+ * WHOLE-BRANCH REVIEW, FINDING A — the loopback listener that stands in for a
+ * browser connection had a FIXED authorized identity and no authentication at
+ * all: `forwardToPreview` is closed over one `{user, project}` ctx and
+ * forwards `req.url` verbatim, so any local process that connected during a
+ * 27s-to-15-minute job got an authenticated, authorized channel into that
+ * tenant's Vite child.
+ */
+describe("exchangeOverLoopback: only the request it drives is authorized", () => {
+  it("serves the driven request and 404s a foreign one on the same port, without invoking the handler", async () => {
+    let handlerCalls = 0;
+    let port = 0;
+    let releaseHandler: (() => void) | undefined;
+    const handlerGate = new Promise<void>((res) => { releaseHandler = res; });
+
+    const exchange = exchangeOverLoopback(
+      async (req, res) => {
+        handlerCalls += 1;
+        // The listener's own port, read off the real socket — nothing else
+        // exposes it, which is exactly why a foreign process would have to
+        // scan for it (and, over a minutes-long job, can).
+        port = req.socket.localPort ?? 0;
+        await handlerGate;
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      },
+      "/__regen",
+      JSON.stringify({ section: "home.hero" }),
+    );
+
+    await waitUntil(() => port !== 0);
+
+    // A second, uninvited request to the SAME live port: this is the attack.
+    const foreign = await new Promise<{ status: number }>((resolveForeign, rejectForeign) => {
+      const req = http.request(
+        { hostname: "127.0.0.1", port, path: "/__overrides/home", method: "POST", headers: { "content-type": "application/json" } },
+        (res) => { res.resume(); res.on("end", () => resolveForeign({ status: res.statusCode ?? 0 })); },
+      );
+      req.on("error", rejectForeign);
+      req.end("{}");
+    });
+
+    expect(foreign.status).toBe(404);
+    // The load-bearing half: the foreign request never reached the handler,
+    // so it never reached `forwardToPreview`, the pool, or the child.
+    expect(handlerCalls).toBe(1);
+
+    releaseHandler!();
+    const result = await exchange;
+    expect(result.status).toBe(200);
+    expect(result.body).toBe(JSON.stringify({ ok: true }));
+  });
+
+  it("404s a request presenting a wrong token", async () => {
+    let handlerCalls = 0;
+    let port = 0;
+    let releaseHandler: (() => void) | undefined;
+    const handlerGate = new Promise<void>((res) => { releaseHandler = res; });
+
+    const exchange = exchangeOverLoopback(
+      async (req, res) => {
+        handlerCalls += 1;
+        port = req.socket.localPort ?? 0;
+        await handlerGate;
+        res.writeHead(200);
+        res.end("{}");
+      },
+      "/__regen",
+      "{}",
+    );
+    await waitUntil(() => port !== 0);
+
+    const foreign = await new Promise<{ status: number }>((resolveForeign, rejectForeign) => {
+      const req = http.request(
+        {
+          hostname: "127.0.0.1", port, path: "/__regen", method: "POST",
+          // Right length, wrong value — proves the comparison is on the VALUE,
+          // not merely on the header's presence.
+          headers: { [LOOPBACK_TOKEN_HEADER]: "0".repeat(32) },
+        },
+        (res) => { res.resume(); res.on("end", () => resolveForeign({ status: res.statusCode ?? 0 })); },
+      );
+      req.on("error", rejectForeign);
+      req.end();
+    });
+
+    expect(foreign.status).toBe(404);
+    expect(handlerCalls).toBe(1);
+    releaseHandler!();
+    await exchange;
+  });
+
+  it("does not forward the token on to the handler (and so never to the child)", async () => {
+    let seenToken: unknown = "not-read";
+    const result = await exchangeOverLoopback(
+      (req, res) => {
+        seenToken = req.headers[LOOPBACK_TOKEN_HEADER];
+        res.writeHead(200);
+        res.end("{}");
+      },
+      "/__regen",
+      "{}",
+    );
+    expect(result.status).toBe(200);
+    expect(seenToken).toBeUndefined();
+  });
+});
+
+/**
+ * WHOLE-BRANCH REVIEW, FINDING C — unbounded shutdown, orphaned child,
+ * deleted spend.
+ *
+ * `stop()` awaited the in-flight tick with no timeout (up to ~400s for a
+ * generate, 15 minutes on the proxy timeout), so under any supervisor SIGKILL
+ * landed first; the orchestrator child was never tracked and never killed, so
+ * it outlived the server, kept spending, and kept appending to a usage log
+ * that the next boot's `sweepStaleUsageLogs` unlinks unread.
+ */
+describe("JobWorker: stop() is bounded and terminates the orchestrator child", () => {
+  type FakeChild = EventEmitter & {
+    stdout: EventEmitter; stderr: EventEmitter; kill: (signal?: NodeJS.Signals) => boolean;
+  };
+
+  function fakeChildWith(kill: (signal?: NodeJS.Signals) => boolean): FakeChild {
+    const child = new EventEmitter() as FakeChild;
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.kill = kill;
+    return child;
+  }
+
+  it("returns within its own bound, escalating SIGTERM to SIGKILL, when the child ignores both", async () => {
+    const genProject = createProject(db, user.id, "run-gen", "Run Gen");
+    // Never exits on its own, and ignores SIGTERM — the worst case, and the
+    // one that used to hang stop() forever.
+    const kill = vi.fn((_signal?: NodeJS.Signals) => true);
+    const child = fakeChildWith(kill);
+    let spawned = false;
+    const orchestratorSpawnFn = vi.fn(() => { spawned = true; return child; });
+    createJob(db, {
+      userId: user.id, projectId: genProject.id, kind: "generate",
+      requestJson: JSON.stringify({ brief: "a bakery" }), now: NOW,
+    });
+    const worker = new JobWorker({
+      db, pool: fakePool(), masterKey: MASTER_KEY, projectsRoot: PROJECTS_ROOT,
+      pollIntervalMs: 5, shutdownWaitMs: 40, shutdownKillGraceMs: 40, now: () => NOW,
+      orchestratorSpawnFn,
+    });
+    setApiKey(db, MASTER_KEY, user.id, "sk-ant-key");
+
+    worker.start();
+    await waitUntil(() => spawned);
+
+    const startedAt = Date.now();
+    await worker.stop();
+    const elapsed = Date.now() - startedAt;
+
+    // The bound itself. Generous headroom over 40+40 so this is not a timing
+    // flake, but nowhere near the ~400s a real generate takes — which is the
+    // only thing it needs to discriminate.
+    expect(elapsed).toBeLessThan(5_000);
+    expect(kill).toHaveBeenCalledWith("SIGTERM");
+    expect(kill).toHaveBeenCalledWith("SIGKILL");
+  });
+
+  it("kills the child, and the run's own ingest + finishJob then land inside the grace window", async () => {
+    const genProject = createProject(db, user.id, "run-gen", "Run Gen");
+    // A well-behaved child: SIGTERM makes it exit, which is what lets
+    // runGenerateJob reach its own ingestUsageLog + finishJob rather than
+    // leaving the spend for the next boot's sweeper to delete unread.
+    const kill = vi.fn((signal?: NodeJS.Signals) => { if (signal === "SIGTERM") child.emit("exit", null); return true; });
+    const child: FakeChild = fakeChildWith(kill);
+    let spawned = false;
+    const orchestratorSpawnFn = vi.fn(() => { spawned = true; return child; });
+    const job = createJob(db, {
+      userId: user.id, projectId: genProject.id, kind: "generate",
+      requestJson: JSON.stringify({ brief: "a bakery" }), now: NOW,
+    });
+    const worker = new JobWorker({
+      db, pool: fakePool(), masterKey: MASTER_KEY, projectsRoot: PROJECTS_ROOT,
+      pollIntervalMs: 5, shutdownWaitMs: 40, shutdownKillGraceMs: 2_000, now: () => NOW,
+      orchestratorSpawnFn,
+    });
+    setApiKey(db, MASTER_KEY, user.id, "sk-ant-key");
+
+    worker.start();
+    await waitUntil(() => spawned);
+    await worker.stop();
+
+    expect(kill).toHaveBeenCalledWith("SIGTERM");
+    expect(kill).not.toHaveBeenCalledWith("SIGKILL");
+    // Reached a terminal state under its OWN code path, which is the same
+    // code path that ingests the usage log — not left `running` for
+    // markRunningJobsInterrupted to clean up at the next boot.
+    expect(findJobById(db, job.id)?.status).toBe("failed");
+  });
+
+  it("does not wait out a proxied job's own 15-minute ceiling", async () => {
+    // An upstream that accepts the connection and never answers — exactly
+    // what `PREVIEW_PROXY_TIMEOUT_MS` exists for, and what stop() used to sit
+    // behind for the full 15 minutes.
+    const upstream = await startUpstream(() => { /* never responds */ });
+    const pool = fakePool({
+      acquire: vi.fn(async (): Promise<PreviewProcess> => ({
+        projectId: project.id, port: upstream.port, base: "/", inFlight: 0, lastUsedAt: Date.now(),
+      })),
+    });
+    const job = createJob(db, { userId: user.id, projectId: project.id, kind: "regen", requestJson: "{}", now: NOW });
+    const worker = new JobWorker({
+      db, pool, masterKey: MASTER_KEY, projectsRoot: PROJECTS_ROOT,
+      pollIntervalMs: 5, shutdownWaitMs: 40, shutdownKillGraceMs: 40, now: () => NOW,
+    });
+
+    try {
+      worker.start();
+      await waitUntil(() => (pool.acquire as ReturnType<typeof vi.fn>).mock.calls.length > 0);
+      const startedAt = Date.now();
+      await worker.stop();
+      expect(Date.now() - startedAt).toBeLessThan(5_000);
+      // Still running: nothing here kills a preview child (the pool owns
+      // those, and serve.ts shuts it down immediately after), and the row
+      // becomes `interrupted` on the next boot. What changed is only that
+      // shutdown stopped blocking on it.
+      expect(findJobById(db, job.id)?.status).toBe("running");
     } finally {
       await upstream.close();
     }

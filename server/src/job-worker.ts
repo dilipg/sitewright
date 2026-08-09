@@ -117,7 +117,7 @@
  * only, for the identical reason.
  */
 import { spawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import type { EventEmitter } from "node:events";
 import { mkdirSync, unlinkSync } from "node:fs";
 import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse } from "node:http";
@@ -197,8 +197,38 @@ function extractErrorMessage(body: string, status: number): string {
  * listener, drives ONE request against it with the recorded body, and hands
  * `handler` the resulting real `(req, res)`. The listener is closed the
  * moment that one exchange ends; nothing here is held open past it.
+ *
+ * WHOLE-BRANCH REVIEW, FINDING A — the listener is NOT open to whoever
+ * reaches it. `handler` is `forwardToPreview` closed over a FIXED, already
+ * authorized `{user, project}` ctx, and it forwards `req.url` verbatim into
+ * that tenant's Vite child. A bare `server.listen(0, "127.0.0.1")` therefore
+ * hands ANY other local process that connects during a 27s-to-15-minute job
+ * an authenticated, authorized channel into that tenant: `PUT
+ * /__overrides/...`, `/@fs/...` reads, or another billable `/__regen` on that
+ * user's account. Ephemeral, but discoverable by `ss -ltn` or by brute force
+ * over a minutes-long window — and "an ephemeral port nobody guesses" is not
+ * an authorization decision.
+ *
+ * So every request must carry a per-exchange 128-bit token in
+ * `LOOPBACK_TOKEN_HEADER`, generated here and known only to the one client
+ * request this function itself drives. Anything else gets a 404 (not a 401 or
+ * 403: a foreign connection learns nothing at all about what is listening,
+ * which is also the answer `require-project.ts` already gives a foreign
+ * project id). The header is compared in constant time and then DELETED
+ * before `handler` runs, so it is never forwarded on to the child.
  */
-function exchangeOverLoopback(
+export const LOOPBACK_TOKEN_HEADER = "x-webgen-loopback-token";
+
+/** Constant-time on the equal-length path; a length mismatch is already a miss. */
+function tokenMatches(presented: string | string[] | undefined, expected: string): boolean {
+  if (typeof presented !== "string") return false;
+  const a = Buffer.from(presented, "utf8");
+  const b = Buffer.from(expected, "utf8");
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(a, b);
+}
+
+export function exchangeOverLoopback(
   handler: (req: IncomingMessage, res: ServerResponse) => Promise<void> | void,
   path: string,
   requestBody: string,
@@ -211,7 +241,21 @@ function exchangeOverLoopback(
       fn();
     };
 
+    // Fresh per exchange, never derived from the job or the user: the token
+    // exists only to prove "this is the request this function itself sent",
+    // so it must not be predictable from anything an attacker could know.
+    const token = randomBytes(16).toString("hex");
+
     const server = createServer((req, res) => {
+      if (!tokenMatches(req.headers[LOOPBACK_TOKEN_HEADER], token)) {
+        res.statusCode = 404;
+        res.end();
+        return;
+      }
+      // Never forwarded to the child — the child has no use for it, and the
+      // rule this module follows everywhere else is that nothing internal
+      // leaks outward into a process running unvalidated code.
+      delete req.headers[LOOPBACK_TOKEN_HEADER];
       Promise.resolve(handler(req, res)).catch(() => {
         // `forwardToPreview` does not throw in practice (proxyHttp never
         // rejects, and this module's own `after` hook never throws either —
@@ -236,7 +280,11 @@ function exchangeOverLoopback(
           port,
           path,
           method: "POST",
-          headers: { "content-type": "application/json", "content-length": String(bodyBuf.length) },
+          headers: {
+            "content-type": "application/json",
+            "content-length": String(bodyBuf.length),
+            [LOOPBACK_TOKEN_HEADER]: token,
+          },
         },
         (clientRes) => {
           const chunks: Buffer[] = [];
@@ -280,6 +328,15 @@ interface OrchestratorSpawnedChild {
   readonly stderr: EventEmitter;
   on(event: "exit", listener: (code: number | null) => void): unknown;
   on(event: "error", listener: (err: Error) => void): unknown;
+  /**
+   * Whole-branch review, FINDING C: shutdown has to be able to terminate this
+   * child. Without it the orchestrator survives the server that started it,
+   * keeps spending, and keeps appending to a usage log the next boot's
+   * `sweepStaleUsageLogs` unlinks unread. Optional so an existing test double
+   * that never needed one still satisfies the type; `stop()` treats an absent
+   * `kill` as "nothing I can do" and says so in its log line.
+   */
+  kill?(signal?: NodeJS.Signals): boolean;
 }
 
 type OrchestratorSpawnFn = (
@@ -379,6 +436,45 @@ export function assertProjectsRootMatchesOrchestrator(
 /** How often `start()`'s interval attempts a claim when the queue was empty (or blocked) last time. */
 const DEFAULT_POLL_INTERVAL_MS = 1_000;
 
+/**
+ * WHOLE-BRANCH REVIEW, FINDING C — how long `stop()` waits for the in-flight
+ * tick to finish ON ITS OWN before it starts terminating things.
+ *
+ * `stop()` used to await that tick with no bound at all: up to ~400s for a
+ * generate, or the full 15 minutes of `PREVIEW_PROXY_TIMEOUT_MS` for a
+ * proxied kind. Under any supervisor, SIGKILL lands long before that — so the
+ * "await" bought nothing and the orchestrator child (never tracked, never
+ * killed) simply survived, kept spending, and kept appending to a usage log
+ * that the NEXT boot's `sweepStaleUsageLogs` unlinks unread. A deploy during a
+ * generation destroyed the record of ~$1-2 of real spend.
+ *
+ * Bounded, the sequence becomes: wait this long, then kill the orchestrator
+ * child, then give the tick `SHUTDOWN_KILL_GRACE_MS` more to notice the exit
+ * and run its OWN ingest + `finishJob`. That second window is the point —
+ * killing the child makes `runOrchestratorProcess` resolve, which puts the
+ * spend into `usage_event` instead of leaving it for the sweeper. Total bound:
+ * the two added together, chosen to sit comfortably inside a typical 10-30s
+ * supervisor grace period.
+ */
+const SHUTDOWN_WAIT_MS = 5_000;
+
+/** How long `stop()` waits AFTER killing the orchestrator child, so the tick can ingest its spend and finish the job. */
+const SHUTDOWN_KILL_GRACE_MS = 2_000;
+
+/** Resolves `undefined` if `promise` has not settled within `ms` — mirrors preview-pool.ts's own `raceReadyPromise`. */
+function raceWithTimeout<T>(promise: Promise<T>, ms: number): Promise<T | undefined> {
+  return new Promise((resolve) => {
+    // unref()'d: a shutdown timer must never itself be the reason the process
+    // stays alive, the same rule serve.ts's reaper interval follows.
+    const timer = setTimeout(() => resolve(undefined), ms);
+    timer.unref?.();
+    void promise.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      () => { clearTimeout(timer); resolve(undefined); },
+    );
+  });
+}
+
 /** A generic Error's `.message` only — see `messageOf`. */
 type JobOutcome =
   | { readonly kind: "succeeded"; readonly resultJson: string }
@@ -406,6 +502,10 @@ export interface JobWorkerDeps {
   orchestratorSpawnFn?: OrchestratorSpawnFn;
   /** Defaults to `DEFAULT_POLL_INTERVAL_MS`. */
   pollIntervalMs?: number;
+  /** Defaults to `SHUTDOWN_WAIT_MS`. Overridable so a test can prove the bound exists without waiting 5s for it. */
+  shutdownWaitMs?: number;
+  /** Defaults to `SHUTDOWN_KILL_GRACE_MS`. Same reason. */
+  shutdownKillGraceMs?: number;
   now?: () => number;
   /**
    * Task 7 (resume): stamped onto every job this worker actually runs (see
@@ -428,12 +528,26 @@ export class JobWorker {
   private readonly orchestratorDir: string;
   private readonly orchestratorSpawnFn: OrchestratorSpawnFn;
   private readonly pollIntervalMs: number;
+  private readonly shutdownWaitMs: number;
+  private readonly shutdownKillGraceMs: number;
   private readonly now: () => number;
   private readonly codeVersion: string;
 
   private timer: ReturnType<typeof setInterval> | undefined;
   /** The currently-dispatched tick's promise, tracked so `stop()` can await it — see `stop()`'s own comment. */
   private inFlight: Promise<void> | undefined;
+  /**
+   * The orchestrator subprocess a `generate` job currently has running, if
+   * any — whole-branch review, FINDING C. Tracked for exactly one reason:
+   * `stop()` must be able to terminate it. An untracked child outlives the
+   * server, keeps spending the user's key, and keeps appending to a usage log
+   * the next boot's `sweepStaleUsageLogs` deletes unread. Set for the whole
+   * life of `runOrchestratorProcess` and cleared in the same `finally` that
+   * settles it, so it never names a process that has already exited.
+   */
+  private activeOrchestratorRun:
+    | { child: OrchestratorSpawnedChild; jobId: string; usagePath: string }
+    | undefined;
 
   constructor(deps: JobWorkerDeps) {
     this.db = deps.db;
@@ -447,6 +561,8 @@ export class JobWorker {
     assertProjectsRootMatchesOrchestrator(deps.projectsRoot, this.orchestratorDir);
     this.orchestratorSpawnFn = deps.orchestratorSpawnFn ?? defaultOrchestratorSpawnFn;
     this.pollIntervalMs = deps.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+    this.shutdownWaitMs = deps.shutdownWaitMs ?? SHUTDOWN_WAIT_MS;
+    this.shutdownKillGraceMs = deps.shutdownKillGraceMs ?? SHUTDOWN_KILL_GRACE_MS;
     this.now = deps.now ?? (() => Date.now());
     this.codeVersion = deps.codeVersion ?? resolveCodeVersion();
   }
@@ -495,21 +611,79 @@ export class JobWorker {
   }
 
   /**
-   * Stops arming new ticks and, unlike simply abandoning the worker, AWAITS
+   * Stops arming new ticks and, unlike simply abandoning the worker, awaits
    * whichever tick is currently in flight rather than leaving it to finish
    * (or not) after this promise resolves — a job mid-run at shutdown is
    * exactly the case spec decision 13 says must not be corrupted by being
    * killed partway. Safe to call when nothing is running, or when `start()`
-   * was never called at all.
+   * was never called at all. Idempotent in the sense that matters: a second
+   * call with nothing in flight is a no-op.
+   *
+   * WHOLE-BRANCH REVIEW, FINDING C — that await is now BOUNDED, and the
+   * orchestrator child is killed rather than orphaned.
+   *
+   * The unbounded version was worse than useless. It could wait ~400s for a
+   * generate (or the full 15 minutes of `PREVIEW_PROXY_TIMEOUT_MS` for a
+   * proxied kind), so under any supervisor SIGKILL landed first; the
+   * orchestrator child was never tracked and never killed, so it survived the
+   * server, kept spending, and kept appending to its usage log — which the
+   * NEXT boot's `sweepStaleUsageLogs` unlinks unread. A deploy during a
+   * generation therefore destroyed the record of ~$1-2 of real spend.
+   *
+   * The bounded sequence recovers most of that instead of merely bounding the
+   * damage: wait `shutdownWaitMs` for the tick to finish on its own, then
+   * kill the orchestrator child, then wait `shutdownKillGraceMs` more. That
+   * second window is the load-bearing part — killing the child makes
+   * `runOrchestratorProcess` resolve, so `runGenerateJob` runs its OWN
+   * `ingestUsageLog` and `finishJob` and the spend lands in `usage_event`
+   * rather than being swept away at next boot.
+   *
+   * A PROXIED job in flight is deliberately not killed here: its work runs in
+   * a preview child that `scripts/serve.ts` kills immediately afterwards via
+   * `pool.shutdown()`, and its row becomes `interrupted` on the next boot
+   * (`markRunningJobsInterrupted`) — the designed recovery. What changed for
+   * it is only that shutdown no longer blocks on it for up to 15 minutes.
    */
   async stop(): Promise<void> {
     if (this.timer !== undefined) {
       clearInterval(this.timer);
       this.timer = undefined;
     }
-    if (this.inFlight !== undefined) {
-      await this.inFlight;
+    if (this.inFlight === undefined) return;
+
+    if (await raceWithTimeout(this.inFlight.then(() => true), this.shutdownWaitMs) === true) return;
+
+    const run = this.activeOrchestratorRun;
+    if (run === undefined) {
+      // A proxied job still going. Nothing here owns a process to kill (the
+      // preview child belongs to the pool, which serve.ts shuts down next),
+      // so this is where shutdown stops waiting.
+      console.warn(
+        `[job-worker] shutdown: a job is still running after ${String(this.shutdownWaitMs)}ms; `
+        + "leaving it — it will be marked interrupted on the next boot",
+      );
+      return;
     }
+
+    if (typeof run.child.kill !== "function") {
+      console.error(
+        `[job-worker] shutdown: orchestrator child for job ${run.jobId} cannot be killed (no kill()); `
+        + `spend in ${run.usagePath} may go unrecorded`,
+      );
+      return;
+    }
+    run.child.kill("SIGTERM");
+    if (await raceWithTimeout(this.inFlight.then(() => true), this.shutdownKillGraceMs) === true) return;
+    // It did not exit within the grace period, so its spend is NOT ingested
+    // and the next boot's sweeper will delete the log unread. Named loudly
+    // because that is real money whose record is about to be lost, and this
+    // line is the only trace of it an operator will ever get.
+    run.child.kill("SIGKILL");
+    console.error(
+      `[job-worker] shutdown: orchestrator child for job ${run.jobId} did not exit within `
+      + `${String(this.shutdownKillGraceMs)}ms of SIGTERM; killed. Spend recorded in ${run.usagePath} `
+      + "will be swept unread on the next boot and will NOT be billed",
+    );
   }
 
   /**
@@ -795,7 +969,7 @@ export class JobWorker {
         "run", "python", "-m", "orchestrator.acceptance",
         "--brief", brief,
         "--run-id", runId,
-      ]);
+      ], { jobId: job.id, usagePath });
     } catch (err) {
       // The process never started at all (e.g. `uv` missing from PATH) --
       // nothing ran, so there is nothing to ingest, matching the proxied
@@ -833,12 +1007,27 @@ export class JobWorker {
     return { kind: "succeeded", resultJson: JSON.stringify({ stdout: safeStdout.slice(-4000) }) };
   }
 
+  /**
+   * `track` is what `stop()` needs to be able to terminate this child
+   * (whole-branch review, FINDING C). It is registered synchronously, the
+   * moment the child exists, and cleared when the promise settles — either
+   * way — so `activeOrchestratorRun` never names a process that has already
+   * gone. Only ONE can be live at a time, which is a real property rather
+   * than an assumption: `start()`'s ticks never overlap, and a `generate` is
+   * the whole of its own tick.
+   */
   private runOrchestratorProcess(
     env: NodeJS.ProcessEnv,
     args: string[],
+    track: { jobId: string; usagePath: string },
   ): Promise<{ stdout: string; stderr: string; code: number | null }> {
     return new Promise((resolve, reject) => {
       const child = this.orchestratorSpawnFn("uv", args, { cwd: this.orchestratorDir, env });
+      this.activeOrchestratorRun = { child, jobId: track.jobId, usagePath: track.usagePath };
+      const settle = (fn: () => void): void => {
+        this.activeOrchestratorRun = undefined;
+        fn();
+      };
       let stdout = "";
       let stderr = "";
       child.stdout.on("data", (chunk: Buffer | string) => {
@@ -847,8 +1036,8 @@ export class JobWorker {
       child.stderr.on("data", (chunk: Buffer | string) => {
         stderr += chunk.toString();
       });
-      child.on("error", (err: Error) => reject(err));
-      child.on("exit", (code: number | null) => resolve({ stdout, stderr, code }));
+      child.on("error", (err: Error) => settle(() => reject(err)));
+      child.on("exit", (code: number | null) => settle(() => resolve({ stdout, stderr, code })));
     });
   }
 }

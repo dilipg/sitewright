@@ -343,3 +343,78 @@ test("the preview frame stays interactive while a job is queued/running -- only 
   // a different route's frame is unaffected and fully addressable
   await expect(previewFrameLocator(page).locator('[data-node-id="home.hero.headline"]')).toBeVisible();
 });
+
+/* ---------- a 401 is a session expiring, not a job failure and not the
+   interrupted banner (task-8: hosted mode) ----------
+ * The LOCAL server this whole suite runs against never answers 401 (it has
+ * no session at all), so both scenarios below are entirely synthetic route
+ * interception -- exactly the same technique this file's own header
+ * comment describes for 202/interrupted/etc. What is real is the editor's
+ * OWN handling of a 401 wherever it originates: `App.tsx`'s
+ * `sessionAwareFetch` (passed as `enqueueAndPoll`'s `fetchImpl`) throws a
+ * `SessionExpiredError` the instant either the initial enqueue POST or a
+ * poll GET answers 401, before either ever reaches the generic
+ * outcome/failure handling. */
+
+test("a 401 mid-poll surfaces as its own honest 'session expired' banner, never a job failure and never the interrupted banner", async ({
+  page,
+}) => {
+  await page.route("**/__regen", (route) =>
+    route.fulfill({ status: 202, contentType: "application/json", body: JSON.stringify({ jobId: "job-401-poll" }) }),
+  );
+  await page.route("**/api/jobs/job-401-poll", (route) =>
+    route.fulfill({ status: 401, contentType: "application/json", body: JSON.stringify({ error: "not authenticated" }) }),
+  );
+  await openRegenPrompt(page);
+
+  const banner = page.getByTestId("session-expired-banner");
+  await expect(banner).toBeVisible({ timeout: 15_000 });
+  await expect(banner).toContainText(/session expired/i);
+  // NOT a job failure, and NOT confused with a server-restart interruption
+  await expect(page.getByTestId("regen-failure")).toHaveCount(0);
+  await expect(page.getByTestId("job-interrupted-banner")).toHaveCount(0);
+  // the regen prompt returns to idle rather than staying stuck "Running…"
+  await expect(page.getByTestId("regen-progress")).toHaveCount(0);
+
+  await page.getByTestId("session-expired-dismiss").click();
+  await expect(banner).toBeHidden();
+});
+
+test("a 401 at the INITIAL enqueue (session already expired before the click) also surfaces the session-expired banner, not a generic export failure", async ({
+  page,
+}) => {
+  // Never answers 202 at all -- this is the case enqueueAndPoll's own
+  // non-202 branch would otherwise treat as "the body is the outcome",
+  // which is exactly the fabricated-outcome trap sessionAwareFetch exists
+  // to intercept before that branch ever runs.
+  await page.route("**/__export", (route) =>
+    route.fulfill({ status: 401, contentType: "application/json", body: JSON.stringify({ error: "not authenticated" }) }),
+  );
+  await openEditor(page);
+  await page.getByTestId("export-button").click();
+
+  const banner = page.getByTestId("session-expired-banner");
+  await expect(banner).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByTestId("export-failed-title")).toHaveCount(0);
+  await expect(page.getByTestId("export-panel")).toHaveCount(0);
+  // the button returns to idle rather than staying stuck "Exporting…"
+  await expect(page.getByTestId("export-button")).toHaveText("Export");
+});
+
+test("a stale session-expired banner clears once the SAME flow is retried and succeeds", async ({ page }) => {
+  await page.route("**/__regen", (route) =>
+    route.fulfill({ status: 401, contentType: "application/json", body: JSON.stringify({ error: "not authenticated" }) }),
+  );
+  await openRegenPrompt(page);
+
+  const banner = page.getByTestId("session-expired-banner");
+  await expect(banner).toBeVisible({ timeout: 15_000 });
+
+  await page.unroute("**/__regen");
+  await fakeJob(page, "/__regen", "job-after-relogin", () => ({ status: "succeeded", result: { passed: true } }));
+  await selectNode(page, "home.hero");
+  await page.getByTestId("regen-button").click();
+  await page.getByTestId("regen-confirm").click();
+
+  await expect(banner).toBeHidden({ timeout: 15_000 });
+});

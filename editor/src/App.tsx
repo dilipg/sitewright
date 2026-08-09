@@ -31,6 +31,7 @@ import {
   splitOverridesByRoute,
   zoomAt,
 } from "./lib/canvas";
+import { backend } from "./lib/backend";
 import { applyEditOperations, interpretEditResult, validateEditOperations } from "./lib/edit-ops";
 import type { EditPromptResponse } from "./lib/edit-ops";
 import { expandStyleValue } from "./lib/inventory";
@@ -59,12 +60,6 @@ import type { TokensJson } from "./lib/tokens";
 import { nearestSpaceStep, tokenPathSet } from "./lib/tokens";
 import "./App.css";
 
-// guarded: unit tests import this module in a windowless environment
-const PREVIEW_URL =
-  typeof window === "undefined"
-    ? "http://localhost:5273"
-    : (new URLSearchParams(window.location.search).get("preview") ?? "http://localhost:5273");
-
 type ShimStatus = "connecting" | "ready" | "version-mismatch";
 type SaveStatus = "Loading…" | "Saving…" | "Saved";
 
@@ -91,6 +86,49 @@ const ZOOM_WHEEL_SENSITIVITY = 0.002;
  */
 const JOB_INTERRUPTED_MESSAGE =
   "The server restarted while this was running, so the outcome is unknown. Check the page to see whether the change went through before trying again.";
+
+/**
+ * Thrown by `sessionAwareFetch` in place of ever letting a 401 reach
+ * `enqueueAndPoll`'s own response handling (task-8 brief, hosted mode). A
+ * hosted session can lapse mid-run -- a job runs for minutes, and a tab may
+ * sit open far longer -- and a 401 must surface as ITS OWN honest state,
+ * never as a generic job failure and never silently retried. Without this,
+ * a 401 would land in one of two equally wrong places: at the INITIAL
+ * enqueue POST, `enqueueAndPoll` treats any non-202 status as "the body IS
+ * the outcome" (by design, for the local server's synchronous 200s and a
+ * hosted refusal answered before a job exists), so a 401's `{error: "not
+ * authenticated"}` body would be read as a normal outcome and reported
+ * through whichever flow's own generic failure panel happened to be
+ * asking; MID-POLL, a non-ok response already makes `enqueueAndPoll` reject
+ * with a bare, unstructured Error, indistinguishable from a dead job row or
+ * a transient 500. This class makes the one case that actually means
+ * "your session expired" identifiable by TYPE rather than by parsing
+ * either of those generic shapes.
+ */
+class SessionExpiredError extends Error {
+  constructor() {
+    super("session expired");
+    this.name = "SessionExpiredError";
+  }
+}
+
+/**
+ * Passed as `enqueueAndPoll`'s `fetchImpl` for every job-backed flow.
+ * `enqueueAndPoll` uses the SAME fetch reference for both the initial
+ * enqueue POST and every poll GET (jobs.ts's own `doFetch`), so wrapping it
+ * here catches a 401 at either point with one function -- no change to
+ * jobs.ts itself, which already exposes `fetchImpl` (today only documented
+ * as a test seam) as exactly the injection point this needs. Never fires
+ * against the local, unauthenticated preview server, which has no session
+ * and never answers 401.
+ */
+async function sessionAwareFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  const response = await fetch(input, init);
+  if (response.status === 401) throw new SessionExpiredError();
+  return response;
+}
+
+const SESSION_EXPIRED_MESSAGE = "Your session expired — sign in again.";
 
 /** Nearest active manifest node at or above the given ID. */
 function selectableId(nodeId: string, manifest: Manifest | null): string | undefined {
@@ -204,6 +242,12 @@ export default function App() {
   // component already renders with failure-specific language ("Regeneration
   // failed", "Export failed — nothing was shipped") that would be untrue here.
   const [jobNotice, setJobNotice] = useState<string | undefined>(undefined);
+  // A 401 from a job-backed flow (SessionExpiredError, above) is its own
+  // honest state, distinct from both `jobNotice` (server-restart, work may
+  // have landed) and any flow's own "failed" phase (the work definitely did
+  // not land) -- there is no login page to send the user to (task-8 brief),
+  // so this only ever surfaces, it never auto-recovers.
+  const [sessionExpired, setSessionExpired] = useState(false);
 
   const manifestRef = useRef<Manifest | null>(null);
   const historyRef = useRef<History | null>(null);
@@ -265,7 +309,7 @@ export default function App() {
   useEffect(() => {
     async function bootstrap() {
       // an unapproved plan gates the whole editor (generation spend gate)
-      const plan = (await fetch(`${PREVIEW_URL}/__plan`, { cache: "no-store" }).then((r) =>
+      const plan = (await fetch(backend.apiUrl("/__plan"), { cache: "no-store" }).then((r) =>
         r.json(),
       )) as { exists: boolean; approved: boolean; brief?: PlanBrief; siteplan?: { routes: PlanRoute[] } };
       if (plan.exists && !plan.approved && plan.brief !== undefined && plan.siteplan !== undefined) {
@@ -273,8 +317,8 @@ export default function App() {
       }
 
       const [manifestJson, tokensJson] = await Promise.all([
-        fetch(`${PREVIEW_URL}/manifest.json`).then((r) => r.json() as Promise<Manifest>),
-        fetch(`${PREVIEW_URL}/src/tokens/tokens.json`).then((r) => r.json() as Promise<TokensJson>),
+        fetch(backend.previewUrl("/manifest.json")).then((r) => r.json() as Promise<Manifest>),
+        fetch(backend.previewUrl("/src/tokens/tokens.json")).then((r) => r.json() as Promise<TokensJson>),
       ]);
       manifestRef.current = manifestJson;
       setManifest(manifestJson);
@@ -283,9 +327,9 @@ export default function App() {
       const routeList = routesFromManifest(manifestJson);
       const [overrideFiles, historyFile] = await Promise.all([
         Promise.all(
-          routeList.map((route) => fetch(`${PREVIEW_URL}/__overrides/${route.slug}`).then((r) => r.json())),
+          routeList.map((route) => fetch(backend.apiUrl(`/__overrides/${route.slug}`)).then((r) => r.json())),
         ),
-        fetch(`${PREVIEW_URL}/__overrides-history`).then((r) => r.json()),
+        fetch(backend.apiUrl("/__overrides-history")).then((r) => r.json()),
       ]);
       const mergedOverrides: OverridesMap = Object.assign({}, ...overrideFiles.map(fromOverrideFile));
       const persisted =
@@ -503,14 +547,14 @@ export default function App() {
   ): Promise<void> {
     await Promise.all(
       routeList.map((route) =>
-        fetch(`${PREVIEW_URL}/__overrides/${route.slug}`, {
+        fetch(backend.apiUrl(`/__overrides/${route.slug}`), {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(toOverrideFile(grouped[route.slug] ?? {}, route.path)),
         }),
       ),
     );
-    await fetch(`${PREVIEW_URL}/__overrides-history`, {
+    await fetch(backend.apiUrl("/__overrides-history"), {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -556,13 +600,15 @@ export default function App() {
     if (route === undefined || manifest === null || tokens === null || history === null) return;
     const instruction = editDraft;
     editPromptStartedAtRef.current = Date.now();
-    // A stale interrupted-banner from an earlier run must not linger once
-    // the user is visibly acting on this flow again (task-4 review).
+    // A stale interrupted-banner (or session-expired banner) from an earlier
+    // run must not linger once the user is visibly acting on this flow
+    // again (task-4 review; extended to session-expiry by task-8).
     setJobNotice(undefined);
+    setSessionExpired(false);
     setEditPrompt({ phase: "running", elapsedMs: 0 });
     try {
       const job = await enqueueAndPoll(
-        `${PREVIEW_URL}/__edit-prompt`,
+        backend.apiUrl("/__edit-prompt"),
         { route, instruction, selection: selectedId },
         {
           onStatus: (update) =>
@@ -571,6 +617,7 @@ export default function App() {
                 ? { ...current, elapsedMs: Math.max(current.elapsedMs, update.elapsedMs) }
                 : current,
             ),
+          fetchImpl: sessionAwareFetch,
         },
       );
       if (job.status === "interrupted") {
@@ -607,6 +654,11 @@ export default function App() {
         applied: ops.map((op) => `${op.op} ${op.nodeId ?? op.route ?? ""}`),
       });
     } catch (error) {
+      if (error instanceof SessionExpiredError) {
+        setSessionExpired(true);
+        setEditPrompt({ phase: "idle" });
+        return;
+      }
       setEditPrompt({ phase: "rejected", errors: [String(error)] });
     }
   }
@@ -835,7 +887,7 @@ export default function App() {
    *  must position a node the manifest only just gained) cannot read them from
    *  the closure it was called in. */
   async function refreshManifest(): Promise<Manifest> {
-    const loaded = (await fetch(`${PREVIEW_URL}/manifest.json`, { cache: "no-store" }).then((r) =>
+    const loaded = (await fetch(backend.previewUrl("/manifest.json"), { cache: "no-store" }).then((r) =>
       r.json(),
     )) as Manifest;
     manifestRef.current = loaded;
@@ -850,7 +902,7 @@ export default function App() {
     const frame = iframeRefs.current[slug];
     const routePath = routes.find((route) => route.slug === slug)?.path ?? "/";
     if (frame !== null && frame !== undefined) {
-      frame.src = `${PREVIEW_URL}${routePath}?regen=${Date.now()}`;
+      frame.src = backend.previewUrl(`${routePath}?regen=${Date.now()}`);
     }
   }
 
@@ -877,7 +929,11 @@ export default function App() {
   function openAddSection(route: string, afterSection: string | undefined) {
     setAddSection({ phase: "picking", route, afterSection, instruction: "" });
     if (archetypes.length === 0) {
-      void fetch(`${PREVIEW_URL}/__archetypes`)
+      // Previously called with no `?project=` at all (a known open defect,
+      // CLAUDE.md) -- harmless only because the editor was never hosted.
+      // Routing it through `backend.apiUrl` like every other endpoint is
+      // what fixes it.
+      void fetch(backend.apiUrl("/__archetypes"))
         .then((response) => response.json() as Promise<{ archetypes?: Archetype[] }>)
         .then((body) => setArchetypes(body.archetypes ?? []))
         .catch(() => setArchetypes([]));
@@ -889,10 +945,11 @@ export default function App() {
     const { route, afterSection, archetype, instruction } = addSection;
     addSectionStartedAtRef.current = Date.now();
     setJobNotice(undefined);
+    setSessionExpired(false);
     setAddSection({ phase: "running", route, elapsedMs: 0 });
     try {
       const job = await enqueueAndPoll(
-        `${PREVIEW_URL}/__add-section`,
+        backend.apiUrl("/__add-section"),
         { route, archetype, instruction },
         {
           onStatus: (update) =>
@@ -901,6 +958,7 @@ export default function App() {
                 ? { ...current, elapsedMs: Math.max(current.elapsedMs, update.elapsedMs) }
                 : current,
             ),
+          fetchImpl: sessionAwareFetch,
         },
       );
       if (job.status === "interrupted") {
@@ -955,6 +1013,11 @@ export default function App() {
       setSelectedId(outcome.sectionId);
       reloadPreview(route);
     } catch (error) {
+      if (error instanceof SessionExpiredError) {
+        setSessionExpired(true);
+        setAddSection(null);
+        return;
+      }
       setAddSection({ phase: "failed", route, report: String(error) });
     }
   }
@@ -968,13 +1031,17 @@ export default function App() {
     const { section, instruction, scope } = regen;
     regenStartedAtRef.current = Date.now();
     setJobNotice(undefined);
+    setSessionExpired(false);
     setRegen({ phase: "running", section, scope });
     setRegenElapsedMs(0);
     try {
       const job = await enqueueAndPoll(
-        `${PREVIEW_URL}${scope === "page" ? "/__regen-page" : "/__regen"}`,
+        backend.apiUrl(scope === "page" ? "/__regen-page" : "/__regen"),
         scope === "page" ? { route: section, instruction } : { section, instruction },
-        { onStatus: (update) => setRegenElapsedMs((ms) => Math.max(ms, update.elapsedMs)) },
+        {
+          onStatus: (update) => setRegenElapsedMs((ms) => Math.max(ms, update.elapsedMs)),
+          fetchImpl: sessionAwareFetch,
+        },
       );
       if (job.status === "interrupted") {
         setJobNotice(JOB_INTERRUPTED_MESSAGE);
@@ -1009,13 +1076,18 @@ export default function App() {
       setRegen({ phase: "idle" });
       reloadPreview(section);
     } catch (error) {
+      if (error instanceof SessionExpiredError) {
+        setSessionExpired(true);
+        setRegen({ phase: "idle" });
+        return;
+      }
       setRegen({ phase: "failed", section, scope, report: String(error), instruction });
     }
   }
 
   async function revertRegen() {
     if (revertSection === undefined) return;
-    await fetch(`${PREVIEW_URL}/__regen-revert`, {
+    await fetch(backend.apiUrl("/__regen-revert"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ section: revertSection }),
@@ -1038,7 +1110,7 @@ export default function App() {
   }
 
   function editPlanBrief(routeSlug: string, sectionSlug: string, brief: string) {
-    void fetch(`${PREVIEW_URL}/__plan/section-brief`, {
+    void fetch(backend.apiUrl("/__plan/section-brief"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ routeSlug, sectionSlug, brief }),
@@ -1052,7 +1124,7 @@ export default function App() {
   }
 
   async function approvePlan() {
-    await fetch(`${PREVIEW_URL}/__plan/approve`, { method: "POST" });
+    await fetch(backend.apiUrl("/__plan/approve"), { method: "POST" });
     setPendingPlan(null);
   }
 
@@ -1064,6 +1136,7 @@ export default function App() {
     setExportState("running");
     exportStartedAtRef.current = Date.now();
     setJobNotice(undefined);
+    setSessionExpired(false);
     setExportElapsedMs(0);
     try {
       if (history !== null && routes.length > 0) {
@@ -1071,9 +1144,12 @@ export default function App() {
         setSaveStatus("Saved");
       }
       const job = await enqueueAndPoll(
-        `${PREVIEW_URL}/__export`,
+        backend.apiUrl("/__export"),
         {},
-        { onStatus: (update) => setExportElapsedMs((ms) => Math.max(ms, update.elapsedMs)) },
+        {
+          onStatus: (update) => setExportElapsedMs((ms) => Math.max(ms, update.elapsedMs)),
+          fetchImpl: sessionAwareFetch,
+        },
       );
       if (job.status === "interrupted") {
         setJobNotice(JOB_INTERRUPTED_MESSAGE);
@@ -1096,19 +1172,26 @@ export default function App() {
         // only thing standing between this and a crash.
         throw new Error("job succeeded but returned no result");
       }
-      // A hosted-server refusal answered BEFORE a job was ever created
-      // (e.g. a session expiring between opening the editor and clicking
-      // Export) reaches here as `{error: "..."}` with no `ok` field —
-      // enqueueAndPoll's non-202 branch hands back exactly that body, since
-      // it has no way to know this endpoint's outcome is export-shaped.
-      // Mapped into a real ExportFailure rather than rendering a blank
-      // "Export failed" with no message.
+      // A hosted-server refusal answered BEFORE a job was ever created (e.g.
+      // 402 over the spend cap, 429 over the per-user job bound) reaches
+      // here as `{error: "..."}` with no `ok` field — enqueueAndPoll's
+      // non-202 branch hands back exactly that body, since it has no way to
+      // know this endpoint's outcome is export-shaped. Mapped into a real
+      // ExportFailure rather than rendering a blank "Export failed" with no
+      // message. NOT how a 401 (a session expiring) reaches this function
+      // any more — `sessionAwareFetch` (task-8) intercepts that one before
+      // enqueueAndPoll ever sees it, so it lands in the `catch` block below
+      // as a `SessionExpiredError` instead of a `{error: "..."}` result.
       setExportOutcome(
         result.ok === undefined && typeof result.error === "string"
           ? { ok: false, message: result.error }
           : (result as ExportOutcome),
       );
     } catch (error) {
+      if (error instanceof SessionExpiredError) {
+        setSessionExpired(true);
+        return;
+      }
       setExportOutcome({ ok: false, message: `Export request failed: ${String(error)}` });
     } finally {
       setExportState("idle");
@@ -1322,7 +1405,7 @@ export default function App() {
                       }}
                       title={`preview-${route.slug}`}
                       data-route-slug={route.slug}
-                      src={`${PREVIEW_URL}${route.path}`}
+                      src={backend.previewUrl(route.path)}
                       className="preview-frame"
                       style={{ height: FRAME_HEIGHT }}
                     />
@@ -1601,7 +1684,7 @@ export default function App() {
       {exportOutcome !== null && (
         <ExportPanel
           outcome={exportOutcome}
-          downloadUrl={`${PREVIEW_URL}/__export-download`}
+          downloadUrl={backend.apiUrl("/__export-download")}
           onClose={() => setExportOutcome(null)}
           onRetry={() => void runExport()}
         />
@@ -1625,6 +1708,29 @@ export default function App() {
         <div data-testid="job-interrupted-banner" className="job-interrupted-banner">
           <span>{jobNotice}</span>
           <button type="button" data-testid="job-interrupted-dismiss" onClick={() => setJobNotice(undefined)}>
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      {/* A 401 from a job-backed flow (task-8 brief) is its own honest
+          state -- distinct from `jobNotice` above (the work may have
+          landed) AND from any flow's own "failed" phase (the work
+          definitely did not land): the session merely lapsed, and there is
+          no login page to send the user to yet, so this only ever
+          surfaces. Same visual treatment as `job-interrupted-banner`
+          (persistent, dismiss-only, above every other overlay) but its own
+          testid and message -- reusing that one's would make a real session
+          expiry indistinguishable from a server restart in anything that
+          asserts on it. */}
+      {sessionExpired && (
+        <div data-testid="session-expired-banner" className="job-interrupted-banner">
+          <span>{SESSION_EXPIRED_MESSAGE}</span>
+          <button
+            type="button"
+            data-testid="session-expired-dismiss"
+            onClick={() => setSessionExpired(false)}
+          >
             Dismiss
           </button>
         </div>

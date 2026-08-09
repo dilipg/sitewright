@@ -367,4 +367,22 @@ describe("scripts/serve.ts — job worker wiring (task 3)", () => {
     // sequence's own at-most-once guarantee entirely.
     expect(serveSource).not.toContain(".then(() => pool.shutdown())");
   });
+
+  it("derives BOTH shutdown deadlines from the one operator-declared grace", () => {
+    // shutdown-budget.ts's whole reason to exist: the job worker's proxied
+    // wait and the preview watchdog defeat each other when they are two
+    // independent guesses (a watchdog that fires first kills the child the
+    // waiting job depends on). That only holds if this root actually threads
+    // ONE budget into BOTH, rather than letting either fall back to its own
+    // module default.
+    expect(serveSource).toContain("loadShutdownBudget()");
+    expect(serveSource).toContain("shutdownProxiedWaitMs: shutdownBudget.proxiedWaitMs");
+    expect(serveSource).toContain("watchdogMs: shutdownBudget.watchdogMs");
+    // Loaded before either consumer is constructed — a throw from it must be a
+    // failed boot, not a half-built server.
+    const loadIndex = serveSource.indexOf("loadShutdownBudget()");
+    expect(loadIndex).toBeGreaterThan(-1);
+    expect(serveSource.indexOf("new JobWorker(")).toBeGreaterThan(loadIndex);
+    expect(serveSource.indexOf("createShutdownSequence({")).toBeGreaterThan(loadIndex);
+  });
 });

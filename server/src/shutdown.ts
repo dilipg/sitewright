@@ -22,21 +22,27 @@
  *     survive holding ports — and whatever orchestrator subprocess one of them
  *     spawned keeps spending against a usage log the next boot sweeps unread.
  *
- * Chained, a 25s wait under a supervisor grace at the documented 10s floor
- * (`serve.ts`'s own comment says "a typical 10-30s supervisor grace") means
- * SIGKILL lands DURING the wait and `pool.shutdown()` never runs at all —
- * strictly worse than the 5s behaviour it replaced. Decoupled, cleanup gets its
+ * Chained, a wait longer than the supervisor's grace means SIGKILL lands DURING
+ * the wait and `pool.shutdown()` never runs at all. Decoupled, cleanup gets its
  * own bound: a watchdog armed the moment shutdown begins, which force-runs
  * `shutdownPool` at `POOL_CLEANUP_WATCHDOG_MS` if the worker has not returned
  * by then.
  *
- * KILLING PREVIEW CHILDREN WHILE A PROXIED JOB IS STILL WAITING IS THE
- * WATCHDOG'S INTENDED OUTCOME, NOT A BUG — stated here because it looks like
- * one and the next reader will be tempted to "fix" it back. By the time the
- * watchdog fires, the grace is nearly exhausted on the floor this process must
- * assume; a job that dies mid-run becomes an honest `interrupted` row at the
- * next boot (`markRunningJobsInterrupted`), which is a designed, recoverable
- * state, whereas an orphaned child is an unbounded one nothing ever cleans up.
+ * THE WATCHDOG IS A BACKSTOP, NOT A COMPETITOR — and getting that wrong once is
+ * why `shutdown-budget.ts` exists. A watchdog bound SHORTER than the wait it
+ * is protecting against kills the preview child the waiting job depends on, so
+ * the wait can never pay off under any grace. Every deadline is therefore
+ * derived from one operator-declared number, preserving
+ * `proxiedWaitMs < watchdogMs < graceMs`: `stop()` returns on its own first,
+ * and this fires only if it overruns its own bound entirely.
+ *
+ * IT STILL FIRES SOMETIMES, AND KILLING PREVIEW CHILDREN WHILE A JOB IS IN
+ * FLIGHT IS THEN THE INTENDED OUTCOME, NOT A BUG — stated because it looks like
+ * one and the next reader will be tempted to "fix" it back. At that point the
+ * grace is nearly exhausted; a job that dies mid-run becomes an honest
+ * `interrupted` row at the next boot (`markRunningJobsInterrupted`), a
+ * designed and resumable state, whereas an orphaned child is an unbounded one
+ * nothing ever cleans up.
  *
  * Cleanup runs AT MOST ONCE (`cleanupOnce` memoises the promise, not a
  * boolean, so a concurrent watchdog and normal path await the same call), and
@@ -44,26 +50,25 @@
  * re-thrown afterwards rather than swallowed, so `serve.ts` still exits
  * non-zero for it.
  */
+import { DEFAULT_SHUTDOWN_GRACE_MS, deriveShutdownBudget } from "./shutdown-budget.ts";
 
 /**
  * How long shutdown will wait for the job worker before killing preview
- * children anyway.
+ * children anyway — the DEFAULT only, for a caller that declares no grace.
+ * `scripts/serve.ts` passes the value derived from the operator's own
+ * `WEBGEN_SHUTDOWN_GRACE_MS` instead.
  *
- * Comfortably inside the 10s floor of the "typical 10-30s supervisor grace"
- * `scripts/serve.ts` documents, with ~2s left for the kills themselves and for
- * `process.exit`. Two ordering relationships make this number work, and both
- * are pinned by tests in shutdown.test.ts rather than left to inspection:
- *
- *   - It must be LESS than `SHUTDOWN_PROXIED_WAIT_MS`, or the decoupling
- *     silently stops working: a watchdog that can never fire before the wait
- *     it is protecting against is not a watchdog.
- *   - It must be at least `SHUTDOWN_WAIT_MS + SHUTDOWN_KILL_GRACE_MS` (5s + 2s
- *     = 7s), so a tracked orchestrator run's WHOLE SIGTERM-plus-recovery
- *     sequence — the path that puts ~$1-2 of real spend into `usage_event`
- *     instead of leaving it for the sweeper — completes before the watchdog
- *     would ever cut it short.
+ * At the documented 10s floor this is 8000ms, leaving `CLEANUP_RESERVE_MS` for
+ * the kills themselves and `process.exit`. Three ordering relationships make it
+ * work, all pinned by tests in shutdown.test.ts rather than left to inspection:
+ * it is GREATER than `SHUTDOWN_PROXIED_WAIT_MS` (so the job's own wait expires
+ * first and this stays a backstop), LESS than the grace (so cleanup finishes),
+ * and at least `SHUTDOWN_WAIT_MS + SHUTDOWN_KILL_GRACE_MS` (5s + 2s = 7s), so a
+ * tracked orchestrator run's WHOLE SIGTERM-plus-recovery sequence — the path
+ * that puts ~$1-2 of real spend into `usage_event` instead of leaving it for
+ * the sweeper — completes before this could ever cut it short.
  */
-export const POOL_CLEANUP_WATCHDOG_MS = 8_000;
+export const POOL_CLEANUP_WATCHDOG_MS = deriveShutdownBudget(DEFAULT_SHUTDOWN_GRACE_MS).watchdogMs;
 
 export interface ShutdownSequenceDeps {
   /** `JobWorker.stop()` — bounded by its own two waits, see job-worker.ts. */

@@ -152,6 +152,7 @@ import { findProjectById } from "./projects.ts";
 import { forwardToPreview } from "./preview-forward.ts";
 import { type PreviewPool } from "./preview-pool.ts";
 import { redactSecrets } from "./redact.ts";
+import { DEFAULT_SHUTDOWN_GRACE_MS, deriveShutdownBudget } from "./shutdown-budget.ts";
 import { findUserById } from "./users.ts";
 
 /** Every `JobKind` except `generate` — the five that proxy to a project's own preview child. */
@@ -538,21 +539,24 @@ export const SHUTDOWN_WAIT_MS = 5_000;
  * inside this window bills itself, and one that does not leaves its log to
  * `usage-log-sweep.ts` exactly as it does today.
  *
- * 25s and not 30: it has to sit INSIDE a typical 30s grace with room left for
- * `pool.shutdown()` and process exit AFTER it, so the shutdown actually
- * completes rather than being SIGKILLed one step from the end.
+ * HOW LONG IT ACTUALLY IS IS NOT THIS MODULE'S CHOICE. It is DERIVED from the
+ * supervisor grace the operator declares (`shutdown-budget.ts`,
+ * `WEBGEN_SHUTDOWN_GRACE_MS`), and `scripts/serve.ts` passes the derived value
+ * in explicitly. The constant here is only the default for a caller that
+ * declares nothing — the documented 10s floor, which yields 5000ms.
  *
- * Stated precisely rather than rounded up, because 25 < 27: this does NOT
- * guarantee that a regen STARTING at the instant of shutdown finishes. What it
- * buys is a regen already partway through — the common case, since a job in
- * flight at shutdown is at a uniformly random point in its run. And it buys
- * this only when the supervisor's grace is actually ~30s: under a SHORTER
- * grace, SIGKILL now lands during this wait and `serve.ts` never reaches
- * `pool.shutdown()`, so the preview children are orphaned rather than killed.
- * That is the trade this value makes, chosen deliberately over the previous
- * behaviour of never letting a proxied job finish at all.
+ * SO BE HONEST ABOUT THE DEFAULT: 5s is far short of a 27s regen, so at the
+ * floor a proxied job in flight at shutdown IS still killed partway, and is
+ * recovered as an `interrupted` row at the next boot plus
+ * `POST /api/jobs/:id/resume` — exactly the pre-existing behaviour. This wait
+ * only becomes a real improvement once an operator declares a grace large
+ * enough to contain it (30000 → a 25000ms wait, which does let a regen already
+ * partway through finish). An earlier version of this constant was a flat
+ * 25_000 and could never pay off at all, because `shutdown.ts`'s watchdog
+ * killed the preview child the waiting job depended on first — see
+ * `shutdown-budget.ts` for that account.
  */
-export const SHUTDOWN_PROXIED_WAIT_MS = 25_000;
+export const SHUTDOWN_PROXIED_WAIT_MS = deriveShutdownBudget(DEFAULT_SHUTDOWN_GRACE_MS).proxiedWaitMs;
 
 /** How long `stop()` waits AFTER killing the orchestrator child, so the tick can ingest its spend and finish the job. */
 export const SHUTDOWN_KILL_GRACE_MS = 2_000;

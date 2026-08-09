@@ -22,6 +22,7 @@ import { createPreviewUpgradeListener } from "../src/preview-upgrade.ts";
 import { createRequestListener } from "../src/router.ts";
 import { deleteExpiredSessions } from "../src/sessions.ts";
 import { createShutdownSequence } from "../src/shutdown.ts";
+import { loadShutdownBudget, SHUTDOWN_GRACE_ENV_VAR } from "../src/shutdown-budget.ts";
 import { sweepStaleUsageLogs } from "../src/usage-log-sweep.ts";
 import { findUserByEmail } from "../src/users.ts";
 // Reuses the flag() already fixed twice (server/src/user-cli.ts, applied to
@@ -76,6 +77,23 @@ const secureCookies = process.env.INSECURE_COOKIES !== "1";
 // Before anything else that could fail for a mundane reason: an operator who
 // forgot the master key should learn it immediately, not after a port bind.
 const masterKey = loadMasterKey();
+
+// Read here, alongside the master key and for the same reason: an operator who
+// mistyped it should learn at boot, not discover minutes later that a deploy
+// orphaned a Vite child or killed a regen partway. `loadShutdownBudget` throws
+// on anything it cannot use — at module scope, BEFORE `server.listen` and
+// before the `uncaughtException` handlers are armed, so it is a failed boot
+// with a non-zero exit a supervisor can act on.
+//
+// Every shutdown deadline in this process derives from this ONE number, which
+// is what stops the job worker's wait and the preview watchdog from being two
+// independent guesses that defeat each other — see shutdown-budget.ts.
+const shutdownBudget = loadShutdownBudget();
+console.log(
+  `shutdown budget: grace ${shutdownBudget.graceMs}ms `
+  + `(preview-cleanup watchdog ${shutdownBudget.watchdogMs}ms, proxied-job wait ${shutdownBudget.proxiedWaitMs}ms)`
+  + `${process.env[SHUTDOWN_GRACE_ENV_VAR] === undefined ? ` — default; set ${SHUTDOWN_GRACE_ENV_VAR} to match your supervisor` : ""}`,
+);
 // The Buffer above is now the single in-memory copy of the master key for
 // this process — leaving WEBGEN_MASTER_KEY in process.env would hand it to
 // every child process this server spawns WITHOUT an explicit `env` override.
@@ -189,7 +207,13 @@ if (interruptedCount > 0) {
 // misconfigured `--projects-root` is a failed boot with a non-zero exit a
 // supervisor can see, never a server that comes up and quietly bills people
 // for unreachable sites.
-const jobWorker = new JobWorker({ db, pool, masterKey, projectsRoot, codeVersion });
+const jobWorker = new JobWorker({
+  db, pool, masterKey, projectsRoot, codeVersion,
+  // Derived from the operator's declared grace, never guessed here — see
+  // shutdown-budget.ts for why this and the watchdog below must come from
+  // one number rather than two.
+  shutdownProxiedWaitMs: shutdownBudget.proxiedWaitMs,
+});
 jobWorker.start();
 
 // A truly idle preview gets killed and forgotten so MAX_PREVIEWS reflects
@@ -227,6 +251,7 @@ setInterval(() => {
 const runShutdownSequence = createShutdownSequence({
   stopWorker: () => jobWorker.stop(),
   shutdownPool: () => pool.shutdown(),
+  watchdogMs: shutdownBudget.watchdogMs,
 });
 
 // `shuttingDown` makes this idempotent — some shells deliver both SIGINT and

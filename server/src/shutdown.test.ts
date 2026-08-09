@@ -15,6 +15,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   SHUTDOWN_KILL_GRACE_MS, SHUTDOWN_PROXIED_WAIT_MS, SHUTDOWN_WAIT_MS,
 } from "./job-worker.ts";
+import { DEFAULT_SHUTDOWN_GRACE_MS } from "./shutdown-budget.ts";
 import { createShutdownSequence, POOL_CLEANUP_WATCHDOG_MS } from "./shutdown.ts";
 
 /** A promise plus the handle to settle it — the standard shape for "hold this open until the test says so". */
@@ -135,18 +136,22 @@ describe("createShutdownSequence", () => {
  * two orderings the decoupling actually depends on.
  */
 describe("shutdown budgets", () => {
-  it("pins the production values", () => {
+  it("pins the DEFAULT values — the documented 10s floor, for an operator who declares nothing", () => {
     expect(SHUTDOWN_WAIT_MS).toBe(5_000);
     expect(SHUTDOWN_KILL_GRACE_MS).toBe(2_000);
-    expect(SHUTDOWN_PROXIED_WAIT_MS).toBe(25_000);
     expect(POOL_CLEANUP_WATCHDOG_MS).toBe(8_000);
+    // 5s, not 25s: derived from the 10s floor. Far short of a 27s regen, which
+    // is the honest default — see shutdown-budget.ts. It only grows when an
+    // operator declares a larger grace.
+    expect(SHUTDOWN_PROXIED_WAIT_MS).toBe(5_000);
   });
 
-  it("arms the watchdog BEFORE the proxied wait could expire, or the decoupling does nothing", () => {
-    // A watchdog that cannot fire before the wait it exists to protect against
-    // is not a watchdog: cleanup would once again only ever happen after
-    // stop() returned, which is the chained behaviour this replaced.
-    expect(POOL_CLEANUP_WATCHDOG_MS).toBeLessThan(SHUTDOWN_PROXIED_WAIT_MS);
+  it("expires the job's own wait BEFORE the watchdog, so the watchdog stays a backstop", () => {
+    // The inverse of this ordering is the defect shutdown-budget.ts exists for:
+    // a watchdog that fires FIRST kills the preview child the waiting job
+    // depends on, so the wait can never pay off under any grace and is dead
+    // machinery. Pinned in the direction that makes the wait reachable.
+    expect(SHUTDOWN_PROXIED_WAIT_MS).toBeLessThan(POOL_CLEANUP_WATCHDOG_MS);
   });
 
   it("leaves room for a generate's WHOLE spend-recovery sequence before the watchdog fires", () => {
@@ -158,14 +163,7 @@ describe("shutdown budgets", () => {
     expect(SHUTDOWN_WAIT_MS + SHUTDOWN_KILL_GRACE_MS).toBeLessThanOrEqual(POOL_CLEANUP_WATCHDOG_MS);
   });
 
-  it("keeps the whole sequence inside the documented 10s supervisor-grace floor on the orchestrator path", () => {
-    // scripts/serve.ts documents "a typical 10-30s supervisor grace". The
-    // orchestrator path must complete inside the FLOOR of that range, since
-    // this process cannot discover the actual grace.
-    expect(POOL_CLEANUP_WATCHDOG_MS).toBeLessThan(10_000);
-  });
-
-  it("waits longer for proxied work than for a generate, which is the entire point of having two", () => {
-    expect(SHUTDOWN_PROXIED_WAIT_MS).toBeGreaterThan(SHUTDOWN_WAIT_MS);
+  it("finishes cleanup inside the declared grace, with time left to actually kill and exit", () => {
+    expect(POOL_CLEANUP_WATCHDOG_MS).toBeLessThan(DEFAULT_SHUTDOWN_GRACE_MS);
   });
 });

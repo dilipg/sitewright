@@ -27,10 +27,20 @@ export default defineConfig({
   server: {
     proxy: {
       "/api": { target: HOSTED_SERVER_URL, changeOrigin: true },
-      // Vite's string-key proxy matches by PREFIX, so this covers every
-      // compiler endpoint (`/__regen`, `/__overrides/...`, `/__plan`, ...)
-      // with one entry.
-      "/__": { target: HOSTED_SERVER_URL, changeOrigin: true },
+      // A plain "/__" string key matches by PREFIX (`doesProxyContextMatchUrl`,
+      // vite/dist/node/chunks/node.js), which covers every compiler endpoint
+      // (`/__regen`, `/__overrides/...`, `/__plan`, ...) with one entry --
+      // but ALSO Vite's own built-in `/__open-in-editor` endpoint (the dev
+      // overlay's click-to-open-in-editor), which would otherwise forward to
+      // the hosted server IN LOCAL MODE TOO (task-8 review): the proxy
+      // middleware runs before Vite's own `/__open-in-editor` handler
+      // regardless of mode, so a plain prefix match wins even when nothing
+      // about this request has anything to do with hosted mode. A leading
+      // "^" makes Vite treat the key as a RegExp tested against the full
+      // `req.url` (verified against vite@8.1.5's own source, not assumed);
+      // the negative lookahead excludes exactly that one Vite-owned path
+      // while still matching every compiler endpoint.
+      "^/__(?!open-in-editor)": { target: HOSTED_SERVER_URL, changeOrigin: true },
       // `ws: true` so the child preview's own HMR socket survives this
       // hop too (server/src/preview-upgrade.ts handles the SECOND hop, from
       // the hosted server into the project's own preview child).

@@ -61,6 +61,21 @@ export type BackendMode =
  * reading `window` itself, so a test can exercise both modes directly
  * without fighting ES module caching (the module-level `backend` singleton
  * below is computed exactly once at import time).
+ *
+ * KNOWN HAZARD (task-8 review, not fixed here — recorded for whoever builds
+ * the hosted entry points next): an EMPTY `?project=` (present with no
+ * value, `URLSearchParams.get` returns `""`) is treated as "no project" and
+ * silently falls through to LOCAL mode, pointed at `http://localhost:5273`.
+ * That is the right call for a bare editor URL with no `?project=` at all
+ * (today's only real caller), but once something generates hosted links for
+ * users, a malformed or truncated one (`?project=` with the id dropped)
+ * will not error — it will quietly open an editor aimed at a local server
+ * that does not exist in a hosted deployment, whose failure mode is the
+ * exact silent-hang class of bug this task's bootstrap fix (App.tsx) exists
+ * to prevent, just triggered a different way (no server at all to answer,
+ * rather than a 401 from a real one). Neither `resolveMode` nor any caller
+ * validates that a non-empty `project` value is actually a plausible id
+ * (e.g. UUID-shaped) before committing to hosted mode.
  */
 export function resolveMode(search: string, origin: string): BackendMode {
   const params = new URLSearchParams(search);

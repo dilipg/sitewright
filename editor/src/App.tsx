@@ -308,17 +308,28 @@ export default function App() {
 
   useEffect(() => {
     async function bootstrap() {
+      // Every fetch here goes through `sessionAwareFetch` (task-8 review):
+      // an already-expired session hit on the very FIRST load (a bookmarked
+      // hosted editor URL opened a day later) is arguably the single most
+      // likely way a user meets a 401 at all, and before this fix a 401
+      // body parsed as JSON just fine, so `setManifest`/`routesFromManifest`
+      // (lib/canvas.ts) went on to throw on a shape that was never a real
+      // manifest -- an unhandled rejection with no banner, `routes` stuck
+      // at `[]`, and `saveStatus` stuck at "Loading…" forever.
+      //
       // an unapproved plan gates the whole editor (generation spend gate)
-      const plan = (await fetch(backend.apiUrl("/__plan"), { cache: "no-store" }).then((r) =>
-        r.json(),
+      const plan = (await sessionAwareFetch(backend.apiUrl("/__plan"), { cache: "no-store" }).then(
+        (r) => r.json(),
       )) as { exists: boolean; approved: boolean; brief?: PlanBrief; siteplan?: { routes: PlanRoute[] } };
       if (plan.exists && !plan.approved && plan.brief !== undefined && plan.siteplan !== undefined) {
         setPendingPlan({ brief: plan.brief, routes: plan.siteplan.routes });
       }
 
       const [manifestJson, tokensJson] = await Promise.all([
-        fetch(backend.previewUrl("/manifest.json")).then((r) => r.json() as Promise<Manifest>),
-        fetch(backend.previewUrl("/src/tokens/tokens.json")).then((r) => r.json() as Promise<TokensJson>),
+        sessionAwareFetch(backend.previewUrl("/manifest.json")).then((r) => r.json() as Promise<Manifest>),
+        sessionAwareFetch(backend.previewUrl("/src/tokens/tokens.json")).then(
+          (r) => r.json() as Promise<TokensJson>,
+        ),
       ]);
       manifestRef.current = manifestJson;
       setManifest(manifestJson);
@@ -327,9 +338,11 @@ export default function App() {
       const routeList = routesFromManifest(manifestJson);
       const [overrideFiles, historyFile] = await Promise.all([
         Promise.all(
-          routeList.map((route) => fetch(backend.apiUrl(`/__overrides/${route.slug}`)).then((r) => r.json())),
+          routeList.map((route) =>
+            sessionAwareFetch(backend.apiUrl(`/__overrides/${route.slug}`)).then((r) => r.json()),
+          ),
         ),
-        fetch(backend.apiUrl("/__overrides-history")).then((r) => r.json()),
+        sessionAwareFetch(backend.apiUrl("/__overrides-history")).then((r) => r.json()),
       ]);
       const mergedOverrides: OverridesMap = Object.assign({}, ...overrideFiles.map(fromOverrideFile));
       const persisted =
@@ -341,7 +354,17 @@ export default function App() {
       setSaveStatus("Saved");
       hydratedRef.current = true;
     }
-    void bootstrap();
+    void bootstrap().catch((error: unknown) => {
+      if (error instanceof SessionExpiredError) {
+        setSessionExpired(true);
+        return;
+      }
+      // Not a session expiry -- outside this task's scope to design a full
+      // bootstrap-failure UI (there was none before this task either), but
+      // this keeps the failure from being a completely silent, unhandled
+      // rejection.
+      console.error("[bootstrap] failed", error);
+    });
   }, []);
 
   /* ---------- shim messages (multiple cross-origin iframes, one per route) ---------- */
@@ -477,8 +500,24 @@ export default function App() {
     const grouped = splitOverridesByRoute(map, routes);
     const timer = setTimeout(() => {
       void (async () => {
-        await writeOverrides(grouped, routes, history);
-        setSaveStatus("Saved");
+        try {
+          await writeOverrides(grouped, routes, history);
+          setSaveStatus("Saved");
+        } catch (error) {
+          // task-8 review: an expired session must not leave "Saved" on
+          // screen for an edit that never reached disk -- that is the exact
+          // lie this task's own honest-state requirement exists to
+          // prevent. `saveStatus` is deliberately left at "Saving…" here
+          // rather than flipped to some fabricated "Saved" or a new
+          // "Failed" state neither this task nor its review asked for; the
+          // banner is the honest surface for the one failure mode this task
+          // can name.
+          if (error instanceof SessionExpiredError) {
+            setSessionExpired(true);
+            return;
+          }
+          console.error("[autosave] failed", error);
+        }
       })();
     }, 300);
     return () => clearTimeout(timer);
@@ -539,22 +578,35 @@ export default function App() {
   /** Writes the current override + history state through the preview server's
    * persistence endpoints. Shared by the debounced autosave above and
    * runExport's pre-export flush — the exporter reads overrides from DISK,
-   * so an export racing the debounce would ship the previous state. */
+   * so an export racing the debounce would ship the previous state.
+   *
+   * Every write goes through `sessionAwareFetch` and every response's `.ok`
+   * is checked (task-8 review): before this fix, a 401 (or any other
+   * non-2xx) here was silently ignored — the caller's own `setSaveStatus
+   * ("Saved")` ran unconditionally right after this resolved, regardless of
+   * whether the write actually landed. With a hosted session, that is the
+   * editor asserting the user's edit was saved when it was not, the exact
+   * class of lie the `interrupted`/session-expiry handling exists to
+   * prevent, and the one most likely to cost someone real work. A
+   * SessionExpiredError propagates to the caller unchanged (both callers
+   * already have their own `catch` for it); any OTHER failed write throws a
+   * plain `Error` instead, which is enough to stop "Saved" from being shown
+   * — this function has no UI of its own to report a more specific cause. */
   async function writeOverrides(
     grouped: Record<string, OverridesMap>,
     routeList: RouteInfo[],
     historyState: History,
   ): Promise<void> {
-    await Promise.all(
+    const routeResponses = await Promise.all(
       routeList.map((route) =>
-        fetch(backend.apiUrl(`/__overrides/${route.slug}`), {
+        sessionAwareFetch(backend.apiUrl(`/__overrides/${route.slug}`), {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(toOverrideFile(grouped[route.slug] ?? {}, route.path)),
         }),
       ),
     );
-    await fetch(backend.apiUrl("/__overrides-history"), {
+    const historyResponse = await sessionAwareFetch(backend.apiUrl("/__overrides-history"), {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -563,6 +615,10 @@ export default function App() {
         index: historyState.index,
       }),
     });
+    const failed = [...routeResponses, historyResponse].find((response) => !response.ok);
+    if (failed !== undefined) {
+      throw new Error(`override write failed: HTTP ${String(failed.status)}`);
+    }
   }
 
   /* ---------- edits ---------- */

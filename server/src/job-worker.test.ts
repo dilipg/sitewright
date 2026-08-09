@@ -20,8 +20,10 @@ import { usageLogPathFor, USAGE_ID_HEADER } from "../../compiler/src/usage-log-p
 import { DisabledUserError, MissingApiKeyError } from "./agent-env.ts";
 import { setApiKey, UndecryptableApiKeyError } from "./api-keys.ts";
 import { openDatabase } from "./db.ts";
-import { exchangeOverLoopback, JobWorker, LOOPBACK_TOKEN_HEADER, orchestratorGeneratedDir } from "./job-worker.ts";
-import { claimNextJob, createJob, finishJob, findJobById, recordJobRun } from "./jobs.ts";
+import {
+  exchangeOverLoopback, JobWorker, LOOPBACK_TOKEN_HEADER, MAX_CONCURRENT_JOBS, orchestratorGeneratedDir,
+} from "./job-worker.ts";
+import { claimNextJob, createJob, finishJob, findJobById, MAX_ACTIVE_JOBS_PER_USER, recordJobRun } from "./jobs.ts";
 import { MASTER_KEY_ENV_VAR } from "./master-key.ts";
 import { createProject, type Project } from "./projects.ts";
 import type { PreviewPool, PreviewProcess } from "./preview-pool.ts";
@@ -129,6 +131,54 @@ function startUpstream(handler: (req: http.IncomingMessage, res: http.ServerResp
       });
     });
   });
+}
+
+/**
+ * An upstream that records every request body and answers NONE of them until
+ * `release()` is called.
+ *
+ * This is what makes a concurrency assertion structural rather than
+ * decorative. A worker that runs one job at a time can NEVER reach a second
+ * recorded body here, because the first job's response is gated behind a
+ * release the test only performs once it has already seen them all — so the
+ * "N bodies arrived" wait times out instead of passing for the wrong reason.
+ * A sequential `for`/`await` shape cannot detect a concurrency bug at all,
+ * which is how a bound bug slipped through earlier on this branch.
+ */
+/** A fake orchestrator child whose `kill` the test supplies — shared by every shutdown-behaviour describe below. */
+type FakeChild = EventEmitter & {
+  stdout: EventEmitter; stderr: EventEmitter; kill: (signal?: NodeJS.Signals) => boolean;
+};
+
+function fakeChildWith(kill: (signal?: NodeJS.Signals) => boolean): FakeChild {
+  const child = new EventEmitter() as FakeChild;
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.kill = kill;
+  return child;
+}
+
+async function gatedUpstream(): Promise<{
+  port: number;
+  bodies: string[];
+  release: () => void;
+  close: () => Promise<void>;
+}> {
+  const bodies: string[] = [];
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const upstream = await startUpstream((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (c: Buffer) => chunks.push(c));
+    req.on("end", () => {
+      bodies.push(Buffer.concat(chunks).toString("utf8"));
+      void gate.then(() => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ passed: true }));
+      });
+    });
+  });
+  return { port: upstream.port, bodies, release, close: upstream.close };
 }
 
 describe("JobWorker: proxied kinds", () => {
@@ -700,6 +750,168 @@ describe("JobWorker: per-user bound (enforced by claimNextJob, not this module)"
     } finally {
       await upstream.close();
     }
+  });
+});
+
+/**
+ * Global job concurrency used to be 1: `tick()` returned early whenever
+ * anything was already running. `MAX_ACTIVE_JOBS_PER_USER` was therefore
+ * unreachable in production (only a direct `runOnce()` call ever exercised
+ * it), and one user's ~400s generate blocked every other tenant for nearly
+ * seven minutes.
+ *
+ * Every test here drives `start()`, never `runOnce()` — `runOnce()` is the
+ * single-job primitive and is deliberately neither tracked nor capped, so a
+ * test that called it in a loop would prove nothing about the cap.
+ */
+describe("JobWorker: concurrency", () => {
+  /** Short shutdown bounds throughout: these tests assert scheduling, and must never sit through a production wait during cleanup. */
+  const FAST_SHUTDOWN = { shutdownWaitMs: 20, shutdownKillGraceMs: 20 } as const;
+
+  function poolOn(port: number): ReturnType<typeof fakePool> {
+    return fakePool({
+      acquire: vi.fn(async (): Promise<PreviewProcess> => ({
+        projectId: project.id, port, base: "/", inFlight: 0, lastUsedAt: Date.now(),
+      })),
+    });
+  }
+
+  /** One user, one project, one queued `regen` whose body identifies it. */
+  function queueFor(index: number): { id: string; body: string } {
+    const owner = createUser(db, `concurrent-${String(index)}@example.com`, "hash");
+    const owned = createProject(db, owner.id, `run-concurrent-${String(index)}`, `Run ${String(index)}`);
+    const body = JSON.stringify({ n: index });
+    const job = createJob(db, {
+      userId: owner.id, projectId: owned.id, kind: "regen", requestJson: body, now: NOW + index,
+    });
+    return { id: job.id, body };
+  }
+
+  it("runs several jobs at once — a one-at-a-time worker cannot reach the second request at all", async () => {
+    const queued = [1, 2, 3].map(queueFor);
+    const upstream = await gatedUpstream();
+    const worker = new JobWorker({
+      db, pool: poolOn(upstream.port), masterKey: MASTER_KEY, projectsRoot: PROJECTS_ROOT,
+      pollIntervalMs: 5, ...FAST_SHUTDOWN, now: () => NOW,
+    });
+
+    try {
+      worker.start();
+      // The load-bearing wait: all three requests must be in the child at the
+      // same time, before ANY of them is answered. Serially this deadlocks —
+      // request #1 is still parked on the gate the test has not opened yet,
+      // so #2 and #3 are never dispatched and this times out.
+      await waitUntil(() => upstream.bodies.length === 3);
+      // Exactly once each: `claimNextJob`'s single atomic UPDATE is what
+      // stops two concurrent claims handing out the same row, and a
+      // duplicate or missing body is how that would show up here.
+      expect([...upstream.bodies].sort()).toEqual(queued.map((q) => q.body).sort());
+
+      upstream.release();
+      await waitUntil(() => queued.every((q) => findJobById(db, q.id)?.status === "succeeded"));
+    } finally {
+      upstream.release();
+      await worker.stop();
+      await upstream.close();
+    }
+  });
+
+  it("still holds ONE user to MAX_ACTIVE_JOBS_PER_USER while the worker has capacity for more", async () => {
+    // Three jobs, one user, a worker cap of 6 — so nothing but the per-user
+    // bound can be what stops the third. This is the bound that was
+    // unreachable in production for as long as the worker ran one job at a
+    // time.
+    const bodies = [1, 2, 3].map((n) => JSON.stringify({ n }));
+    const queued = bodies.map((body, i) => createJob(db, {
+      userId: user.id, projectId: project.id, kind: "regen", requestJson: body, now: NOW + i,
+    }));
+    const upstream = await gatedUpstream();
+    const worker = new JobWorker({
+      db, pool: poolOn(upstream.port), masterKey: MASTER_KEY, projectsRoot: PROJECTS_ROOT,
+      pollIntervalMs: 5, ...FAST_SHUTDOWN, now: () => NOW,
+    });
+
+    try {
+      worker.start();
+      await waitUntil(() => upstream.bodies.length === MAX_ACTIVE_JOBS_PER_USER);
+      // Many more poll intervals than it would need to claim a third, if it
+      // were ever going to.
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      expect(upstream.bodies).toHaveLength(MAX_ACTIVE_JOBS_PER_USER);
+      expect(findJobById(db, queued[2]!.id)?.status).toBe("queued");
+      expect(findJobById(db, queued[2]!.id)?.startedAt).toBe(null);
+
+      upstream.release();
+      await waitUntil(() => queued.every((job) => findJobById(db, job.id)?.status === "succeeded"), 4000);
+    } finally {
+      upstream.release();
+      await worker.stop();
+      await upstream.close();
+    }
+  });
+
+  it("stops filling at MAX_CONCURRENT_JOBS across all users", async () => {
+    // One job per user, so the per-user bound cannot be what limits this —
+    // the only thing that can is the worker's own cap.
+    const queued = Array.from({ length: MAX_CONCURRENT_JOBS + 1 }, (_, i) => queueFor(i));
+    const upstream = await gatedUpstream();
+    const worker = new JobWorker({
+      db, pool: poolOn(upstream.port), masterKey: MASTER_KEY, projectsRoot: PROJECTS_ROOT,
+      pollIntervalMs: 5, ...FAST_SHUTDOWN, now: () => NOW,
+    });
+
+    try {
+      worker.start();
+      await waitUntil(() => upstream.bodies.length === MAX_CONCURRENT_JOBS);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      expect(upstream.bodies).toHaveLength(MAX_CONCURRENT_JOBS);
+      const stillQueued = db.prepare("SELECT COUNT(*) AS c FROM job WHERE status = 'queued'").get() as { c: number };
+      expect(stillQueued.c).toBe(1);
+
+      upstream.release();
+      await waitUntil(() => queued.every((q) => findJobById(db, q.id)?.status === "succeeded"), 4000);
+    } finally {
+      upstream.release();
+      await worker.stop();
+      await upstream.close();
+    }
+  });
+
+  /**
+   * The failure mode a naive fill loop has: `runOnce()` answers `false` for
+   * BOTH "nothing queued" and "claimed but had to requeue", so a loop that
+   * filled the cap by reacting to that boolean could not tell the two apart
+   * and would hammer SQLite continuously between ticks.
+   */
+  it("does not spin against SQLite when the queue is empty — about one claim per tick", async () => {
+    let claims = 0;
+    const countingDb = new Proxy(db, {
+      get(target, prop, receiver) {
+        if (prop !== "prepare") {
+          const value: unknown = Reflect.get(target, prop, receiver);
+          return typeof value === "function" ? value.bind(target) : value;
+        }
+        return (sql: string) => {
+          // claimNextJob's own statement, and nothing else in jobs.ts writes
+          // this exact prefix (finishJob's UPDATE is parameterised).
+          if (sql.includes("UPDATE job SET status = 'running'")) claims += 1;
+          return target.prepare(sql);
+        };
+      },
+    });
+    const worker = new JobWorker({
+      db: countingDb, pool: fakePool(), masterKey: MASTER_KEY, projectsRoot: PROJECTS_ROOT,
+      pollIntervalMs: 20, ...FAST_SHUTDOWN, now: () => NOW,
+    });
+
+    worker.start();
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await worker.stop();
+
+    // ~15 ticks fit in 300ms at a 20ms interval; 40 leaves generous slack for
+    // a slow machine. A spinning fill loop reaches thousands.
+    expect(claims).toBeGreaterThan(0);
+    expect(claims).toBeLessThan(40);
   });
 });
 
@@ -1385,18 +1597,6 @@ describe("exchangeOverLoopback: only the request it drives is authorized", () =>
  * that the next boot's `sweepStaleUsageLogs` unlinks unread.
  */
 describe("JobWorker: stop() is bounded and terminates the orchestrator child", () => {
-  type FakeChild = EventEmitter & {
-    stdout: EventEmitter; stderr: EventEmitter; kill: (signal?: NodeJS.Signals) => boolean;
-  };
-
-  function fakeChildWith(kill: (signal?: NodeJS.Signals) => boolean): FakeChild {
-    const child = new EventEmitter() as FakeChild;
-    child.stdout = new EventEmitter();
-    child.stderr = new EventEmitter();
-    child.kill = kill;
-    return child;
-  }
-
   it("returns within its own bound, escalating SIGTERM to SIGKILL, when the child ignores both", async () => {
     const genProject = createProject(db, user.id, "run-gen", "Run Gen");
     // Never exits on its own, and ignores SIGTERM — the worst case, and the
@@ -1493,5 +1693,52 @@ describe("JobWorker: stop() is bounded and terminates the orchestrator child", (
     } finally {
       await upstream.close();
     }
+  });
+
+  /**
+   * `activeOrchestratorRun` used to be a single slot, which was a real
+   * property while global concurrency was 1 and became a silent orphan-and-
+   * keep-spending bug the moment it was not: the most recently spawned child
+   * would be the only one shutdown could signal, and every other generate
+   * would outlive the server with its spend swept unread at the next boot.
+   */
+  it("signals EVERY tracked orchestrator child, not just the most recently spawned one", async () => {
+    setApiKey(db, MASTER_KEY, user.id, "sk-ant-key");
+    const genProjects = [
+      createProject(db, user.id, "run-gen-one", "Gen One"),
+      createProject(db, user.id, "run-gen-two", "Gen Two"),
+    ];
+    const signalled: string[] = [];
+    const spawnedRunIds = new Set<string>();
+    const orchestratorSpawnFn = vi.fn((_command: string, args: string[]) => {
+      const runId = args.at(-1)!;
+      spawnedRunIds.add(runId);
+      // Ignores every signal, so both children are still tracked when the
+      // SIGKILL sweep runs — the worst case, and the one that discriminates.
+      return fakeChildWith((signal?: NodeJS.Signals) => {
+        signalled.push(`${runId}:${String(signal)}`);
+        return true;
+      });
+    });
+    for (const [i, owned] of genProjects.entries()) {
+      createJob(db, {
+        userId: user.id, projectId: owned.id, kind: "generate",
+        requestJson: JSON.stringify({ brief: "a bakery" }), now: NOW + i,
+      });
+    }
+    const worker = new JobWorker({
+      db, pool: fakePool(), masterKey: MASTER_KEY, projectsRoot: PROJECTS_ROOT,
+      pollIntervalMs: 5, shutdownWaitMs: 40, shutdownKillGraceMs: 40, now: () => NOW,
+      orchestratorSpawnFn,
+    });
+
+    worker.start();
+    await waitUntil(() => spawnedRunIds.size === 2);
+    await worker.stop();
+
+    expect(signalled).toContain("run-gen-one:SIGTERM");
+    expect(signalled).toContain("run-gen-two:SIGTERM");
+    expect(signalled).toContain("run-gen-one:SIGKILL");
+    expect(signalled).toContain("run-gen-two:SIGKILL");
   });
 });

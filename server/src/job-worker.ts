@@ -1,6 +1,7 @@
 // server/src/job-worker.ts
 /**
- * Works jobs off the `job` table (server/src/jobs.ts), one at a time.
+ * Works jobs off the `job` table (server/src/jobs.ts), up to
+ * `MAX_CONCURRENT_JOBS` at a time.
  *
  * A job is a server-side wrapper around work the server already performs
  * (spec, docs/superpowers/specs/2026-08-06-job-model-design.md). This module
@@ -93,7 +94,21 @@
  *     rather than being fully subsumed by the claim-time fix above.
  *     `generate` does not touch the pool at all (it has no project preview
  *     child to acquire), so this specific bound does not apply to it — the
- *     asymmetry is real, not an oversight.
+ *     asymmetry is real, not an oversight, and the design doc's own claim
+ *     that "the preview pool's cap of 6 does double duty, because every job
+ *     needs a child" is therefore true of the five proxied kinds and FALSE of
+ *     `generate`. Which is why the third bound below is not a restatement of
+ *     this one.
+ *   - `MAX_CONCURRENT_JOBS` (6) across ALL users, enforced by this module's
+ *     own tick (see `start`/`tick`). Because of the asymmetry just named,
+ *     this is the ONLY thing bounding how many orchestrator subprocesses one
+ *     server runs at once — and each of those is ~$1-2 of a user's real
+ *     money, so "the pool caps it anyway" would have been a comfortable and
+ *     wrong thing to believe. It is also what makes the per-user bound above
+ *     reachable at all: while this worker ran strictly one job at a time,
+ *     `MAX_ACTIVE_JOBS_PER_USER` could never bind in production, and one
+ *     user's ~400s `generate` head-of-line-blocked every other tenant for
+ *     nearly seven minutes.
  *
  * In both cases, "cannot run yet" is NOT a failure: the job is put back to
  * `queued` (never `failed`) so a later claim can try again — "better than
@@ -339,6 +354,13 @@ interface OrchestratorSpawnedChild {
   kill?(signal?: NodeJS.Signals): boolean;
 }
 
+/** One tracked `generate` subprocess — see `JobWorker.activeOrchestratorRuns`. */
+interface OrchestratorRun {
+  child: OrchestratorSpawnedChild;
+  jobId: string;
+  usagePath: string;
+}
+
 type OrchestratorSpawnFn = (
   command: string,
   args: string[],
@@ -437,8 +459,32 @@ export function assertProjectsRootMatchesOrchestrator(
 const DEFAULT_POLL_INTERVAL_MS = 1_000;
 
 /**
- * WHOLE-BRANCH REVIEW, FINDING C — how long `stop()` waits for the in-flight
- * tick to finish ON ITS OWN before it starts terminating things.
+ * How many jobs this worker will have in flight at once, across ALL users.
+ *
+ * Until this existed, `tick()` returned early whenever anything at all was
+ * running, so global job concurrency was 1. Three consequences, all real:
+ * `MAX_ACTIVE_JOBS_PER_USER` (2) was unreachable in production — only a test
+ * calling `runOnce()` directly ever exercised it, so the two rounds of work
+ * that made that bound atomic with its own insert were hardening dead code;
+ * one user's ~400s `generate` head-of-line-blocked every other tenant for
+ * nearly seven minutes with the UI showing only "Running… Ns"; and the
+ * approved design says the opposite ("a seventh concurrent job across all
+ * users waits").
+ *
+ * 6 is the same NUMBER as `preview-pool.ts`'s `MAX_PREVIEWS`, and deliberately
+ * NOT imported from it nor pinned equal to it by a test — the same reasoning
+ * `jobs.ts`'s `MAX_REQUEST_JSON_BYTES` gives for not pinning itself to
+ * `router.ts`'s `MAX_BODY_BYTES`: pinning would assert a relationship that does
+ * not hold. The pool's cap bounds the five PROXIED kinds (as
+ * 503-then-requeue, see `runProxiedJob`) and bounds `generate` not at all,
+ * because a generation acquires no preview child. THIS constant is what bounds
+ * `generate`.
+ */
+export const MAX_CONCURRENT_JOBS = 6;
+
+/**
+ * WHOLE-BRANCH REVIEW, FINDING C — how long `stop()` waits for in-flight work
+ * to finish ON ITS OWN before it starts terminating things.
  *
  * `stop()` used to await that tick with no bound at all: up to ~400s for a
  * generate, or the full 15 minutes of `PREVIEW_PROXY_TIMEOUT_MS` for a
@@ -460,6 +506,25 @@ const SHUTDOWN_WAIT_MS = 5_000;
 
 /** How long `stop()` waits AFTER killing the orchestrator child, so the tick can ingest its spend and finish the job. */
 const SHUTDOWN_KILL_GRACE_MS = 2_000;
+
+/**
+ * The subset of `runs` that can actually be signalled, each paired with its
+ * own bound `kill`. `OrchestratorSpawnedChild.kill` is optional (so a test
+ * double that never needed one still satisfies the type), and narrowing it
+ * once here is what keeps `stop()` free of non-null assertions on a method it
+ * has already checked.
+ */
+function killableRuns(
+  runs: Iterable<OrchestratorRun>,
+): { run: OrchestratorRun; kill: (signal?: NodeJS.Signals) => boolean }[] {
+  const out: { run: OrchestratorRun; kill: (signal?: NodeJS.Signals) => boolean }[] = [];
+  for (const run of runs) {
+    const kill = run.child.kill;
+    if (typeof kill !== "function") continue;
+    out.push({ run, kill: kill.bind(run.child) });
+  }
+  return out;
+}
 
 /** Resolves `undefined` if `promise` has not settled within `ms` — mirrors preview-pool.ts's own `raceReadyPromise`. */
 function raceWithTimeout<T>(promise: Promise<T>, ms: number): Promise<T | undefined> {
@@ -534,20 +599,36 @@ export class JobWorker {
   private readonly codeVersion: string;
 
   private timer: ReturnType<typeof setInterval> | undefined;
-  /** The currently-dispatched tick's promise, tracked so `stop()` can await it — see `stop()`'s own comment. */
-  private inFlight: Promise<void> | undefined;
   /**
-   * The orchestrator subprocess a `generate` job currently has running, if
-   * any — whole-branch review, FINDING C. Tracked for exactly one reason:
-   * `stop()` must be able to terminate it. An untracked child outlives the
-   * server, keeps spending the user's key, and keeps appending to a usage log
-   * the next boot's `sweepStaleUsageLogs` deletes unread. Set for the whole
-   * life of `runOrchestratorProcess` and cleared in the same `finally` that
-   * settles it, so it never names a process that has already exited.
+   * Every dispatched run still in flight, tracked so `tick()` can tell whether
+   * it may start another and `stop()` can await ALL of them rather than one.
+   * A SET and not a single promise since `MAX_CONCURRENT_JOBS` — a single
+   * promise was itself the mechanism that pinned global concurrency at 1.
+   *
+   * Only `start()`'s own dispatch adds to this. A direct `runOnce()` call
+   * (this module's tests, and nothing in production) is deliberately NOT
+   * tracked or capped: it is the "run exactly one job, right now" primitive
+   * the cap is built out of, not a second way to enter the loop.
    */
-  private activeOrchestratorRun:
-    | { child: OrchestratorSpawnedChild; jobId: string; usagePath: string }
-    | undefined;
+  private readonly inFlight = new Set<Promise<void>>();
+  /**
+   * The orchestrator subprocesses `generate` jobs currently have running,
+   * keyed by job id — whole-branch review, FINDING C. Tracked for exactly one
+   * reason: `stop()` must be able to terminate them. An untracked child
+   * outlives the server, keeps spending the user's key, and keeps appending to
+   * a usage log the next boot's `sweepStaleUsageLogs` deletes unread. Each
+   * entry is set for the whole life of its `runOrchestratorProcess` call and
+   * cleared in the same `finally` that settles it, so it never names a process
+   * that has already exited.
+   *
+   * A MAP and not a single slot since `MAX_CONCURRENT_JOBS`: several
+   * `generate` jobs can now be in flight at once, and a single slot would
+   * have silently meant "the most recently spawned child is the only one
+   * shutdown can kill" — every other one orphaned, spending, with its spend
+   * swept unread. Keyed by job id rather than pushed into an array so the
+   * `finally` that clears an entry names exactly its own.
+   */
+  private readonly activeOrchestratorRuns = new Map<string, OrchestratorRun>();
 
   constructor(deps: JobWorkerDeps) {
     this.db = deps.db;
@@ -578,42 +659,79 @@ export class JobWorker {
    * freshly booted server should not sit idle for a full
    * `pollIntervalMs` before its first claim attempt.
    *
-   * Ticks never overlap: a tick that is still running when the next one
-   * would fire is skipped outright rather than queued or run alongside it —
-   * "claim a job, run it, finish it, repeat," not a job pool. A caller that
-   * wants genuine concurrency (this module's own tests, to prove the
-   * per-user bound) can still call `runOnce()` directly without going
-   * through `start()` at all; nothing about `runOnce()` itself is
-   * single-flight.
+   * Runs overlap, up to `MAX_CONCURRENT_JOBS`: each tick keeps claiming and
+   * dispatching until either the cap is full or nothing is claimable — see
+   * `tick()`.
    */
   start(): void {
     if (this.timer !== undefined) return;
-    const runTick = async (): Promise<void> => {
-      try {
-        await this.runOnce();
-      } catch (err) {
-        // A tick that throws must not take the whole interval down with it
-        // — `runOnce()` itself should not throw (every failure path inside
-        // it is caught and turned into a `failed` job), but this is the
-        // backstop if it ever does.
-        console.error(`[job-worker] tick failed: ${redactSecrets(messageOf(err))}`);
-      } finally {
-        this.inFlight = undefined;
-      }
-    };
-    const tick = (): void => {
-      if (this.inFlight !== undefined) return;
-      this.inFlight = runTick();
-    };
-    this.timer = setInterval(tick, this.pollIntervalMs);
+    this.timer = setInterval(() => { this.tick(); }, this.pollIntervalMs);
     this.timer.unref();
-    tick();
+    this.tick();
+  }
+
+  /**
+   * Fills the worker up to `MAX_CONCURRENT_JOBS`, then stops.
+   *
+   * THE CLAIM IS SEPARATED FROM THE RUN on purpose, and this is the whole
+   * shape of the function. `claimNextJob` is synchronous (`node:sqlite` has no
+   * async surface), so this loop can claim, dispatch, and immediately claim
+   * again inside ONE synchronous pass — the dispatched runs then proceed
+   * concurrently. Awaiting each `runOnce()` to learn whether it claimed
+   * anything would have serialised exactly what this exists to parallelise.
+   *
+   * NOT SPINNING is the other half. `runOnce()` returns `false` for BOTH
+   * "nothing queued" and "claimed but had to requeue", and a caller reacts to
+   * both the same way, so a fill loop written against its boolean could not
+   * tell "the queue is empty" from "that one job is not runnable yet" and
+   * would hammer SQLite in a tight loop until the next tick. Claiming
+   * directly, and returning the moment a claim comes back `null`, means an
+   * idle server costs exactly ONE statement per tick — the same as before
+   * concurrency existed. (`null` covers both "nothing queued" and "every
+   * queued job's user is at `MAX_ACTIVE_JOBS_PER_USER`", since that bound
+   * lives inside the claim's own SQL.)
+   *
+   * The `try` is the backstop the old `runTick` had: this now runs from a
+   * `setInterval` callback and from `start()` itself, so an uncaught throw
+   * here would be an `uncaughtException` or a failed boot rather than a
+   * skipped tick.
+   */
+  private tick(): void {
+    while (this.inFlight.size < MAX_CONCURRENT_JOBS) {
+      let job: Job | null;
+      try {
+        job = claimNextJob(this.db, this.now());
+      } catch (err) {
+        console.error(`[job-worker] claim failed: ${redactSecrets(messageOf(err))}`);
+        return;
+      }
+      if (job === null) return;
+      this.dispatch(job);
+    }
+  }
+
+  /** Runs an already-claimed job in the background, tracked in `inFlight` for the cap and for `stop()`. */
+  private dispatch(job: Job): void {
+    const run = this.runClaimedJob(job).then(
+      () => undefined,
+      (err: unknown) => {
+        // A run that throws must not take the whole interval down with it —
+        // `runClaimedJob` itself should not throw (every failure path inside
+        // it is caught and turned into a `failed` job), but this is the
+        // backstop if it ever does. Swallowed rather than rethrown so the
+        // promise this adds to `inFlight` never rejects, which is what lets
+        // `stop()` race it without an unhandled rejection.
+        console.error(`[job-worker] tick failed: ${redactSecrets(messageOf(err))}`);
+      },
+    );
+    this.inFlight.add(run);
+    void run.finally(() => { this.inFlight.delete(run); });
   }
 
   /**
    * Stops arming new ticks and, unlike simply abandoning the worker, awaits
-   * whichever tick is currently in flight rather than leaving it to finish
-   * (or not) after this promise resolves — a job mid-run at shutdown is
+   * every run currently in flight rather than leaving them to finish (or not)
+   * after this promise resolves — a job mid-run at shutdown is
    * exactly the case spec decision 13 says must not be corrupted by being
    * killed partway. Safe to call when nothing is running, or when `start()`
    * was never called at all. Idempotent in the sense that matters: a second
@@ -649,41 +767,55 @@ export class JobWorker {
       clearInterval(this.timer);
       this.timer = undefined;
     }
-    if (this.inFlight === undefined) return;
+    if (this.inFlight.size === 0) return;
 
-    if (await raceWithTimeout(this.inFlight.then(() => true), this.shutdownWaitMs) === true) return;
+    const waitMs = this.shutdownWaitMs;
+    if (await this.raceInFlight(waitMs)) return;
 
-    const run = this.activeOrchestratorRun;
-    if (run === undefined) {
-      // A proxied job still going. Nothing here owns a process to kill (the
-      // preview child belongs to the pool, which serve.ts shuts down next),
-      // so this is where shutdown stops waiting.
+    // Re-read AFTER the wait: an entry clears itself the moment its child
+    // exits, so this is the set that is genuinely still alive.
+    const runs = [...this.activeOrchestratorRuns.values()];
+    if (runs.length === 0) {
+      // Only proxied jobs still going. Nothing here owns a process to kill
+      // (the preview child belongs to the pool, which serve.ts shuts down
+      // next), so this is where shutdown stops waiting.
       console.warn(
-        `[job-worker] shutdown: a job is still running after ${String(this.shutdownWaitMs)}ms; `
-        + "leaving it — it will be marked interrupted on the next boot",
+        `[job-worker] shutdown: ${String(this.inFlight.size)} job(s) still running after ${String(waitMs)}ms; `
+        + "leaving them — they will be marked interrupted on the next boot",
       );
       return;
     }
 
-    if (typeof run.child.kill !== "function") {
+    const killable = killableRuns(runs);
+    for (const run of runs) {
+      if (typeof run.child.kill === "function") continue;
       console.error(
         `[job-worker] shutdown: orchestrator child for job ${run.jobId} cannot be killed (no kill()); `
         + `spend in ${run.usagePath} may go unrecorded`,
       );
-      return;
     }
-    run.child.kill("SIGTERM");
-    if (await raceWithTimeout(this.inFlight.then(() => true), this.shutdownKillGraceMs) === true) return;
-    // It did not exit within the grace period, so its spend is NOT ingested
-    // and the next boot's sweeper will delete the log unread. Named loudly
-    // because that is real money whose record is about to be lost, and this
-    // line is the only trace of it an operator will ever get.
-    run.child.kill("SIGKILL");
-    console.error(
-      `[job-worker] shutdown: orchestrator child for job ${run.jobId} did not exit within `
-      + `${String(this.shutdownKillGraceMs)}ms of SIGTERM; killed. Spend recorded in ${run.usagePath} `
-      + "will be swept unread on the next boot and will NOT be billed",
-    );
+    if (killable.length === 0) return;
+    for (const entry of killable) entry.kill("SIGTERM");
+    if (await this.raceInFlight(this.shutdownKillGraceMs)) return;
+    // Whatever is STILL tracked did not exit within the grace period, so its
+    // spend is NOT ingested and the next boot's sweeper will delete the log
+    // unread. Named loudly, once per surviving child, because that is real
+    // money whose record is about to be lost and this line is the only trace
+    // of it an operator will ever get.
+    for (const entry of killableRuns(this.activeOrchestratorRuns.values())) {
+      entry.kill("SIGKILL");
+      console.error(
+        `[job-worker] shutdown: orchestrator child for job ${entry.run.jobId} did not exit within `
+        + `${String(this.shutdownKillGraceMs)}ms of SIGTERM; killed. Spend recorded in ${entry.run.usagePath} `
+        + "will be swept unread on the next boot and will NOT be billed",
+      );
+    }
+  }
+
+  /** True if every run in flight AT THE MOMENT OF THE CALL settled within `ms`. Snapshotted, since the set shrinks as runs finish. */
+  private async raceInFlight(ms: number): Promise<boolean> {
+    const all = Promise.all([...this.inFlight]).then(() => true);
+    return await raceWithTimeout(all, ms) === true;
   }
 
   /**
@@ -715,7 +847,17 @@ export class JobWorker {
   async runOnce(): Promise<boolean> {
     const job = claimNextJob(this.db, this.now());
     if (job === null) return false;
+    return await this.runClaimedJob(job);
+  }
 
+  /**
+   * Everything `runOnce()` does AFTER the claim, split out so `tick()` can
+   * claim synchronously (and so keep claiming, up to `MAX_CONCURRENT_JOBS`)
+   * without awaiting each run in turn — see `tick()` for why the split is
+   * what makes concurrency and no-spin compatible. Returns the same boolean
+   * `runOnce()` documents.
+   */
+  private async runClaimedJob(job: Job): Promise<boolean> {
     if (job.resumedFromJobId !== null) {
       const original = findJobById(this.db, job.resumedFromJobId);
       // `original === null` is unreachable via any path that exists today
@@ -1011,10 +1153,12 @@ export class JobWorker {
    * `track` is what `stop()` needs to be able to terminate this child
    * (whole-branch review, FINDING C). It is registered synchronously, the
    * moment the child exists, and cleared when the promise settles — either
-   * way — so `activeOrchestratorRun` never names a process that has already
-   * gone. Only ONE can be live at a time, which is a real property rather
-   * than an assumption: `start()`'s ticks never overlap, and a `generate` is
-   * the whole of its own tick.
+   * way — so `activeOrchestratorRuns` never names a process that has already
+   * gone. SEVERAL can be live at once since `MAX_CONCURRENT_JOBS`, which is
+   * why the entry is keyed by job id and why the clear below deletes its own
+   * key rather than emptying the collection: a `generate` that finishes must
+   * not untrack a sibling `generate` still running, or shutdown would orphan
+   * it.
    */
   private runOrchestratorProcess(
     env: NodeJS.ProcessEnv,
@@ -1023,9 +1167,9 @@ export class JobWorker {
   ): Promise<{ stdout: string; stderr: string; code: number | null }> {
     return new Promise((resolve, reject) => {
       const child = this.orchestratorSpawnFn("uv", args, { cwd: this.orchestratorDir, env });
-      this.activeOrchestratorRun = { child, jobId: track.jobId, usagePath: track.usagePath };
+      this.activeOrchestratorRuns.set(track.jobId, { child, jobId: track.jobId, usagePath: track.usagePath });
       const settle = (fn: () => void): void => {
-        this.activeOrchestratorRun = undefined;
+        this.activeOrchestratorRuns.delete(track.jobId);
         fn();
       };
       let stdout = "";

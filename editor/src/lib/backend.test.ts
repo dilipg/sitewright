@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { backend, createBackend, resolveMode } from "./backend";
+import { backend, createBackend, encodePathSegment, neutralizeDotSegments, resolveMode } from "./backend";
 
 const LOCAL_ORIGIN = "http://localhost:5273";
 const EDITOR_ORIGIN = "http://localhost:5174";
@@ -172,5 +172,83 @@ describe("the default export singleton", () => {
     // === "undefined"` branch, exactly as `PREVIEW_URL` always did.
     expect(backend.mode).toBe("local");
     expect(backend.apiUrl("/__regen")).toBe("http://localhost:5273/__regen");
+  });
+});
+
+/**
+ * WHOLE-BRANCH REVIEW, FINDING E — the PATH half of the traversal hazard this
+ * module already defended the project id against.
+ *
+ * `previewUrl`'s `path` and the `route.slug` in `/__overrides/<slug>` are both
+ * MODEL-GENERATED (`lib/canvas.ts` reads them off manifest nodes), and both
+ * were interpolated raw. `new URL("/__overrides/../../api/key", origin)`
+ * normalizes to `/api/key`; an iframe `src` and a plain `fetch()` apply the
+ * identical normalization. Three `..` defects at three layers have now come out
+ * of this codebase, so this closes the fourth instance rather than reasoning
+ * about whether it is currently reachable.
+ */
+describe("neutralizeDotSegments (finding E)", () => {
+  it("leaves a real path completely untouched, dots and all", () => {
+    // The reason a blanket encodePathSegment over every segment is WRONG:
+    // legitimate paths are full of dots.
+    expect(neutralizeDotSegments("/manifest.json")).toBe("/manifest.json");
+    expect(neutralizeDotSegments("/src/tokens/tokens.json")).toBe("/src/tokens/tokens.json");
+    expect(neutralizeDotSegments("/")).toBe("/");
+    expect(neutralizeDotSegments("/pricing")).toBe("/pricing");
+    expect(neutralizeDotSegments("/pricing?regen=123")).toBe("/pricing?regen=123");
+    // A sibling-looking name that merely BEGINS with dots is not a traversal.
+    expect(neutralizeDotSegments("/..foo/bar")).toBe("/..foo/bar");
+  });
+
+  it("stops a traversal from climbing out of the project prefix", () => {
+    const built = `/preview/abc${neutralizeDotSegments("/../../api/key")}`;
+    expect(new URL(built, "http://editor.test/").pathname).toBe("/preview/abc/%252E%252E/%252E%252E/api/key");
+  });
+
+  it("stops the percent-encoded spelling too", () => {
+    // The WHATWG parser treats %2e/%2E as equivalent to a literal dot for
+    // dot-segment detection, so matching only the literal forms would leave
+    // the encoded bypass wide open.
+    for (const encoded of ["/%2e%2e/api/key", "/%2E%2E/api/key", "/%2e./api/key"]) {
+      const built = `/preview/abc${neutralizeDotSegments(encoded)}`;
+      expect(new URL(built, "http://editor.test/").pathname.startsWith("/preview/abc/")).toBe(true);
+    }
+  });
+
+  it("does not rewrite inside a query string, where a dot segment means nothing", () => {
+    expect(neutralizeDotSegments("/pricing?to=../x")).toBe("/pricing?to=../x");
+  });
+});
+
+describe("previewUrl and the override URL both escape their model-generated part (finding E)", () => {
+  it("previewUrl: a route path of '../../api/key' cannot climb out of /preview/<id>/", () => {
+    const hosted = createBackend({ kind: "hosted", projectId: "proj-1", origin: EDITOR_ORIGIN });
+    const resolved = new URL(hosted.previewUrl("/../../api/key"), `${EDITOR_ORIGIN}/`);
+    expect(resolved.pathname.startsWith("/preview/proj-1/")).toBe(true);
+    expect(resolved.pathname).not.toBe("/api/key");
+  });
+
+  it("previewUrl: an ordinary route path is byte-identical to what it was before the fix", () => {
+    // Local mode must stay byte-identical, and hosted mode must not churn
+    // every real URL to close a hazard no real value triggers.
+    const hosted = createBackend({ kind: "hosted", projectId: "proj-1", origin: EDITOR_ORIGIN });
+    expect(hosted.previewUrl("/")).toBe("/preview/proj-1/");
+    expect(hosted.previewUrl("/manifest.json")).toBe("/preview/proj-1/manifest.json");
+    expect(hosted.previewUrl("/pricing?regen=9")).toBe("/preview/proj-1/pricing?regen=9");
+    const local = createBackend({ kind: "local", previewOrigin: "http://localhost:5273" });
+    expect(local.previewUrl("/manifest.json")).toBe("http://localhost:5273/manifest.json");
+  });
+
+  it("encodePathSegment: a slug of '..' cannot turn /__overrides/<slug> into another endpoint", () => {
+    const hosted = createBackend({ kind: "hosted", projectId: "proj-1", origin: EDITOR_ORIGIN });
+    const built = hosted.apiUrl(`/__overrides/${encodePathSegment("../api/key")}`);
+    expect(new URL(built).pathname).not.toBe("/api/key");
+    expect(new URL(built).pathname.startsWith("/__overrides/")).toBe(true);
+  });
+
+  it("encodePathSegment: an ordinary slug round-trips unchanged", () => {
+    for (const slug of ["home", "pricing", "about-us", "route_2"]) {
+      expect(encodePathSegment(slug)).toBe(slug);
+    }
   });
 });

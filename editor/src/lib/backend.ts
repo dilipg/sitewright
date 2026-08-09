@@ -108,6 +108,13 @@ export interface Backend {
 }
 
 /**
+ * Escapes ONE path segment so it can never be read as a dot segment. Used for
+ * the project id in `previewUrl`, and (whole-branch review, FINDING E) for the
+ * route slug every `/__overrides/<slug>` URL carries — a slug is
+ * `nodeId.split(".")[0]` of a MODEL-GENERATED node id (`lib/canvas.ts`), and
+ * `apiUrl`'s own `new URL(path, origin)` normalizes `/__overrides/../api/key`
+ * to `/api/key`.
+ *
  * `encodeURIComponent` leaves `.` unescaped (it is in its own "unreserved"
  * set), so a project id of exactly `".."` survives it completely unchanged
  * — and naively re-escaping the dot AFTERWARDS (`.replace(/\./g, "%2E")`)
@@ -128,8 +135,57 @@ export interface Backend {
  * and none of them are subject to any decode-then-reinterpret step the way
  * a dot-segment is.
  */
-function encodeProjectPathSegment(projectId: string): string {
-  return encodeURIComponent(projectId.replace(/\./g, "%2E"));
+export function encodePathSegment(segment: string): string {
+  return encodeURIComponent(segment.replace(/\./g, "%2E"));
+}
+
+/**
+ * WHOLE-BRANCH REVIEW, FINDING E — the other half of the hazard the comment
+ * above already describes.
+ *
+ * `previewUrl`'s own `projectId` was double-escaped against `..` from the day
+ * it was written; the `path` it is concatenated with was left completely raw,
+ * and its callers pass `route.path` — a MODEL-GENERATED value (`lib/canvas.ts`
+ * reads it off a manifest node). `new URL("/preview/<id>/../../api/key",
+ * origin)` normalizes to `/api/key`, and an iframe `src` or a plain `fetch()`
+ * applies the identical normalization. This codebase has now produced three
+ * `..` defects at three different layers, so the path half is closed too.
+ *
+ * A blanket `encodePathSegment` over every segment is WRONG here and was
+ * tried first: `/manifest.json` would become `/manifest%252Ejson` and stop
+ * resolving. A path legitimately contains dots; what it must not contain is a
+ * dot SEGMENT. So only genuine `.`/`..` segments are rewritten, and every
+ * other segment passes through byte-for-byte — which is what keeps LOCAL mode
+ * and every real route path completely unchanged.
+ *
+ * Percent-encoded spellings are folded first because the WHATWG URL parser
+ * treats `%2e`/`%2e%2e` as equivalent to `.`/`..` for dot-segment detection
+ * (the same fact the comment above records for the project id), so matching
+ * only the literal forms would leave the encoded bypass wide open.
+ *
+ * Total by construction: it never throws and never clamps. A traversal-shaped
+ * route path yields a harmless 404 inside the project's own preview instead of
+ * a request aimed at `/api/key` — and `previewUrl` is called from render
+ * (`src={backend.previewUrl(route.path)}`), where a throw would take the whole
+ * editor down with no error boundary to catch it.
+ */
+export function neutralizeDotSegments(path: string): string {
+  // Split off the query/fragment: only the PATH portion is subject to
+  // dot-segment normalization, and rewriting inside a query string would
+  // corrupt a legitimate value.
+  const cut = path.search(/[?#]/);
+  const pathname = cut === -1 ? path : path.slice(0, cut);
+  const rest = cut === -1 ? "" : path.slice(cut);
+  const safe = pathname
+    .split("/")
+    .map((segment) => {
+      const decoded = segment.replace(/%2e/gi, ".");
+      // `%252E` is `%2E` with its own `%` escaped, which matches none of the
+      // spec's recognized dot-segment forms at any single decode step.
+      return decoded === "." || decoded === ".." ? decoded.replace(/\./g, "%252E") : segment;
+    })
+    .join("/");
+  return `${safe}${rest}`;
 }
 
 export function createBackend(mode: BackendMode): Backend {
@@ -153,7 +209,7 @@ export function createBackend(mode: BackendMode): Backend {
       url.searchParams.set(PROJECT_QUERY_PARAM, projectId);
       return url.toString();
     },
-    previewUrl: (path) => `/preview/${encodeProjectPathSegment(projectId)}${path}`,
+    previewUrl: (path) => `/preview/${encodePathSegment(projectId)}${neutralizeDotSegments(path)}`,
   };
 }
 

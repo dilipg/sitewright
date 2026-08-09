@@ -31,12 +31,13 @@ import {
   splitOverridesByRoute,
   zoomAt,
 } from "./lib/canvas";
-import { backend } from "./lib/backend";
+import { backend, encodePathSegment } from "./lib/backend";
 import { applyEditOperations, interpretEditResult, validateEditOperations } from "./lib/edit-ops";
 import type { EditPromptResponse } from "./lib/edit-ops";
 import { expandStyleValue } from "./lib/inventory";
 import { enqueueAndPoll, formatElapsedSeconds } from "./lib/jobs";
 import { breadcrumbFor, humanizeSegment, parentNodeId } from "./lib/labels";
+import { fetchJson, SessionExpiredError, sessionAwareFetch } from "./lib/session-fetch";
 import type { History, OverridesMap } from "./lib/store";
 import {
   applyLayoutProperty,
@@ -86,47 +87,6 @@ const ZOOM_WHEEL_SENSITIVITY = 0.002;
  */
 const JOB_INTERRUPTED_MESSAGE =
   "The server restarted while this was running, so the outcome is unknown. Check the page to see whether the change went through before trying again.";
-
-/**
- * Thrown by `sessionAwareFetch` in place of ever letting a 401 reach
- * `enqueueAndPoll`'s own response handling (task-8 brief, hosted mode). A
- * hosted session can lapse mid-run -- a job runs for minutes, and a tab may
- * sit open far longer -- and a 401 must surface as ITS OWN honest state,
- * never as a generic job failure and never silently retried. Without this,
- * a 401 would land in one of two equally wrong places: at the INITIAL
- * enqueue POST, `enqueueAndPoll` treats any non-202 status as "the body IS
- * the outcome" (by design, for the local server's synchronous 200s and a
- * hosted refusal answered before a job exists), so a 401's `{error: "not
- * authenticated"}` body would be read as a normal outcome and reported
- * through whichever flow's own generic failure panel happened to be
- * asking; MID-POLL, a non-ok response already makes `enqueueAndPoll` reject
- * with a bare, unstructured Error, indistinguishable from a dead job row or
- * a transient 500. This class makes the one case that actually means
- * "your session expired" identifiable by TYPE rather than by parsing
- * either of those generic shapes.
- */
-class SessionExpiredError extends Error {
-  constructor() {
-    super("session expired");
-    this.name = "SessionExpiredError";
-  }
-}
-
-/**
- * Passed as `enqueueAndPoll`'s `fetchImpl` for every job-backed flow.
- * `enqueueAndPoll` uses the SAME fetch reference for both the initial
- * enqueue POST and every poll GET (jobs.ts's own `doFetch`), so wrapping it
- * here catches a 401 at either point with one function -- no change to
- * jobs.ts itself, which already exposes `fetchImpl` (today only documented
- * as a test seam) as exactly the injection point this needs. Never fires
- * against the local, unauthenticated preview server, which has no session
- * and never answers 401.
- */
-async function sessionAwareFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
-  const response = await fetch(input, init);
-  if (response.status === 401) throw new SessionExpiredError();
-  return response;
-}
 
 const SESSION_EXPIRED_MESSAGE = "Your session expired — sign in again.";
 
@@ -339,7 +299,7 @@ export default function App() {
       const [overrideFiles, historyFile] = await Promise.all([
         Promise.all(
           routeList.map((route) =>
-            sessionAwareFetch(backend.apiUrl(`/__overrides/${route.slug}`)).then((r) => r.json()),
+            sessionAwareFetch(backend.apiUrl(`/__overrides/${encodePathSegment(route.slug)}`)).then((r) => r.json()),
           ),
         ),
         sessionAwareFetch(backend.apiUrl("/__overrides-history")).then((r) => r.json()),
@@ -599,7 +559,7 @@ export default function App() {
   ): Promise<void> {
     const routeResponses = await Promise.all(
       routeList.map((route) =>
-        sessionAwareFetch(backend.apiUrl(`/__overrides/${route.slug}`), {
+        sessionAwareFetch(backend.apiUrl(`/__overrides/${encodePathSegment(route.slug)}`), {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(toOverrideFile(grouped[route.slug] ?? {}, route.path)),
@@ -941,11 +901,31 @@ export default function App() {
   /** Returns the reloaded manifest as well as storing it: `manifest` is state,
    *  so a caller that needs the new nodes in the SAME tick (add-a-section, which
    *  must position a node the manifest only just gained) cannot read them from
-   *  the closure it was called in. */
+   *  the closure it was called in.
+   *
+   *  Whole-branch review, FINDING B: this used bare `fetch` and read `.json()`
+   *  unconditionally — the ONE remaining fetch in this component that did
+   *  neither of the things task 8 established for every other one. A hosted
+   *  401's body parses as JSON perfectly well, so `manifest.nodes` became
+   *  `undefined` and render threw at `manifest?.nodes[selectedId]` (the
+   *  optional chain short-circuits on `manifest`, which is not null, so
+   *  `.nodes` is read and indexed) with no error boundary above it. And
+   *  because both regen paths call this AFTER the job already succeeded, the
+   *  same 401 surfaced as `setRegen({phase: "failed"})` — reporting failure
+   *  for work that landed. `fetchJson` throws `SessionExpiredError` on a 401
+   *  (routing to the session banner, which every caller's `catch` already
+   *  handles) and a plain `Error` on any other non-2xx, both before `.json()`
+   *  is ever called.
+   *
+   *  The shape check is deliberately separate from the status check: a 200
+   *  carrying something that is not a manifest is a different failure from a
+   *  401 carrying something that parses, and it is the one that actually
+   *  reached the DOM. */
   async function refreshManifest(): Promise<Manifest> {
-    const loaded = (await fetch(backend.previewUrl("/manifest.json"), { cache: "no-store" }).then((r) =>
-      r.json(),
-    )) as Manifest;
+    const loaded = await fetchJson<Manifest>(backend.previewUrl("/manifest.json"), { cache: "no-store" });
+    if (loaded === null || typeof loaded !== "object" || typeof loaded.nodes !== "object" || loaded.nodes === null) {
+      throw new Error("manifest.json did not have the expected shape");
+    }
     manifestRef.current = loaded;
     setManifest(loaded);
     return loaded;
@@ -1179,8 +1159,27 @@ export default function App() {
     setHistory((h) => (h === null ? h : pushHistory(h, applyTextValue(currentSnapshot(h), selectedId, src, "src"))));
   }
 
+  /** Whole-branch review, FINDING B: `setPendingPlan(null)` used to run
+   *  unconditionally after a bare `fetch`, so a hosted 401 (or any other
+   *  failure) dismissed the plan gate for an approval that never happened —
+   *  the user drops into the editor believing generation is unblocked, while
+   *  the server still has `plan-status.json` unapproved. The gate now stays up
+   *  unless the write actually landed. */
   async function approvePlan() {
-    await fetch(backend.apiUrl("/__plan/approve"), { method: "POST" });
+    try {
+      const response = await sessionAwareFetch(backend.apiUrl("/__plan/approve"), { method: "POST" });
+      if (!response.ok) {
+        setJobNotice(`Could not approve the plan (HTTP ${String(response.status)}). Nothing was changed — try again.`);
+        return;
+      }
+    } catch (error) {
+      if (error instanceof SessionExpiredError) {
+        setSessionExpired(true);
+        return;
+      }
+      setJobNotice(`Could not approve the plan: ${String(error)}. Nothing was changed — try again.`);
+      return;
+    }
     setPendingPlan(null);
   }
 

@@ -81,8 +81,12 @@ test("Enter is guarded like the submit button: a rapid double press sends one re
 
   await input.fill("make the headline shorter");
   await input.press("Enter");
-  // in flight and visibly so: the guard the second press must hit
-  await expect(page.getByTestId("edit-prompt-submit")).toHaveText("Working…");
+  // in flight and visibly so: the guard the second press must hit. The
+  // exact text now carries elapsed time (slice 5, job model: "Working…
+  // Ns" -- a job is opaque until it finishes, so elapsed time is the only
+  // honest thing left to show), hence a prefix match rather than an exact
+  // one -- this assertion only cares that the button is in its busy state.
+  await expect(page.getByTestId("edit-prompt-submit")).toHaveText(/^Working…/);
   await input.press("Enter");
   expect(requests, "the second Enter must not reach the server").toBe(1);
 

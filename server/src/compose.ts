@@ -12,6 +12,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import { authRoutes } from "./auth-routes.ts";
 import { compilerRoutes } from "./compiler-routes.ts";
+import { jobRoutes } from "./job-routes.ts";
 import { keyRoutes } from "./key-routes.ts";
 import type { PreviewPool } from "./preview-pool.ts";
 import { previewRoutes } from "./preview-routes.ts";
@@ -29,12 +30,35 @@ export function buildRoutes(args: {
    * when there is a pool to serve them, never mounted half-wired.
    */
   pool?: PreviewPool;
+  /**
+   * Optional, and INDEPENDENT of `pool` — slice 5's job routes (job-routes.ts)
+   * need a place to create a fresh project's directory (`POST /api/generate`)
+   * but touch no preview child at all, so they need no `PreviewPool` object.
+   * `PreviewPool` never exposes its own `projectsRoot` (it is a private
+   * field), so this cannot be derived from `pool` even when one is given —
+   * scripts/serve.ts always supplies both together, from the same local
+   * variable, but the two are independently optional here so a caller with
+   * no need for job routes (every pre-existing test) is not forced to
+   * construct one just to keep compiling.
+   */
+  projectsRoot?: string;
+  /**
+   * Optional (task 7, resume): threaded through to jobRoutes' resume
+   * endpoint, which compares a job's own recorded `codeVersion` against
+   * this. scripts/serve.ts computes ONE value at boot and passes it here AND
+   * into `JobWorker` (the thing that stamps a job's `codeVersion` in the
+   * first place), so both sides read the identical string. Every test that
+   * does not care about resume's code-version safety rail is free to omit
+   * this — jobRoutes falls back to its own real, harmless default.
+   */
+  codeVersion?: string;
 }): Route[] {
-  const { db, masterKey, secureCookies, pool } = args;
+  const { db, masterKey, secureCookies, pool, projectsRoot, codeVersion } = args;
   return [
     ...authRoutes({ db, secureCookies }),
     ...keyRoutes({ db, masterKey }),
     ...projectRoutes({ db }),
+    ...(projectsRoot === undefined ? [] : jobRoutes({ db, projectsRoot, ...(codeVersion === undefined ? {} : { codeVersion }) })),
     ...(pool === undefined ? [] : previewRoutes({ db, pool })),
     ...(pool === undefined ? [] : compilerRoutes({ db, pool })),
   ];

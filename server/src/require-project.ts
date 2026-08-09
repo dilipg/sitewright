@@ -29,8 +29,17 @@ export type ProjectHandler = (
   ctx: { url: URL; params: Record<string, string>; user: User; project: Project },
 ) => Promise<void> | void;
 
-/** One message for both failure modes, so the pair is indistinguishable. */
-const NOT_FOUND = { error: "project not found" };
+/**
+ * One message for both failure modes, so the pair is indistinguishable.
+ * Exported so job-routes.ts's `GET /api/jobs/:id` — which is owner-checked on
+ * the job's own `user_id` rather than through this wrapper, since a job may
+ * outlive its project (`project_id` is `ON DELETE SET NULL`) — can answer a
+ * foreign or absent job id with the exact same shape. A job id must not be an
+ * enumeration oracle either, and reusing this literal object (not a second,
+ * differently-worded copy) is what keeps the two responses byte-identical
+ * without relying on two authors remembering to agree.
+ */
+export const NOT_FOUND = { error: "project not found" };
 
 export function requireProject(
   db: DatabaseSync,

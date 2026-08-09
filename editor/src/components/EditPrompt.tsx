@@ -4,10 +4,17 @@
  * One box. The agent resolves which nodes are meant, and the result lands
  * immediately with a summary — overrides are free and reversible, so a confirm
  * step on every edit would cost more than a wrong target does.
+ *
+ * `/__edit-prompt` is one of the job-model's five converted endpoints
+ * (slice 5): against the hosted server the request is a job, opaque until
+ * it finishes, so `running` carries `elapsedMs` — real information, not a
+ * fabricated percentage — and nothing else this state can honestly show.
  */
+import { formatElapsedSeconds } from "../lib/jobs";
+
 export type EditPromptState =
   | { phase: "idle" }
-  | { phase: "running" }
+  | { phase: "running"; elapsedMs: number }
   | { phase: "done"; notes: string; applied: string[] }
   | { phase: "clarify"; question: string }
   | { phase: "rejected"; errors: string[] }
@@ -53,7 +60,7 @@ export default function EditPrompt({ state, value, onChange, onSubmit, onUndo }:
           disabled={state.phase === "running" || value.trim() === ""}
           onClick={onSubmit}
         >
-          {state.phase === "running" ? "Working…" : "Apply"}
+          {state.phase === "running" ? `Working… ${formatElapsedSeconds(state.elapsedMs)}` : "Apply"}
         </button>
       </div>
 

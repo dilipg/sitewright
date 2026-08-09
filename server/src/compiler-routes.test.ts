@@ -2,57 +2,62 @@
 /**
  * Drives the real, composed route table
  * (createRequestListener(compilerRoutes(...))) against a FAKE pool and a
- * mocked preview-proxy — the same idiom preview-routes.test.ts uses, since
- * the underlying shape (ownership check, then acquire/retain/proxy/release)
- * is identical; only the project-id source (every compiler entry is
- * `BY_QUERY`, never a route `:param`) and the spend-cap wrapper on billable
- * entries differ.
+ * mocked preview-proxy — the same idiom preview-routes.test.ts uses, for the
+ * entries that still proxy synchronously through this layer.
  *
- * DELIBERATE GAP, reported rather than papered over: the brief's item 8 ("a
- * client-supplied x-webgen-usage-id header does not reach the upstream")
- * cannot be proven through THIS harness. proxyHttp is stubbed here, so the
- * real deletion code (preview-proxy.ts's `upstreamHeaders`) never runs —
- * compiler-routes.ts always forwards `req` (headers untouched) straight into
- * `proxyHttp`, by design (stripping is proxyHttp's job, not this module's),
- * so a correct implementation and a buggy one would produce an IDENTICAL
- * recorded call here. A test built on this mock could assert the header is
- * present in the mock's `args.req.headers` and it would pass regardless of
- * whether the real code strips it — which is exactly the "can never fail no
- * matter what" shape this codebase's own decisions.md repeatedly flags. The
- * actual, perturbation-provable test for that property lives in
- * preview-proxy.test.ts, sibling to the pre-existing cookie/authorization
- * case, where the real (unmocked) upstreamHeaders/proxyHttp genuinely runs.
- * See the task report for Step 5's proof against that test.
+ * SLICE 5 (the job model): the five long-running entries — /__regen,
+ * /__regen-page, /__add-section, /__edit-prompt, /__export — no longer proxy
+ * from THIS layer at all; they enqueue a job and answer 202 `{jobId}`
+ * immediately. The usage-id-header / ingest-on-completion machinery this
+ * file used to test here (a `billableForward` built on `forwardToPreview`'s
+ * own `billable` hook) moved, unchanged in shape, into job-worker.ts's
+ * `runProxiedJob` — see job-worker.test.ts for that coverage: "ingests the
+ * usage log for a completed exchange, and deletes it", "generates a
+ * DIFFERENT usage id per job" (task-3-review finding 3 — the original single-
+ * job test only proved one id's SHAPE, never that two jobs get two different
+ * ones), the `skipped`/`unreadable` warning-logging pair and their two
+ * "logs nothing" negative counterparts (finding 4 — the negatives were
+ * dropped with no replacement the first time this moved), "still ingests the
+ * usage log ... when the proxy exchange itself fails" (finding 2 — a task-3
+ * comment claimed this property had already moved here, but no test anywhere
+ * actually exercised it until this fix), and "skips ingest ... on an
+ * incomplete exchange". Likewise "releases the preview even when the proxy
+ * call rejects" no longer has anything to prove for an async entry (there is
+ * no proxy call at this layer for one any more) — that test below now uses
+ * two SYNCHRONOUS entries instead.
+ *
+ * What remains here: mounting (bidirectional against the registry),
+ * authorization (401/404) across every entry, the enqueue itself (202 + a
+ * real, correctly-shaped job row) for the five async entries, synchronous
+ * forwarding (unchanged) for every entry that stayed synchronous, and the
+ * spend-cap / API-key gates on the four billable entries (all of which are
+ * also async, but the gates themselves — requireApiKey, requireBudget — sit
+ * in front of the SAME `inner` handler regardless of what it does).
  */
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DatabaseSync } from "node:sqlite";
 import { openDatabase } from "./db.ts";
 import { createUser } from "./users.ts";
 import { createSession, SESSION_COOKIE } from "./sessions.ts";
 import { createProject, type Project } from "./projects.ts";
-import { recordUsageEvent, spendSince } from "./usage.ts";
-import { createRequestListener } from "./router.ts";
 import {
-  MAX_BILLABLE_IN_FLIGHT_PER_USER,
-  MAX_PREVIEWS,
-  PreviewCapacityError,
-  type PreviewPool,
-} from "./preview-pool.ts";
+  findJobById, finishJob, listJobsByProject, MAX_ENQUEUED_BILLABLE_JOBS_PER_USER,
+  MAX_ENQUEUED_NON_BILLABLE_JOBS_PER_USER, MAX_REQUEST_JSON_BYTES, NON_BILLABLE_ENQUEUE_BOUND_REFUSED,
+} from "./jobs.ts";
+import { recordUsageEvent } from "./usage.ts";
+import { createRequestListener } from "./router.ts";
+import { MAX_PREVIEWS, PreviewCapacityError, type PreviewPool } from "./preview-pool.ts";
 import { PROJECT_SCOPED_ENDPOINTS } from "./project-registry.ts";
 import { compilerRoutes } from "./compiler-routes.ts";
 import { DisabledUserError, MissingApiKeyError, UnknownUserError } from "./agent-env.ts";
 import { UndecryptableApiKeyError } from "./api-keys.ts";
-import { USAGE_ID_HEADER, isValidUsageId, usageLogPathFor } from "../../compiler/src/usage-log-path.ts";
 
 const proxyMocks = vi.hoisted(() => ({
   // Return type matches the REAL proxyHttp's contract (FIX 3): `{ completed
-  // }`, not bare `void` — preview-forward.ts reads `.completed` off
-  // whatever this resolves to, so a test that wants the ingest gate to run
-  // (the common case) must resolve `{ completed: true }`, exactly like a
-  // real, fully-relayed exchange would.
+  // }`, not bare `void`.
   impl: async (args: {
     res: { writeHead: (code: number) => unknown; end: (chunk?: string) => unknown };
     setHeaders?: Record<string, string>;
@@ -66,7 +71,8 @@ const proxyMocks = vi.hoisted(() => ({
 
 // Vitest hoists vi.mock calls above every import in this file, so
 // compiler-routes.ts's own `import { proxyHttp } from "./preview-proxy.ts"`
-// resolves to this mock — same idiom preview-routes.test.ts uses.
+// (reached via forwardToPreview, used by every SYNCHRONOUS entry) resolves
+// to this mock — same idiom preview-routes.test.ts uses.
 vi.mock("./preview-proxy.ts", () => ({
   proxyHttp: (args: {
     req: unknown;
@@ -92,46 +98,29 @@ interface FakePool {
   retain: ReturnType<typeof vi.fn>;
   release: ReturnType<typeof vi.fn>;
   assertApiKeyUsable: ReturnType<typeof vi.fn>;
-  // Explicitly typed (not the bare `ReturnType<typeof vi.fn>` the other
-  // fields use): those are only ever asserted ON, never called BY test code,
-  // so the untyped default (which TS widens to the constraint `Procedure |
-  // Constructable`, and a union of those two is not directly callable) never
-  // mattered until these two — the concurrency tests below call them
-  // directly to seed/drain reservations.
-  reserveBillableSlot: ReturnType<typeof vi.fn<(userId: string) => boolean>>;
-  releaseBillableSlot: ReturnType<typeof vi.fn<(userId: string) => void>>;
 }
 
+// No reserveBillableSlot/releaseBillableSlot here (unlike this file's
+// pre-slice-5 fakePool): compiler-routes.ts no longer calls either — the
+// concurrent-start bound they implemented moved to jobs.ts's `claimNextJob`
+// (see that function's own comment) — so a fake that still offered them
+// would be testing a mechanism this file's subject no longer uses. Same
+// idiom job-worker.test.ts's own fakePool already adopted for the identical
+// reason.
 function fakePool(acquireImpl?: (project: Project, ownerId: string) => Promise<{ port: number; base: string }>): FakePool {
-  // A real (small, in-memory) per-user counter, not just a spy that always
-  // succeeds — the concurrency tests below need genuine reserve/refuse/
-  // release behaviour to prove compiler-routes.ts actually WIRES the
-  // wrapper around the forward call correctly. PreviewPool's OWN counting
-  // logic is separately, directly unit-tested in preview-pool.test.ts; this
-  // is deliberately an independent implementation of the same small rule; a
-  // shared bug in both would still be caught by preview-pool.test.ts.
-  const billableInFlight = new Map<string, number>();
   return {
     acquire: vi.fn(acquireImpl ?? (async () => ({ port: 6001, base: "/preview/x/" }))),
     retain: vi.fn(),
     release: vi.fn(),
     assertApiKeyUsable: vi.fn(),
-    reserveBillableSlot: vi.fn<(userId: string) => boolean>((userId) => {
-      const current = billableInFlight.get(userId) ?? 0;
-      if (current >= MAX_BILLABLE_IN_FLIGHT_PER_USER) return false;
-      billableInFlight.set(userId, current + 1);
-      return true;
-    }),
-    releaseBillableSlot: vi.fn<(userId: string) => void>((userId) => {
-      const current = billableInFlight.get(userId) ?? 0;
-      billableInFlight.set(userId, Math.max(0, current - 1));
-    }),
   };
 }
 
 /** Every /__* entry in the registry — what compilerRoutes is supposed to derive its output from. */
 const COMPILER_ENTRIES = PROJECT_SCOPED_ENDPOINTS.filter((e) => e.path.startsWith("/__"));
 const BILLABLE_ENTRIES = COMPILER_ENTRIES.filter((e) => e.billable);
+const ASYNC_ENTRIES = COMPILER_ENTRIES.filter((e) => e.async);
+const SYNC_ENTRIES = COMPILER_ENTRIES.filter((e) => !e.async);
 
 type CompilerEntry = (typeof PROJECT_SCOPED_ENDPOINTS)[number];
 
@@ -170,7 +159,10 @@ function harness(pool: FakePool) {
   const project = createProject(db, alice.id, "alice-run", "Alice");
   const listener = createRequestListener(compilerRoutes({ db, pool: pool as unknown as PreviewPool }));
 
-  async function call(method: string, path: string, cookie?: string) {
+  // `body` is JSON.stringified as usual; `raw`, when given, bypasses that and
+  // is sent as-is — the only way to put non-JSON bytes on the wire, needed to
+  // prove the enqueue path's own malformed-body handling.
+  async function call(method: string, path: string, cookie?: string, body?: unknown, raw?: Buffer) {
     const chunks: string[] = [];
     let status = 0;
     const res = {
@@ -179,9 +171,11 @@ function harness(pool: FakePool) {
       setHeader() {},
       end(chunk?: string) { if (chunk !== undefined) chunks.push(chunk); },
     };
-    const req = Object.assign((async function* () {})(), {
-      method, url: path, headers: { host: "localhost", ...(cookie ? { cookie } : {}) },
-    });
+    const payload = raw !== undefined ? [raw] : body === undefined ? [] : [Buffer.from(JSON.stringify(body))];
+    const req = Object.assign(
+      (async function* () { yield* payload; })(),
+      { method, url: path, headers: { host: "localhost", ...(cookie ? { cookie } : {}) } },
+    );
     await listener(req as never, res as never);
     return { status, body: chunks.join("") };
   }
@@ -231,7 +225,7 @@ describe("compilerRoutes", () => {
     expect(pool.acquire).not.toHaveBeenCalled();
   });
 
-  it.each(COMPILER_ENTRIES)("proxies $method $path for the owner, forwarding req.url verbatim including the query string", async (entry) => {
+  it.each(SYNC_ENTRIES)("proxies $method $path for the owner, forwarding req.url verbatim including the query string", async (entry) => {
     const pool = fakePool(async () => ({ port: 7777, base: "/preview/x/" }));
     const { call, project, alice, aliceCookie } = harness(pool);
     const base = pathFor(entry, project.id);
@@ -241,56 +235,82 @@ describe("compilerRoutes", () => {
     const requestPath = `${base}${base.includes("?") ? "&" : "?"}extra=1&token=abc`;
     const result = await call(entry.method, requestPath, aliceCookie);
     expect(result.status).toBe(200);
-    // A billable entry also carries a setHeaders (task 3's usage id) that
-    // this test isn't about — asserted separately in the "attributing
-    // billable spend" block below — so it's allowed here, not required.
-    expect(proxyMocks.calls).toEqual([
-      { port: 7777, path: requestPath, setHeaders: entry.billable ? expect.any(Object) : undefined },
-    ]);
+    // No SYNC entry is billable any more (every billable entry is also
+    // async, see project-registry.ts), so no synchronous forward ever
+    // carries a usage-id header — unlike before slice 5, this is now always
+    // undefined, not conditional.
+    expect(proxyMocks.calls).toEqual([{ port: 7777, path: requestPath, setHeaders: undefined }]);
     expect(pool.acquire).toHaveBeenCalledWith(expect.objectContaining({ id: project.id }), alice.id);
   });
 
-  it.each(BILLABLE_ENTRIES)(
-    "refuses $method $path with 402 over the cap, carrying capUsd/spentUsd/resetAt, and never touches the pool",
-    async (entry) => {
-      const pool = fakePool();
-      const { db, call, project, alice, aliceCookie } = harness(pool);
-      recordUsageEvent(db, {
-        userId: alice.id, projectId: null, role: "section", model: "claude-sonnet-5",
-        inputTokens: 0, outputTokens: 0, cacheCreationInputTokens: 0, cacheReadInputTokens: 0,
-        costUsd: 11, at: Date.now(),
-      });
-      const result = await call(entry.method, pathFor(entry, project.id), aliceCookie);
-      expect(result.status).toBe(402);
-      const body = JSON.parse(result.body) as { capUsd: number; spentUsd: number; resetAt: number | null };
-      expect(body.capUsd).toBe(10);
-      expect(body.spentUsd).toBe(11);
-      expect(typeof body.resetAt).toBe("number");
-      expect(pool.acquire).not.toHaveBeenCalled();
-    },
-  );
+  it.each(ASYNC_ENTRIES)("enqueues $method $path for the owner, returning 202 with a real job row, and never touches the pool", async (entry) => {
+    const pool = fakePool();
+    const { db, call, project, alice, aliceCookie } = harness(pool);
+    const payload = { instruction: "make it bigger", route: "/pricing" };
+    const result = await call(entry.method, pathFor(entry, project.id), aliceCookie, payload);
 
-  it.each(COMPILER_ENTRIES.filter((e) => e.path === "/__export" || e.path === "/__export-download"))(
-    "does not gate $method $path on the spend cap — a user over the cap still reaches the proxy",
-    async (entry) => {
-      const pool = fakePool(async () => ({ port: 7777, base: "/preview/x/" }));
-      const { db, call, project, alice, aliceCookie } = harness(pool);
-      recordUsageEvent(db, {
-        userId: alice.id, projectId: null, role: "section", model: "claude-sonnet-5",
-        inputTokens: 0, outputTokens: 0, cacheCreationInputTokens: 0, cacheReadInputTokens: 0,
-        costUsd: 999, at: Date.now(),
-      });
-      const result = await call(entry.method, pathFor(entry, project.id), aliceCookie);
-      // Exporting spends nothing, so refusing it over the cap would strand a
-      // user's finished work behind a bill (spec, binding constraint).
-      expect(result.status).toBe(200);
-      expect(pool.acquire).toHaveBeenCalled();
-    },
-  );
+    expect(result.status).toBe(202);
+    const parsed = JSON.parse(result.body) as { jobId: string };
+    expect(typeof parsed.jobId).toBe("string");
+    expect(parsed.jobId.length).toBeGreaterThan(0);
+
+    const job = findJobById(db, parsed.jobId);
+    expect(job).not.toBeNull();
+    expect(job?.userId).toBe(alice.id);
+    expect(job?.projectId).toBe(project.id);
+    expect(job?.status).toBe("queued");
+    // The exact body the client sent, round-tripped through JSON — this is
+    // the payload job-worker.ts will later replay to the child verbatim.
+    expect(job?.requestJson).toBe(JSON.stringify(payload));
+
+    // No proxy call, no pool interaction: the work has not happened yet.
+    expect(proxyMocks.calls).toEqual([]);
+    expect(pool.acquire).not.toHaveBeenCalled();
+  });
+
+  it.each(ASYNC_ENTRIES)("rejects a malformed-JSON body on $method $path with 400, creating no job", async (entry) => {
+    const pool = fakePool();
+    const { db, call, project, aliceCookie } = harness(pool);
+    const result = await call(entry.method, pathFor(entry, project.id), aliceCookie, undefined, Buffer.from("not valid json"));
+    expect(result.status).toBe(400);
+    expect(listJobsByProject(db, project.id, 10)).toEqual([]);
+    expect(pool.acquire).not.toHaveBeenCalled();
+  });
+
+  it("does not gate the async-but-non-billable /__export on the spend cap — a user over the cap still gets 202", async () => {
+    const pool = fakePool();
+    const { db, call, project, alice, aliceCookie } = harness(pool);
+    recordUsageEvent(db, {
+      userId: alice.id, projectId: null, role: "section", model: "claude-sonnet-5",
+      inputTokens: 0, outputTokens: 0, cacheCreationInputTokens: 0, cacheReadInputTokens: 0,
+      costUsd: 999, at: Date.now(),
+    });
+    const entry = ASYNC_ENTRIES.find((e) => e.path === "/__export")!;
+    const result = await call(entry.method, pathFor(entry, project.id), aliceCookie);
+    // Exporting spends nothing, so refusing to even ENQUEUE it over the cap
+    // would strand a user's finished work behind a bill (spec, binding
+    // constraint) — same reasoning as /__export-download below, just at the
+    // enqueue step instead of the proxy step.
+    expect(result.status).toBe(202);
+  });
+
+  it("does not gate the synchronous /__export-download on the spend cap — a user over the cap still reaches the proxy", async () => {
+    const pool = fakePool(async () => ({ port: 7777, base: "/preview/x/" }));
+    const { db, call, project, alice, aliceCookie } = harness(pool);
+    recordUsageEvent(db, {
+      userId: alice.id, projectId: null, role: "section", model: "claude-sonnet-5",
+      inputTokens: 0, outputTokens: 0, cacheCreationInputTokens: 0, cacheReadInputTokens: 0,
+      costUsd: 999, at: Date.now(),
+    });
+    const entry = SYNC_ENTRIES.find((e) => e.path === "/__export-download")!;
+    const result = await call(entry.method, pathFor(entry, project.id), aliceCookie);
+    expect(result.status).toBe(200);
+    expect(pool.acquire).toHaveBeenCalled();
+  });
 
   it.each([
-    COMPILER_ENTRIES.find((e) => e.path === "/__regen")!,
-    COMPILER_ENTRIES.find((e) => e.path === "/__export")!,
+    SYNC_ENTRIES.find((e) => e.path === "/__plan")!,
+    SYNC_ENTRIES.find((e) => e.path === "/__regen-revert")!,
   ])("releases the preview even when the proxy call rejects ($method $path)", async (entry) => {
     proxyMocks.impl = async () => { throw new Error("proxy exploded"); };
     const pool = fakePool();
@@ -315,276 +335,130 @@ describe("compilerRoutes", () => {
 });
 
 /**
- * Task 3: attributing a billable request's model spend to the user who paid.
- * The mocked `proxyHttp` from the top of this file stands in for the child:
- * these tests script its `impl` to read `args.setHeaders[USAGE_ID_HEADER]`
- * (the id `compiler-routes.ts` generated for THIS request) and write a fake
- * usage log at exactly the path `usageLogPathFor` derives from it — the same
- * path `compiler-routes.ts` itself ingests from afterwards — so the test
- * proves the real id round-trips through the real path derivation, not a
- * hardcoded stand-in.
+ * Task-3-review finding 1 / round 2: the deleted `requireBillableSlot`
+ * bounded "the concurrent-start multiplier on the spend cap" — N billable
+ * requests in flight for one user all evaluating `checkSpendCap` against the
+ * same pre-run total, since spend lands in `usage_event` only at ingest,
+ * after a run finishes. Round 1's replacement, a decorator
+ * (`requireEnqueueSlot`, `server/src/require-enqueue-slot.ts`, since
+ * DELETED), read `countActiveBillableJobsForUser` and let a separate
+ * `createJob` write happen later — an `await` apart — which is not atomic:
+ * every test in this block used to fire requests SEQUENTIALLY (`await
+ * call(...)` per loop iteration, each request fully resolving before the
+ * next begins), and a sequential loop cannot observe two requests'
+ * synchronous prefixes in flight at once, so all of them passed while the
+ * bug shipped. Proven empirically (10 concurrent `POST /api/generate` for
+ * one user via `Promise.all` produced 10/10 202s against a bound of 2 —
+ * job-routes.test.ts has the equivalent live test for that endpoint). The
+ * fix moved the check INTO the write itself: `jobs.ts`'s
+ * `createBillableJobIfUnderBound` is one atomic `INSERT ... SELECT ...
+ * WHERE` — the same technique `claimNextJob` already uses for its own
+ * per-user bound (see that function's own comment: "This MUST be a single
+ * statement, not a SELECT followed by an UPDATE").
+ *
+ * The sequential tests below are KEPT — they cover a real, different
+ * property (the bound survives across separate, COMPLETED requests, and
+ * frees correctly) — with a concurrent test ADDED first, firing with
+ * `Promise.all` and no `await` between requests: the one shape of test that
+ * can actually catch the class of bug that shipped in round 1.
  */
-function usageRow(overrides: Record<string, unknown> = {}): Record<string, unknown> {
-  return {
-    timestamp: new Date().toISOString(),
-    role: "section",
-    model: "claude-sonnet-5",
-    input_tokens: 10,
-    output_tokens: 20,
-    cache_creation_input_tokens: 0,
-    cache_read_input_tokens: 0,
-    cost_usd: 1,
-    ...overrides,
-  };
-}
+describe("compilerRoutes: per-user billable enqueue bound (atomic INSERT — jobs.ts's createBillableJobIfUnderBound)", () => {
+  it(`allows exactly ${String(MAX_ENQUEUED_BILLABLE_JOBS_PER_USER)} of ${String(MAX_ENQUEUED_BILLABLE_JOBS_PER_USER * 5)} TRULY CONCURRENT billable enqueues for one user (Promise.all, no await between requests), refusing the rest with 429 and creating no job row for any refused one`, async () => {
+    const pool = fakePool();
+    const { db, call, project, aliceCookie } = harness(pool);
+    const entry = BILLABLE_ENTRIES[0]!;
+    const burst = MAX_ENQUEUED_BILLABLE_JOBS_PER_USER * 5;
+    // No `await` between these dispatches — every one of the `burst`
+    // requests is in flight before any of them completes, reproducing the
+    // exact shape that let round 1's decorator pass every sequential test
+    // while remaining exploitable for real.
+    const results = await Promise.all(
+      Array.from({ length: burst }, () => call(entry.method, pathFor(entry, project.id), aliceCookie, {})),
+    );
+    const statuses = results.map((r) => r.status);
+    expect(statuses.filter((s) => s === 202)).toHaveLength(MAX_ENQUEUED_BILLABLE_JOBS_PER_USER);
+    expect(statuses.filter((s) => s === 429)).toHaveLength(burst - MAX_ENQUEUED_BILLABLE_JOBS_PER_USER);
+    expect(statuses.every((s) => s === 202 || s === 429)).toBe(true);
+    // The load-bearing assertion: the JOB ROW COUNT matches the number of
+    // 202s exactly — a race that let extra rows through would inflate this
+    // independently of whatever the HTTP responses themselves claimed.
+    expect(listJobsByProject(db, project.id, burst + 10)).toHaveLength(MAX_ENQUEUED_BILLABLE_JOBS_PER_USER);
+  });
 
-/** Writes a fake child usage log at the path the given usage id implies, creating the temp directory `usageLogPathFor` expects. */
-function writeUsageLog(usageId: string, rows: Array<Record<string, unknown>>): string {
-  const path = usageLogPathFor(usageId);
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, rows.map((row) => JSON.stringify(row)).join("\n"), "utf8");
-  return path;
-}
+  it(`refuses the ${String(MAX_ENQUEUED_BILLABLE_JOBS_PER_USER + 1)}th SEQUENTIAL billable enqueue for one user with 429, creating no job row for it`, async () => {
+    const pool = fakePool();
+    const { db, call, project, aliceCookie } = harness(pool);
+    const entry = BILLABLE_ENTRIES[0]!;
+    const results: number[] = [];
+    for (let i = 0; i < MAX_ENQUEUED_BILLABLE_JOBS_PER_USER + 1; i += 1) {
+      const result = await call(entry.method, pathFor(entry, project.id), aliceCookie, {});
+      results.push(result.status);
+    }
+    expect(results.slice(0, MAX_ENQUEUED_BILLABLE_JOBS_PER_USER)).toEqual(
+      Array(MAX_ENQUEUED_BILLABLE_JOBS_PER_USER).fill(202),
+    );
+    expect(results[MAX_ENQUEUED_BILLABLE_JOBS_PER_USER]).toBe(429);
+    // Exactly the bound's worth of job rows — the refused Nth+1 request
+    // created none.
+    expect(listJobsByProject(db, project.id, 10)).toHaveLength(MAX_ENQUEUED_BILLABLE_JOBS_PER_USER);
+  });
 
-describe("compilerRoutes: attributing billable spend", () => {
-  const billableEntry = BILLABLE_ENTRIES[0]!;
-
-  it("sets a well-formed x-webgen-usage-id on a billable request, a different one per request", async () => {
+  it("does not gate /__export on the bound, and an /__export enqueue does not itself count against it", async () => {
     const pool = fakePool();
     const { call, project, aliceCookie } = harness(pool);
-    await call(billableEntry.method, pathFor(billableEntry, project.id), aliceCookie);
-    await call(billableEntry.method, pathFor(billableEntry, project.id), aliceCookie);
-
-    expect(proxyMocks.calls).toHaveLength(2);
-    const id1 = proxyMocks.calls[0]?.setHeaders?.[USAGE_ID_HEADER];
-    const id2 = proxyMocks.calls[1]?.setHeaders?.[USAGE_ID_HEADER];
-    expect(id1).toBeDefined();
-    expect(id2).toBeDefined();
-    // Pinned against the real predicate, not a copy of its regex: this fails
-    // if compiler-routes.ts ever generates the id a different way (e.g. a
-    // different byte length, or uppercase hex) even if that value still
-    // "looks like" an id to the eye.
-    expect(isValidUsageId(id1)).toBe(true);
-    expect(isValidUsageId(id2)).toBe(true);
-    expect(id1).toMatch(/^[0-9a-f]{32}$/);
-    // A different one per request — this is the assertion Step 4's third
-    // perturbation (making the id a constant) is proved against.
-    expect(id1).not.toBe(id2);
-  });
-
-  it("sends no usage id header on a non-billable request", async () => {
-    const pool = fakePool();
-    const { call, project, aliceCookie } = harness(pool);
-    const entry = COMPILER_ENTRIES.find((e) => !e.billable)!;
-    await call(entry.method, pathFor(entry, project.id), aliceCookie);
-
-    expect(proxyMocks.calls).toHaveLength(1);
-    expect(proxyMocks.calls[0]?.setHeaders).toBeUndefined();
-  });
-
-  it("ingests the child's usage log into usage_event, attributed to the owner, and deletes the file afterwards", async () => {
-    const pool = fakePool();
-    const { db, call, project, alice, aliceCookie } = harness(pool);
-    let capturedPath = "";
-    proxyMocks.impl = async (args) => {
-      const usageId = args.setHeaders?.[USAGE_ID_HEADER];
-      if (usageId === undefined) throw new Error("expected a usage id header on a billable request");
-      capturedPath = writeUsageLog(usageId, [usageRow({ cost_usd: 1 }), usageRow({ cost_usd: 2 })]);
-      args.res.writeHead(200);
-      args.res.end("proxied");
-      return { completed: true };
-    };
-
-    const result = await call(billableEntry.method, pathFor(billableEntry, project.id), aliceCookie);
-    expect(result.status).toBe(200);
-
-    // usage_event holds the rows, attributed to alice — and exactly the two
-    // rows the child wrote, not double: this is Step 1's item 7, "ingest
-    // happens exactly once."
-    const window = spendSince(db, alice.id, 0);
-    expect(window.events).toBe(2);
-    expect(window.costUsd).toBe(3);
-
-    // The log file is gone afterwards.
-    expect(existsSync(capturedPath)).toBe(false);
-  });
-
-  it("ingests nothing and does not throw when the child wrote no usage log", async () => {
-    const pool = fakePool();
-    const { db, call, project, alice, aliceCookie } = harness(pool);
-    // beforeEach's default impl never writes a log file for any id.
-    const result = await call(billableEntry.method, pathFor(billableEntry, project.id), aliceCookie);
-    expect(result.status).toBe(200);
-    expect(spendSince(db, alice.id, 0)).toEqual({ costUsd: 0, events: 0, unpricedEvents: 0 });
-  });
-
-  it("still ingests the usage log when the proxy call rejects — spend survives failure", async () => {
-    const pool = fakePool();
-    const { db, call, project, alice, aliceCookie } = harness(pool);
-    proxyMocks.impl = async (args) => {
-      const usageId = args.setHeaders?.[USAGE_ID_HEADER];
-      if (usageId === undefined) throw new Error("expected a usage id header on a billable request");
-      writeUsageLog(usageId, [usageRow({ cost_usd: 5 })]);
-      throw new Error("proxy exploded partway through a real run");
-    };
-
-    const result = await call(billableEntry.method, pathFor(billableEntry, project.id), aliceCookie);
-    // The router's own top-level catch turns the re-thrown error into a 500
-    // — the property under test is that the spend was still recorded despite
-    // the failed request, because ingest runs in the same finally as
-    // release, not only on the success path.
-    expect(result.status).toBe(500);
-    const window = spendSince(db, alice.id, 0);
-    expect(window.events).toBe(1);
-    expect(window.costUsd).toBe(5);
-  });
-
-  /**
-   * FIX 3 (whole-branch review): a client abort or PREVIEW_PROXY_TIMEOUT_MS
-   * resolves the REAL proxyHttp with `{ completed: false }` WITHOUT throwing
-   * — the orchestrator subprocess behind it may still be running and still
-   * appending to its log. Ingesting now would read a PARTIAL file and then
-   * delete it, so every later line lands nowhere. This is the one case that
-   * must skip `after()` entirely: no ingest, and no delete either (the
-   * eventual startup sweep is what cleans this file up, not this handler).
-   */
-  it("does not ingest — and does not delete the log file — when the proxy resolves without the exchange completing", async () => {
-    const pool = fakePool();
-    const { db, call, project, alice, aliceCookie } = harness(pool);
-    let capturedPath = "";
-    try {
-      proxyMocks.impl = async (args) => {
-        const usageId = args.setHeaders?.[USAGE_ID_HEADER];
-        if (usageId === undefined) throw new Error("expected a usage id header on a billable request");
-        // A partial write — standing in for a subprocess still appending when
-        // the run timed out — followed by resolving (not throwing) with
-        // completed: false, exactly like the real proxyHttp's own
-        // PREVIEW_PROXY_TIMEOUT_MS path: it still writes a 504 to the client,
-        // but the exchange with the upstream never finished.
-        capturedPath = writeUsageLog(usageId, [usageRow({ cost_usd: 7 })]);
-        args.res.writeHead(504);
-        args.res.end("timed out");
-        return { completed: false };
-      };
-
-      const result = await call(billableEntry.method, pathFor(billableEntry, project.id), aliceCookie);
-      expect(result.status).toBe(504);
-
-      // Nothing ingested — the spend from this partial file must NOT be
-      // recorded now (it would double-count once the file is eventually
-      // ingested some other way, and this file is never ingested any other
-      // way today — it is left for usage-log-sweep.ts to clear on the next
-      // restart).
-      expect(spendSince(db, alice.id, 0)).toEqual({ costUsd: 0, events: 0, unpricedEvents: 0 });
-      // And the file itself must survive this request — deleting an
-      // un-ingested, still-partial file would lose whatever the subprocess
-      // still appends to it after this response returns.
-      expect(existsSync(capturedPath)).toBe(true);
-    } finally {
-      if (capturedPath !== "") rmSync(capturedPath, { force: true });
+    const billableEntry = BILLABLE_ENTRIES[0]!;
+    // Fill the bound entirely with the billable entry.
+    for (let i = 0; i < MAX_ENQUEUED_BILLABLE_JOBS_PER_USER; i += 1) {
+      const result = await call(billableEntry.method, pathFor(billableEntry, project.id), aliceCookie, {});
+      expect(result.status).toBe(202);
     }
+    // /__export is async but not billable — must still enqueue even though
+    // the user is at the billable bound.
+    const exportEntry = ASYNC_ENTRIES.find((e) => e.path === "/__export")!;
+    const exportResult = await call(exportEntry.method, pathFor(exportEntry, project.id), aliceCookie);
+    expect(exportResult.status).toBe(202);
+    // And the export enqueue itself must not have consumed a billable slot:
+    // the user is still exactly at the bound, no more, no less — a further
+    // billable enqueue is still refused, proving /__export was never counted.
+    const stillBlocked = await call(billableEntry.method, pathFor(billableEntry, project.id), aliceCookie, {});
+    expect(stillBlocked.status).toBe(429);
   });
 
-  /**
-   * Fix from code review: `ingestUsageLog`'s result used to be discarded
-   * entirely — `skipped`/`unreadable` exist, per that function's own
-   * docstring, "precisely so the caller can log them," and the caller did
-   * not. These pin that a loss is now surfaced (with enough to act on: the
-   * user and project id) and that a clean ingest stays silent, since a log
-   * line on every successful regen would be noise an operator learns to
-   * ignore.
-   */
-  it("logs a warning naming the user and project when the ingest loses spend (skipped > 0)", async () => {
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    try {
-      const pool = fakePool();
-      const { call, project, alice, aliceCookie } = harness(pool);
-      proxyMocks.impl = async (args) => {
-        const usageId = args.setHeaders?.[USAGE_ID_HEADER];
-        if (usageId === undefined) throw new Error("expected a usage id header on a billable request");
-        // One valid row and one row missing model/role: ingest-usage.ts
-        // counts the second as `skipped`, not a throw — exactly the "lost
-        // spend, but silently" shape this warning exists to surface.
-        writeUsageLog(usageId, [usageRow({ cost_usd: 1 }), { bogus: true }]);
-        args.res.writeHead(200);
-        args.res.end("proxied");
-        return { completed: true };
-      };
-      const result = await call(billableEntry.method, pathFor(billableEntry, project.id), aliceCookie);
-      expect(result.status).toBe(200);
-      expect(errorSpy).toHaveBeenCalled();
-      const logged = errorSpy.mock.calls.map((c) => c.join(" ")).join("\n");
-      expect(logged).toContain(alice.id);
-      expect(logged).toContain(project.id);
-      expect(logged).toMatch(/skipped/i);
-    } finally {
-      errorSpy.mockRestore();
+  it("is scoped per user -- a second user at their own bound does not affect a fresh user with none active", async () => {
+    const pool = fakePool();
+    const { db, call, project, aliceCookie } = harness(pool);
+    const entry = BILLABLE_ENTRIES[0]!;
+    for (let i = 0; i < MAX_ENQUEUED_BILLABLE_JOBS_PER_USER; i += 1) {
+      await call(entry.method, pathFor(entry, project.id), aliceCookie, {});
     }
+    const blocked = await call(entry.method, pathFor(entry, project.id), aliceCookie, {});
+    expect(blocked.status).toBe(429);
+
+    // A different user, owning their own project, is unaffected.
+    const carol = createUser(db, "c@example.com", "h");
+    const carolCookie = `${SESSION_COOKIE}=${createSession(db, carol.id).id}`;
+    const carolProject = createProject(db, carol.id, "carol-run", "Carol");
+    const carolResult = await call(entry.method, pathFor(entry, carolProject.id), carolCookie, {});
+    expect(carolResult.status).toBe(202);
   });
 
-  it("logs a warning naming the user and project when the usage log is unreadable", async () => {
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    let dirPath: string | undefined;
-    try {
-      const pool = fakePool();
-      const { call, project, alice, aliceCookie } = harness(pool);
-      proxyMocks.impl = async (args) => {
-        const usageId = args.setHeaders?.[USAGE_ID_HEADER];
-        if (usageId === undefined) throw new Error("expected a usage id header on a billable request");
-        // A directory at the log's path: exists, but unreadable as a file --
-        // the same trick ingest-usage.test.ts uses for this exact case.
-        dirPath = usageLogPathFor(usageId);
-        mkdirSync(dirPath, { recursive: true });
-        args.res.writeHead(200);
-        args.res.end("proxied");
-        return { completed: true };
-      };
-      const result = await call(billableEntry.method, pathFor(billableEntry, project.id), aliceCookie);
-      expect(result.status).toBe(200);
-      expect(errorSpy).toHaveBeenCalled();
-      const logged = errorSpy.mock.calls.map((c) => c.join(" ")).join("\n");
-      expect(logged).toContain(alice.id);
-      expect(logged).toContain(project.id);
-      expect(logged).toMatch(/unreadable/i);
-    } finally {
-      errorSpy.mockRestore();
-      if (dirPath !== undefined) rmSync(dirPath, { recursive: true, force: true });
+  it("frees a slot as soon as a job reaches a terminal status", async () => {
+    const pool = fakePool();
+    const { db, call, project, aliceCookie } = harness(pool);
+    const entry = BILLABLE_ENTRIES[0]!;
+    const jobIds: string[] = [];
+    for (let i = 0; i < MAX_ENQUEUED_BILLABLE_JOBS_PER_USER; i += 1) {
+      const result = await call(entry.method, pathFor(entry, project.id), aliceCookie, {});
+      jobIds.push((JSON.parse(result.body) as { jobId: string }).jobId);
     }
-  });
+    const blocked = await call(entry.method, pathFor(entry, project.id), aliceCookie, {});
+    expect(blocked.status).toBe(429);
 
-  it("does not log anything when the ingest is clean (rows recorded, nothing lost)", async () => {
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    try {
-      const pool = fakePool();
-      const { call, project, aliceCookie } = harness(pool);
-      proxyMocks.impl = async (args) => {
-        const usageId = args.setHeaders?.[USAGE_ID_HEADER];
-        if (usageId === undefined) throw new Error("expected a usage id header on a billable request");
-        writeUsageLog(usageId, [usageRow({ cost_usd: 1 }), usageRow({ cost_usd: 2 })]);
-        args.res.writeHead(200);
-        args.res.end("proxied");
-        return { completed: true };
-      };
-      const result = await call(billableEntry.method, pathFor(billableEntry, project.id), aliceCookie);
-      expect(result.status).toBe(200);
-      expect(errorSpy).not.toHaveBeenCalled();
-    } finally {
-      errorSpy.mockRestore();
-    }
-  });
+    // One of the two active jobs finishes.
+    finishJob(db, jobIds[0]!, { status: "succeeded", now: Date.now() });
 
-  it("does not log anything when the child wrote no usage log at all (the legitimate no-op)", async () => {
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    try {
-      const pool = fakePool();
-      const { call, project, aliceCookie } = harness(pool);
-      // beforeEach's default impl never writes a log file for any id.
-      const result = await call(billableEntry.method, pathFor(billableEntry, project.id), aliceCookie);
-      expect(result.status).toBe(200);
-      expect(errorSpy).not.toHaveBeenCalled();
-    } finally {
-      errorSpy.mockRestore();
-    }
+    const afterFinish = await call(entry.method, pathFor(entry, project.id), aliceCookie, {});
+    expect(afterFinish.status).toBe(202);
   });
 });
 
@@ -596,46 +470,54 @@ describe("compilerRoutes: attributing billable spend", () => {
  * OWN mapping logic — the real `PreviewPool.assertApiKeyUsable` (does it
  * throw the right typed error for the right stored state) is separately,
  * directly unit-tested in preview-pool.test.ts.
+ *
+ * Unaffected by slice 5: requireApiKey wraps the SAME `inner` handler
+ * (enqueue, for these four) that requireBudget wraps — a key failure short-
+ * circuits before either requireBudget or the enqueue ever runs, exactly as
+ * it short-circuited before `billableForward` before this slice.
  */
 describe("compilerRoutes: API key error mapping", () => {
   it.each(BILLABLE_ENTRIES)(
-    "maps MissingApiKeyError to 400 with the error's own message on $method $path, never touching the pool",
+    "maps MissingApiKeyError to 400 with the error's own message on $method $path, creating no job",
     async (entry) => {
       const pool = fakePool();
       pool.assertApiKeyUsable.mockImplementation(() => { throw new MissingApiKeyError(); });
-      const { call, project, aliceCookie } = harness(pool);
+      const { db, call, project, aliceCookie } = harness(pool);
       const result = await call(entry.method, pathFor(entry, project.id), aliceCookie);
       expect(result.status).toBe(400);
       expect(JSON.parse(result.body)).toEqual({ error: new MissingApiKeyError().message });
       expect(pool.acquire).not.toHaveBeenCalled();
+      expect(listJobsByProject(db, project.id, 10)).toEqual([]);
     },
   );
 
   it.each(BILLABLE_ENTRIES)(
-    "maps DisabledUserError to 403 on $method $path, never touching the pool",
+    "maps DisabledUserError to 403 on $method $path, creating no job",
     async (entry) => {
       const pool = fakePool();
       pool.assertApiKeyUsable.mockImplementation(() => { throw new DisabledUserError(); });
-      const { call, project, aliceCookie } = harness(pool);
+      const { db, call, project, aliceCookie } = harness(pool);
       const result = await call(entry.method, pathFor(entry, project.id), aliceCookie);
       expect(result.status).toBe(403);
       expect(JSON.parse(result.body)).toEqual({ error: new DisabledUserError().message });
       expect(pool.acquire).not.toHaveBeenCalled();
+      expect(listJobsByProject(db, project.id, 10)).toEqual([]);
     },
   );
 
   it.each(BILLABLE_ENTRIES)(
-    "maps UndecryptableApiKeyError to 500, logs it, and never touches the pool ($method $path)",
+    "maps UndecryptableApiKeyError to 500, logs it, and creates no job ($method $path)",
     async (entry) => {
       const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
       try {
         const pool = fakePool();
         pool.assertApiKeyUsable.mockImplementation(() => { throw new UndecryptableApiKeyError(); });
-        const { call, project, aliceCookie } = harness(pool);
+        const { db, call, project, aliceCookie } = harness(pool);
         const result = await call(entry.method, pathFor(entry, project.id), aliceCookie);
         expect(result.status).toBe(500);
         expect(JSON.parse(result.body)).toEqual({ error: new UndecryptableApiKeyError().message });
         expect(pool.acquire).not.toHaveBeenCalled();
+        expect(listJobsByProject(db, project.id, 10)).toEqual([]);
         expect(errorSpy).toHaveBeenCalled();
         const logged = errorSpy.mock.calls.map((c) => String(c[0])).join("\n");
         expect(logged).toContain("undecryptable");
@@ -646,17 +528,18 @@ describe("compilerRoutes: API key error mapping", () => {
   );
 
   it.each(BILLABLE_ENTRIES)(
-    "maps UnknownUserError to 500 and never touches the pool ($method $path)",
+    "maps UnknownUserError to 500 and creates no job ($method $path)",
     async (entry) => {
       const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
       try {
         const pool = fakePool();
         pool.assertApiKeyUsable.mockImplementation(() => { throw new UnknownUserError(); });
-        const { call, project, aliceCookie } = harness(pool);
+        const { db, call, project, aliceCookie } = harness(pool);
         const result = await call(entry.method, pathFor(entry, project.id), aliceCookie);
         expect(result.status).toBe(500);
         expect(JSON.parse(result.body)).toEqual({ error: new UnknownUserError().message });
         expect(pool.acquire).not.toHaveBeenCalled();
+        expect(listJobsByProject(db, project.id, 10)).toEqual([]);
         expect(errorSpy).toHaveBeenCalled();
       } finally {
         errorSpy.mockRestore();
@@ -665,110 +548,93 @@ describe("compilerRoutes: API key error mapping", () => {
   );
 
   it.each(COMPILER_ENTRIES.filter((e) => !e.billable))(
-    "never checks the API key on a non-billable entry — a keyless user still reaches the proxy ($method $path)",
+    "never checks the API key on a non-billable entry — a keyless user still reaches the proxy or the enqueue ($method $path)",
     async (entry) => {
-      // Only billable endpoints need a key (spec, task 4): a preview or an
-      // export must keep working for a user with no stored key at all. This
-      // proves it structurally — assertApiKeyUsable would refuse EVERY
-      // request if it were called, so a 200 here is only possible because
-      // the wrapper is never applied to this entry.
+      // Only billable endpoints need a key (spec, task 4): a preview, an
+      // export, or reading a plan must keep working for a user with no
+      // stored key at all. This proves it structurally — assertApiKeyUsable
+      // would refuse EVERY request if it were called, so success here is
+      // only possible because the wrapper is never applied to this entry.
+      // "Success" means 200 for a still-synchronous entry, 202 for the one
+      // non-billable ASYNC entry (/__export).
       const pool = fakePool();
       pool.assertApiKeyUsable.mockImplementation(() => { throw new MissingApiKeyError(); });
       const { call, project, aliceCookie } = harness(pool);
       const result = await call(entry.method, pathFor(entry, project.id), aliceCookie);
-      expect(result.status).toBe(200);
+      expect(result.status).toBe(entry.async ? 202 : 200);
       expect(pool.assertApiKeyUsable).not.toHaveBeenCalled();
     },
   );
 });
 
 /**
- * Task 4, gap 2: bounding the concurrent-start multiplier. `fakePool`'s
- * `reserveBillableSlot`/`releaseBillableSlot` are a real (if independent)
- * per-user counter — see the module comment on `fakePool` above — so these
- * tests exercise genuine concurrency through the composed route table,
- * matching the brief's own framing: the second concurrent request is
- * allowed, the third refused, and the count drops when a request completes,
- * including when it fails.
+ * WHOLE-BRANCH REVIEW, FINDING D — `/__export` stored unbounded rows forever.
+ *
+ * It is `async: true, billable: false`, so it took the plain `createJob`
+ * branch: no enqueue bound, no cap, and `enqueueHandler` persisting
+ * `JSON.stringify(parsed)` of a body up to `router.ts`'s 1,000,000-byte
+ * `MAX_BODY_BYTES` into a table with no retention or delete path. An invited
+ * user could loop `POST /__export?project=X` with 1 MB bodies and grow the
+ * identity database without limit — and, because claims are FIFO, have those
+ * queued exports served ahead of their own later regens.
  */
-describe("compilerRoutes: concurrent-start bound", () => {
-  it(`refuses a billable request with 429 once ${MAX_BILLABLE_IN_FLIGHT_PER_USER} are already reserved for that user, never touching the pool`, async () => {
+describe("compilerRoutes: async NON-billable enqueue is bounded too (finding D)", () => {
+  it(`allows exactly ${String(MAX_ENQUEUED_NON_BILLABLE_JOBS_PER_USER)} concurrent /__export enqueues, refusing the rest with 429 and creating no row for a refused one`, async () => {
     const pool = fakePool();
-    const { call, project, alice, aliceCookie } = harness(pool);
-    for (let i = 0; i < MAX_BILLABLE_IN_FLIGHT_PER_USER; i += 1) pool.reserveBillableSlot(alice.id);
-    const entry = BILLABLE_ENTRIES[0]!;
-    const result = await call(entry.method, pathFor(entry, project.id), aliceCookie);
-    expect(result.status).toBe(429);
-    expect(result.body).toContain(String(MAX_BILLABLE_IN_FLIGHT_PER_USER));
-    expect(pool.acquire).not.toHaveBeenCalled();
+    const { db, call, project, aliceCookie } = harness(pool);
+    const entry = ASYNC_ENTRIES.find((e) => e.path === "/__export")!;
+    const burst = MAX_ENQUEUED_NON_BILLABLE_JOBS_PER_USER * 5;
+    const results = await Promise.all(
+      Array.from({ length: burst }, () => call(entry.method, pathFor(entry, project.id), aliceCookie, {})),
+    );
+    const statuses = results.map((r) => r.status);
+    expect(statuses.filter((s) => s === 202)).toHaveLength(MAX_ENQUEUED_NON_BILLABLE_JOBS_PER_USER);
+    expect(statuses.filter((s) => s === 429)).toHaveLength(burst - MAX_ENQUEUED_NON_BILLABLE_JOBS_PER_USER);
+    // The load-bearing assertion, as for the billable bound: the ROW COUNT
+    // matches the 202s exactly, independently of what the responses claimed.
+    expect(listJobsByProject(db, project.id, burst + 10)).toHaveLength(MAX_ENQUEUED_NON_BILLABLE_JOBS_PER_USER);
   });
 
-  it("never reserves a billable slot for a non-billable entry", async () => {
+  it("is a CONCURRENCY bound, not a spend one: an export at the bound refuses with 429 while a billable enqueue is unaffected", async () => {
     const pool = fakePool();
     const { call, project, aliceCookie } = harness(pool);
-    const entry = COMPILER_ENTRIES.find((e) => !e.billable)!;
-    await call(entry.method, pathFor(entry, project.id), aliceCookie);
-    expect(pool.reserveBillableSlot).not.toHaveBeenCalled();
-  });
-
-  it("releases the reservation once a billable request completes, even when the forward call fails", async () => {
-    proxyMocks.impl = async () => { throw new Error("boom"); };
-    const pool = fakePool();
-    const { call, project, alice, aliceCookie } = harness(pool);
-    const entry = BILLABLE_ENTRIES[0]!;
-    const result = await call(entry.method, pathFor(entry, project.id), aliceCookie);
-    expect(result.status).toBe(500); // the router's own catch-all
-    // If the reservation had leaked, one of these would already be false.
-    for (let i = 0; i < MAX_BILLABLE_IN_FLIGHT_PER_USER; i += 1) {
-      expect(pool.reserveBillableSlot(alice.id)).toBe(true);
+    const exportEntry = ASYNC_ENTRIES.find((e) => e.path === "/__export")!;
+    for (let i = 0; i < MAX_ENQUEUED_NON_BILLABLE_JOBS_PER_USER; i += 1) {
+      expect((await call(exportEntry.method, pathFor(exportEntry, project.id), aliceCookie, {})).status).toBe(202);
     }
+    const refused = await call(exportEntry.method, pathFor(exportEntry, project.id), aliceCookie, {});
+    expect(refused.status).toBe(429);
+    // 429, never 402: retrying genuinely helps once an export finishes, and
+    // an export must never be refused over a BILL (/__export's own registry
+    // entry). The message names exports, not "billable jobs".
+    expect(JSON.parse(refused.body)).toEqual(NON_BILLABLE_ENQUEUE_BOUND_REFUSED);
+    // Exports do not consume the billable allowance either — the two bounds
+    // count disjoint kind sets.
+    const billableEntry = BILLABLE_ENTRIES[0]!;
+    expect((await call(billableEntry.method, pathFor(billableEntry, project.id), aliceCookie, {})).status).toBe(202);
   });
 
-  it("allows a second concurrent billable request but refuses a third, then frees a slot once one of the two finishes — even by failing", async () => {
+  it("413s a request body past MAX_REQUEST_JSON_BYTES, storing no row — on a billable and a non-billable async entry alike", async () => {
     const pool = fakePool();
-    const { call, project, aliceCookie } = harness(pool);
-    const entry = BILLABLE_ENTRIES[0]!;
-    const path = pathFor(entry, project.id);
+    const { db, call, project, aliceCookie } = harness(pool);
+    // Comfortably over the ceiling but well under router.ts's own
+    // MAX_BODY_BYTES, so this proves THIS bound rather than that one.
+    const oversized = { instruction: "x".repeat(MAX_REQUEST_JSON_BYTES + 1) };
+    for (const entry of [BILLABLE_ENTRIES[0]!, ASYNC_ENTRIES.find((e) => e.path === "/__export")!]) {
+      const result = await call(entry.method, pathFor(entry, project.id), aliceCookie, oversized);
+      expect(result.status).toBe(413);
+    }
+    expect(listJobsByProject(db, project.id, 10)).toHaveLength(0);
+  });
 
-    // proxyHttp is mocked at module scope; this impl hands back a controller
-    // per call so the test can decide exactly when — and how — each of two
-    // genuinely concurrent requests finishes.
-    const pending: Array<{ resolve: () => void; reject: (err: Error) => void }> = [];
-    proxyMocks.impl = (args) =>
-      new Promise<{ completed: boolean }>((resolve, reject) => {
-        pending.push({
-          resolve: () => { args.res.writeHead(200); args.res.end("proxied"); resolve({ completed: true }); },
-          reject,
-        });
-      });
-
-    const first = call(entry.method, path, aliceCookie);
-    const second = call(entry.method, path, aliceCookie);
-    // Let both requests actually reach proxyHttp (and so hold their
-    // reservation) before the third is sent — everything on the path there
-    // is promise-chained with no real I/O, so a single macrotask tick
-    // flushes it.
-    await new Promise((resolve) => setImmediate(resolve));
-    expect(pending).toHaveLength(2);
-
-    const third = await call(entry.method, path, aliceCookie);
-    expect(third.status).toBe(429);
-    expect(pending).toHaveLength(2); // the third never reached the proxy at all
-
-    // The SECOND in-flight request fails outright — proving a reservation is
-    // freed on failure, not only on success.
-    pending[1]!.reject(new Error("simulated mid-run failure"));
-    expect((await second).status).toBe(500);
-
-    // A slot just freed by that failure — a fresh concurrent request is
-    // allowed again, alongside the still-unfinished first one.
-    const fourth = call(entry.method, path, aliceCookie);
-    await new Promise((resolve) => setImmediate(resolve));
-    expect(pending).toHaveLength(3);
-
-    pending[0]!.resolve();
-    pending[2]!.resolve();
-    expect((await first).status).toBe(200);
-    expect((await fourth).status).toBe(200);
+  it("still accepts a body just under the ceiling, so the bound is not merely rejecting everything", async () => {
+    const pool = fakePool();
+    const { db, call, project, aliceCookie } = harness(pool);
+    const entry = ASYNC_ENTRIES.find((e) => e.path === "/__export")!;
+    // `{"instruction":"..."}` is 18 characters of framing around the value.
+    const justUnder = { instruction: "x".repeat(MAX_REQUEST_JSON_BYTES - 100) };
+    const result = await call(entry.method, pathFor(entry, project.id), aliceCookie, justUnder);
+    expect(result.status).toBe(202);
+    expect(listJobsByProject(db, project.id, 10)).toHaveLength(1);
   });
 });

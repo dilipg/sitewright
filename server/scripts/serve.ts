@@ -11,13 +11,18 @@
 import { createServer } from "node:http";
 import { resolve } from "node:path";
 import { adoptExistingProjects } from "../src/adopt.ts";
+import { resolveCodeVersion } from "../src/code-version.ts";
 import { buildRoutes } from "../src/compose.ts";
 import { openDatabase } from "../src/db.ts";
+import { JobWorker } from "../src/job-worker.ts";
+import { markRunningJobsInterrupted } from "../src/jobs.ts";
 import { loadMasterKey, MASTER_KEY_ENV_VAR } from "../src/master-key.ts";
 import { PreviewPool } from "../src/preview-pool.ts";
 import { createPreviewUpgradeListener } from "../src/preview-upgrade.ts";
 import { createRequestListener } from "../src/router.ts";
 import { deleteExpiredSessions } from "../src/sessions.ts";
+import { createShutdownSequence } from "../src/shutdown.ts";
+import { loadShutdownBudget, SHUTDOWN_GRACE_ENV_VAR } from "../src/shutdown-budget.ts";
 import { sweepStaleUsageLogs } from "../src/usage-log-sweep.ts";
 import { findUserByEmail } from "../src/users.ts";
 // Reuses the flag() already fixed twice (server/src/user-cli.ts, applied to
@@ -72,6 +77,23 @@ const secureCookies = process.env.INSECURE_COOKIES !== "1";
 // Before anything else that could fail for a mundane reason: an operator who
 // forgot the master key should learn it immediately, not after a port bind.
 const masterKey = loadMasterKey();
+
+// Read here, alongside the master key and for the same reason: an operator who
+// mistyped it should learn at boot, not discover minutes later that a deploy
+// orphaned a Vite child or killed a regen partway. `loadShutdownBudget` throws
+// on anything it cannot use — at module scope, BEFORE `server.listen` and
+// before the `uncaughtException` handlers are armed, so it is a failed boot
+// with a non-zero exit a supervisor can act on.
+//
+// Every shutdown deadline in this process derives from this ONE number, which
+// is what stops the job worker's wait and the preview watchdog from being two
+// independent guesses that defeat each other — see shutdown-budget.ts.
+const shutdownBudget = loadShutdownBudget();
+console.log(
+  `shutdown budget: grace ${shutdownBudget.graceMs}ms `
+  + `(preview-cleanup watchdog ${shutdownBudget.watchdogMs}ms, proxied-job wait ${shutdownBudget.proxiedWaitMs}ms)`
+  + `${process.env[SHUTDOWN_GRACE_ENV_VAR] === undefined ? ` — default; set ${SHUTDOWN_GRACE_ENV_VAR} to match your supervisor` : ""}`,
+);
 // The Buffer above is now the single in-memory copy of the master key for
 // this process — leaving WEBGEN_MASTER_KEY in process.env would hand it to
 // every child process this server spawns WITHOUT an explicit `env` override.
@@ -85,6 +107,17 @@ const masterKey = loadMasterKey();
 // model-generated page/section source — untrusted input either way. One
 // process.env read there would decrypt every user's stored key.
 delete process.env[MASTER_KEY_ENV_VAR];
+
+// Computed exactly once, here, and threaded into BOTH the job worker (which
+// stamps it onto every job it runs) and buildRoutes (whose resume endpoint
+// compares against it) — task 7's resume feature depends on both sides
+// reading the identical string for the WHOLE lifetime of this process, per
+// docs/decisions.md's 2026-07-28 row: resuming a job across a deploy that
+// edited a checkpoint's body risks silently skipping a paired checkpoint's
+// side effect, so this is the value that refuses that resume with a 409
+// instead.
+const codeVersion = resolveCodeVersion();
+console.log(`code version: ${codeVersion}`);
 
 const db = openDatabase(dbPath);
 const pruned = deleteExpiredSessions(db);
@@ -145,6 +178,44 @@ if (bootstrapEmail !== undefined) {
 // that enforces.
 const pool = new PreviewPool({ db, masterKey, projectsRoot });
 
+// Boot recovery (slice 5, the job model): a job left `running` when the
+// process last died (crash, deploy, kill -9) is not actually running any
+// more, and nothing will ever claim or finish it again — converting it to
+// `interrupted` is what lets a poller stop waiting on it instead of hanging
+// forever. Runs AFTER the database is open and adoption has run (so a
+// project a job references is already owned), and BEFORE the worker starts
+// (a job must never be found `running` by a fresh worker that did not claim
+// it itself).
+const interruptedCount = markRunningJobsInterrupted(db, Date.now());
+if (interruptedCount > 0) {
+  console.log(`marked ${interruptedCount} running job(s) interrupted after restart`);
+}
+
+// One in-process worker loop draining the `job` table — see job-worker.ts's
+// own module comment for the two execution strategies behind it. Constructed
+// from the same `pool` and `masterKey` already in hand; started immediately
+// so a job queued by a request that arrives right after boot is not left
+// waiting a full poll interval for nothing.
+//
+// `projectsRoot` is the SAME value `pool` and `adoptExistingProjects` above
+// were given, and passing it is not optional: the worker's constructor
+// refuses to build when it disagrees with the orchestrator's own hardcoded
+// output directory, which is what stops a generation from spending real money
+// writing a site into a directory nothing here will ever look at (whole-branch
+// review, CRITICAL 1 — see assertProjectsRootMatchesOrchestrator). The
+// refusal is a throw at module scope, BEFORE `server.listen`, so a
+// misconfigured `--projects-root` is a failed boot with a non-zero exit a
+// supervisor can see, never a server that comes up and quietly bills people
+// for unreachable sites.
+const jobWorker = new JobWorker({
+  db, pool, masterKey, projectsRoot, codeVersion,
+  // Derived from the operator's declared grace, never guessed here — see
+  // shutdown-budget.ts for why this and the watchdog below must come from
+  // one number rather than two.
+  shutdownProxiedWaitMs: shutdownBudget.proxiedWaitMs,
+});
+jobWorker.start();
+
 // A truly idle preview gets killed and forgotten so MAX_PREVIEWS reflects
 // real usage, not history. Interval itself is unref()'d — it must never be
 // the reason this process stays alive — which is unrelated to (and does not
@@ -159,16 +230,40 @@ setInterval(() => {
 
 // Every child must die with the server: an orphaned Vite process holding a
 // port open past this process's own lifetime is exactly the failure
-// preview-pool.ts exists to bound. `shuttingDown` makes this idempotent —
-// some shells deliver both SIGINT and SIGTERM for one Ctrl-C, and a second
-// signal arriving mid-shutdown must not race a second pool.shutdown() against
-// the first.
+// preview-pool.ts exists to bound.
+//
+// The worker stops FIRST, awaiting every run currently in flight
+// (JobWorker.stop()'s own contract — spec decision 13, a job mid-run must not
+// be killed partway; several ticks run concurrently since MAX_CONCURRENT_JOBS,
+// so this is "all of them", not "the one") — only once that settles is it safe
+// to kill preview children, since an in-flight proxied job's own exchange may
+// still depend on one of them.
+//
+// But that ordering must not make cleanup HOSTAGE to the wait, which is what
+// the hand-written chain here used to do — stop(), then the pool, one after
+// the other with no independent bound. stop()'s 25s proxied wait meant a
+// supervisor grace at the 10s floor documented above SIGKILLed this process
+// mid-wait, so the pool was never shut down at all and the children outlived
+// it. createShutdownSequence keeps the ordering and gives
+// cleanup its own independent bound — see shutdown.ts, where the whole
+// guarantee is tested (this file's module body cannot be imported by a unit
+// test at all).
+const runShutdownSequence = createShutdownSequence({
+  stopWorker: () => jobWorker.stop(),
+  shutdownPool: () => pool.shutdown(),
+  watchdogMs: shutdownBudget.watchdogMs,
+});
+
+// `shuttingDown` makes this idempotent — some shells deliver both SIGINT and
+// SIGTERM for one Ctrl-C, and a second signal arriving mid-shutdown must not
+// race a second sequence against the first (createShutdownSequence is itself
+// idempotent about the pool, but the log line and the exit are this file's).
 let shuttingDown = false;
 function shutdown(signal: NodeJS.Signals): void {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log(`received ${signal}, killing preview processes...`);
-  pool.shutdown()
+  runShutdownSequence()
     .then(() => process.exit(0))
     .catch((error: unknown) => {
       console.error("error while shutting down preview processes:", error);
@@ -179,7 +274,7 @@ process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 const server = createServer(
-  createRequestListener(buildRoutes({ db, masterKey, secureCookies, pool })),
+  createRequestListener(buildRoutes({ db, masterKey, secureCookies, pool, projectsRoot, codeVersion })),
 );
 
 // A failure to bind (EADDRINUSE, EACCES on a privileged port) is a failed boot,

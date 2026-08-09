@@ -2,13 +2,14 @@
 /**
  * The compiler's `/__*` endpoints, mounted.
  *
- * They are NOT reimplemented here. Each already exists as Vite plugin
+ * Most are NOT reimplemented here. Each already exists as Vite plugin
  * middleware inside the project's own preview child (compiler/src/
  * regen-api.ts, plan-api.ts, export-api.ts, preview.ts) — the spec's "two
  * composition roots over the same handlers". This module adds authorization
  * (and, for the endpoints that start a model call, the spend cap) by
  * composition, then forwards bytes to the child exactly like
- * preview-routes.ts already does.
+ * preview-routes.ts already does — for every entry EXCEPT the five the job
+ * model (slice 5) converts to async, below.
  *
  * The path forwarded is `req.url` VERBATIM — query string and all. Two
  * reasons, both learned the hard way in 4c-1 (see preview-routes.ts's module
@@ -39,26 +40,6 @@
  * `BY_QUERY` — so `req.url` is already exactly what the child's middleware
  * expects, with no per-route path construction needed.
  *
- * Task 3 ("attribute the spend") adds a second forward, `billableForward`,
- * used only for the four `billable: true` entries. It supplies
- * `forwardToPreview`'s `billable` hook: a fresh 32-hex-char id per request
- * (`randomBytes(16).toString("hex")` — exactly what `isValidUsageId`
- * accepts, pinned by a test), sent as `x-webgen-usage-id` on the forwarded
- * request, then — in the same `finally` as `pool.release`, so it runs even
- * when the proxy call rejected — ingested from `usageLogPathFor(id)` and
- * deleted. `ingestUsageLog` never throws (it was built for exactly this call
- * site) and is NOT idempotent, which is why the id is generated once per
- * request and the file is removed immediately after: re-ingesting the same
- * path would double a real user's bill. A non-billable entry keeps using the
- * plain `forward` with no id at all — generating one nobody writes to would
- * create a file an ingest can only ever find empty. The result is captured
- * and, when `skipped > 0` or `unreadable` (lost spend, per that function's
- * own docstring), logged with the user/project id and the counts — nothing
- * from the log's own content, which the ingest never hands back anyway.
- * Nothing is logged on the clean path (`{skipped: 0, unreadable: false}`,
- * which also covers the legitimate "no model calls" no-op) — a line per
- * successful billable request would be noise an operator learns to ignore.
- *
  * Task 4 closes two gaps, both scoped to the four billable entries only —
  * `requireProject`'s ownership check and `requireBudget`'s spend cap already
  * cover every entry, but these two exist ONLY where a model call actually
@@ -67,23 +48,33 @@
  * `requireApiKey` maps `agent-env.ts`'s `MissingApiKeyError`/
  * `DisabledUserError`/`UnknownUserError` and `api-keys.ts`'s
  * `UndecryptableApiKeyError` to 400/403/500/500 respectively, via
- * `PreviewPool.assertApiKeyUsable` — called BEFORE the request ever reaches
- * `acquire`/proxy, so a keyless user gets an actionable 400 instead of the
- * orchestrator failing on a missing key deep inside a subprocess and
- * surfacing as an opaque 500. `assertApiKeyUsable` only ever consults the
- * DATABASE, though — on its own it says nothing about a warm child whose
- * key no longer matches (a keyless spawn whose owner has since saved one, a
- * rotated key, ...), which does NOT fail loudly: the orchestrator's own
- * dotenv fallback (`override=False`) means an absent injected key silently
- * spends the OPERATOR's instead. That gap is closed separately, in
- * `PreviewPool.acquire()` itself (FIX 2, a whole-branch review): every
- * reuse of a warm entry re-checks the child's key fingerprint against the
- * owner's current one and, if idle, respawns before this request ever
- * reaches it. Deliberately NOT added to `forwardToPreview` itself (shared
- * with `preview-routes.ts`'s `/preview/:projectId/*`, task 3's module
- * comment): previewing and exporting spend nothing and must keep working
- * for a keyless user (`PreviewPool.buildChildEnv` already falls back to a
- * scrubbed, keyless child env for exactly that reason), so mapping
+ * `PreviewPool.assertApiKeyUsable` — called BEFORE the request is even
+ * enqueued, so a keyless user gets an actionable 400 immediately instead of
+ * a job that will simply fail later once the worker gets to it.
+ * That enqueue-time check is NOT sufficient on its own any more, and slice 5
+ * is what made it insufficient: before the job model, this check and the
+ * `pool.acquire` that consumed its answer sat in ONE synchronous request, so
+ * the window between them was a millisecond. A job turns it into a job
+ * LIFETIME — a user can save a key, enqueue (202), then `DELETE /api/key`
+ * before the worker claims it. `job-worker.ts`'s `runProxiedJob` therefore
+ * re-runs `assertApiKeyUsable` at CLAIM time for every billable kind (a
+ * whole-branch review, CRITICAL 2); this call stays because a keyless user
+ * still deserves an actionable 400 immediately rather than a job that will
+ * simply fail later.
+ *
+ * `assertApiKeyUsable` only ever consults the DATABASE, though — on its own
+ * it says nothing about a warm child whose key no longer matches (a keyless
+ * spawn whose owner has since saved one, a rotated key, ...), which does NOT
+ * fail loudly: the orchestrator's own dotenv fallback (`override=False`)
+ * means an absent injected key silently spends the OPERATOR's instead. That
+ * gap is closed separately, in `PreviewPool.acquire()` itself (FIX 2, a
+ * whole-branch review): every reuse of a warm entry re-checks the child's
+ * key fingerprint against the owner's current one and, if idle, respawns
+ * before the job's own eventual proxy call ever reaches it. Deliberately NOT
+ * added to `forwardToPreview` itself (shared with `preview-routes.ts`'s
+ * `/preview/:projectId/*`): previewing and exporting spend nothing and must
+ * keep working for a keyless user (`PreviewPool.buildChildEnv` already falls
+ * back to a scrubbed, keyless child env for exactly that reason), so mapping
  * `MissingApiKeyError` in the shared handler would refuse those endpoints
  * too. `UndecryptableApiKeyError` is logged (never the key itself — only the
  * typed error's own message, which names none): the ciphertext no longer
@@ -91,29 +82,105 @@
  * one, and `getApiKeyFingerprint` cannot detect it (it never touches the
  * master key), so this log line is the only signal an operator gets.
  *
- * `requireBillableSlot` bounds the concurrent-start multiplier on the spend
- * cap: spend lands in `usage_event` only at ingest (after a run finishes),
- * so N billable requests in flight at once for one user all evaluate
- * `checkSpendCap` against the same pre-run total. `PreviewPool.
- * reserveBillableSlot`/`releaseBillableSlot` hold a small per-user in-flight
- * count; a reservation is taken before `requireBudget` runs and released in
- * a `finally` — so it is held (briefly) even for a request `requireBudget`
- * itself goes on to refuse, and released whether the eventual forward
- * succeeds, throws, or never runs at all.
+ * SLICE 5 (the job model) converts the five long-running entries —
+ * `/__regen`, `/__regen-page`, `/__add-section`, `/__edit-prompt`,
+ * `/__export` — from proxying inline to ENQUEUING a job and answering 202
+ * `{jobId}` immediately. `entry.async` (project-registry.ts) is what marks
+ * these five; everything else keeps proxying synchronously via `forward`,
+ * completely unchanged.
+ *
+ * This is a real simplification, not just a rename: the usage-id-header /
+ * ingest-on-completion machinery that USED to live in this file (a
+ * `billableForward` built on `forwardToPreview`'s own `billable` hook) moved
+ * OUT, whole, into `job-worker.ts`'s `runProxiedJob` — it calls
+ * `forwardToPreview` itself, over a synthetic loopback connection, with the
+ * IDENTICAL hook shape (same usage-id generation, same "same finally as
+ * release", same skip-on-incomplete-exchange rule), so every property that
+ * machinery was reviewed for carries over unchanged; it is relocated, not
+ * reimplemented (see job-worker.ts's own module comment, and the design doc
+ * this slice implements: "`retain`/`release`, the usage-log id, and ingest
+ * move unchanged in shape into the worker"). The five async entries never
+ * touch `pool.acquire` at all from THIS layer any more — there is nothing
+ * left here to hold a preview slot, generate a usage id, or ingest a log for.
+ *
+ * The old `requireBillableSlot` (an in-memory, per-process reservation held
+ * only across THIS handler's own `await`) is gone, but NOT because there is
+ * nothing left for it to bound — a task-3 review corrected an earlier,
+ * mistaken version of this comment that claimed exactly that. What it
+ * bounded — "spend lands in `usage_event` only at ingest (after a run
+ * finishes), so N billable requests in flight at once for one user all
+ * evaluate `checkSpendCap` against the same pre-run total" (the deleted
+ * guard's own doc comment, `git show 995e851`) — still needs bounding, and
+ * enqueuing being fast makes the UNGATED version of this gap WORSE, not
+ * moot: a user under the cap could `POST /__regen` a hundred times in a
+ * second, every one passing `requireBudget` against the identical
+ * pre-run spend total, every one enqueued, before a single one finishes to
+ * move the total. `jobs.ts`'s `claimNextJob`/`MAX_ACTIVE_JOBS_PER_USER` is
+ * NOT this bound's replacement — it caps concurrently RUNNING jobs per user
+ * (a scheduling fairness bound, applies to all six kinds including the
+ * non-billable `export`), not how much billable work a user may COMMIT by
+ * enqueuing.
+ *
+ * ROUND 1's actual replacement — a decorator, `require-enqueue-slot.ts`'s
+ * `requireEnqueueSlot`, wrapped around every billable entry — was ALSO
+ * wrong, and a task-3-review ROUND 2 caught it empirically (10 concurrent
+ * `POST /api/generate` for one user, fired via `Promise.all`, produced
+ * 10/10 202s against a bound of 2): the decorator's read
+ * (`countActiveBillableJobsForUser`) and the eventual write (`createJob`,
+ * inside `enqueueHandler` below) were two SEPARATE statements, separated by
+ * `enqueueHandler`'s own `await readJsonBody(req)` — so N requests fired at
+ * once all ran their synchronous prefix (session, ownership, key check, the
+ * COUNT, the cap check) before any of them reached the write, and all read
+ * the identical pre-insert count. `require-enqueue-slot.ts` has been
+ * DELETED, not patched: once the insert itself is made authoritative (below),
+ * a decorator that reads first and lets a separate write happen later is
+ * either redundant with it or, if the two ever drift, actively misleading —
+ * "two checks that both read as authoritative" is worse than one. There is
+ * now exactly ONE enforcement point.
+ *
+ * The REAL fix is `jobs.ts`'s `createBillableJobIfUnderBound`: a single
+ * `INSERT ... SELECT ... WHERE (<active billable count>) < <bound>`
+ * statement — the check and the write are literally the same SQL statement,
+ * so there is no `await` for a second request to interleave inside. This is
+ * the identical technique `claimNextJob` already uses for its own per-user
+ * bound (see that function's own comment: "This MUST be a single statement,
+ * not a SELECT followed by an UPDATE"), applied here to a conditional INSERT
+ * instead of a conditional UPDATE. Zero rows inserted means the user was at
+ * the bound; `enqueueHandler` below maps that to 429
+ * (`jobs.ts`'s `ENQUEUE_BOUND_REFUSED`, shared verbatim with
+ * `job-routes.ts` so the two 429 bodies cannot drift in wording).
+ * `PreviewPool.reserveBillableSlot`/`releaseBillableSlot` themselves are
+ * untouched and still directly unit-tested (preview-pool.test.ts) — only
+ * this file's WIRING of them is gone, because nothing here holds an
+ * in-memory slot across an `await` boundary any more; the bound they used to
+ * enforce is enforced differently now, not left unenforced.
+ *
+ * `kind` for each async entry is resolved by `jobKindForAsyncPath`, an
+ * EXHAUSTIVE switch rather than a `Record<string, JobKind>` lookup. Task 1's
+ * review flagged that `JobKind` is a compile-time union only — nothing stops
+ * a runtime string that does not match one of its members from reaching
+ * `createJob`'s INSERT — and a plain object/Record lookup degrades silently
+ * to `undefined` for an unmapped key. This throws instead, and does so once
+ * per async entry when `compilerRoutes()` itself runs (route-table
+ * construction, not per-request), so a future async registry entry added
+ * without a matching case here fails the moment the server boots (or a test
+ * calls `compilerRoutes()`), never silently at whatever later moment a
+ * request happens to hit it.
  */
-import { randomBytes } from "node:crypto";
-import { unlinkSync } from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
-import { USAGE_ID_HEADER, usageLogPathFor } from "../../compiler/src/usage-log-path.ts";
 import { DisabledUserError, MissingApiKeyError, UnknownUserError } from "./agent-env.ts";
 import { UndecryptableApiKeyError } from "./api-keys.ts";
-import { ingestUsageLog } from "./ingest-usage.ts";
+import {
+  createBillableJobIfUnderBound, createNonBillableAsyncJobIfUnderBound, ENQUEUE_BOUND_REFUSED,
+  NON_BILLABLE_ENQUEUE_BOUND_REFUSED, REQUEST_TOO_LARGE, requestJsonTooLarge,
+  type CreateJobInput, type JobKind,
+} from "./jobs.ts";
 import { forwardToPreview } from "./preview-forward.ts";
-import { MAX_BILLABLE_IN_FLIGHT_PER_USER, type PreviewPool } from "./preview-pool.ts";
+import type { PreviewPool } from "./preview-pool.ts";
 import { PROJECT_SCOPED_ENDPOINTS } from "./project-registry.ts";
 import { requireBudget } from "./require-budget.ts";
 import { requireProject, type ProjectHandler } from "./require-project.ts";
-import { sendJson, type Route } from "./router.ts";
+import { readJsonBody, sendJson, type Route } from "./router.ts";
 
 /** Every registry entry that names one of the compiler's own `/__*` endpoints. */
 const COMPILER_ENDPOINTS = PROJECT_SCOPED_ENDPOINTS.filter((entry) => entry.path.startsWith("/__"));
@@ -154,98 +221,114 @@ function requireApiKey(pool: PreviewPool, inner: ProjectHandler): ProjectHandler
   };
 }
 
+/** See this module's own top comment. Exhaustive on purpose — an unmapped path throws rather than reaching `createJob` with a bad `kind`. */
+function jobKindForAsyncPath(path: string): JobKind {
+  switch (path) {
+    case "/__regen": return "regen";
+    case "/__regen-page": return "regen-page";
+    case "/__add-section": return "add-section";
+    case "/__edit-prompt": return "edit-prompt";
+    case "/__export": return "export";
+    default:
+      throw new Error(`compiler-routes: no job kind mapped for async endpoint "${path}"`);
+  }
+}
+
+const BAD_JSON_BODY = { error: "request body must be valid JSON within the size limit" };
+
 /**
- * Bounds task 4's second gap: refuses beyond `MAX_BILLABLE_IN_FLIGHT_PER_USER`
- * concurrent billable requests for one user with 429 — not 402, because
- * retrying genuinely helps here once the in-flight run finishes, unlike the
- * spend cap's 402 where no amount of retrying helps until the window rolls.
- * `release` runs in a `finally` so a leaked reservation (freed only on
- * success) cannot permanently shrink a user's allowance after one failure.
+ * Enqueues `kind` against the request's own project and user, storing the
+ * request body verbatim (re-serialized after parsing, not the raw bytes) as
+ * `request_json` — the exact payload `job-worker.ts`'s `runProxiedJob` will
+ * later replay to the child. No shape validation beyond "valid JSON, within
+ * the body-size limit" happens here: that is unchanged from today (the CHILD
+ * has always been the one that validates a `/__regen`-shaped body, and still
+ * is — this endpoint only decides whether to run it now or later).
+ *
+ * `billable` selects which INSERT primitive runs: `createBillableJobIfUnderBound`
+ * (`jobs.ts`) for a billable kind — one atomic statement that inserts zero
+ * rows and returns `null` when the user is at `MAX_ENQUEUED_BILLABLE_JOBS_PER_USER`,
+ * mapped here to 429 — or `createNonBillableAsyncJobIfUnderBound` for a
+ * non-billable one (`/__export` is the only async-but-non-billable entry
+ * today). Deciding this from `entry.billable` at ROUTE-TABLE construction
+ * time, not by re-deriving "is this kind billable" per request, mirrors
+ * `jobKindForAsyncPath`'s own "fail at construction, not per-request" bias.
+ *
+ * WHOLE-BRANCH REVIEW, FINDING D: the non-billable branch used to be the
+ * plain, unconditional `createJob` with no bound of any kind, and this
+ * handler stored `JSON.stringify(parsed)` of a body up to `router.ts`'s
+ * 1,000,000-byte `MAX_BODY_BYTES` into a table with no retention or delete
+ * path. Looping `POST /__export?project=X` with 1 MB bodies therefore grew
+ * the identity database without limit — and, since claims are FIFO, served
+ * those queued exports ahead of the user's own later regens. Both halves are
+ * closed: a bounded insert for the non-billable kinds too (a CONCURRENCY
+ * bound answering 429, NOT the spend cap — an export must still never be
+ * refused over a bill, per `/__export`'s own registry entry), and a
+ * `MAX_REQUEST_JSON_BYTES` ceiling answering 413 before anything is stored.
  */
-function requireBillableSlot(pool: PreviewPool, inner: ProjectHandler): ProjectHandler {
+function enqueueHandler(db: DatabaseSync, kind: JobKind, billable: boolean): ProjectHandler {
   return async (req, res, ctx) => {
-    if (!pool.reserveBillableSlot(ctx.user.id)) {
-      sendJson(res, 429, {
-        error: `at most ${MAX_BILLABLE_IN_FLIGHT_PER_USER} billable requests may run at once for this account; wait for one to finish and retry`,
-      });
+    let parsed: unknown;
+    try {
+      parsed = await readJsonBody(req);
+    } catch {
+      sendJson(res, 400, BAD_JSON_BODY);
       return;
     }
-    try {
-      await inner(req, res, ctx);
-    } finally {
-      pool.releaseBillableSlot(ctx.user.id);
+    const requestJson = JSON.stringify(parsed);
+    // Checked BEFORE any insert: an over-sized body must leave no row at all,
+    // the same "refused requests create no side effect" rule the spend cap
+    // and the enqueue bound already follow.
+    if (requestJsonTooLarge(requestJson)) {
+      sendJson(res, 413, REQUEST_TOO_LARGE);
+      return;
     }
+    const input: CreateJobInput = {
+      userId: ctx.user.id,
+      projectId: ctx.project.id,
+      kind,
+      requestJson,
+      now: Date.now(),
+    };
+    const job = billable
+      ? createBillableJobIfUnderBound(db, input)
+      : createNonBillableAsyncJobIfUnderBound(db, input);
+    if (job === null) {
+      sendJson(res, 429, billable ? ENQUEUE_BOUND_REFUSED : NON_BILLABLE_ENQUEUE_BOUND_REFUSED);
+      return;
+    }
+    sendJson(res, 202, { jobId: job.id });
   };
 }
 
 export function compilerRoutes(deps: { db: DatabaseSync; pool: PreviewPool }): Route[] {
   const { db, pool } = deps;
   const forward = forwardToPreview(pool);
-  const billableForward = forwardToPreview(pool, {
-    billable: (ctx) => {
-      const usageId = randomBytes(16).toString("hex");
-      return {
-        setHeaders: { [USAGE_ID_HEADER]: usageId },
-        after: () => {
-          const path = usageLogPathFor(usageId);
-          // Never throws, by contract (ingest-usage.ts) — safe to call
-          // unconditionally, including for a run that wrote no log at all
-          // (the "no model calls" case), which is a legitimate no-op, not
-          // an error.
-          const result = ingestUsageLog(db, {
-            path, userId: ctx.user.id, projectId: ctx.project.id, now: Date.now(),
-          });
-          // `skipped > 0` or `unreadable` means spend was lost, not merely
-          // that nothing happened — ingest-usage.ts's own docstring calls out
-          // that distinction "precisely so the caller can log it." Only the
-          // counts and ids are logged (no line from the child's file, which
-          // could in principle carry redacted-but-still-sensitive content) —
-          // an operator needs to know WHO and WHERE to look, not the content.
-          // Nothing logged on the clean path: a line per successful regen
-          // would be noise, and `{skipped: 0, unreadable: false}` is the
-          // legitimate result for both "ingested fine" and "no model calls."
-          if (result.skipped > 0 || result.unreadable) {
-            console.error(
-              `[compiler-routes] usage log ingest lost spend for user ${ctx.user.id} `
-              + `(project ${ctx.project.id}): ingested=${result.ingested} skipped=${result.skipped} `
-              + `unreadable=${result.unreadable} — spend may be unrecorded`,
-            );
-          }
-          try {
-            unlinkSync(path);
-          } catch {
-            // Nothing to delete — either the child wrote no log for this
-            // request, or it's already gone. Either way, ingest above
-            // already ran (or correctly no-opped), so there is nothing left
-            // to protect by throwing here.
-          }
-        },
-      };
-    },
-  });
 
-  return COMPILER_ENDPOINTS.map((entry) => ({
-    method: entry.method,
-    path: entry.path,
-    // requireProject runs first (session + ownership), so an
-    // unauthenticated or non-owner request never reaches requireApiKey,
-    // requireBillableSlot, requireBudget, or the pool. All three of those
-    // wrap the forward only for a billable entry — a non-billable one
-    // (notably /__export and /__export-download: the exporter is
-    // deterministic, and refusing an export over the cap would strand a
-    // user's finished work behind a bill) reaches `forward` directly,
-    // ungated, never checked for a key, and never gets a usage id. Order
-    // among the three billable-only wrappers: the key check runs first
-    // (a precondition with no side effect — no point holding a concurrency
-    // slot or consulting the cap for a request that cannot succeed anyway),
-    // then the in-flight reservation, then the spend cap, then the forward
-    // itself.
-    handler: requireProject(
-      db,
-      entry.idFrom,
-      entry.billable
-        ? requireApiKey(pool, requireBillableSlot(pool, requireBudget(db, billableForward)))
-        : forward,
-    ),
-  }));
+  return COMPILER_ENDPOINTS.map((entry) => {
+    const inner: ProjectHandler = entry.async
+      ? enqueueHandler(db, jobKindForAsyncPath(entry.path), entry.billable)
+      : forward;
+    return {
+      method: entry.method,
+      path: entry.path,
+      // requireProject runs first (session + ownership), so an
+      // unauthenticated or non-owner request never reaches requireApiKey,
+      // requireBudget, the job table, or the pool. Only a `billable` entry
+      // gets the key check + spend cap wrapped around it — a non-billable
+      // one (notably /__export, async but not billable, and
+      // /__export-download: the exporter is deterministic, and refusing an
+      // export over the cap would strand a user's finished work behind a
+      // bill) reaches `inner` directly, ungated, never checked for a key.
+      // The enqueue-time concurrency bound is NOT a wrapper here at all any
+      // more (see this module's own top comment) — it is enforced inside
+      // `inner` itself, by the INSERT `enqueueHandler` runs, so there is
+      // nothing to add to this chain for it.
+      handler: requireProject(
+        db,
+        entry.idFrom,
+        entry.billable ? requireApiKey(pool, requireBudget(db, inner)) : inner,
+      ),
+    };
+  });
 }

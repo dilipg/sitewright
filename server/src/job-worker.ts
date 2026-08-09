@@ -44,7 +44,11 @@
  *     request to the child at all), and stdout/stderr both go through
  *     `redactSecrets` before anything is logged or stored — the orchestrator
  *     is untrusted output for exactly the reason preview-pool.ts's own
- *     children are (see redact.ts's module comment).
+ *     children are (see redact.ts's module comment). `orchestrator.acceptance`
+ *     takes only a `--run-id` and writes into its OWN hardcoded
+ *     `GENERATED_DIR`, so where the site lands is not something this module
+ *     gets to choose — `assertProjectsRootMatchesOrchestrator` (below) is how
+ *     the disagreement is made impossible to have silently.
  *
  * BOUNDS, enforced at claim time (not at enqueue — that is a later task's
  * concern for the spend cap specifically; this module only ever runs after a
@@ -113,7 +117,7 @@ import { randomBytes } from "node:crypto";
 import type { EventEmitter } from "node:events";
 import { mkdirSync, unlinkSync } from "node:fs";
 import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse } from "node:http";
-import { dirname } from "node:path";
+import { dirname, relative, resolve } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { USAGE_ID_HEADER, usageLogPathFor } from "../../compiler/src/usage-log-path.ts";
@@ -288,6 +292,84 @@ const defaultOrchestratorSpawnFn: OrchestratorSpawnFn = (command, args, options)
 // reason (the repo can be checked out anywhere).
 const DEFAULT_ORCHESTRATOR_DIR = fileURLToPath(new URL("../../orchestrator", import.meta.url));
 
+/**
+ * The directory `orchestrator.acceptance` ACTUALLY writes a generated site
+ * into, derived here exactly the way the orchestrator derives it for itself:
+ * `orchestrator/src/orchestrator/section_pipeline.py`'s
+ * `GENERATED_DIR = REPO_ROOT / "generated"`, where `config.py` defines
+ * `REPO_ROOT = ORCHESTRATOR_ROOT.parent` and `ORCHESTRATOR_ROOT` is the
+ * `orchestrator/` package root. So: the sibling `generated/` of whatever
+ * `orchestrator/` directory this worker spawns `uv` in.
+ *
+ * This is a DERIVATION of a value this package does not own, which is exactly
+ * why it is pinned by a test that reads the Python source
+ * (job-worker.test.ts, "orchestrator output directory") — the same
+ * "two languages, one contract, one machine-checked pin" shape
+ * `fixtures/usage-log-contract.jsonl` already uses for the usage log.
+ */
+export function orchestratorGeneratedDir(orchestratorDir: string): string {
+  return resolve(orchestratorDir, "..", "generated");
+}
+
+/**
+ * WHOLE-BRANCH REVIEW, CRITICAL 1 — "a generation writes its site where
+ * nothing looks for it."
+ *
+ * `scripts/serve.ts` takes `--projects-root`, defaulting to `../generated`
+ * relative to CWD, and everything on the SERVER side resolves a project's
+ * directory under it: `job-routes.ts`'s `POST /api/generate` creates
+ * `<projectsRoot>/web-<uuid>`, `PreviewPool.installEntry` spawns Vite in it,
+ * `adopt.ts` scans it. But `orchestrator.acceptance` takes only `--run-id`
+ * and writes into its OWN `GENERATED_DIR`, an absolute path derived from the
+ * orchestrator package's location, with no output-directory argument and no
+ * environment override. If the two disagree, a generation still runs, still
+ * spends real money, and still finishes `succeeded` — into a directory
+ * nothing on the server side will ever look at, leaving the user billed for a
+ * site that cannot be previewed, exported, or edited.
+ *
+ * Nothing could OBSERVE that disagreement before this: `JobWorkerDeps` did not
+ * carry `projectsRoot` at all. It does now, and this refuses to construct the
+ * worker — and so refuses to boot the server — when the two do not name the
+ * same directory.
+ *
+ * WHY THIS SHAPE AND NOT AN `--out-dir` ON THE PYTHON SIDE (the other option
+ * the review offered, and the one that is "correct in general"): `GENERATED_DIR`
+ * is a module-level constant imported and re-derived by twenty orchestrator
+ * modules — the plan pipeline, the design pipeline, the shell pipeline,
+ * fan-out, the page worker, regeneration, add-section, the edit agent, soak,
+ * stress, and both acceptance entry points. Threading a real output directory
+ * through all of them is a cross-cutting change to the entire Python package
+ * whose only honest end-to-end verification is a live generation run — which
+ * this round may not perform (no real API calls). A loud, boot-time refusal
+ * makes the disagreement structurally impossible to have SILENTLY, which is
+ * the actual failure being fixed, at a small fraction of that risk. The
+ * general fix stays available; it is recorded as the follow-up, not smuggled
+ * in here.
+ *
+ * The message names BOTH resolved absolute paths, because the whole class of
+ * mistake this catches is an operator not realising which directory a
+ * relative `--projects-root` resolved against.
+ */
+export function assertProjectsRootMatchesOrchestrator(
+  projectsRoot: string,
+  orchestratorDir: string,
+): void {
+  const resolvedProjectsRoot = resolve(projectsRoot);
+  const generatedDir = orchestratorGeneratedDir(orchestratorDir);
+  // `relative(a, b) === ""` rather than a string `===`: on win32 the two
+  // sides can legitimately differ in drive-letter case (one comes from
+  // `process.cwd()`, the other from a `file:` URL), and `path.relative`
+  // already applies the platform's own comparison rules.
+  if (relative(resolvedProjectsRoot, generatedDir) !== "") {
+    throw new Error(
+      "job worker refused to start: --projects-root and the orchestrator's own output directory disagree, "
+      + `so a generation would write its site where nothing looks for it. projects root: ${resolvedProjectsRoot}; `
+      + `orchestrator writes into: ${generatedDir}. `
+      + "orchestrator.acceptance has no output-directory argument, so these must name the same directory.",
+    );
+  }
+}
+
 /** How often `start()`'s interval attempts a claim when the queue was empty (or blocked) last time. */
 const DEFAULT_POLL_INTERVAL_MS = 1_000;
 
@@ -302,6 +384,16 @@ export interface JobWorkerDeps {
   db: DatabaseSync;
   pool: PreviewPool;
   masterKey: Buffer;
+  /**
+   * The SAME projects root `scripts/serve.ts` hands `PreviewPool` and
+   * `adoptExistingProjects` — where a project's `directory` is resolved
+   * against. REQUIRED, not optional with a safe default: making it a
+   * compile error to omit is what forces the composition root to state it,
+   * and stating it is what lets the constructor check it against the
+   * orchestrator's own hardcoded output directory. See
+   * `assertProjectsRootMatchesOrchestrator`.
+   */
+  projectsRoot: string;
   /** cwd for `generate`'s orchestrator spawn. Defaults to the repo's own `orchestrator/` directory. */
   orchestratorDir?: string;
   /** Overridable for tests; production default spawns `uv` for real via `node:child_process`. */
@@ -342,6 +434,11 @@ export class JobWorker {
     this.pool = deps.pool;
     this.masterKey = deps.masterKey;
     this.orchestratorDir = deps.orchestratorDir ?? DEFAULT_ORCHESTRATOR_DIR;
+    // BEFORE anything else this constructor does: a worker whose projects
+    // root disagrees with where the orchestrator actually writes must never
+    // exist at all, let alone be startable. See
+    // `assertProjectsRootMatchesOrchestrator` for the full account.
+    assertProjectsRootMatchesOrchestrator(deps.projectsRoot, this.orchestratorDir);
     this.orchestratorSpawnFn = deps.orchestratorSpawnFn ?? defaultOrchestratorSpawnFn;
     this.pollIntervalMs = deps.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
     this.now = deps.now ?? (() => Date.now());

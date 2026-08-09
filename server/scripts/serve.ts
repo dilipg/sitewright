@@ -177,7 +177,18 @@ if (interruptedCount > 0) {
 // from the same `pool` and `masterKey` already in hand; started immediately
 // so a job queued by a request that arrives right after boot is not left
 // waiting a full poll interval for nothing.
-const jobWorker = new JobWorker({ db, pool, masterKey, codeVersion });
+//
+// `projectsRoot` is the SAME value `pool` and `adoptExistingProjects` above
+// were given, and passing it is not optional: the worker's constructor
+// refuses to build when it disagrees with the orchestrator's own hardcoded
+// output directory, which is what stops a generation from spending real money
+// writing a site into a directory nothing here will ever look at (whole-branch
+// review, CRITICAL 1 — see assertProjectsRootMatchesOrchestrator). The
+// refusal is a throw at module scope, BEFORE `server.listen`, so a
+// misconfigured `--projects-root` is a failed boot with a non-zero exit a
+// supervisor can see, never a server that comes up and quietly bills people
+// for unreachable sites.
+const jobWorker = new JobWorker({ db, pool, masterKey, projectsRoot, codeVersion });
 jobWorker.start();
 
 // A truly idle preview gets killed and forgotten so MAX_PREVIEWS reflects

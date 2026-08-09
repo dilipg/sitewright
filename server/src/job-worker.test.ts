@@ -12,13 +12,14 @@ import { once } from "node:events";
 import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DatabaseSync } from "node:sqlite";
 import { usageLogPathFor, USAGE_ID_HEADER } from "../../compiler/src/usage-log-path.ts";
 import { setApiKey } from "./api-keys.ts";
 import { openDatabase } from "./db.ts";
-import { JobWorker } from "./job-worker.ts";
+import { JobWorker, orchestratorGeneratedDir } from "./job-worker.ts";
 import { claimNextJob, createJob, finishJob, findJobById, recordJobRun } from "./jobs.ts";
 import { MASTER_KEY_ENV_VAR } from "./master-key.ts";
 import { createProject, type Project } from "./projects.ts";
@@ -27,6 +28,25 @@ import { createUser, type User } from "./users.ts";
 
 const MASTER_KEY = Buffer.alloc(32, 9);
 const NOW = 1_800_000_000_000;
+
+/**
+ * The repo's own `generated/`, derived from THIS FILE's location rather than
+ * by calling `orchestratorGeneratedDir` — deliberately an independent
+ * derivation, so the "refuses to construct when they disagree" tests below
+ * are not merely comparing the implementation to itself.
+ */
+const PROJECTS_ROOT = fileURLToPath(new URL("../../generated", import.meta.url));
+
+/**
+ * The three `generate` tests that spawn a FAKE orchestrator point
+ * `orchestratorDir` somewhere that does not exist, so their projects root has
+ * to be that fake directory's own sibling `generated/` — the same relationship
+ * the real pair has. Spelled out as two constants rather than one derived from
+ * the other precisely so the relationship stays visible: change one and the
+ * constructor refuses, which is the whole point of the check.
+ */
+const FAKE_ORCHESTRATOR_DIR = "/fake/orchestrator/dir";
+const FAKE_PROJECTS_ROOT = "/fake/orchestrator/generated";
 
 let dir: string;
 let db: DatabaseSync;
@@ -125,7 +145,7 @@ describe("JobWorker: proxied kinds", () => {
     const requestJson = JSON.stringify({ section: "home.hero", instruction: "make it bigger" });
     const job = createJob(db, { userId: user.id, projectId: project.id, kind: "regen", requestJson, now: NOW });
 
-    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, now: () => NOW });
+    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, projectsRoot: PROJECTS_ROOT, now: () => NOW });
     const ran = await worker.runOnce();
 
     try {
@@ -163,7 +183,7 @@ describe("JobWorker: proxied kinds", () => {
     });
     const job = createJob(db, { userId: user.id, projectId: project.id, kind: "regen", requestJson: "{}", now: NOW });
 
-    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, now: () => NOW, codeVersion: "sha-fixed-for-test" });
+    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, projectsRoot: PROJECTS_ROOT, now: () => NOW, codeVersion: "sha-fixed-for-test" });
     try {
       await worker.runOnce();
       const finished = findJobById(db, job.id);
@@ -189,7 +209,7 @@ describe("JobWorker: proxied kinds", () => {
       runId: "web-a-preset-run-id",
     });
 
-    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, now: () => NOW });
+    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, projectsRoot: PROJECTS_ROOT, now: () => NOW });
     try {
       await worker.runOnce();
       expect(findJobById(db, job.id)?.runId).toBe("web-a-preset-run-id");
@@ -213,7 +233,7 @@ describe("JobWorker: proxied kinds", () => {
       userId: user.id, projectId: project.id, kind: "add-section", requestJson: "{}", now: NOW,
     });
 
-    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, now: () => NOW });
+    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, projectsRoot: PROJECTS_ROOT, now: () => NOW });
     const ran = await worker.runOnce();
 
     try {
@@ -270,7 +290,7 @@ describe("JobWorker: proxied kinds", () => {
       })),
     });
     const job = createJob(db, { userId: user.id, projectId: project.id, kind: "regen", requestJson: "{}", now: NOW });
-    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, now: () => NOW });
+    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, projectsRoot: PROJECTS_ROOT, now: () => NOW });
 
     try {
       const ran = await worker.runOnce();
@@ -298,7 +318,7 @@ describe("JobWorker: proxied kinds", () => {
       })),
     });
     const job = createJob(db, { userId: user.id, projectId: project.id, kind: "regen-page", requestJson: "{}", now: NOW });
-    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, now: () => NOW });
+    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, projectsRoot: PROJECTS_ROOT, now: () => NOW });
 
     try {
       const ran = await worker.runOnce();
@@ -335,7 +355,7 @@ describe("JobWorker: proxied kinds", () => {
       })),
     });
     const job = createJob(db, { userId: user.id, projectId: project.id, kind: "regen", requestJson: "{}", now: NOW });
-    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, now: () => NOW });
+    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, projectsRoot: PROJECTS_ROOT, now: () => NOW });
 
     try {
       await worker.runOnce();
@@ -375,7 +395,7 @@ describe("JobWorker: proxied kinds", () => {
     });
     createJob(db, { userId: user.id, projectId: project.id, kind: "regen", requestJson: "{}", now: NOW });
     createJob(db, { userId: user.id, projectId: project.id, kind: "regen", requestJson: "{}", now: NOW + 1 });
-    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, now: () => NOW });
+    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, projectsRoot: PROJECTS_ROOT, now: () => NOW });
 
     try {
       expect(await worker.runOnce()).toBe(true); // first job, claimed+run+finished
@@ -429,7 +449,7 @@ describe("JobWorker: proxied kinds", () => {
       })),
     });
     const job = createJob(db, { userId: user.id, projectId: project.id, kind: "regen", requestJson: "{}", now: NOW });
-    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, now: () => NOW });
+    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, projectsRoot: PROJECTS_ROOT, now: () => NOW });
 
     try {
       const ran = await worker.runOnce();
@@ -465,7 +485,7 @@ describe("JobWorker: proxied kinds", () => {
       })),
     });
     const job = createJob(db, { userId: user.id, projectId: project.id, kind: "add-section", requestJson: "{}", now: NOW });
-    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, now: () => NOW });
+    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, projectsRoot: PROJECTS_ROOT, now: () => NOW });
 
     try {
       const ran = await worker.runOnce();
@@ -525,7 +545,7 @@ describe("JobWorker: proxied kinds", () => {
       })),
     });
     const job = createJob(db, { userId: user.id, projectId: project.id, kind: "regen", requestJson: "{}", now: NOW });
-    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, now: () => NOW });
+    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, projectsRoot: PROJECTS_ROOT, now: () => NOW });
 
     try {
       const ran = await worker.runOnce();
@@ -552,7 +572,7 @@ describe("JobWorker: proxied kinds", () => {
       })),
     });
     const job = createJob(db, { userId: user.id, projectId: project.id, kind: "add-section", requestJson: "{}", now: NOW });
-    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, now: () => NOW });
+    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, projectsRoot: PROJECTS_ROOT, now: () => NOW });
 
     try {
       const ran = await worker.runOnce();
@@ -597,7 +617,7 @@ describe("JobWorker: proxied kinds", () => {
       })),
     });
     const job = createJob(db, { userId: user.id, projectId: project.id, kind: "regen", requestJson: "{}", now: NOW });
-    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, now: () => NOW });
+    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, projectsRoot: PROJECTS_ROOT, now: () => NOW });
 
     try {
       const runPromise = worker.runOnce();
@@ -659,7 +679,7 @@ describe("JobWorker: per-user bound (enforced by claimNextJob, not this module)"
         projectId: otherProject.id, port: upstream.port, base: "/", inFlight: 0, lastUsedAt: Date.now(),
       })),
     });
-    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, now: () => NOW + 30 });
+    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, projectsRoot: PROJECTS_ROOT, now: () => NOW + 30 });
 
     try {
       const ran = await worker.runOnce();
@@ -695,7 +715,7 @@ describe("JobWorker: stop()", () => {
       })),
     });
     const job = createJob(db, { userId: user.id, projectId: project.id, kind: "regen", requestJson: "{}", now: NOW });
-    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, pollIntervalMs: 5, now: () => NOW });
+    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, projectsRoot: PROJECTS_ROOT, pollIntervalMs: 5, now: () => NOW });
 
     try {
       worker.start();
@@ -722,7 +742,7 @@ describe("JobWorker: stop()", () => {
 
   it("start() is idempotent and stop() is safe to call with nothing running", async () => {
     const pool = fakePool();
-    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, pollIntervalMs: 5, now: () => NOW });
+    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, projectsRoot: PROJECTS_ROOT, pollIntervalMs: 5, now: () => NOW });
     worker.start();
     worker.start(); // second call must not arm a second interval
     await worker.stop();
@@ -761,8 +781,8 @@ describe("JobWorker: generate", () => {
     const job = createJob(db, { userId: user.id, projectId: genProject.id, kind: "generate", requestJson, now: NOW });
     const pool = fakePool();
     const worker = new JobWorker({
-      db, pool, masterKey: MASTER_KEY, now: () => NOW,
-      orchestratorDir: "/fake/orchestrator/dir",
+      db, pool, masterKey: MASTER_KEY, projectsRoot: FAKE_PROJECTS_ROOT, now: () => NOW,
+      orchestratorDir: FAKE_ORCHESTRATOR_DIR,
       orchestratorSpawnFn,
     });
 
@@ -824,8 +844,8 @@ describe("JobWorker: generate", () => {
     });
     const pool = fakePool();
     const worker = new JobWorker({
-      db, pool, masterKey: MASTER_KEY, now: () => NOW,
-      orchestratorDir: "/fake/orchestrator/dir",
+      db, pool, masterKey: MASTER_KEY, projectsRoot: FAKE_PROJECTS_ROOT, now: () => NOW,
+      orchestratorDir: FAKE_ORCHESTRATOR_DIR,
       orchestratorSpawnFn,
       codeVersion: "sha-for-this-test",
     });
@@ -860,8 +880,8 @@ describe("JobWorker: generate", () => {
     const job = createJob(db, { userId: user.id, projectId: genProject.id, kind: "generate", requestJson, now: NOW });
     const pool = fakePool();
     const worker = new JobWorker({
-      db, pool, masterKey: MASTER_KEY, now: () => NOW,
-      orchestratorDir: "/fake/orchestrator/dir",
+      db, pool, masterKey: MASTER_KEY, projectsRoot: FAKE_PROJECTS_ROOT, now: () => NOW,
+      orchestratorDir: FAKE_ORCHESTRATOR_DIR,
       orchestratorSpawnFn,
     });
 
@@ -881,7 +901,7 @@ describe("JobWorker: generate", () => {
       userId: user.id, projectId: genProject.id, kind: "generate", requestJson: JSON.stringify({}), now: NOW,
     });
     const pool = fakePool();
-    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, now: () => NOW });
+    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, projectsRoot: PROJECTS_ROOT, now: () => NOW });
 
     const ran = await worker.runOnce();
     expect(ran).toBe(true);
@@ -913,7 +933,7 @@ describe("JobWorker: resumed job safety checks (task-7-review findings 3 and 5)"
       runId: "web-x", resumedFromJobId: originalFailedJob.id,
     });
     const pool = fakePool();
-    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, now: () => NOW, codeVersion: "NEW-sha-after-a-deploy" });
+    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, projectsRoot: PROJECTS_ROOT, now: () => NOW, codeVersion: "NEW-sha-after-a-deploy" });
 
     const ran = await worker.runOnce();
 
@@ -945,7 +965,7 @@ describe("JobWorker: resumed job safety checks (task-7-review findings 3 and 5)"
     const orchestratorSpawnFn = vi.fn();
     const pool = fakePool();
     const worker = new JobWorker({
-      db, pool, masterKey: MASTER_KEY, now: () => NOW, orchestratorSpawnFn, codeVersion: "NEW-sha",
+      db, pool, masterKey: MASTER_KEY, projectsRoot: PROJECTS_ROOT, now: () => NOW, orchestratorSpawnFn, codeVersion: "NEW-sha",
     });
 
     const ran = await worker.runOnce();
@@ -977,7 +997,7 @@ describe("JobWorker: resumed job safety checks (task-7-review findings 3 and 5)"
         projectId: project.id, port: upstream.port, base: "/", inFlight: 0, lastUsedAt: Date.now(),
       })),
     });
-    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, now: () => NOW, codeVersion: "sha-1" });
+    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, projectsRoot: PROJECTS_ROOT, now: () => NOW, codeVersion: "sha-1" });
 
     try {
       const ran = await worker.runOnce();
@@ -1004,7 +1024,7 @@ describe("JobWorker: resumed job safety checks (task-7-review findings 3 and 5)"
       runId: "../../etc/passwd",
     });
     const pool = fakePool();
-    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, now: () => NOW });
+    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, projectsRoot: PROJECTS_ROOT, now: () => NOW });
 
     const ran = await worker.runOnce();
 
@@ -1024,7 +1044,7 @@ describe("JobWorker: resumed job safety checks (task-7-review findings 3 and 5)"
     });
     const orchestratorSpawnFn = vi.fn();
     const pool = fakePool();
-    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, now: () => NOW, orchestratorSpawnFn });
+    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, projectsRoot: PROJECTS_ROOT, now: () => NOW, orchestratorSpawnFn });
 
     const ran = await worker.runOnce();
 
@@ -1039,7 +1059,7 @@ describe("JobWorker: resumed job safety checks (task-7-review findings 3 and 5)"
 describe("JobWorker: nothing queued", () => {
   it("runOnce() returns false and does nothing when the queue is empty", async () => {
     const pool = fakePool();
-    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, now: () => NOW });
+    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, projectsRoot: PROJECTS_ROOT, now: () => NOW });
     const ran = await worker.runOnce();
     expect(ran).toBe(false);
     expect(pool.acquire).not.toHaveBeenCalled();
@@ -1054,10 +1074,81 @@ describe("JobWorker: uses jobs.ts's own claimNextJob", () => {
     const job = createJob(db, { userId: user.id, projectId: project.id, kind: "regen", requestJson: "{}", now: NOW });
     claimNextJob(db, NOW + 1); // claims it out from under the worker
     const pool = fakePool();
-    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, now: () => NOW + 2 });
+    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, projectsRoot: PROJECTS_ROOT, now: () => NOW + 2 });
     const ran = await worker.runOnce();
     expect(ran).toBe(false);
     expect(findJobById(db, job.id)?.status).toBe("running"); // untouched by this worker
     expect(pool.acquire).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * WHOLE-BRANCH REVIEW, CRITICAL 1 — "a generation writes its site where
+ * nothing looks for it."
+ *
+ * `scripts/serve.ts --projects-root <X>` decides where the server creates,
+ * previews, adopts and exports a project; `orchestrator.acceptance` writes
+ * into its OWN hardcoded `GENERATED_DIR` and accepts no output-directory
+ * argument. When those disagree, a ~400s, ~$1.09 generation still finishes
+ * `succeeded` and the resulting site is unreachable. These tests are the
+ * "must fail if the two paths diverge again" requirement: the first two cover
+ * an operator-supplied divergence, the third covers a divergence introduced
+ * by editing the Python constant.
+ */
+describe("JobWorker: projects root must agree with the orchestrator's output directory", () => {
+  it("refuses to construct when --projects-root names a different directory, naming both paths", () => {
+    const pool = fakePool();
+    let thrown: unknown;
+    try {
+      new JobWorker({ db, pool, masterKey: MASTER_KEY, projectsRoot: "/var/lib/webgen", now: () => NOW });
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    const message = (thrown as Error).message;
+    expect(message).toContain("refused to start");
+    // Both RESOLVED paths must appear: the entire class of mistake this
+    // catches is an operator not realising which directory a relative
+    // --projects-root resolved against, and an error naming neither is
+    // useless for that.
+    expect(message).toContain(resolve("/var/lib/webgen"));
+    expect(message).toContain(PROJECTS_ROOT);
+  });
+
+  it("accepts a projects root that resolves to the same directory by a different spelling", () => {
+    const pool = fakePool();
+    // `<repo>/server/..//generated` is the same directory as `<repo>/generated`
+    // — the check compares RESOLVED paths, not strings, so an operator's
+    // equivalent-but-differently-spelled value is not a false alarm.
+    const equivalent = join(PROJECTS_ROOT, "..", "server", "..", "generated");
+    expect(() => new JobWorker({
+      db, pool, masterKey: MASTER_KEY, projectsRoot: equivalent, now: () => NOW,
+    })).not.toThrow();
+  });
+
+  it("pins the derivation against the orchestrator's own source, so editing GENERATED_DIR fails here", () => {
+    // The Python side is the authority; this package only DERIVES its
+    // expectation. Nothing else in either language proves the two agree —
+    // the same gap `fixtures/usage-log-contract.jsonl` exists to close for
+    // the usage log, closed here by reading the constant itself.
+    const pipelineSource = readFileSync(
+      join(PROJECTS_ROOT, "..", "orchestrator", "src", "orchestrator", "section_pipeline.py"),
+      "utf8",
+    );
+    const match = /^GENERATED_DIR = REPO_ROOT \/ "([^"]+)"$/m.exec(pipelineSource);
+    expect(match, "section_pipeline.py no longer defines GENERATED_DIR as REPO_ROOT / \"<name>\"").not.toBe(null);
+    const configSource = readFileSync(
+      join(PROJECTS_ROOT, "..", "orchestrator", "src", "orchestrator", "config.py"),
+      "utf8",
+    );
+    // REPO_ROOT is `ORCHESTRATOR_ROOT.parent` (section_pipeline.py), and
+    // ORCHESTRATOR_ROOT is `Path(__file__).resolve().parents[2]` — the
+    // `orchestrator/` package root. Both halves of that chain are pinned, so
+    // changing EITHER one fails this test rather than silently invalidating
+    // orchestratorGeneratedDir's own "resolve(orchestratorDir, '..', name)".
+    expect(configSource).toContain("ORCHESTRATOR_ROOT = Path(__file__).resolve().parents[2]");
+    expect(pipelineSource).toContain("REPO_ROOT = ORCHESTRATOR_ROOT.parent");
+    const orchestratorDir = join(PROJECTS_ROOT, "..", "orchestrator");
+    expect(orchestratorGeneratedDir(orchestratorDir)).toBe(resolve(orchestratorDir, "..", match![1]!));
   });
 });

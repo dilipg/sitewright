@@ -315,6 +315,25 @@ describe("scripts/serve.ts — job worker wiring (task 3)", () => {
     expect(startIndex).toBeGreaterThan(constructIndex);
   });
 
+  it("hands the job worker the SAME projectsRoot the preview pool got", () => {
+    // Whole-branch review, CRITICAL 1: the worker's constructor refuses when
+    // `projectsRoot` disagrees with the orchestrator's own hardcoded output
+    // directory, but it can only refuse over a value it is actually given.
+    // `JobWorkerDeps.projectsRoot` is required, so omitting it is already a
+    // compile error — what this adds is that the value passed is the SAME
+    // variable `new PreviewPool(...)` and `adoptExistingProjects(...)` use,
+    // not a second, independently-computed one that could drift.
+    const construct = serveSource.slice(
+      serveSource.indexOf("new JobWorker("),
+      serveSource.indexOf(")", serveSource.indexOf("new JobWorker(")) + 1,
+    );
+    expect(construct).toContain("projectsRoot");
+    // Shorthand — `projectsRoot: somethingElse` would not match.
+    expect(construct).toMatch(/[{,]\s*projectsRoot\s*[,}]/);
+    expect(serveSource).toMatch(/new PreviewPool\(\{[^}]*projectsRoot[,}\s]/);
+    expect(serveSource).toContain("adoptExistingProjects(db, projectsRoot, owner.id)");
+  });
+
   it("stops the job worker on both termination signals, before shutting the preview pool down", () => {
     // A job mid-run at shutdown must not be killed partway (spec decision
     // 13) — JobWorker.stop() itself awaits any in-flight tick, but that

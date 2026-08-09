@@ -51,6 +51,17 @@
  * `PreviewPool.assertApiKeyUsable` — called BEFORE the request is even
  * enqueued, so a keyless user gets an actionable 400 immediately instead of
  * a job that will simply fail later once the worker gets to it.
+ * That enqueue-time check is NOT sufficient on its own any more, and slice 5
+ * is what made it insufficient: before the job model, this check and the
+ * `pool.acquire` that consumed its answer sat in ONE synchronous request, so
+ * the window between them was a millisecond. A job turns it into a job
+ * LIFETIME — a user can save a key, enqueue (202), then `DELETE /api/key`
+ * before the worker claims it. `job-worker.ts`'s `runProxiedJob` therefore
+ * re-runs `assertApiKeyUsable` at CLAIM time for every billable kind (a
+ * whole-branch review, CRITICAL 2); this call stays because a keyless user
+ * still deserves an actionable 400 immediately rather than a job that will
+ * simply fail later.
+ *
  * `assertApiKeyUsable` only ever consults the DATABASE, though — on its own
  * it says nothing about a warm child whose key no longer matches (a keyless
  * spawn whose owner has since saved one, a rotated key, ...), which does NOT

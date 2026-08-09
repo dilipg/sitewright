@@ -17,7 +17,8 @@ import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DatabaseSync } from "node:sqlite";
 import { usageLogPathFor, USAGE_ID_HEADER } from "../../compiler/src/usage-log-path.ts";
-import { setApiKey } from "./api-keys.ts";
+import { DisabledUserError, MissingApiKeyError } from "./agent-env.ts";
+import { setApiKey, UndecryptableApiKeyError } from "./api-keys.ts";
 import { openDatabase } from "./db.ts";
 import { JobWorker, orchestratorGeneratedDir } from "./job-worker.ts";
 import { claimNextJob, createJob, finishJob, findJobById, recordJobRun } from "./jobs.ts";
@@ -93,6 +94,12 @@ function fakePool(overrides: Record<string, unknown> = {}): PreviewPool & {
     })),
     retain: vi.fn(),
     release: vi.fn(),
+    // Whole-branch review, CRITICAL 2: `runProxiedJob` re-checks the user's
+    // API key at CLAIM time for every billable kind. The real method throws
+    // on a missing/disabled/undecryptable key and returns nothing otherwise —
+    // this default is the "key is fine" case, which is what every
+    // pre-existing test in this file assumes.
+    assertApiKeyUsable: vi.fn(),
     ...overrides,
   } as unknown as PreviewPool & {
     acquire: ReturnType<typeof vi.fn>;
@@ -1150,5 +1157,111 @@ describe("JobWorker: projects root must agree with the orchestrator's output dir
     expect(pipelineSource).toContain("REPO_ROOT = ORCHESTRATOR_ROOT.parent");
     const orchestratorDir = join(PROJECTS_ROOT, "..", "orchestrator");
     expect(orchestratorGeneratedDir(orchestratorDir)).toBe(resolve(orchestratorDir, "..", match![1]!));
+  });
+});
+
+/**
+ * WHOLE-BRANCH REVIEW, CRITICAL 2 — "a user can hand their regen bill to the
+ * operator."
+ *
+ * `compiler-routes.ts` checks the key at ENQUEUE. The job model turned the
+ * millisecond gap between that check and the run into a job-lifetime one, and
+ * every layer below deliberately degrades rather than refuses:
+ * `PreviewPool.buildChildEnv` swallows `MissingApiKeyError` and spawns a
+ * keyless child, and `config.py`'s `load_dotenv(override=False)` then lets the
+ * absent key fall through to `orchestrator/.env` — the OPERATOR's key,
+ * recorded against the user's project, with zero `usage_event` rows.
+ */
+describe("JobWorker: re-checks the API key at claim time for billable kinds", () => {
+  /** The three typed failures `PreviewPool.assertApiKeyUsable` can actually raise here. */
+  const typedFailures = [
+    { name: "missing key", error: () => new MissingApiKeyError() },
+    { name: "disabled account", error: () => new DisabledUserError() },
+    { name: "undecryptable key", error: () => new UndecryptableApiKeyError() },
+  ];
+
+  for (const failure of typedFailures) {
+    it(`fails a billable job without ever reaching the preview child — ${failure.name}`, async () => {
+      let upstreamHits = 0;
+      const upstream = await startUpstream((_req, res) => {
+        upstreamHits += 1;
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ passed: true }));
+      });
+      const pool = fakePool({
+        acquire: vi.fn(async (): Promise<PreviewProcess> => ({
+          projectId: project.id, port: upstream.port, base: "/", inFlight: 0, lastUsedAt: Date.now(),
+        })),
+        assertApiKeyUsable: vi.fn(() => { throw failure.error(); }),
+      });
+      const job = createJob(db, {
+        userId: user.id, projectId: project.id, kind: "regen",
+        requestJson: JSON.stringify({ section: "home.hero", instruction: "x" }), now: NOW,
+      });
+
+      const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, projectsRoot: PROJECTS_ROOT, now: () => NOW });
+      const ran = await worker.runOnce();
+
+      try {
+        expect(ran).toBe(true);
+        const finished = findJobById(db, job.id);
+        expect(finished?.status).toBe("failed");
+        expect(finished?.error).toBe(failure.error().message);
+        // The point of the fix: the run never starts. No child is acquired,
+        // nothing is proxied, and so nothing spends the operator's key.
+        expect(pool.acquire).not.toHaveBeenCalled();
+        expect(upstreamHits).toBe(0);
+      } finally {
+        await upstream.close();
+      }
+    });
+  }
+
+  it("checks the key against the JOB's own user", async () => {
+    const pool = fakePool({ assertApiKeyUsable: vi.fn() });
+    const other = createUser(db, "b@example.com", "hash");
+    // A project owned by `user`, but a job enqueued by `other` — impossible
+    // through the live route table (requireProject would refuse), asserted
+    // anyway so the check can never quietly drift onto `project.ownerId`,
+    // which is what would let a second account's key pay for this run.
+    const job = createJob(db, {
+      userId: other.id, projectId: project.id, kind: "regen", requestJson: "{}", now: NOW,
+    });
+    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, projectsRoot: PROJECTS_ROOT, now: () => NOW });
+    await worker.runOnce();
+    expect(findJobById(db, job.id)).not.toBe(null);
+    expect(pool.assertApiKeyUsable).toHaveBeenCalledWith(other.id);
+  });
+
+  it("still runs a NON-billable kind (export) for a user with no key at all", async () => {
+    let upstreamHits = 0;
+    const upstream = await startUpstream((_req, res) => {
+      upstreamHits += 1;
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    });
+    const pool = fakePool({
+      acquire: vi.fn(async (): Promise<PreviewProcess> => ({
+        projectId: project.id, port: upstream.port, base: "/", inFlight: 0, lastUsedAt: Date.now(),
+      })),
+      // Would refuse if it were consulted — exporting is deterministic and
+      // spends no model money, so it must never be.
+      assertApiKeyUsable: vi.fn(() => { throw new MissingApiKeyError(); }),
+    });
+    const job = createJob(db, {
+      userId: user.id, projectId: project.id, kind: "export", requestJson: "{}", now: NOW,
+    });
+
+    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, projectsRoot: PROJECTS_ROOT, now: () => NOW });
+    const ran = await worker.runOnce();
+
+    try {
+      expect(ran).toBe(true);
+      expect(pool.assertApiKeyUsable).not.toHaveBeenCalled();
+      expect(upstreamHits).toBe(1);
+      expect(findJobById(db, job.id)?.status).toBe("succeeded");
+    } finally {
+      await upstream.close();
+    }
   });
 });

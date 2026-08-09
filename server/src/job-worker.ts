@@ -27,7 +27,11 @@
  *     error never carries a stack trace) carries over unchanged. The only
  *     new code here is the plumbing needed because a job has no live
  *     browser connection to hand `forwardToPreview` a real
- *     `(req, res)` pair — see `exchangeOverLoopback` below.
+ *     `(req, res)` pair — see `exchangeOverLoopback` below. One check that
+ *     used to be purely an enqueue-time concern is re-run HERE, at claim
+ *     time, for a billable kind: the user's API key must still be usable when
+ *     the work actually starts, not merely when it was queued (see
+ *     `runProxiedJob`).
  *
  *   - `generate` is NOT a wrapper around an existing proxied request, and
  *     cannot be: there is no project preview child to proxy to, because the
@@ -121,11 +125,13 @@ import { dirname, relative, resolve } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { USAGE_ID_HEADER, usageLogPathFor } from "../../compiler/src/usage-log-path.ts";
-import { buildAgentEnv } from "./agent-env.ts";
+import { buildAgentEnv, DisabledUserError, MissingApiKeyError, UnknownUserError } from "./agent-env.ts";
+import { UndecryptableApiKeyError } from "./api-keys.ts";
 import { codeVersionsIncompatible, resolveCodeVersion } from "./code-version.ts";
 import { ingestUsageLog } from "./ingest-usage.ts";
 import {
-  claimNextJob, finishJob, findJobById, isSafeRunId, recordJobRun, requeueJob, type Job, type JobKind,
+  BILLABLE_JOB_KINDS, claimNextJob, finishJob, findJobById, isSafeRunId, recordJobRun, requeueJob,
+  type Job, type JobKind,
 } from "./jobs.ts";
 import { findProjectById } from "./projects.ts";
 import { forwardToPreview } from "./preview-forward.ts";
@@ -591,6 +597,59 @@ export class JobWorker {
     const user = findUserById(this.db, job.userId);
     if (user === null) {
       return { kind: "failed", error: "user no longer exists" };
+    }
+
+    // WHOLE-BRANCH REVIEW, CRITICAL 2 — "a user can hand their regen bill to
+    // the operator."
+    //
+    // `compiler-routes.ts` gates the four billable `/__*` entries with
+    // `requireApiKey` at ENQUEUE. Before the job model, the check and the
+    // `pool.acquire` that consumed its answer sat in ONE synchronous request,
+    // so the window between them was a millisecond. A job turns that window
+    // into a job LIFETIME: a user can save a key, `POST /__regen` (202, the
+    // key check passes), then `DELETE /api/key` seconds or minutes before
+    // this worker claims the job.
+    //
+    // Nothing downstream catches that. `PreviewPool.buildChildEnv`
+    // DELIBERATELY swallows `MissingApiKeyError` and spawns a scrubbed,
+    // keyless child (previewing is free — its own comment says so), and
+    // `acquire`'s fingerprint check respawns a warm child KEYLESS rather than
+    // refusing. `config.py`'s `load_dotenv(override=False)` then lets the
+    // absent injected key fall through to `orchestrator/.env`, so the run
+    // spends the OPERATOR's key, recorded against the user's project, with
+    // zero `usage_event` rows. That is the 4c-2 "operator pays" bug reopened
+    // through a new door.
+    //
+    // `runGenerateJob` is not affected — `buildAgentEnv` THROWS there rather
+    // than falling back — which is exactly the asymmetry that made this
+    // invisible to a per-task review: only the five proxied kinds degrade
+    // silently. `assertApiKeyUsable` exists precisely for this and
+    // deliberately does NOT catch `MissingApiKeyError` (see its own doc
+    // comment), so it is the right primitive rather than a new one.
+    //
+    // Billable kinds only: `export` spends nothing and must keep working for
+    // a keyless user, the same rule `compiler-routes.ts` applies when it
+    // wraps ONLY `entry.billable` entries in `requireApiKey`.
+    if (BILLABLE_JOB_KINDS.includes(kind)) {
+      try {
+        this.pool.assertApiKeyUsable(job.userId);
+      } catch (err) {
+        // Mirrors `compiler-routes.ts`'s `requireApiKey` mapping, translated
+        // from statuses to a job outcome: the two user-actionable errors
+        // (missing key, disabled account) carry their own message, and the
+        // two operator-facing ones are ALSO logged, because a user cannot act
+        // on either and nothing else would surface them. Anything unexpected
+        // becomes a failed job too rather than being rethrown — a throw out of
+        // here would escape `runOnce`'s own terminal-state handling and leave
+        // the job stuck `running` forever, which is strictly worse than a
+        // clean failure with a generic message.
+        if (err instanceof UndecryptableApiKeyError || err instanceof UnknownUserError) {
+          console.error(`[job-worker] job ${job.id} (user ${job.userId}): ${err.message}`);
+        } else if (!(err instanceof MissingApiKeyError) && !(err instanceof DisabledUserError)) {
+          console.error(`[job-worker] job ${job.id}: unexpected API-key failure: ${redactSecrets(messageOf(err))}`);
+        }
+        return { kind: "failed", error: redactSecrets(messageOf(err)) };
+      }
     }
 
     // Task 7: recorded BEFORE the actual exchange runs, not after — a job

@@ -4,7 +4,12 @@
  *   POST /__regen        { section, instruction } -> { passed, orphanedOverrides,
  *                                                     tombstoned, failureReport, canRevert }
  *   POST /__regen-page   { route, instruction }   -> same, plus { sections, perSection }
- *   POST /__regen-revert { section | route }      -> { ok }
+ *   POST /__regen-revert { section }              -> { ok }
+ *       (the FIELD is always `section`; its VALUE may be a section id or a
+ *        bare route slug. This line previously read `{ section | route }`,
+ *        which reads as "either field name" and is wrong — a `route` field
+ *        yields 400 `invalid route slug`. Round 1's own plan copied the error
+ *        from here and wasted a live call on it.)
  *   GET  /__archetypes                            -> { archetypes: [{name, description}] }
  *   POST /__add-section  { route, archetype, instruction }
  *                                                 -> { passed, sectionId, failureReport }
@@ -242,22 +247,96 @@ function snapshotSection(root: string, section: string): void {
   snapshotRoute(root, section.split(".")[0]!);
 }
 
-function snapshotRoute(root: string, routeSlug: string): void {
-  const backup = snapshotDir(root);
-  rmSync(backup, { recursive: true, force: true });
-  cpSync(join(root, "src", "pages", routeSlug), join(backup, "page"), { recursive: true });
-  cpSync(join(root, "manifest.json"), join(backup, "manifest.json"));
+/**
+ * Which route the single pending snapshot belongs to.
+ *
+ * There is ONE snapshot slot per project, and it stays that way deliberately:
+ * the slot holds a whole-project `manifest.json` alongside one route's page
+ * directory, so two coexisting snapshots would let a restore of route A roll
+ * the manifest back over route B's committed entries. Keeping one slot keeps
+ * the page and the manifest inside it paired, which is the invariant the
+ * revert depends on. What was missing was any record of WHOSE snapshot it is.
+ */
+function snapshotOwnerFile(root: string): string {
+  return join(snapshotDir(root), "route.txt");
 }
 
-/** Accepts a section id or a bare route slug: the snapshot is route-wide
- *  either way, so `home.hero` and `home` restore exactly the same thing. */
-function restoreSnapshot(root: string, sectionOrRoute: string): void {
+export function snapshotRoute(root: string, routeSlug: string): void {
+  const source = join(root, "src", "pages", routeSlug);
+  // Validated BEFORE the existing slot is destroyed (F13 review, finding 4).
+  // The old order wiped the slot and only then discovered it had nothing to
+  // copy, so `POST /__regen-page {"route":"contact"}` — a VALID slug with no
+  // such directory — destroyed whatever legitimate pre-regen copy was pending
+  // and left the revert answering "no regeneration to revert". Same
+  // destructive-step-ahead-of-validation shape this module was just fixed for;
+  // it existed twice more, and this is one of them.
+  if (!existsSync(source)) {
+    throw new Error(
+      `route ${JSON.stringify(routeSlug)} has no page directory; nothing was snapshotted`,
+    );
+  }
+  const backup = snapshotDir(root);
+  rmSync(backup, { recursive: true, force: true });
+  cpSync(source, join(backup, "page"), { recursive: true });
+  cpSync(join(root, "manifest.json"), join(backup, "manifest.json"));
+  // Written LAST, so a crash mid-copy leaves an unowned slot that the restore
+  // below refuses rather than a slot that lies about what it contains.
+  // `.trim()`ed on the way IN as well as on the way out, so the two sides of
+  // the comparison normalise identically (F13 review, finding 5): a read-side
+  // trim alone accepted `"home"` for a snapshot recorded as `" home"`.
+  writeFileSync(snapshotOwnerFile(root), routeSlug.trim(), "utf8");
+}
+
+/**
+ * Accepts a section id or a bare route slug: the snapshot is route-wide
+ * either way, so `home.hero` and `home` restore exactly the same thing.
+ *
+ * F13 (found by round 1's live verification, docs/reports/m8-live-verification.md):
+ * this used to restore the single slot into WHATEVER route the caller named,
+ * deleting that route first. Regenerating `home` and then reverting `about`
+ * therefore deleted `about` and replaced its files with `home`'s — cross-route
+ * data loss, reachable over the authenticated HTTP surface. The editor never
+ * tripped it because it only ever reverts the route it just regenerated; the
+ * HTTP API has no such discipline.
+ *
+ * The ownership check runs BEFORE the `rmSync`, because the old ordering
+ * destroyed the target route first and could not have been undone even if the
+ * copy had then failed.
+ */
+export function restoreSnapshot(root: string, sectionOrRoute: string): void {
   const routeSlug = sectionOrRoute.split(".")[0]!;
   const backup = snapshotDir(root);
   if (!existsSync(backup)) throw new Error("no regeneration to revert");
+
+  const ownerFile = snapshotOwnerFile(root);
+  const owner = existsSync(ownerFile) ? readFileSync(ownerFile, "utf8").trim() : null;
+  if (owner !== routeSlug) {
+    // An absent owner file means a snapshot taken before this guard existed.
+    // Refused rather than trusted: the whole point is that a slot of unknown
+    // provenance is exactly what caused the data loss.
+    throw new Error(
+      `the pending regeneration snapshot belongs to route ${JSON.stringify(owner)}, ` +
+        `not ${JSON.stringify(routeSlug)}; nothing was changed`,
+    );
+  }
+
+  // Both halves of the snapshot must be present BEFORE the target route is
+  // deleted (F13 review, finding 3). Checking only that `.regen-backup/` exists
+  // was not enough: with `page/` or `manifest.json` missing, the old order
+  // deleted `src/pages/<route>` and then threw on the copy, destroying the
+  // route with nothing left to restore it from. The third instance of the same
+  // destructive-step-ahead-of-validation shape.
+  const page = join(backup, "page");
+  const manifestCopy = join(backup, "manifest.json");
+  if (!existsSync(page) || !existsSync(manifestCopy)) {
+    throw new Error(
+      "the pending regeneration snapshot is incomplete (missing page or manifest); nothing was changed",
+    );
+  }
+
   rmSync(join(root, "src", "pages", routeSlug), { recursive: true, force: true });
-  cpSync(join(backup, "page"), join(root, "src", "pages", routeSlug), { recursive: true });
-  cpSync(join(backup, "manifest.json"), join(root, "manifest.json"));
+  cpSync(page, join(root, "src", "pages", routeSlug), { recursive: true });
+  cpSync(manifestCopy, join(root, "manifest.json"));
   rmSync(backup, { recursive: true, force: true });
 }
 

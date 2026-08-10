@@ -32,29 +32,51 @@ Verified against the code on 2026-08-10. Use these shapes verbatim.
 
 | What | Shape |
 |---|---|
-| Create user | `npm run -w server user -- create --email <email> --db "$DB"` → prints a generated password once |
-| Set spend cap | `npm run -w server user -- set-cap --email <email> --cap 20 --db "$DB"` |
-| Read spend | `npm run -w server user -- usage --email <email> --db "$DB"` |
-| Boot server | `WEBGEN_MASTER_KEY=<64 hex> node server/scripts/serve.ts --port 4000 --db "$DB" --projects-root ./generated` |
-
-**`$DB` MUST be an absolute path, and every command above must be given it explicitly.** `npm run -w server user` executes with cwd `server/`, while `node server/scripts/serve.ts` executes from the repo root — so the *same* relative `--db` string resolves to two different files. The failure is quiet and expensive: the CLI creates the user in one database, the server reads another, and login returns the uniform auth failure with no hint that two files exist. Set it once at the repo root and reuse it:
-
-```bash
-export DB="$PWD/server/data/identity.db"
-```
+| Create user | `node server/scripts/user.ts create --email <email> --db "$DB"` → prints a generated password once |
+| Set spend cap | `node server/scripts/user.ts set-cap --email <email> --usd 20 --db "$DB"` |
+| Read spend | `node server/scripts/user.ts usage --email <email> --db "$DB"` |
+| Boot server | `WEBGEN_MASTER_KEY=<canonical padded base64, 32 bytes> node server/scripts/serve.ts --port 4000 --db "$DB" --projects-root ./generated` |
 | Login | `POST /api/login` `{ "email", "password" }` — **`Content-Type: application/json` is required** (it is what closes login-CSRF) |
 | Store key | `PUT /api/key` `{ "apiKey": "sk-ant-…" }` → `{ fingerprint }` |
 | Generate | `POST /api/generate` `{ "brief": "…" }` → **202** `{ jobId, projectId }` |
 | Add section | `POST /__add-section?project=<id>` `{ "route", "archetype", "instruction" }` → 202 `{ jobId }` |
 | Regen page | `POST /__regen-page?project=<id>` `{ "route", "instruction" }` → 202 `{ jobId }` |
-| Revert | `POST /__regen-revert?project=<id>` `{ "route" }` → `{ ok }` |
+| Revert | `POST /__regen-revert?project=<id>` **`{ "section" }`** → `{ ok }` — the value may be a section id *or* a bare route slug, but the FIELD is always `section`. `{"route":…}` returns 400 `invalid route slug` |
 | Archetypes | `GET /__archetypes?project=<id>` → `{ archetypes: [{name, description}] }` |
 | Poll job | `GET /api/jobs/:id` |
 | Resume | `POST /api/jobs/:id/resume` → 202; **409 if the job is not `failed`**; 409 on a `code_version` mismatch |
 | Run report | `uv run --directory orchestrator python -m orchestrator.run_report <run_id> -o <out>.html` |
 | Run log path | `uv run --directory orchestrator python -c "from orchestrator.runlog import default_run_log_path; print(default_run_log_path('<run_id>'))"` |
 
+**Two traps in that table, both found by reading the code rather than assuming.**
+
+`set-cap` takes **`--usd`**, not `--cap` (`server/src/user-cli.ts:101`). A wrong flag name throws `--usd must be a non-negative number`, which reads like a bad *value* rather than a bad *name*.
+
+**`$DB` must be an absolute path, given explicitly to every command.** `user.ts` defaults to `./data/identity.db` **relative to cwd** (`server/scripts/user.ts:15`), so invoking it via `npm run -w server` (cwd `server/`) and running the server from the repo root resolve the *same* default string to two different files. The failure is quiet and expensive: the CLI creates the user in one database, the server reads another, and login returns the deliberately uniform auth failure with no hint that two files exist. Invoke both with `node` from the repo root, and set the path once:
+
+```bash
+export DB="$PWD/server/data/identity.db"
+```
+
 **THE TRAP, repeated from `CLAUDE.md` because it will bite:** `succeeded` means *the request completed*, not that the work passed. A gate failure arrives as a `succeeded` job whose `result.passed` is `false`. Every assertion below that says "succeeded" means **`status === "succeeded"` AND `result.passed !== false`**.
+
+**Corrected by V1's live run — `$PROJECT_ID` is NOT a directory name.** A project's id and its on-disk directory are **two different UUIDs by design**: the API returns the id (`ba169e65-…`), while the directory is the run id (`web-2578801a-…`). `generated/$PROJECT_ID` does not exist. So:
+
+- **HTTP** always takes the project **id**: `?project=$PROJECT_ID`.
+- **Filesystem** paths always take the run directory: `generated/$RUN_DIR`.
+- `GET /api/jobs/:id` does **not** expose `run_id` (`publicJobView` omits it). Get the directory from `node server/scripts/user.ts list-projects --email <email> --db "$DB"`, which prints it.
+
+**Corrected again by V2's live run — the success field differs per endpoint, and getting it wrong passes a failure straight through:**
+
+| Endpoint kind | Success field |
+|---|---|
+| `/__regen`, `/__regen-page`, `/__add-section`, `/__edit-prompt` | **`passed`** |
+| `/__export` | **`ok`** — a gate failure returns HTTP 200 + `{ok:false}`, which `job-worker.ts:1123` maps to a `succeeded` job |
+| `generate` | **neither** — result is `{ stdout }`; a gate failure surfaces as a `failed` job |
+
+So `result.passed !== false` is *vacuously true* for an export that failed its gates. Check the right field for the endpoint you called.
+
+**Also corrected: `result.passed` does not exist on a `generate` job** — its result is `{ stdout }` only, so `result.passed !== false` is vacuously true there. THE TRAP is real for the five **proxied** kinds (Tasks 3 and 4) and inapplicable to V1/V4. For `generate`, a gate failure surfaces as a `failed` job instead, because `acceptance.py` raises on a non-zero exporter exit.
 
 ---
 
@@ -79,18 +101,22 @@ uv --version
 - [ ] **Step 2: Generate a master key and record its provenance, not its value**
 
 ```bash
-export WEBGEN_MASTER_KEY=$(node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))")
-echo "master key: generated fresh for this round, 32 random bytes, never written to disk" >> "$SCRATCH/harness.md"
+export WEBGEN_MASTER_KEY=$(node -e "console.log(require('node:crypto').randomBytes(32).toString('base64'))")
+echo "master key: generated fresh for this round, 32 random bytes, base64" >> "$SCRATCH/harness.md"
 ```
+
+**It must be `base64`, not `hex`** (`server/src/master-key.ts:40`) — and a hex string fails in a way worth understanding, because the same shape will catch anyone who guesses. Hex characters are all inside the base64 alphabet and 64 of them need no padding, so a 64-char hex key **passes** the canonical-base64 check at line 41 and is caught only by the length check at line 48, reporting `got 48` rather than "that's hex". Exactly what that function's own comment says it is for.
+
+The key must **persist for the whole round**: once the Anthropic key is encrypted under it, a restart with a different one cannot decrypt it, and Task 5 Step 7 restarts the server deliberately. Keep it in a session-scoped scratchpad env file (never the repo), and record in the journal that you did.
 
 If an identity database already exists from earlier work, **a fresh master key cannot decrypt its stored keys.** Either reuse the original key or start a fresh `--db` path. Record which you did.
 
 - [ ] **Step 3: Create the user and raise the cap above the round's budget**
 
 ```bash
-npm run -w server user -- create --email verify-round1@local.test
+node server/scripts/user.ts create --email verify-round1@local.test --db "$DB"
 # capture the printed password into the scratchpad, NOT into the repo
-npm run -w server user -- set-cap --email verify-round1@local.test --cap 20
+node server/scripts/user.ts set-cap --email verify-round1@local.test --usd 20 --db "$DB"
 ```
 
 The cap must exceed ~$6 or a later run is refused with **402** partway through and the round stalls with money already spent.
@@ -98,7 +124,7 @@ The cap must exceed ~$6 or a later run is refused with **402** partway through a
 - [ ] **Step 4: Boot the server in the background**
 
 ```bash
-node server/scripts/serve.ts --port 4000 --db ./server/data/identity.db --projects-root ./generated
+node server/scripts/serve.ts --port 4000 --db "$DB" --projects-root ./generated
 ```
 
 `--projects-root` must resolve to the orchestrator's own `generated/` or the worker **refuses to boot** by design. A non-zero exit here is the guard working, not a bug.
@@ -127,7 +153,7 @@ Expected: `{ "fingerprint": "…" }`. **Only the fingerprint may be echoed into 
 - [ ] **Step 7: Confirm zero spend before any run**
 
 ```bash
-npm run -w server user -- usage --email verify-round1@local.test
+node server/scripts/user.ts usage --email verify-round1@local.test --db "$DB"
 ```
 
 Expected: `$0.00 spent of $20.00`. This is the baseline every later delta is measured against.
@@ -161,8 +187,8 @@ Expected: **202** with `{ jobId, projectId }`. Record both. Note the wall-clock 
 - [ ] **Step 2: Confirm the project row and directory exist immediately**
 
 ```bash
-npm run -w server user -- list-projects --email verify-round1@local.test
-ls "generated/$PROJECT_ID"
+node server/scripts/user.ts list-projects --email verify-round1@local.test --db "$DB"
+ls "generated/$RUN_DIR"
 ```
 
 Expected: both exist **before the job has run** — that is the design ("a failed generation leaves an owned, deletable project rather than an orphan"). An empty directory at this moment is correct, not a failure.
@@ -178,7 +204,7 @@ Poll every 15s. Expected terminal state: `status === "succeeded"` **and** `resul
 - [ ] **Step 4: Read actual spend, not an estimate**
 
 ```bash
-npm run -w server user -- usage --email verify-round1@local.test
+node server/scripts/user.ts usage --email verify-round1@local.test --db "$DB"
 ```
 
 Record the delta from Task 1's baseline. **If the `unpriced events` note appears, the figure is a floor** — say so in the report rather than quoting it as the total.
@@ -186,8 +212,8 @@ Record the delta from Task 1's baseline. **If the `unpriced events` note appears
 - [ ] **Step 5: Verify the site is real**
 
 ```bash
-ls "generated/$PROJECT_ID/src/pages"          # expect 3 route directories
-find "generated/$PROJECT_ID/src/pages" -name "*.tsx" | wc -l
+ls "generated/$RUN_DIR/src/pages"          # expect 3 route directories
+find "generated/$RUN_DIR/src/pages" -name "*.tsx" | wc -l
 ```
 
 Then open the preview and confirm it renders with node ids present:
@@ -239,8 +265,8 @@ Pick an archetype **that the generated site does not already use on the target r
 - [ ] **Step 2: Record the pre-state**
 
 ```bash
-cat "generated/$PROJECT_ID/overrides/home.overrides.json" 2>/dev/null
-ls "generated/$PROJECT_ID/src/pages/home"
+cat "generated/$RUN_DIR/overrides/home.overrides.json" 2>/dev/null
+ls "generated/$RUN_DIR/src/pages/home"
 ```
 
 Capture the current `sectionOrder` override (or its absence) and the section file list. Task 3's central claim is a *diff* against this.
@@ -278,7 +304,7 @@ Poll to terminal. Expected `succeeded` with `result.passed === true`. Gate 1 now
 - [ ] **Step 6: Read spend and append to the report**
 
 ```bash
-npm run -w server user -- usage --email verify-round1@local.test
+node server/scripts/user.ts usage --email verify-round1@local.test --db "$DB"
 ```
 
 Append a V2 section recording every assertion above with its result, the actual cost delta, and the archetype chosen.
@@ -303,7 +329,7 @@ git commit -m "docs(report): V2 add-section, live"
 - [ ] **Step 1: Record the pre-state of every section on the route**
 
 ```bash
-md5sum generated/$PROJECT_ID/src/pages/home/*.tsx > "$SCRATCH/home-before.txt"
+md5sum generated/$RUN_DIR/src/pages/home/*.tsx > "$SCRATCH/home-before.txt"
 cat "$SCRATCH/home-before.txt"
 ```
 
@@ -322,7 +348,7 @@ Expected: **202** `{ jobId }`. Poll to terminal. The response carries `sections`
 - [ ] **Step 3: Assert each section was actually regenerated**
 
 ```bash
-md5sum generated/$PROJECT_ID/src/pages/home/*.tsx > "$SCRATCH/home-after.txt"
+md5sum generated/$RUN_DIR/src/pages/home/*.tsx > "$SCRATCH/home-after.txt"
 diff "$SCRATCH/home-before.txt" "$SCRATCH/home-after.txt"
 ```
 
@@ -338,7 +364,7 @@ Assert:
 curl -s -b "$SCRATCH/cookies.txt" -X POST "http://localhost:4000/__regen-revert?project=$PROJECT_ID" \
   -H 'Content-Type: application/json' \
   -d '{"route":"home"}'
-md5sum generated/$PROJECT_ID/src/pages/home/*.tsx > "$SCRATCH/home-reverted.txt"
+md5sum generated/$RUN_DIR/src/pages/home/*.tsx > "$SCRATCH/home-reverted.txt"
 diff "$SCRATCH/home-before.txt" "$SCRATCH/home-reverted.txt"
 ```
 
@@ -347,7 +373,7 @@ Expected: **byte-identical to Step 1**, from the single route-wide snapshot take
 - [ ] **Step 5: Read spend and append to the report**
 
 ```bash
-npm run -w server user -- usage --email verify-round1@local.test
+node server/scripts/user.ts usage --email verify-round1@local.test --db "$DB"
 ```
 
 - [ ] **Step 6: Commit**
@@ -370,6 +396,8 @@ git commit -m "docs(report): V3 page regeneration and revert, live"
 - Produces: the answer to the one open question with genuine doubt
 
 **Why the fault must hit the orchestrator, not the server:** resume requires `original.status === "failed"` ([job-routes.ts:348](../../../server/src/job-routes.ts#L348)), and a `generate` job reaches `failed` only when `orchestrator.acceptance` exits non-zero. Killing the **server** produces `interrupted`, which is deliberately never retried and not resumable.
+
+> **DO NOT RESTART THE SERVER BETWEEN STEP 1 AND STEP 6 OF THIS TASK.** `resolveCodeVersion` is called **once, at boot** (`server/scripts/serve.ts:119`) and threaded from there — verified in code after V1's run. So ordinary commits during the task are **harmless**: the running server stays pinned to whatever HEAD was when it started, and the round's server is already pinned to `05d5360`, several commits behind. What *is* load-bearing is a **restart**: a server that comes back up re-reads HEAD, and every resume of a job recorded under the old sha is then refused **409** — the guard working exactly as designed, but indistinguishable at a glance from the feature being broken. Step 7's deliberate restart is therefore the LAST resume-related action in this task; if you must restart earlier, pin `WEBGEN_CODE_VERSION=05d53603e7ba1bcfb0f862f9ef058717e43082e9` on the way back up.
 
 - [ ] **Step 1: Start a second generation**
 
@@ -466,7 +494,7 @@ git commit -m "docs(report): V4 fan-out-subprocess resume, live"
 - [ ] **Step 1: Report total actual spend against the authorisation**
 
 ```bash
-npm run -w server user -- usage --email verify-round1@local.test
+node server/scripts/user.ts usage --email verify-round1@local.test --db "$DB"
 ```
 
 State the total against the ~$6 ceiling and the ~$2.72 estimate. If the `unpriced events` note appeared at any point, say the figure is a floor.

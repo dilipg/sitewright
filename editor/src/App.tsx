@@ -1123,13 +1123,33 @@ export default function App() {
 
   async function revertRegen() {
     if (revertSection === undefined) return;
-    await fetch(backend.apiUrl("/__regen-revert"), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ section: revertSection }),
-    });
-    await refreshManifest();
     const section = revertSection;
+    // F13 review, finding 2: this was a bare `fetch` with no `.ok` check and
+    // not `sessionAwareFetch`, so a refusal rendered as a SUCCESSFUL revert —
+    // it cleared the revert affordance, cleared the orphan list and reloaded
+    // the preview, leaving the user believing their regeneration had been
+    // undone when nothing on disk had changed. The same class of lie as the
+    // autosave "Saved" bug, and it became reachable the moment the snapshot
+    // guard gained a refusal to report: a failed regen on another route
+    // reassigns the snapshot slot while leaving `revertSection` pointing here.
+    try {
+      await fetchJson(backend.apiUrl("/__regen-revert"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ section }),
+      });
+    } catch (error) {
+      if (error instanceof SessionExpiredError) {
+        setSessionExpired(true);
+        return;
+      }
+      // `revertSection` and the orphan list are deliberately LEFT IN PLACE: the
+      // revert did not happen, so the affordance must stay available rather
+      // than silently disappearing.
+      setRegen({ phase: "failed", section, scope: "section", report: String(error), instruction: "" });
+      return;
+    }
+    await refreshManifest();
     setRevertSection(undefined);
     setOrphans([]);
     reloadPreview(section);

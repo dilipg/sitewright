@@ -12,13 +12,13 @@
  */
 import { afterEach, describe, expect, it } from "vitest";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { Plugin } from "vite";
 import { MAX_BODY_BYTES } from "./max-body-bytes.ts";
-import { regenApiPlugin, runProcess, usageEnvFor } from "./regen-api.ts";
+import { regenApiPlugin, restoreSnapshot, runProcess, snapshotRoute, usageEnvFor } from "./regen-api.ts";
 import { USAGE_ID_HEADER, usageLogPathFor } from "./usage-log-path.ts";
 
 const REPO_ROOT = resolve(import.meta.dirname, "..", "..");
@@ -409,5 +409,176 @@ describe("regenApiPlugin: bounds a proxied body before ever parsing it (residual
     // the request landed on.
     expect(result.status).toBe(500);
     expect(existsSync(join(root, ".regen-backup"))).toBe(true);
+  });
+});
+
+/**
+ * F13, found by round 1's live verification (docs/reports/m8-live-verification.md).
+ *
+ * `snapshotRoute` wrote to `.regen-backup/page` -- ONE fixed path, not keyed by
+ * route -- and `restoreSnapshot` deleted the TARGET route before copying, with
+ * nothing recording which route the snapshot came from. So regenerating one
+ * route and then reverting a DIFFERENT one deleted the second route and
+ * replaced its files with the first's: cross-route data loss, reachable over
+ * the authenticated HTTP surface (`POST /__regen-revert`).
+ *
+ * The editor never tripped it because it only ever reverts the route it just
+ * regenerated. The HTTP API has no such discipline.
+ *
+ * Driven through the exported helpers rather than the HTTP middleware because
+ * the endpoint's own mock path needs a populated manifest and spends 1.5s per
+ * section; the defect lives entirely in these two functions, and the module
+ * already exports `runProcess`/`usageEnvFor` for tests by the same precedent.
+ */
+describe("snapshot/restore: a snapshot may only restore the route it came from (F13)", () => {
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
+    dirs.length = 0;
+  });
+
+  /** Two routes, each with a uniquely-named file, so a swap is unmistakable. */
+  function twoRouteProject(): string {
+    const dir = mkdtempSync(join(tmpdir(), "regen-f13-"));
+    dirs.push(dir);
+    for (const route of ["home", "about"]) {
+      mkdirSync(join(dir, "src", "pages", route, "sections"), { recursive: true });
+      writeFileSync(join(dir, "src", "pages", route, `${route}-only.tsx`), `// belongs to ${route}
+`, "utf8");
+    }
+    writeFileSync(join(dir, "manifest.json"), JSON.stringify({ nodes: {} }), "utf8");
+    return dir;
+  }
+
+  it("refuses to restore `home`'s snapshot into `about`, leaving `about` untouched", () => {
+    const root = twoRouteProject();
+    snapshotRoute(root, "home");
+
+    expect(() => restoreSnapshot(root, "about")).toThrow(/belongs to route "home"/);
+
+    // The actual defect: `about` must still be `about`.
+    expect(existsSync(join(root, "src", "pages", "about", "about-only.tsx"))).toBe(true);
+    expect(existsSync(join(root, "src", "pages", "about", "home-only.tsx"))).toBe(false);
+  });
+
+  it("does not consume the snapshot, so the legitimate revert still works after a refused one", () => {
+    const root = twoRouteProject();
+    snapshotRoute(root, "home");
+    try {
+      restoreSnapshot(root, "about");
+    } catch {
+      // expected
+    }
+
+    // Asserting on the SLOT, not on `existsSync(pages/about)`: the first draft
+    // of this test checked the latter and did not discriminate, because the
+    // destructive restore recreated `pages/about` (with `home`'s files) so the
+    // directory existed either way. The old code also deleted the backup at
+    // the end of every restore, so reverting the wrong route destroyed the
+    // ability to revert the right one -- that is the property under test.
+    expect(existsSync(join(root, ".regen-backup", "route.txt"))).toBe(true);
+
+    rmSync(join(root, "src", "pages", "home"), { recursive: true, force: true });
+    restoreSnapshot(root, "home");
+    expect(existsSync(join(root, "src", "pages", "home", "home-only.tsx"))).toBe(true);
+  });
+
+  it("still restores the route the snapshot WAS taken from", () => {
+    const root = twoRouteProject();
+    snapshotRoute(root, "home");
+    rmSync(join(root, "src", "pages", "home"), { recursive: true, force: true });
+
+    restoreSnapshot(root, "home");
+
+    expect(existsSync(join(root, "src", "pages", "home", "home-only.tsx"))).toBe(true);
+  });
+
+  it("accepts a section id for the owning route, not just a bare slug", () => {
+    const root = twoRouteProject();
+    snapshotRoute(root, "home");
+    expect(() => restoreSnapshot(root, "home.hero")).not.toThrow();
+  });
+
+  it("refuses a snapshot slot with no owner record (taken before this guard)", () => {
+    const root = twoRouteProject();
+    snapshotRoute(root, "home");
+    rmSync(join(root, ".regen-backup", "route.txt"), { force: true });
+
+    expect(() => restoreSnapshot(root, "home")).toThrow(/belongs to route null/);
+    expect(existsSync(join(root, "src", "pages", "home", "home-only.tsx"))).toBe(true);
+  });
+});
+
+/**
+ * F13 REVIEW findings 3, 4 and 5. The independent review of the F13 fix found
+ * that the same defect shape being fixed — a destructive step ahead of its
+ * validation — existed in TWO more places in these same two functions. One
+ * instance was fixed and two were left.
+ */
+describe("snapshot/restore: no destructive step may precede its validation (F13 review)", () => {
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
+    dirs.length = 0;
+  });
+
+  function twoRouteProject(): string {
+    const dir = mkdtempSync(join(tmpdir(), "regen-f13r-"));
+    dirs.push(dir);
+    for (const route of ["home", "about"]) {
+      mkdirSync(join(dir, "src", "pages", route), { recursive: true });
+      writeFileSync(join(dir, "src", "pages", route, `${route}-only.tsx`), `// ${route}\n`, "utf8");
+    }
+    writeFileSync(join(dir, "manifest.json"), JSON.stringify({ nodes: {} }), "utf8");
+    return dir;
+  }
+
+  it("finding 4: a valid slug with no page directory must not destroy the pending snapshot", () => {
+    const root = twoRouteProject();
+    snapshotRoute(root, "home");
+
+    // "contact" passes ROUTE_SLUG but has no directory. The old order wiped the
+    // slot first and only then threw on the copy.
+    expect(() => snapshotRoute(root, "contact")).toThrow(/no page directory/);
+
+    // home's snapshot must have survived, and must still be restorable.
+    expect(existsSync(join(root, ".regen-backup", "route.txt"))).toBe(true);
+    rmSync(join(root, "src", "pages", "home"), { recursive: true, force: true });
+    restoreSnapshot(root, "home");
+    expect(existsSync(join(root, "src", "pages", "home", "home-only.tsx"))).toBe(true);
+  });
+
+  it("finding 3: an incomplete snapshot must not delete the target route first", () => {
+    const root = twoRouteProject();
+    snapshotRoute(root, "home");
+    // Simulate a slot whose page half is gone but whose owner record is intact.
+    rmSync(join(root, ".regen-backup", "page"), { recursive: true, force: true });
+
+    expect(() => restoreSnapshot(root, "home")).toThrow(/incomplete/);
+
+    // The route must still be there. The old order deleted it and then threw on
+    // the copy, leaving nothing to restore it from.
+    expect(existsSync(join(root, "src", "pages", "home", "home-only.tsx"))).toBe(true);
+  });
+
+  it("finding 3: a missing manifest half is refused too, non-destructively", () => {
+    const root = twoRouteProject();
+    snapshotRoute(root, "home");
+    rmSync(join(root, ".regen-backup", "manifest.json"), { force: true });
+
+    expect(() => restoreSnapshot(root, "home")).toThrow(/incomplete/);
+    expect(existsSync(join(root, "src", "pages", "home", "home-only.tsx"))).toBe(true);
+  });
+
+  it("finding 5: the owner record is normalised on write, not only on read", () => {
+    const root = twoRouteProject();
+    // A read-side `.trim()` alone made `" home"` and `"home"` compare equal, so
+    // a snapshot of one could be restored into the other. Normalising both
+    // sides makes the stored value canonical instead.
+    mkdirSync(join(root, "src", "pages", " home"), { recursive: true });
+    writeFileSync(join(root, "src", "pages", " home", "spaced.tsx"), "// spaced\n", "utf8");
+    snapshotRoute(root, " home");
+
+    expect(readFileSync(join(root, ".regen-backup", "route.txt"), "utf8")).toBe("home");
   });
 });

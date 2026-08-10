@@ -2,12 +2,15 @@ import { describe, expect, it } from "vitest";
 import {
   backend,
   createBackend,
+  editorUrlForProject,
   encodePathSegment,
+  generateUrl,
   hostedMode,
   isHostedMode,
   loginUrl,
   meUrl,
   neutralizeDotSegments,
+  projectsUrl,
   resolveMode,
 } from "./backend";
 
@@ -233,6 +236,75 @@ describe("session-scoped URLs (no ?project=)", () => {
   it("neither carries a project id — both routes are session-only on the server", () => {
     expect(loginUrl()).not.toContain("project=");
     expect(meUrl()).not.toContain("project=");
+  });
+
+  it("TASK 3: the project list and generate are session-only too", () => {
+    // `GET /api/projects` answers the CALLER's own projects (scoped by the
+    // server's SQL, not by a parameter), and `POST /api/generate` is the one
+    // route that CREATES a project — "which project?" is not a question
+    // either could answer.
+    expect(projectsUrl()).toBe("/api/projects");
+    expect(generateUrl()).toBe("/api/generate");
+    expect(projectsUrl()).not.toContain("project=");
+    expect(generateUrl()).not.toContain("project=");
+  });
+});
+
+/**
+ * TASK 3 — the editor's own URL for a chosen project, and the one place a
+ * project id supplied by the SERVER re-enters this app.
+ */
+describe("editorUrlForProject", () => {
+  it("sets ?project=<id> on the current URL", () => {
+    expect(editorUrlForProject("proj-1", "http://localhost:5173/")).toBe(
+      "http://localhost:5173/?project=proj-1",
+    );
+  });
+
+  it("replaces an existing ?project= rather than appending a second one", () => {
+    // Two `project` values would make `URLSearchParams.get` (and therefore
+    // `resolveMode`) pick the first — i.e. the project the user just navigated
+    // AWAY from — while the URL bar showed both.
+    const url = new URL(editorUrlForProject("proj-2", "http://localhost:5173/?project=proj-1"));
+    expect(url.searchParams.getAll("project")).toEqual(["proj-2"]);
+  });
+
+  it("keeps every other query parameter the URL already carried", () => {
+    const url = new URL(
+      editorUrlForProject("proj-1", "http://localhost:5173/?preview=http%3A%2F%2Fx&debug=1"),
+    );
+    expect(url.searchParams.get("preview")).toBe("http://x");
+    expect(url.searchParams.get("debug")).toBe("1");
+  });
+
+  it("round-trips through resolveMode — the id that goes in is the id that comes out", () => {
+    // The property that actually matters: this is the ONLY handoff between
+    // the picker and the mode resolver, and a mismatch would open the wrong
+    // project (or none) with no error anywhere.
+    for (const id of ["proj-1", "3f8c1a54-0000-4000-8000-000000000001", "a b", "a&b=c", "a/b", "a?b"]) {
+      const href = editorUrlForProject(id, "http://localhost:5173/");
+      const mode = resolveMode(new URL(href).search, EDITOR_ORIGIN);
+      expect(mode).toEqual({ kind: "hosted", projectId: id, origin: EDITOR_ORIGIN });
+    }
+  });
+
+  it("does NOT apply previewUrl's double-escape — a query value is not a path segment", () => {
+    // `encodePathSegment` exists because the WHATWG parser normalizes
+    // `%2e`/`%2e%2e` dot SEGMENTS away, so a path needs `%2E` escaped a
+    // second time (`%252E`). A query VALUE is subject to no such step:
+    // `URLSearchParams` encodes once and `resolveMode` decodes once. Running
+    // the double-escape here would not be extra safety, it would corrupt the
+    // id into one no project has — which is what this asserts.
+    const href = editorUrlForProject("a.b..c", "http://localhost:5173/");
+    expect(new URL(href).searchParams.get("project")).toBe("a.b..c");
+    expect(href).not.toContain("%252E");
+  });
+
+  it("a '..' id cannot climb the path, because it never reaches the path at all", () => {
+    const href = editorUrlForProject("../../api/key", "http://localhost:5173/editor/");
+    const url = new URL(href);
+    expect(url.pathname).toBe("/editor/");
+    expect(url.searchParams.get("project")).toBe("../../api/key");
   });
 });
 

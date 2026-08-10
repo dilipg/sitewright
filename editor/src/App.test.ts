@@ -93,6 +93,68 @@ describe("App.tsx: every read goes through the session-aware layer (finding B)",
     expect(bootstrapEffect).toContain("if (hostedShellWithoutProject) return;");
   });
 
+  /**
+   * TASK 3 — the picker replaces task 2's placeholder, and the id it hands
+   * back is the API's id.
+   *
+   * Source-text again, for the same structural reason as everything around
+   * it: this is JSX inside a component that cannot be mounted here. The
+   * BEHAVIOUR (`startGeneration`, `toProjectRows`, `loadProjects`) is tested
+   * directly in `components/ProjectPicker.test.ts`; what these assert is the
+   * half a library test structurally cannot — that App reaches the picker at
+   * all, and that what it does with the picker's output is a navigation
+   * carrying that exact id.
+   */
+  it("renders the project picker in the hosted shell, replacing task 2's placeholder", () => {
+    expect(appSource).toContain("<ProjectPicker");
+    expect(appSource).toContain("onOpen={openProject}");
+    // The picker is reached ONLY from the hosted-shell branch, so local mode
+    // (and the whole milestone-7 Playwright suite, which navigates to a bare
+    // `/` with the flag unset) never renders it.
+    const pickerIndex = appSource.indexOf("<ProjectPicker");
+    const branchIndex = appSource.indexOf("if (hostedShellWithoutProject) {");
+    expect(branchIndex).toBeGreaterThan(-1);
+    expect(pickerIndex).toBeGreaterThan(branchIndex);
+  });
+
+  it("opens a project by the ID the API returned — App never touches a directory", () => {
+    // This codebase's most repeated mistake, guarded at the layer that
+    // performs the navigation as well as the layer that shapes the list. A
+    // project's id and its on-disk run directory are BOTH UUIDs, and
+    // `requireProject` answers a wrong-UUID request with the same 404 it
+    // gives a foreign project — so the failure would read as "that project
+    // does not exist" for a project that plainly does.
+    // `functionBody` above only finds `async function`s; `openProject` is
+    // synchronous (it navigates and nothing follows), so it is sliced here.
+    const start = appSource.indexOf("function openProject(");
+    expect(start, 'App.tsx no longer declares "function openProject("').toBeGreaterThan(-1);
+    const body = appSource.slice(start, appSource.indexOf("\n  }", start));
+    expect(body).toContain("editorUrlForProject(projectId,");
+    expect(appSource).not.toMatch(/\.directory\b/);
+    expect(appSource).not.toMatch(/["']directory["']/);
+  });
+
+  it("holds BOTH ids a started generation produced, since they name different things", () => {
+    // `jobId` is what task 4's progress view polls; `projectId` is what the
+    // editor opens once it succeeds. Storing the whole object rather than
+    // one field is what keeps the second available when the first finishes.
+    expect(appSource).toContain("useState<StartedGeneration | null>(null)");
+    expect(appSource).toContain("onGenerationStarted={setStartedGeneration}");
+  });
+
+  it("does not offer to open a project whose generation has only just started", () => {
+    // `POST /api/generate` creates the project row AND its directory before
+    // queueing the job, so a project legitimately exists with an empty
+    // directory for the ~11 minutes the run takes. Opening it then
+    // bootstraps a canvas against a manifest that does not exist yet.
+    const started = appSource.slice(
+      appSource.indexOf('data-testid="generation-started"'),
+      appSource.indexOf('<ProjectPicker'),
+    );
+    expect(started.length).toBeGreaterThan(0);
+    expect(started).not.toContain("openProject(");
+  });
+
   it("approvePlan dismisses the plan gate only after the write actually landed", () => {
     const body = functionBody("approvePlan");
     expect(body).toContain("sessionAwareFetch(");

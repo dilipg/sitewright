@@ -16,6 +16,8 @@ import { AddSectionPanel } from "./components/AddSection";
 import type { EditPromptState } from "./components/EditPrompt";
 import EditPrompt from "./components/EditPrompt";
 import LoginScreen from "./components/LoginScreen";
+import type { StartedGeneration } from "./components/ProjectPicker";
+import ProjectPicker from "./components/ProjectPicker";
 import type { RegenPhase } from "./components/Regen";
 import { OrphanDialog, RegenControls } from "./components/Regen";
 import type { PreviewWidth, RouteInfo, Viewport } from "./lib/canvas";
@@ -32,7 +34,7 @@ import {
   splitOverridesByRoute,
   zoomAt,
 } from "./lib/canvas";
-import { backend, encodePathSegment, hostedMode, meUrl } from "./lib/backend";
+import { backend, editorUrlForProject, encodePathSegment, hostedMode, meUrl } from "./lib/backend";
 import { applyEditOperations, interpretEditResult, validateEditOperations } from "./lib/edit-ops";
 import type { EditPromptResponse } from "./lib/edit-ops";
 import { expandStyleValue } from "./lib/inventory";
@@ -243,6 +245,13 @@ export default function App() {
   // branch below. NOT a login flag (that is `sessionExpired`) -- it is the
   // identity the project picker (task 3) renders.
   const [account, setAccount] = useState<AccountSummary | null>(null);
+  // TASK 3. A generation that has STARTED — both ids, held together, because
+  // they name different things: `jobId` is what task 4's progress view polls,
+  // `projectId` is what the editor opens once the job succeeds. `null` means
+  // "none started in this tab", which is not the same as "none running": a
+  // generation survives a reload and this state does not, so a reload
+  // legitimately returns to the picker with a real run still in flight.
+  const [startedGeneration, setStartedGeneration] = useState<StartedGeneration | null>(null);
 
   const manifestRef = useRef<Manifest | null>(null);
   const historyRef = useRef<History | null>(null);
@@ -657,6 +666,26 @@ export default function App() {
    */
   function onAuthenticated() {
     window.location.reload();
+  }
+
+  /**
+   * TASK 3. Opening a project is a full NAVIGATION, not a state change.
+   *
+   * `backend` and `hostedMode` are module-scope singletons computed exactly
+   * once at import time from `window.location.search` (backend.ts says so, and
+   * says why: a test could not otherwise exercise both modes). Every URL the
+   * canvas builds — the preview iframe's `src`, every `/__*` endpoint's
+   * `?project=` — comes from that singleton, so setting `?project=` without
+   * reloading would leave the whole app pointed at the previous project, or in
+   * this case at a local preview server that a hosted tester is not running.
+   * Same reasoning as `onAuthenticated`'s reload, one step further along.
+   *
+   * `projectId` is the API's id, never the on-disk directory — see
+   * ProjectPicker's header comment for why the two are not interchangeable and
+   * why confusing them produces a 404 that reads as a deleted project.
+   */
+  function openProject(projectId: string) {
+    window.location.assign(editorUrlForProject(projectId, window.location.href));
   }
 
   /* ---------- edits ---------- */
@@ -1427,28 +1456,58 @@ export default function App() {
     );
   }
 
-  // Signed in, hosted, but no project selected yet. TASK 3 replaces this
-  // placeholder with the project picker + new-site form; until then it is
-  // deliberately a plain, honest statement of where the user is rather than
-  // a blank screen or a canvas pointed at nothing.
+  // Signed in, hosted, but no project selected yet — TASK 3's picker, which
+  // replaces task 2's placeholder. Reaching a project no longer means reading
+  // a UUID out of `user-cli list-projects` and pasting it into the URL.
   if (hostedShellWithoutProject) {
+    if (account === null) {
+      return (
+        <div className="editor-root">
+          <div className="account-gate" data-testid="account-gate">
+            <p>Checking your session…</p>
+          </div>
+        </div>
+      );
+    }
+    if (startedGeneration !== null) {
+      // TASK 4 replaces this with the live progress view (stage, sections
+      // done, elapsed, and `degraded_sections` on completion). Until then it
+      // is deliberately a plain statement of the one thing that is certainly
+      // true — the run started — rather than anything resembling progress.
+      //
+      // It deliberately offers NO "open the project" button. `POST
+      // /api/generate` creates the project row and its directory BEFORE
+      // queueing the job, so the project genuinely exists from the first
+      // moment while its directory stays empty for ~11 minutes; opening it
+      // now would bootstrap a canvas against a manifest that does not exist
+      // yet. And no "back to the list" either, because that would put the
+      // Generate button back in front of a user whose run is already
+      // costing money.
+      return (
+        <div className="editor-root">
+          <div className="account-gate" data-testid="generation-started">
+            <p>
+              Generation started — job <code>{startedGeneration.jobId}</code>.
+            </p>
+            <p className="account-gate-hint">
+              It takes about 11 minutes and cannot be cancelled. Live progress arrives with the next
+              step; for now, reload this page when it has had time to finish and open the new site
+              from your list.
+            </p>
+          </div>
+        </div>
+      );
+    }
     return (
       <div className="editor-root">
-        <div className="account-gate" data-testid="account-gate">
-          {account === null ? (
-            <p>Checking your session…</p>
-          ) : (
-            <>
-              <p>
-                Signed in as <strong>{account.email}</strong>.
-              </p>
-              <p className="account-gate-hint">
-                Open a project by adding <code>?project=&lt;id&gt;</code> to this URL. A picker and a
-                new-site form arrive with the next step.
-              </p>
-            </>
-          )}
-        </div>
+        <ProjectPicker
+          accountEmail={account.email}
+          onOpen={openProject}
+          onGenerationStarted={setStartedGeneration}
+          // The single "the session is not usable" flag, reused rather than
+          // duplicated — `showLogin` above turns it into the login screen.
+          onSessionExpired={() => setSessionExpired(true)}
+        />
       </div>
     );
   }

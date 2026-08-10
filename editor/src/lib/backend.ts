@@ -165,6 +165,54 @@ export function meUrl(): string {
   return "/api/me";
 }
 
+/**
+ * TASK 3. Both are session-only in `server/src/project-registry.ts` and take
+ * no `?project=` for the same reason `loginUrl`/`meUrl` do not: they are what
+ * a caller uses when there is no project yet. `POST /api/generate` is
+ * additionally the one route in this codebase that CREATES a project, so
+ * "which project?" is not a question it could answer.
+ *
+ * Neither interpolates anything, which is worth stating rather than leaving
+ * as an accident: no client- or server-supplied string reaches either path,
+ * so neither is a `..` site.
+ */
+export function projectsUrl(): string {
+  return "/api/projects";
+}
+
+export function generateUrl(): string {
+  return "/api/generate";
+}
+
+/**
+ * The editor's OWN url for a chosen project — what the picker navigates to,
+ * and the one place a project id supplied by the server re-enters this app.
+ *
+ * The id goes in the QUERY, never the path, and that is what decides the
+ * escaping. `previewUrl` double-escapes its id (`%2E` then
+ * `encodeURIComponent`) because a path segment is subject to the WHATWG URL
+ * parser's dot-segment normalization, which treats `%2e`/`%2e%2e` as
+ * equivalent to `.`/`..` and collapses them. A query VALUE is subject to no
+ * such step: `URLSearchParams` percent-encodes it once, `resolveMode`'s own
+ * `URLSearchParams.get` decodes it once, and the round trip is exact. Running
+ * `encodePathSegment` here would not be "extra safety" — it would corrupt the
+ * value, turning an id containing a dot into a different id (`%252E`) that no
+ * project has.
+ *
+ * Built from the CURRENT href rather than from a bare origin so nothing else
+ * on the URL is silently dropped: `?preview=` still round-trips (hosted wins
+ * over it in `resolveMode`, but discarding a query parameter as a side effect
+ * of opening a project would be a surprise), and so does anything a future
+ * link carries. Pure — it takes the href as a string instead of reading
+ * `window` — so a test can exercise it in the windowless vitest environment,
+ * the same shape `resolveMode` and `isHostedMode` already have.
+ */
+export function editorUrlForProject(projectId: string, currentHref: string): string {
+  const url = new URL(currentHref);
+  url.searchParams.set(PROJECT_QUERY_PARAM, projectId);
+  return url.toString();
+}
+
 export interface Backend {
   readonly mode: BackendMode["kind"];
   /** `undefined` in local mode — there is no project, only the fixed local

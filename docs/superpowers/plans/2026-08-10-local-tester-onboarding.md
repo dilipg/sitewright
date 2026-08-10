@@ -23,6 +23,8 @@
 - **A 401 is its own state**, distinguishable from a job failure. Reporting "generation failed" for a lapsed session is the same lie `interrupted` exists to prevent.
 - **Every new endpoint must appear in `server/src/project-registry.ts`**, which is a partition of the live route table — an endpoint added without an authorization rule fails a test.
 - **Any client- or model-influenced string reaching a path, URL, or spawn argument is a `..` hazard.** Four such defects have shipped at four layers. Reuse `isSafeRunId` rather than writing a new check.
+- **Name editor test files `.test.ts`, never `.test.tsx`.** Task 2 found that `editor/vitest.config.ts` included `src/**/*.test.ts` **only**, so a `.test.tsx` file was silently skipped — a test file that exists, reads as coverage, and never runs. That is invisible to perturbation, because a test that does not execute cannot fail. The glob is now `{ts,tsx}` so either works, but the repo precedent is `.test.ts` (`ExportPanel.test.ts`); keep to it so a future narrowing of the glob cannot re-arm the trap.
+- **A substring assertion is not a discriminating assertion.** Task 2 measured that `rejects.toThrow(/invalid email or password/)` still PASSES when the message is perturbed by *appending* to it. Where the exact wording is the point, assert the exact string.
 - No new runtime dependencies. Red tests never cross a commit boundary. Migrations append-only and idempotent.
 - **Every test must fail if the behaviour it names is removed.** Perturb, watch it fail, restore. **If a perturbation does not fail, say so** rather than moving on.
 
@@ -149,7 +151,7 @@ error message name the field and confirm the second fails.
 ### Task 3: Project picker and new-site form
 
 **Files:**
-- Create: `editor/src/components/ProjectPicker.tsx`, `editor/src/components/ProjectPicker.test.tsx`
+- Create: `editor/src/components/ProjectPicker.tsx`, `editor/src/components/ProjectPicker.test.ts`
 - Modify: `editor/src/App.tsx`, `editor/src/lib/backend.ts`, `editor/src/App.css`
 
 **Interfaces:**
@@ -173,7 +175,7 @@ it("refuses to submit an empty brief without calling the server", async () => {
 });
 ```
 
-- [ ] **Step 2: Run it and watch it fail** — `npx vitest run editor/src/components/ProjectPicker.test.tsx`
+- [ ] **Step 2: Run it and watch it fail** — `npx vitest run editor/src/components/ProjectPicker.test.ts`
 
 - [ ] **Step 3: Implement**
 
@@ -202,7 +204,7 @@ and confirm the second fails.
 ### Task 4: Generation progress view
 
 **Files:**
-- Create: `editor/src/components/GenerationProgress.tsx`, `editor/src/components/GenerationProgress.test.tsx`
+- Create: `editor/src/components/GenerationProgress.tsx`, `editor/src/components/GenerationProgress.test.ts`
 - Modify: `editor/src/App.tsx`, `editor/src/App.css`
 
 **Interfaces:**
@@ -227,7 +229,7 @@ it("keeps polling through a transient progress error instead of declaring failur
 });
 ```
 
-- [ ] **Step 2: Run it and watch it fail** — `npx vitest run editor/src/components/GenerationProgress.test.tsx`
+- [ ] **Step 2: Run it and watch it fail** — `npx vitest run editor/src/components/GenerationProgress.test.ts`
 
 - [ ] **Step 3: Implement**
 

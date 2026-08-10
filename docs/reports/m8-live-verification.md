@@ -1099,3 +1099,42 @@ cost (58% over estimate on V1) are **measured and reported, not remediated** —
 primitives retry worth 152.7s and $0.36. Per-section latency matched
 `m7-wall-clock.md`'s model closely (29.2s vs 27.1s), so the earlier diagnosis
 still holds and the lever is the prelude, not fan-out.
+
+---
+
+## Post-round fix: F13
+
+Fixed in-round, per the round's rule that a proven-broken thing gets fixed when
+the fix is contained. `.regen-backup/route.txt` now records the owning route,
+and `restoreSnapshot` refuses a mismatched or unowned slot **before** any
+destructive step. Five new tests; `npm run check` green.
+
+**Per-route slots were rejected**, and the reason matters more than the fix: the
+slot holds a whole-project `manifest.json` beside one route's page directory, so
+two coexisting snapshots would let a revert of route A roll the manifest back
+over route B's committed entries — trading cross-route file loss for cross-route
+manifest loss. One slot keeps the page and manifest inside it paired.
+
+**One of the five tests did not discriminate on first draft**, and it is recorded
+because the same mistake is easy to repeat: it asserted
+`existsSync(src/pages/about)`, which held with the guard disabled too, because
+the destructive restore *recreated* the directory with the wrong contents.
+Directory existence was never the property under test. Rewritten to assert the
+snapshot slot survives a refused revert. Three of five now fail with the guard
+disabled; the other two are non-discriminating by design — they prove the good
+path still works.
+
+**Not fixed, deliberately:** the refusal returns the handler's existing **500**
+rather than a client-error status. A mismatched revert is a client-state
+conflict and 409 would be more correct, but changing it is outside a data-loss
+fix's blast radius. Recorded as a cosmetic follow-up.
+
+## Still open after round 1
+
+| | |
+|---|---|
+| **F3** `<UNKNOWN>` title + package name shipping into the handover export | Fix is contained; **confirming it costs another ~$1.74 generation** — needs a human call before spending |
+| **F19** which mechanism carries fan-out resume (Kitaru cache vs `progress.json`) | Needs a run that inspects the filesystem *during* fan-out |
+| **F20** nine section checkpoints produced eight sections | Unexplained |
+| **H1** the orphaned orchestrator grandchild | **No evidence gained.** V4 killed the orchestrator tree directly, not a preview child — that path remains untested |
+| **F9, F15 (status), F17, F18, F21** | Recorded above; none blocking |

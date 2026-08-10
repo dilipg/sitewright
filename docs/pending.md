@@ -71,7 +71,6 @@ design and all three look like bugs:
 |---|---|---|
 | **H2** | **The fifth `..`.** A systematic audit of every place a client- or model-influenced string reaches a path, a URL, or a spawn argument | Four found at four layers, each by a different mechanism. Never done. Cheap, and hunts unknowns rather than confirming knowns |
 | **F19** | Which mechanism carries fan-out resume — Kitaru's cache or `page_worker.py`'s `progress.json` skip | Round 1 proved the *outcome* (0 re-execution, 31% cost) but not the cause; no `progress.json` survives a finished project. Needs a run that inspects the filesystem *during* fan-out |
-| **F20** | Nine section checkpoints produced eight sections | Unexplained. A resume silently discarding completed work would be a cost bug |
 | **F17** | `manifest.json` key order is unstable across a regen — same keys, same byte count, different hash | Defeats hash-based change detection. Worth checking against 6.2's byte-identical export-zip guarantee |
 
 ## OPEN — cost and latency (measured, never remediated)
@@ -110,3 +109,4 @@ design and all three look like bugs:
 | **F3** every generated site shipped `<title><UNKNOWN></title>` + `"name": "unknown"` into the handover export | `8b7d66c` |
 | **7.6 / 7.9 / fan-out resume** verified against a live model for the first time | `95068c3` |
 | **H7 (part)** two stale `CLAUDE.md` claims corrected (`/__archetypes`, the 15-primitive drift) | `d80cc05` |
+| **F20 EXPLAINED, not a defect** — 9 section checkpoints producing 8 files is designed behaviour: `home.community-values` failed gates on all 3 attempts, exhausted `MAX_ATTEMPTS`, and shipped as a `<FailedSectionPlaceholder />` (present in `home/index.tsx`). The placeholder deliberately carries no `data-node-id` and no manifest entry, because no agent proposed one and a stray id would fail gate 4. **It was reported correctly**: the job result carries `degraded_sections: ["home.community-values"]`, and its own cost total matches `usage_event` to the cent | investigated 2026-08-10 |

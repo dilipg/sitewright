@@ -244,6 +244,18 @@ time.
 Show the elapsed time against an honest expectation (**~11 minutes measured**),
 and state that there is **no cancellation** — spend continues regardless.
 
+**Surface `degraded_sections`, and this is not optional.** A generation can
+legitimately finish with a section missing: one that fails its gates on all
+`MAX_ATTEMPTS` (3) attempts ships as a `<FailedSectionPlaceholder />`, which is
+valid code that passes gates, so the page renders with a visible placeholder box.
+**This happened on a real measured run** — `home.community-values`, 3 attempts,
+all failed. The orchestrator reports it correctly as
+`degraded_sections: ["home.community-values"]`, but that value is buried inside
+`result.stdout` as JSON and **nothing in the UI reads it**. A tester who gets a
+placeholder box with no explanation will file it as a bug, so parse it out and
+name the affected sections plainly, alongside the fact that the section can be
+regenerated from the canvas.
+
 - [ ] **Step 4: Tests pass, then perturb** — make `interrupted` render as
 "failed" and confirm the first test fails; make a progress error abort the poll
 and confirm the second fails.

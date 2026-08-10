@@ -41,7 +41,7 @@ Verified against the code on 2026-08-10. Use these shapes verbatim.
 | Generate | `POST /api/generate` `{ "brief": "…" }` → **202** `{ jobId, projectId }` |
 | Add section | `POST /__add-section?project=<id>` `{ "route", "archetype", "instruction" }` → 202 `{ jobId }` |
 | Regen page | `POST /__regen-page?project=<id>` `{ "route", "instruction" }` → 202 `{ jobId }` |
-| Revert | `POST /__regen-revert?project=<id>` `{ "route" }` → `{ ok }` |
+| Revert | `POST /__regen-revert?project=<id>` **`{ "section" }`** → `{ ok }` — the value may be a section id *or* a bare route slug, but the FIELD is always `section`. `{"route":…}` returns 400 `invalid route slug` |
 | Archetypes | `GET /__archetypes?project=<id>` → `{ archetypes: [{name, description}] }` |
 | Poll job | `GET /api/jobs/:id` |
 | Resume | `POST /api/jobs/:id/resume` → 202; **409 if the job is not `failed`**; 409 on a `code_version` mismatch |

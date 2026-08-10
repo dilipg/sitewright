@@ -788,6 +788,103 @@ body {
   font-size: 12px;
 }
 
+/* Login screen (task 2) — hosted mode only. Note there is no rule here for a
+   sign-up or password-reset link, because the markup has neither: account
+   creation exists only in the operator CLI. */
+.login-screen {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  padding: 24px;
+}
+
+.login-card {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-width: 360px;
+  background: #1e1e26;
+  border: 1px solid #333340;
+  border-radius: 10px;
+  padding: 28px 26px 22px;
+}
+
+.login-card h1 {
+  margin: 0 0 4px;
+  font-size: 20px;
+}
+
+.login-intro {
+  margin: 0 0 20px;
+  color: #9a9aa8;
+  font-size: 13px;
+}
+
+.login-card label {
+  font-size: 12px;
+  color: #9a9aa8;
+  margin-bottom: 4px;
+}
+
+.login-card input {
+  background: #14141a;
+  border: 1px solid #3a3a46;
+  color: #e8e8ee;
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 14px;
+  font-family: inherit;
+  margin-bottom: 14px;
+}
+
+.login-error {
+  margin: 0 0 12px;
+  color: #ff9a9a;
+  font-size: 13px;
+}
+
+.login-submit {
+  background: #4f8ef7;
+  border: none;
+  color: white;
+  border-radius: 8px;
+  padding: 10px 16px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.login-submit:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.login-footnote {
+  margin: 18px 0 0;
+  color: #9a9aa8;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+/* Hosted, signed in, no project selected yet — task 3 replaces this with the
+   project picker. */
+.account-gate {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  gap: 6px;
+  font-size: 14px;
+}
+
+.account-gate-hint {
+  margin: 0;
+  color: #9a9aa8;
+  font-size: 12px;
+}
+
 .pad-band {
   position: absolute;
   background: rgba(99, 189, 138, 0.28);

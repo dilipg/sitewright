@@ -1,5 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { backend, createBackend, encodePathSegment, neutralizeDotSegments, resolveMode } from "./backend";
+import {
+  backend,
+  createBackend,
+  encodePathSegment,
+  hostedMode,
+  isHostedMode,
+  loginUrl,
+  meUrl,
+  neutralizeDotSegments,
+  resolveMode,
+} from "./backend";
 
 const LOCAL_ORIGIN = "http://localhost:5273";
 const EDITOR_ORIGIN = "http://localhost:5174";
@@ -164,7 +174,78 @@ describe("a malicious project id cannot corrupt the resulting URL", () => {
   });
 });
 
+/**
+ * TASK 2 — hosted-shell mode, which is a DIFFERENT question from
+ * `resolveMode`'s and must stay one.
+ *
+ * `resolveMode` answers "whose URLs do I build?", and only `?project=<id>` can
+ * answer that. `isHostedMode` answers "am I talking to the hosted server at
+ * all?", which has to be answerable before any project exists — a tester
+ * following the README opens a bare `/` and must land on the login screen.
+ */
+describe("isHostedMode", () => {
+  it("a bare URL with the flag unset is LOCAL — the state every existing test runs in", () => {
+    // This is the assertion that makes local mode structural. Playwright's
+    // webServer runs the plain `dev` script (never `.env.hosted`), so the flag
+    // is absent for the entire milestone-7 suite and every one of its bare-`/`
+    // navigations lands here.
+    expect(isHostedMode("", undefined)).toBe(false);
+    expect(isHostedMode("?preview=http://localhost:9999", undefined)).toBe(false);
+  });
+
+  it("VITE_WEBGEN_HOSTED=1 selects hosted mode with no ?project= at all", () => {
+    // The whole point: a tester's very first page load has no project yet.
+    expect(isHostedMode("", "1")).toBe(true);
+  });
+
+  it("only the exact string \"1\" turns it on", () => {
+    // "0" and "false" are non-empty strings, and every non-empty string is
+    // truthy — an operator who writes either means OFF, and reading them as ON
+    // would drop a tester into hosted mode with no way back to local.
+    for (const flag of ["0", "false", "", "yes", "true", "2"]) {
+      expect(isHostedMode("", flag)).toBe(false);
+    }
+  });
+
+  it("?project=<id> still selects hosted mode on its own, so every existing hosted URL is unchanged", () => {
+    expect(isHostedMode("?project=proj-1", undefined)).toBe(true);
+  });
+
+  it("agrees with resolveMode about what counts as a project", () => {
+    // The two read `?project=` through one shared helper precisely so they
+    // cannot drift: an empty `?project=` is "no project" to both.
+    for (const search of ["", "?project=", "?project=proj-1", "?preview=http://x"]) {
+      const hostedByResolve = resolveMode(search, EDITOR_ORIGIN).kind === "hosted";
+      expect(isHostedMode(search, undefined)).toBe(hostedByResolve);
+    }
+  });
+});
+
+describe("session-scoped URLs (no ?project=)", () => {
+  it("login and me are relative, same-origin paths", () => {
+    // Same-origin is what keeps the session cookie flowing under
+    // `SameSite=Lax` with no CORS: the Vite dev server proxies `/api` to the
+    // hosted server, so the browser only ever sees one origin.
+    expect(loginUrl()).toBe("/api/login");
+    expect(meUrl()).toBe("/api/me");
+  });
+
+  it("neither carries a project id — both routes are session-only on the server", () => {
+    expect(loginUrl()).not.toContain("project=");
+    expect(meUrl()).not.toContain("project=");
+  });
+});
+
 describe("the default export singleton", () => {
+  it("hostedMode is false in a windowless, flag-less environment", () => {
+    // The structural guarantee for local mode, asserted on the real singleton
+    // rather than inferred from `isHostedMode`: `import.meta.env.
+    // VITE_WEBGEN_HOSTED` is a build-time substitution, and neither vitest nor
+    // Playwright's webServer loads `.env.hosted`, so nothing has to remember
+    // to unset anything.
+    expect(hostedMode).toBe(false);
+  });
+
   it("resolves to local mode when imported with no window (this test file's own environment)", () => {
     // vitest.config.ts runs src/**/*.test.ts in Node, not jsdom (matching
     // App.test.ts's own "windowless environment" guard comment) -- so the

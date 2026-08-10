@@ -15,6 +15,7 @@ import type { AddSectionState, Archetype } from "./components/AddSection";
 import { AddSectionPanel } from "./components/AddSection";
 import type { EditPromptState } from "./components/EditPrompt";
 import EditPrompt from "./components/EditPrompt";
+import LoginScreen from "./components/LoginScreen";
 import type { RegenPhase } from "./components/Regen";
 import { OrphanDialog, RegenControls } from "./components/Regen";
 import type { PreviewWidth, RouteInfo, Viewport } from "./lib/canvas";
@@ -31,7 +32,7 @@ import {
   splitOverridesByRoute,
   zoomAt,
 } from "./lib/canvas";
-import { backend, encodePathSegment } from "./lib/backend";
+import { backend, encodePathSegment, hostedMode, meUrl } from "./lib/backend";
 import { applyEditOperations, interpretEditResult, validateEditOperations } from "./lib/edit-ops";
 import type { EditPromptResponse } from "./lib/edit-ops";
 import { expandStyleValue } from "./lib/inventory";
@@ -89,6 +90,29 @@ const JOB_INTERRUPTED_MESSAGE =
   "The server restarted while this was running, so the outcome is unknown. Check the page to see whether the change went through before trying again.";
 
 const SESSION_EXPIRED_MESSAGE = "Your session expired — sign in again.";
+
+/** What `GET /api/me` gives back for a valid session. Only the two fields
+ *  this task needs are read; the endpoint also returns spend-cap figures,
+ *  which the project picker (task 3) will want. */
+interface AccountSummary {
+  id: string;
+  email: string;
+}
+
+/**
+ * HOSTED SHELL WITH NO PROJECT YET — the state a tester following the README
+ * boots into: `npm run dev:hosted`, a bare `http://localhost:5173/`, no
+ * `?project=`. There is no project to bootstrap a canvas for, so the canvas
+ * bootstrap must NOT run (its URLs would point at the local preview server on
+ * :5273, which a hosted tester is not running — a silent hang, not an error).
+ * Instead the app asks who the user is and shows either the login screen or,
+ * from task 3, the project picker.
+ *
+ * `backend.projectId` rather than a second query-string read: `backend.ts`
+ * owns that parse, and `hostedMode` deliberately answers a different question
+ * (it is true for BOTH the flag and `?project=`).
+ */
+const hostedShellWithoutProject = hostedMode && backend.projectId === undefined;
 
 /** Nearest active manifest node at or above the given ID. */
 function selectableId(nodeId: string, manifest: Manifest | null): string | undefined {
@@ -207,7 +231,18 @@ export default function App() {
   // have landed) and any flow's own "failed" phase (the work definitely did
   // not land) -- there is no login page to send the user to (task-8 brief),
   // so this only ever surfaces, it never auto-recovers.
+  //
+  // TASK 2 changes what it RENDERS in hosted mode, not what it means: there
+  // IS a login screen now, so hosted mode shows it in place of the canvas.
+  // Local mode keeps today's banner byte-identically. This stays the single
+  // "the session is not usable" flag -- a parallel "not logged in yet" state
+  // would be the same fact recorded twice, free to disagree.
   const [sessionExpired, setSessionExpired] = useState(false);
+  // The signed-in account, once known. `null` means "not asked yet, or still
+  // asking", and it is only ever consulted in the hosted-shell-without-project
+  // branch below. NOT a login flag (that is `sessionExpired`) -- it is the
+  // identity the project picker (task 3) renders.
+  const [account, setAccount] = useState<AccountSummary | null>(null);
 
   const manifestRef = useRef<Manifest | null>(null);
   const historyRef = useRef<History | null>(null);
@@ -267,6 +302,12 @@ export default function App() {
   /* ---------- bootstrap: manifest, tokens, persisted overrides + history ---------- */
 
   useEffect(() => {
+    // TASK 2: with no project there is nothing to bootstrap, and every URL
+    // below would resolve against the LOCAL preview server on :5273 that a
+    // hosted tester is not running -- a hang with no banner, which is exactly
+    // the failure class the bootstrap `.catch` was added to end. The
+    // `/api/me` gate below owns this case instead.
+    if (hostedShellWithoutProject) return;
     async function bootstrap() {
       // Every fetch here goes through `sessionAwareFetch` (task-8 review):
       // an already-expired session hit on the very FIRST load (a bookmarked
@@ -325,6 +366,31 @@ export default function App() {
       // rejection.
       console.error("[bootstrap] failed", error);
     });
+  }, []);
+
+  /* ---------- the session gate (task 2): hosted shell, no project yet ---------- */
+
+  /**
+   * The one request made before a project exists. `GET /api/me` is
+   * session-only (`project-registry.ts`), so it is answerable with no project
+   * at all — which is precisely why the login screen can be reached from a
+   * bare URL.
+   *
+   * ANY failure lands on the login screen, not only a 401. A 401 is the
+   * ordinary case (no cookie, or a lapsed one). A network error means the
+   * hosted server is not running — different cause, but leaving the user on
+   * a "Checking…" screen forever is the silent-hang bug this codebase has
+   * now fixed three times, and the real cause surfaces the moment they press
+   * Sign in (`submitLogin` reports it verbatim). One flag, no third state.
+   */
+  useEffect(() => {
+    if (!hostedShellWithoutProject) return;
+    void fetchJson<AccountSummary>(meUrl(), { cache: "no-store" })
+      .then(setAccount)
+      .catch((error: unknown) => {
+        if (!(error instanceof SessionExpiredError)) console.error("[session] /api/me failed", error);
+        setSessionExpired(true);
+      });
   }, []);
 
   /* ---------- shim messages (multiple cross-origin iframes, one per route) ---------- */
@@ -579,6 +645,18 @@ export default function App() {
     if (failed !== undefined) {
       throw new Error(`override write failed: HTTP ${String(failed.status)}`);
     }
+  }
+
+  /**
+   * TASK 2. Every session-dependent load in this component runs exactly once,
+   * on mount — `bootstrap` and the `/api/me` gate — and the one that failed
+   * is what put the user in front of the login screen. Reloading re-derives
+   * all of them from the new cookie in one step, instead of growing a second
+   * entry point into each that only this path would ever use (and that only
+   * this path would ever exercise, i.e. never, until it was wrong).
+   */
+  function onAuthenticated() {
+    window.location.reload();
   }
 
   /* ---------- edits ---------- */
@@ -1323,6 +1401,57 @@ export default function App() {
   // Narrow widths are read-only (PRD 7 P1): an override carries no
   // breakpoint, so an edit made at 390px would silently apply everywhere.
   const widthEditable = isEditableWidth(previewWidth);
+
+  /**
+   * LOCAL MODE MUST NOT RENDER THE LOGIN SCREEN AT ALL — that is what the
+   * `hostedMode &&` is doing, and it is the whole reason the mode decision is
+   * a build-time flag rather than a runtime probe. `compiler/scripts/
+   * preview.ts` is unauthenticated and local, never answers 401, and the
+   * milestone-7 Playwright suite navigates to a bare `/` asserting today's
+   * behaviour (including, in `hosted-mode.spec.ts`, that a faked 401 raises
+   * the DISMISSIBLE BANNER below). Both stay true because Playwright's
+   * `webServer` runs the plain `dev` script, which never sets
+   * `VITE_WEBGEN_HOSTED`.
+   *
+   * In hosted mode the login screen REPLACES the canvas rather than sitting
+   * over it as a banner: with the session gone, nothing on the canvas can be
+   * saved, regenerated or exported, so leaving it interactive would invite
+   * work that silently cannot land.
+   */
+  const showLogin = hostedMode && sessionExpired;
+  if (showLogin) {
+    return (
+      <div className="editor-root">
+        <LoginScreen onAuthenticated={onAuthenticated} />
+      </div>
+    );
+  }
+
+  // Signed in, hosted, but no project selected yet. TASK 3 replaces this
+  // placeholder with the project picker + new-site form; until then it is
+  // deliberately a plain, honest statement of where the user is rather than
+  // a blank screen or a canvas pointed at nothing.
+  if (hostedShellWithoutProject) {
+    return (
+      <div className="editor-root">
+        <div className="account-gate" data-testid="account-gate">
+          {account === null ? (
+            <p>Checking your session…</p>
+          ) : (
+            <>
+              <p>
+                Signed in as <strong>{account.email}</strong>.
+              </p>
+              <p className="account-gate-hint">
+                Open a project by adding <code>?project=&lt;id&gt;</code> to this URL. A picker and a
+                new-site form arrive with the next step.
+              </p>
+            </>
+          )}
+        </div>
+      </div>
+    );
+  }
 
   if (pendingPlan !== null) {
     return (

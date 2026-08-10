@@ -57,6 +57,42 @@ describe("App.tsx: every read goes through the session-aware layer (finding B)",
     expect(body).toContain("throw new Error");
   });
 
+  /**
+   * TASK 2 — the login screen is gated on hosted mode, and local mode must
+   * not render it at all.
+   *
+   * Source-text again, for the same structural reason as the tests around it:
+   * this is JSX inside a component that cannot be mounted here. The BEHAVIOUR
+   * of the request lives in `components/LoginScreen.tsx` and is tested
+   * directly; what this asserts is the half a library test structurally
+   * cannot — that App reaches it only under `hostedMode`.
+   *
+   * The end-to-end proof for local mode is `e2e/hosted-mode.spec.ts`, which
+   * fakes a 401 against the bare, unauthenticated local URL and asserts the
+   * DISMISSIBLE BANNER appears. Forcing `isHostedMode` on breaks that spec as
+   * well as this test.
+   */
+  it("renders the login screen only in hosted mode, never in local mode", () => {
+    expect(appSource).toContain("const showLogin = hostedMode && sessionExpired;");
+    // The single flag, reused. A second "not logged in yet" state would be the
+    // same fact recorded twice, free to disagree with this one.
+    expect(appSource).not.toMatch(/useState.*notLoggedIn|useState.*loggedOut/i);
+  });
+
+  it("skips the canvas bootstrap when hosted mode has no project yet", () => {
+    // Otherwise every bootstrap URL resolves against the LOCAL preview server
+    // on :5273, which a hosted tester is not running: a hang with no banner,
+    // the exact failure class the bootstrap `.catch` was added to end.
+    expect(appSource).toContain(
+      "const hostedShellWithoutProject = hostedMode && backend.projectId === undefined;",
+    );
+    const bootstrapEffect = appSource.slice(
+      appSource.indexOf("async function bootstrap()") - 600,
+      appSource.indexOf("async function bootstrap()"),
+    );
+    expect(bootstrapEffect).toContain("if (hostedShellWithoutProject) return;");
+  });
+
   it("approvePlan dismisses the plan gate only after the write actually landed", () => {
     const body = functionBody("approvePlan");
     expect(body).toContain("sessionAwareFetch(");

@@ -693,3 +693,243 @@ really testing, was confirmed empirically in both directions.
 
 The project is released to V3 with **6 sections on `home`, 205 nodes, and an
 empty `home.overrides.json`.**
+
+---
+
+## V3 — page regeneration and revert against a live model
+
+7.9 had **never run against a live model**. Two claims were at stake: that the
+sequential loop regenerates **each** section rather than rewriting one file N
+times, and that **one revert restores the whole page** from a single route-wide
+snapshot. Both hold. Getting there required correcting two errors in the
+verification instructions themselves, and the *evidence* for the first claim is
+not the evidence the brief predicted.
+
+### Identifiers, verbatim
+
+| What | Value |
+|---|---|
+| jobId | `81ed8d3e-b8d8-4a58-bf78-36e8bf1ab2b5`, kind `regen-page` |
+| projectId (HTTP) | `ba169e65-f173-4cff-9619-2909ef3fe8be` |
+| run directory (filesystem) | `generated/web-2578801a-9d5a-4461-90eb-4a771fde5648` |
+| instruction | `Warmer, more personal tone throughout; keep all facts and structure.` |
+| HTTP | `POST /__regen-page?project=…` -> **202** `{ jobId }` |
+| terminal status | `succeeded` **and** `result.passed === true` |
+| wall clock | **316 s** polled; **305.9 s** server-side (`finishedAt - startedAt`) |
+| cost | **$0.562575**, 6 `usage_event` rows, 0 unpriced |
+
+`attempts: 6`, `gate7Retries: 0`, `orphanedOverrides: []`, `tombstoned: []`,
+`failureReport: ""`, `overriddenIds: []`, `canRevert: true`.
+
+### Result
+
+```
+sections:   ["home.hero","home.story","home.beans","home.trust","home.cta","home.faq-accordion"]
+perSection: { home.hero: true, home.story: true, home.beans: true,
+              home.trust: true, home.cta: true, home.faq-accordion: true }
+```
+
+### Every assertion, with its result
+
+| # | Assertion | Result |
+|---|---|---|
+| 1 | Every section regenerated — not one file N times | **PASS**, but *not* via the signal the brief named (F16) |
+| 2 | `perSection` has one entry per section, count matches file count | **PASS** — 6 entries, 6 section roots, 6 section files |
+| 3 | Node ids survived; compare against `manifest.json` | **PASS** — 111/111 active `home` ids, 0 missing, 0 added, 0 tombstoned, 205 total unchanged |
+| 4 | No orphaned overrides reported | **PASS** — `orphanedOverrides: []` (and `home.overrides.json` was empty going in) |
+| 5 | One revert restores the page byte-identically | **PASS** — empty diff across all 15 tracked files including `manifest.json` |
+
+### Assertion 1 — what actually proves it
+
+The brief said to hash `src/pages/home/*.tsx` and assert every section file's
+hash changed. Followed literally that check is **doubly wrong**, and both halves
+matter (F14, F16):
+
+- the glob matches exactly **one** file, `index.tsx` — section components live
+  in `home/sections/`;
+- and **no `sections/*.tsx` file changed at all**, on a run where every section
+  genuinely regenerated.
+
+A worker following the brief verbatim would have seen one unchanged hash and
+reported a total failure of 7.9. The truth is the opposite. Three independent
+signals, each sufficient on its own, show six distinct section regenerations:
+
+**1. Six distinct data files, each with distinct new content.** All six
+`mock/*.data.ts` changed; all six `sections/*.tsx` are byte-identical. That is
+the architecture behaving correctly, not a miss: the instruction was tone-only
+and *copy lives in the data file* while the component holds structure. Each
+rewrite is section-appropriate — hero copy in `Hero.data.ts`, CTA copy in
+`Cta.data.ts` — which is precisely what "one file rewritten six times" could not
+produce:
+
+```diff
+-  eyebrow: "Small-Batch Roastery",
++  eyebrow: "From Our Family to Your Kitchen Table",
+-    "We source rare micro-lots from single farms and roast each batch by hand, so every bag you brew tastes like the harvest that made it."
++    "We fall in love with a handful of rare micro-lots each season, roast every batch by hand with our own two hands, and get it to your door while the harvest is still singing in the cup."
+```
+
+```diff
+-  heading: "Get this week's roast before it's gone",
++  heading: "Let us send your first bag of this week's roast",
+```
+
+Facts preserved (12-pound batches, 48 hours), structure preserved, tone warmer.
+The instruction was honoured.
+
+**2. Six distinct write timestamps, in section order.** Each section's `.tsx`
+*and* its `.data.ts` share one mtime, and the six pairs are 30–90 s apart in
+exactly the manifest's section-root order. The components *were* rewritten —
+mtime moved — and simply came out byte-identical:
+
+```
+13:02:16  Hero.tsx + Hero.data.ts
+13:03:48  Story.tsx + Story.data.ts
+13:04:48  Beans.tsx + Beans.data.ts
+13:05:26  Trust.tsx + Trust.data.ts
+13:05:58  Cta.tsx + Cta.data.ts
+13:06:47  FaqAccordion.tsx + FaqAccordion.data.ts
+```
+
+**3. Six billing events.** Six `usage_event` rows, one per section, at
+07:32:14–07:36:45 UTC — the same six instants as the file writes (+05:30). One
+file rewritten six times could not bill six differently-sized model calls.
+
+### Assertion 5 — one revert, whole page
+
+After correcting the request field (F15), `POST /__regen-revert` returned
+`{"ok":true}` (HTTP 200), and the diff against the Step 1 hashes was **empty** —
+all 15 tracked files byte-identical, including `manifest.json` and
+`overrides/home.overrides.json`. The single route-wide snapshot taken before the
+first section restored all six sections in one step, exactly as 7.9 claims.
+
+Confirmed afterwards: 205 nodes, 111 `home` nodes, all six section roots in
+order, other routes untouched, hero copy back to `"Small-Batch Roastery"`, and
+`.regen-backup/` **deleted** (one revert only, as F13 predicted). Live preview
+re-checked in a real browser: HTTP 200, **111 `[data-node-id]` nodes**, section
+roots in DOM order `home.hero -> home.story -> home.beans -> home.trust ->
+home.cta -> home.faq-accordion`. The only console errors are V1's pre-existing
+broken `.example` image hosts (F7).
+
+**F13's hazard was navigated, not triggered.** The snapshot slot held `home`'s
+*pre-add-section* state when V3 began; issuing a revert first would have deleted
+V2's FAQ. Running `/__regen-page` first overwrote the slot with the correct
+6-section pre-regen state, and the revert then restored exactly that.
+
+### Cost
+
+| Section call | in | out | cache-create | cache-read | $ |
+|---|---|---|---|---|---|
+| 1 | 3 805 | 1 769 | 4 268 | **0** | 0.053955 |
+| 2 | 8 530 | 4 928 | 4 200 | **0** | 0.115260 |
+| 3 | 10 630 | 6 812 | 4 255 | **0** | 0.150026 |
+| 4 | 7 000 | 3 114 | 4 254 | **0** | 0.083663 |
+| 5 | 4 408 | 1 644 | 4 239 | **0** | 0.053780 |
+| 6 | 7 722 | 4 452 | 4 252 | **0** | 0.105891 |
+| **total** | | | | | **0.562575** |
+
+All `claude-sonnet-5`, role `page`, 0 unpriced. **$0.5626 against the brief's
+~$0.40 estimate — 41 % over** (F4's pattern again). Cumulative round spend
+**$2.39207575**, well inside the $3.50 stop threshold and the ~$6 authorisation.
+
+## Findings
+
+### F14 — the brief's md5 glob matches one file, and it is not a section
+
+`md5sum generated/$RUN_DIR/src/pages/home/*.tsx` returns exactly one line,
+`index.tsx`. Section components are in `src/pages/home/sections/`. The check
+designed to catch "one file rewritten six times" would itself have inspected one
+file — and that file legitimately does not change on a regen, since `index.tsx`
+is the page assembly, not section content.
+
+This is a defect in the **verification instructions**, not in the product. It is
+recorded because its failure mode is maximally misleading: it reports a false
+*negative* on the exact claim the task exists to prove, and a worker who trusted
+it would have filed 7.9 as broken.
+
+### F15 — `/__regen-revert` takes `{ section }`, not `{ route }`
+
+The plan's reference table and the brief's Step 4 both send `{"route":"home"}`.
+The handler reads `body.section` (`compiler/src/regen-api.ts:216`) and answers
+**400 `{"error":"invalid route slug"}`** — because the missing field yields an
+empty slug, and the guard fails closed.
+
+The code's own header comment, `POST /__regen-revert { section | route } -> { ok }`,
+is what the plan appears to have been read from; it describes the accepted
+**value** (`restoreSnapshot` explicitly takes "a section id or a bare route
+slug"), not the field **name**. The editor sends `{ section: revertSection }`
+(`editor/src/App.tsx:1129`), which is the real contract. `{"section":"home"}`
+succeeded.
+
+Two things worth noting. The 400 was a **clean fail-closed rejection that
+changed nothing on disk** — the snapshot survived intact and the correct call
+then worked, so the wrong field cost nothing but a round trip. And this is a
+*documentation* defect: no production code was changed to complete the
+verification. The header comment is ambiguous enough to have caused it and is
+worth rewording to `{ section }  // a section id or a bare route slug`.
+
+### F16 — a tone-only page regen changes no component file, and the brief asserts it must
+
+Every `sections/*.tsx` on `home` is byte-identical across a regen in which all
+six sections genuinely ran. This is **correct behaviour**: copy lives in
+`mock/*.data.ts`, structure lives in the component, and the instruction asked
+only for tone. The components were rewritten (mtimes moved) and reproduced
+identically.
+
+The finding is that the brief's assertion 1 — "**Every** section file's hash
+changed" — is false as stated, and would be false for any content-only
+instruction. The durable check for "each section regenerated" is the set of
+**data** files plus per-section mtimes plus per-section billing rows, not the
+component hashes. Anyone re-running this verification should assert on those.
+
+### F17 — `manifest.json` key order is not stable across a page regen
+
+Before and after the regen, `manifest.json` had the **same 205 keys, the same
+2 458 lines, the same 60 497 bytes, and zero structurally-changed node records**
+— but a different md5, because the key **order** changed: `home.hero` moved from
+index 0 to index 94. The route's nodes are evidently removed and re-appended, so
+the whole `home` block relocates behind `about` and `pricing`. Section-root
+order *within* `home` is preserved.
+
+Semantically harmless — it is a map keyed by node id, and every consumer looks
+nodes up by key. Recorded because it means `manifest.json` is **not byte-stable
+across a semantically-null regeneration**, which makes manifest diffs noisy and
+would defeat any future check that hashes the manifest to detect real change.
+Worth confirming it does not perturb 6.2's byte-identical export zip.
+
+### F18 — the sequential page loop gets zero prompt-cache reuse
+
+Every one of the six section calls paid ~4 250 cache-**creation** tokens and read
+**0** cache tokens. Six sequential regenerations on one route, moments apart,
+sharing the same contract and archetype preamble, and not one of them hit a warm
+cache. V2's single add-section showed the same `cache_read 0`.
+
+The consequence is that page-regen cost scales strictly linearly in sections
+with no amortisation — a 10-section page would pay the full preamble ten times.
+This is a cost-efficiency observation rather than a correctness defect, and it is
+the most likely single lever on the 41 % cost overrun. Whether the cache TTL,
+the cache breakpoints, or the per-section subprocess boundary is responsible was
+not investigated here.
+
+## V3 verdict
+
+**Verified.** Page regeneration works against a live model on its first-ever real
+run, and both claims 7.9 makes are true. The sequential loop regenerated **each**
+of the six sections — proven three ways over, by content, by timing, and by
+billing — with `perSection` reporting all six `true`, **100 % node-id survival
+(111/111)**, zero orphans and zero tombstones. **One revert restored the entire
+page byte-identically**, manifest included, from the single route-wide snapshot
+taken before the first section, and then deleted the snapshot.
+
+The two errors were in the verification instructions, not the product (F14, F15),
+and one of them (F14) would have inverted the result. The three genuine product
+observations — component files legitimately unchanged by a content-only regen
+(F16), unstable manifest key order (F17), and zero cache reuse across the loop
+(F18) — are none of them correctness failures, and F18 is the one with real
+money attached.
+
+Wall clock 305.9 s server-side for six sections (~51 s/section, consistent with
+V2's 52.6 s single add) and $0.5626, 41 % over the brief's estimate.
+
+The project is released to V4 in its **pre-V3 state**: 6 sections on `home`, 205
+nodes, empty `home.overrides.json`, no `.regen-backup/` slot.

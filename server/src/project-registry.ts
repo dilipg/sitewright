@@ -139,6 +139,20 @@ export const SESSION_ONLY_ENDPOINTS: ReadonlyArray<{ method: Route["method"]; pa
   { method: "PUT", path: "/api/key", billable: false, async: false },
   { method: "DELETE", path: "/api/key", billable: false, async: false },
   { method: "GET", path: "/api/jobs/:id", billable: false, async: false },
+  // Task 1 (local tester onboarding): how far a running job has actually got,
+  // read from the orchestrator's own run log (progress-routes.ts). Session-only
+  // for the identical reason GET /api/jobs/:id above is — ownership is on the
+  // job's own user_id, checked by hand, not via requireProject.
+  //
+  // `billable: false` is load-bearing rather than incidental, and it is NOT
+  // the conditional kind `CONDITIONALLY_BILLABLE_ENDPOINTS` names: this
+  // endpoint spends nothing under any condition, and must never be refused
+  // over the spend cap. The user whose own generation put them over the cap is
+  // exactly the user who most needs to see how far it got; refusing them would
+  // leave them staring at a screen with no signal at all, which is the failure
+  // this endpoint exists to remove. `async: false` — it reads a file and
+  // answers inline, enqueuing nothing.
+  { method: "GET", path: "/api/jobs/:id/progress", billable: false, async: false },
   // Task 7 (resume): session-only for the identical reason GET
   // /api/jobs/:id above is — ownership is on the job's own user_id, checked
   // by hand inside job-routes.ts, not via requireProject. `billable: false`

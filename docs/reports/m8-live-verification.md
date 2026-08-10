@@ -327,3 +327,369 @@ took 328.9 s and $0.74 to produce none of the site's content, and threw away a
 $0.36 attempt on the way.
 
 `$PROJECT_ID` and `$RUN_ID` are released to V2–V4 as recorded above.
+
+---
+
+## V2 — add-section against a live model
+
+7.6 (add-a-section) had **never run against a live model** — only unit tests and
+mock-mode e2e. It is a **first generation, not a replay**: the section never
+existed, so there is no recorded Kitaru execution to fork, which is precisely
+what mock mode cannot exercise. This run is the first time
+`orchestrator/src/orchestrator/add_section.py` has been executed against a real
+API over the hosted HTTP path.
+
+### Identifiers, verbatim
+
+| | |
+|---|---|
+| Endpoint | `POST /__add-section?project=ba169e65-f173-4cff-9619-2909ef3fe8be` |
+| Body | `{"route":"home","archetype":"faq-accordion","instruction":"Answer common questions about shipping, subscriptions, and bean freshness."}` |
+| HTTP response | **202** `{"jobId":"ca23a7fc-48c7-4e26-bc29-83e685299085"}` |
+| jobId | `ca23a7fc-48c7-4e26-bc29-83e685299085` |
+| kind | `add-section` |
+| project directory | `generated/web-2578801a-9d5a-4461-90eb-4a771fde5648` |
+| enqueued / started / finished | 1786345993761 / 1786345993855 / 1786346046448 |
+| wall clock | **52.6 s** (job start to finish) |
+| terminal result | `{"passed":true,"sectionId":"home.faq-accordion","archetype":"faq-accordion","failureReport":"","canRevert":true}` |
+
+### Archetype choice, and why
+
+The live catalog (`GET /__archetypes`) returned **27** archetypes — not the 20
+`CLAUDE.md` describes, because the form-builder set (`app-shell`,
+`element-palette`, `builder-canvas`, `properties-inspector`, `form-renderer`,
+`data-toolbar`, `data-grid`, `detail-drawer`) was added after that text was
+written. Not a defect; noted because the doc is stale.
+
+`home` already used **hero, feature-spotlight, product-card-grid, social-proof,
+cta-band** (confirmed against both `plan/siteplan.json` and the manifest's five
+section-root ids, not assumed from Task 2's journal). `faq-accordion` appears on
+`pricing` only (`pricing.pricing-faq`), never on `home`, so it was
+**unambiguously new to the target route** — which is what the Step 4 assertions
+require — and is the natural choice for a coffee-roaster home page. Used as
+written in the brief, instruction unchanged.
+
+### Assertions
+
+**1. `status === "succeeded"` and `result.passed !== false` — PASS.**
+
+Both checked explicitly, and this is the first task in the round where THE TRAP
+is *not* vacuous: `/__add-section` is a proxied kind, so a gate failure would
+have arrived as a `succeeded` job with `passed: false`. It did not.
+`result.passed` is `true` — the stronger condition, not merely `!== false`.
+
+**2. A new `.tsx` under `src/pages/home/` — PASS.**
+
+Per-file MD5s taken before and after. Exactly three files differ, and no
+existing section's source changed:
+
+```
+> FaqAccordion.tsx          (new)
+> FaqAccordion.data.ts      (new)
+  index.tsx  b3cfa47d... -> 76ee604922be8a9c9d70cb38b1ae7aab   (changed)
+```
+
+`index.tsx` gained two imports and one render line, appended — never
+re-assembled, which is what stops a page's `FailedSectionPlaceholder` being
+silently dropped (`add_section.py` docstring, point 2).
+
+**3. Registered in `manifest.json` with semantic node ids — PASS.**
+
+184 to **205** nodes: **21 added, 0 removed, 0 modified**. Every added id is
+semantic; none is positional:
+
+```
+home.faq-accordion                                    (section, editable: style/layout/visibility)
+home.faq-accordion.heading                            (Heading)
+home.faq-accordion.description                        (Text)
+home.faq-accordion.faq-shipping-time{,.question,.answer}
+home.faq-accordion.faq-freshness{,.question,.answer}
+home.faq-accordion.faq-subscription-flexibility{,.question,.answer}
+home.faq-accordion.faq-subscription-savings{,.question,.answer}
+home.faq-accordion.faq-grind-options{,.question,.answer}
+home.faq-accordion.faq-satisfaction-guarantee{,.question,.answer}
+```
+
+The six list-item slugs are drawn from the *meaning* of each question
+(`faq-shipping-time`, `faq-freshness`, ...), not from its index. The source
+builds them as the contract-5.2 template form `${nodeId}.faq-${faq.key}` — the
+shape 7.1 had to fix for 19 of 20 archetypes — present and correct here, so this
+section is regenerable. The list-item data shape carries the four exporter-only
+override slots (`className`, `childClassNames`, `hidden`, `childHidden`)
+required by contract 5.5.
+
+**4. A `sectionOrder` override naming every section on the route — FAIL, by
+design. See F9.**
+
+`overrides/home.overrides.json` is **byte-identical before and after**:
+
+```json
+{ "version": 1, "route": "/", "overrides": [] }
+```
+
+No `sectionOrder` override was written, because `add_section.py` deliberately
+never writes one — "Position is not this module's business" (its docstring,
+point 3). Positioning is the **editor's** job (`App.tsx:1025-1040`, calling
+`placeSectionAfter`). Over the pure HTTP path the brief prescribes, that code
+never runs. Detail and consequences in **F9**; the *substance* of the assertion
+(that an order, once written, must name every section) was verified separately
+and **holds** — see **F10**.
+
+**5. The site plan reflects the new section — PASS.**
+
+`plan/siteplan.json`'s `home` route gained a sixth entry, appended:
+
+```json
+{ "slug": "faq-accordion", "archetype": "faq-accordion",
+  "brief": "Answer common questions about shipping, subscriptions, and bean freshness." }
+```
+
+The instruction is recorded verbatim as the section's brief, so a later re-plan
+or regeneration sees it.
+
+### Step 5 — export, all seven gates
+
+`POST /__export` returned 202 `{"jobId":"d10c48fa-953f-45b3-9ec4-fe0153922507"}`,
+terminal **`succeeded`** in **3.0 s** with `ok: true`, 71 files,
+`zipBytes: 67667`, `appliedOverrides: 0`, `tombstoned: []`,
+`integrationCount: 0`, `offScaleCount: 0`.
+
+The production build genuinely ran — `...-export/dist/assets/` holds a
+494,668-byte JS bundle and a 55,182-byte CSS bundle, and `WG_EXPORT_SKIP_BUILD`
+is set nowhere outside `editor/playwright.config.ts`, so gate 1's `tsc --noEmit`
+and `npm run build` both executed against live-generated code. The exported
+`src/pages/home/sections/FaqAccordion.tsx` and its mock data are present, and
+the FAQ copy is in the built bundle.
+
+**The brief's stated check for this step is unsatisfiable — see F11.**
+`/__export` returns `ok`, never `passed`, so `result.passed === true` is false
+for every export that has ever succeeded.
+
+### Live preview
+
+Driven in a real browser (Edge via `chromium.launch({ channel: "msedge" })`;
+curl cannot see this, per V1's F2). `GET /preview/<projectId>/` returned 200 with
+**111** `[data-node-id]` nodes on `home`, up from 90 — exactly the 21 added. All
+21 FAQ nodes are individually addressable, and the accordion renders real
+content:
+
+```
+"How fast will my coffee arrive?" | "How fresh is the coffee, really?" |
+"Can I pause or change my subscription anytime?" | "Do I save money with a subscription?" |
+"Can I choose whole bean or a specific grind?" | "What if I don't like a bag I ordered?"
+```
+
+DOM section order: `home.hero -> home.story -> home.beans -> home.trust ->
+home.cta -> home.faq-accordion`. **The FAQ renders after the closing
+call-to-action band** — the visible consequence of F9. The only console errors
+are V1's F7 (unresolvable invented image hostnames); no new page errors.
+
+### Cost
+
+Read from `usage_event`, never estimated.
+
+| | |
+|---|---|
+| Rows attributed to this run | **1** (`role: page`, `claude-sonnet-5`) |
+| Tokens | 3,227 in / 4,282 out / 4,252 cache-creation / **0 cache-read** |
+| **Cost** | **$0.089856** |
+| Unpriced (`cost_usd IS NULL`) rows | **0** — the figure is exact, not a floor |
+| Estimate in the brief | ~$0.12 |
+| Cumulative round spend | $1.739645 to **$1.829501** |
+
+Under estimate, and the round is at $1.83 of ~$6 authorised. One model call for
+one section, which is the whole shape of the operation.
+
+Worth noting: **`cache_read_input_tokens` is 0**. This run got no prompt-cache
+benefit from V1's generation an hour earlier — expected, since the cache TTL is
+far shorter, but it means an add-section always pays full price for its design
+context.
+
+---
+
+### F9 — `/__add-section` writes no `sectionOrder` override, and the API cannot position a section at all
+
+**Assertion 4 fails as literally stated, and it fails by design.**
+`add_section.py` appends the new section to the end of the page's source and
+explicitly declines to place it:
+
+> **Position is not this module's business.** Node ids are semantic and never
+> positional (contract 5.2), so a new section appends to the source and the
+> EDITOR places it with a `sectionOrder` override (PRD 3.3, milestone 7.5).
+
+That is coherent, and the editor does hold up its end (`App.tsx:1025-1040` ->
+`placeSectionAfter`). But two things follow that are worth stating plainly:
+
+1. **The HTTP API has no position parameter.** `POST /__add-section` accepts
+   `{route, archetype, instruction}` and nothing else. The editor's own
+   `AddSectionState` carries `afterSection`, but it is *purely client-side* — it
+   is never sent. So any consumer of the hosted API other than this one editor
+   can only ever append. Slice 5 made the job model the product surface; this
+   capability did not follow it there.
+2. **The observable result on this run is a bad page.** The FAQ renders *after*
+   the closing CTA band, confirmed in the browser. Nothing is broken, but the
+   default placement for an appended section is the one position a closing band
+   makes wrong.
+
+Not filed as a code defect, because the docstring and the editor agree and no
+contract is violated. Filed because the brief asserted the override would exist,
+and over the prescribed path it does not — and because the gap between "the
+editor can position a section" and "the API can" is invisible until someone
+drives the API directly, which is what this round did.
+
+### F10 — a pre-existing reorder plus an add-section leaves an un-exportable project
+
+This is the risk F9 creates, and it is **reachable in production**. Proven
+empirically rather than reasoned about: a copy of the live project was made in
+the session scratchpad (outside the repo — the project itself was never
+hand-patched) and exported twice through `compiler/scripts/export.ts`.
+
+**Probe B — the stale order.** A user reorders `home` (5 sections, override
+written), then adds a section. The override now names 5 of 6:
+
+```
+$ node compiler/scripts/export.ts <probe> <out>
+sectionOrder for route "home" omits "home.faq-accordion"; a reorder must list
+every section on the route, or the omitted ones would vanish from the export.
+(exit 1)
+```
+
+**Probe A — the healed order.** The full 6, FAQ moved before the CTA:
+
+```
+Exported with 1 override(s) -> .../out-A
+71 file(s) packaged; 0 integration TODO(s), 0 off-scale override(s)
+(exit 0)
+```
+
+and the exported `index.tsx` renders `Hero -> Story -> Beans -> Trust ->
+FaqAccordion -> Cta`.
+
+**The design works exactly as documented.** `validateSectionOrder`
+(`exporter.ts:373`) is strict on purpose, and it names the omitted section rather
+than dropping it — the substance of the brief's assertion 4 holds, even though
+the assertion itself does not. Preview = handover is not at risk.
+
+The exposure is narrower than it first looks: the editor rebuilds a *full* order
+after every add (`placeSectionAfter` starts from `sectionOrderOf`, which returns
+every rendered section), so the ordinary in-editor flow self-heals. It fails only
+when that client-side write does not land — an API-driven add, a session that
+401s between the job and the override write, or a closed tab. The job has already
+`succeeded` server-side by then, so the project is left un-exportable until
+someone reorders again. **Loud, recoverable, and not silent content loss** —
+which is the property the design was built for — but a server-side operation
+leaving a project in a state only the client can repair is worth recording.
+
+### F11 — `/__export`'s result has no `passed` field, so the plan's stated check is unsatisfiable
+
+The plan and this task's brief both say the export step expects "`succeeded` with
+`result.passed === true`". `/__export` has never returned a `passed` field.
+`export-api.ts:55-65` returns `{ ok, files, handover, integrationCount,
+offScaleCount, appliedOverrides, tombstoned, zipName, zipBytes }`, and a failure
+returns **HTTP 200** with `{ ok: false, message, gateReport?, buildLog? }` —
+deliberately, so the editor can render the gate report field by field instead of
+receiving a 500-with-a-string.
+
+Because `job-worker.ts:1123-1124` maps *any* 2xx to `succeeded` with the body
+verbatim, **a gate-failing export arrives as a `succeeded` job with `ok: false`.**
+So THE TRAP is real for `/__export` too — but under a different field name than
+the one the plan tells a verifier to check. Checking `result.passed !== false` on
+an export is vacuously true and would pass a gate failure straight through.
+
+**The code is correct**: `App.tsx:1214-1217`'s THE TRAP comment reads `ok`, not
+`passed`. This is a defect in the plan and brief, and a second instance of V1's
+F1 (`result.passed` does not exist on a `generate` job either). Stated precisely,
+for the two remaining tasks: THE TRAP's `passed` field is real for `/__regen`,
+`/__regen-page`, `/__add-section` and `/__edit-prompt`; `/__export` uses `ok`;
+`generate` has neither.
+
+### F12 — cosmetic: a reordered `index.tsx` ships mis-indented
+
+Surfaced by probe A, and pre-existing 7.5 behaviour rather than anything
+add-section introduced. `applySectionOrder` rewrites the fragment's children
+through ts-morph and does not re-indent, so a reordered page's exported
+`index.tsx` is:
+
+```tsx
+    <>
+            <Hero nodeId="home.hero" {...heroData} />
+            ...
+          </>
+```
+
+against the 6-space, correctly-closed original. It compiles, the build passes,
+and no pixel is affected — but "developer-handover-quality code" is the product's
+stated bar, and this is the one file a developer reads first to understand the
+page. Not fixed: out of this task's scope, and the exporter is load-bearing for
+the two runs still to come in this round.
+
+### F13 — the regen snapshot is ONE global slot, not one per route (code reading, not empirically proven)
+
+Noticed while confirming what state V2 hands to V3, because `/__add-section`
+takes a route-wide snapshot exactly as a regen does (`regen-api.ts:171`).
+`.regen-backup/` is a **single directory for the whole project**, and
+`snapshotRoute` clears it before every write (`regen-api.ts:245-250`):
+
+```ts
+function snapshotRoute(root: string, routeSlug: string): void {
+  const backup = snapshotDir(root);
+  rmSync(backup, { recursive: true, force: true });
+  cpSync(join(root, "src", "pages", routeSlug), join(backup, "page"), { recursive: true });
+  cpSync(join(root, "manifest.json"), join(backup, "manifest.json"));
+}
+```
+
+Nothing in the snapshot records **which route it came from**, and
+`restoreSnapshot` (`regen-api.ts:254-262`) copies `backup/page` into
+`src/pages/<whatever route the caller named>` after deleting that directory.
+So a caller that regenerates `about` and then reverts `home` would have
+`home`'s page directory **replaced by `about`'s sections**, plus `about`'s
+manifest — cross-route corruption, not a no-op.
+
+**Severity is bounded by who can call it, and the editor cannot.** `App.tsx`
+keeps a single `revertSection` that every regen overwrites and every revert
+clears (`App.tsx:1124-1136`), so the editor's own `revertSection` always
+matches the snapshot that exists. The hazard lives on the **HTTP surface**:
+`/__regen-revert` accepts any `{route}` or `{section}` the caller sends, and
+slice 5 made that surface the product. Two lesser consequences of the same
+single-slot design are reachable from the editor: only the most recent
+regenerated route is ever revertable (a second route's regen silently discards
+the first's undo), and a second revert throws `no regeneration to revert`
+because `restoreSnapshot` deletes the backup on the way out.
+
+**Not empirically proven** — no revert was issued in this task, and proving it
+would mean deliberately corrupting the live project V3 and V4 still need. Filed
+from code reading, with the exact line references, so V3 (which does drive
+`/__regen-revert` over HTTP) can confirm or refute it cheaply. Recorded here
+rather than fixed: it is a design question about snapshot scoping, not a
+contained bug, and the round's rules send those back to the human.
+
+One directly operational consequence for V3, already verified on disk:
+`.regen-backup/` currently holds `home`'s **pre-add-section** state (its
+`manifest.json` is 54,103 bytes — the 184-node one — against the live 205-node
+manifest). A revert issued *before* V3's own `/__regen-page` would therefore
+delete the section V2 just added.
+
+---
+
+## V2 verdict
+
+**Verified, with findings.** Add-a-section works against a live model on its
+first-ever real run. The single most valuable thing this proves is that the path
+mock mode structurally cannot reach — a *first generation* of a section that
+never existed, `generate_section_flow` with `reuse_workspace=True` — runs
+correctly end to end: 21 new semantically-named nodes, zero existing ids
+disturbed, the page's `index.tsx` appended rather than re-assembled, the site
+plan updated, all seven gates plus a real `tsc --noEmit` and production build
+passing afterwards, and the section rendering live and individually addressable
+in the preview. 52.6 s and $0.0899, both inside expectations.
+
+**Assertion 4 is the one that did not hold**, and the reason is a design boundary
+rather than a bug: positioning lives in the editor, so the HTTP API appends and
+cannot place. The consequence on this run is visible — the FAQ sits after the
+closing CTA band — and the associated risk (F10) is real but loud and
+recoverable, not silent. The exporter's strictness, which is what assertion 4 was
+really testing, was confirmed empirically in both directions.
+
+The project is released to V3 with **6 sections on `home`, 205 nodes, and an
+empty `home.overrides.json`.**

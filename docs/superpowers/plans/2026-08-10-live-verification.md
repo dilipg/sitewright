@@ -60,6 +60,14 @@ export DB="$PWD/server/data/identity.db"
 
 **THE TRAP, repeated from `CLAUDE.md` because it will bite:** `succeeded` means *the request completed*, not that the work passed. A gate failure arrives as a `succeeded` job whose `result.passed` is `false`. Every assertion below that says "succeeded" means **`status === "succeeded"` AND `result.passed !== false`**.
 
+**Corrected by V1's live run — `$PROJECT_ID` is NOT a directory name.** A project's id and its on-disk directory are **two different UUIDs by design**: the API returns the id (`ba169e65-…`), while the directory is the run id (`web-2578801a-…`). `generated/$PROJECT_ID` does not exist. So:
+
+- **HTTP** always takes the project **id**: `?project=$PROJECT_ID`.
+- **Filesystem** paths always take the run directory: `generated/$RUN_DIR`.
+- `GET /api/jobs/:id` does **not** expose `run_id` (`publicJobView` omits it). Get the directory from `node server/scripts/user.ts list-projects --email <email> --db "$DB"`, which prints it.
+
+**Also corrected: `result.passed` does not exist on a `generate` job** — its result is `{ stdout }` only, so `result.passed !== false` is vacuously true there. THE TRAP is real for the five **proxied** kinds (Tasks 3 and 4) and inapplicable to V1/V4. For `generate`, a gate failure surfaces as a `failed` job instead, because `acceptance.py` raises on a non-zero exporter exit.
+
 ---
 
 ### Task 1: Stand up the harness (no model spend)
@@ -170,7 +178,7 @@ Expected: **202** with `{ jobId, projectId }`. Record both. Note the wall-clock 
 
 ```bash
 node server/scripts/user.ts list-projects --email verify-round1@local.test --db "$DB"
-ls "generated/$PROJECT_ID"
+ls "generated/$RUN_DIR"
 ```
 
 Expected: both exist **before the job has run** — that is the design ("a failed generation leaves an owned, deletable project rather than an orphan"). An empty directory at this moment is correct, not a failure.
@@ -194,8 +202,8 @@ Record the delta from Task 1's baseline. **If the `unpriced events` note appears
 - [ ] **Step 5: Verify the site is real**
 
 ```bash
-ls "generated/$PROJECT_ID/src/pages"          # expect 3 route directories
-find "generated/$PROJECT_ID/src/pages" -name "*.tsx" | wc -l
+ls "generated/$RUN_DIR/src/pages"          # expect 3 route directories
+find "generated/$RUN_DIR/src/pages" -name "*.tsx" | wc -l
 ```
 
 Then open the preview and confirm it renders with node ids present:
@@ -247,8 +255,8 @@ Pick an archetype **that the generated site does not already use on the target r
 - [ ] **Step 2: Record the pre-state**
 
 ```bash
-cat "generated/$PROJECT_ID/overrides/home.overrides.json" 2>/dev/null
-ls "generated/$PROJECT_ID/src/pages/home"
+cat "generated/$RUN_DIR/overrides/home.overrides.json" 2>/dev/null
+ls "generated/$RUN_DIR/src/pages/home"
 ```
 
 Capture the current `sectionOrder` override (or its absence) and the section file list. Task 3's central claim is a *diff* against this.
@@ -311,7 +319,7 @@ git commit -m "docs(report): V2 add-section, live"
 - [ ] **Step 1: Record the pre-state of every section on the route**
 
 ```bash
-md5sum generated/$PROJECT_ID/src/pages/home/*.tsx > "$SCRATCH/home-before.txt"
+md5sum generated/$RUN_DIR/src/pages/home/*.tsx > "$SCRATCH/home-before.txt"
 cat "$SCRATCH/home-before.txt"
 ```
 
@@ -330,7 +338,7 @@ Expected: **202** `{ jobId }`. Poll to terminal. The response carries `sections`
 - [ ] **Step 3: Assert each section was actually regenerated**
 
 ```bash
-md5sum generated/$PROJECT_ID/src/pages/home/*.tsx > "$SCRATCH/home-after.txt"
+md5sum generated/$RUN_DIR/src/pages/home/*.tsx > "$SCRATCH/home-after.txt"
 diff "$SCRATCH/home-before.txt" "$SCRATCH/home-after.txt"
 ```
 
@@ -346,7 +354,7 @@ Assert:
 curl -s -b "$SCRATCH/cookies.txt" -X POST "http://localhost:4000/__regen-revert?project=$PROJECT_ID" \
   -H 'Content-Type: application/json' \
   -d '{"route":"home"}'
-md5sum generated/$PROJECT_ID/src/pages/home/*.tsx > "$SCRATCH/home-reverted.txt"
+md5sum generated/$RUN_DIR/src/pages/home/*.tsx > "$SCRATCH/home-reverted.txt"
 diff "$SCRATCH/home-before.txt" "$SCRATCH/home-reverted.txt"
 ```
 
@@ -379,7 +387,7 @@ git commit -m "docs(report): V3 page regeneration and revert, live"
 
 **Why the fault must hit the orchestrator, not the server:** resume requires `original.status === "failed"` ([job-routes.ts:348](../../../server/src/job-routes.ts#L348)), and a `generate` job reaches `failed` only when `orchestrator.acceptance` exits non-zero. Killing the **server** produces `interrupted`, which is deliberately never retried and not resumable.
 
-> **DO NOT COMMIT ANYTHING BETWEEN STEP 1 AND STEP 6 OF THIS TASK.** `resolveCodeVersion` falls back to `git rev-parse HEAD` (confirmed live: the server logs `code version: <sha>` at boot). A commit changes HEAD, so the resume would be refused **409** by the code-version guard — the guard working exactly as designed, but indistinguishable at a glance from the feature being broken. Batch every commit for this task into Step 10, after the resume has been observed.
+> **DO NOT RESTART THE SERVER BETWEEN STEP 1 AND STEP 6 OF THIS TASK.** `resolveCodeVersion` is called **once, at boot** (`server/scripts/serve.ts:119`) and threaded from there — verified in code after V1's run. So ordinary commits during the task are **harmless**: the running server stays pinned to whatever HEAD was when it started, and the round's server is already pinned to `05d5360`, several commits behind. What *is* load-bearing is a **restart**: a server that comes back up re-reads HEAD, and every resume of a job recorded under the old sha is then refused **409** — the guard working exactly as designed, but indistinguishable at a glance from the feature being broken. Step 7's deliberate restart is therefore the LAST resume-related action in this task; if you must restart earlier, pin `WEBGEN_CODE_VERSION=05d53603e7ba1bcfb0f862f9ef058717e43082e9` on the way back up.
 
 - [ ] **Step 1: Start a second generation**
 

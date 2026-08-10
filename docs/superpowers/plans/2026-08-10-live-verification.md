@@ -66,6 +66,16 @@ export DB="$PWD/server/data/identity.db"
 - **Filesystem** paths always take the run directory: `generated/$RUN_DIR`.
 - `GET /api/jobs/:id` does **not** expose `run_id` (`publicJobView` omits it). Get the directory from `node server/scripts/user.ts list-projects --email <email> --db "$DB"`, which prints it.
 
+**Corrected again by V2's live run — the success field differs per endpoint, and getting it wrong passes a failure straight through:**
+
+| Endpoint kind | Success field |
+|---|---|
+| `/__regen`, `/__regen-page`, `/__add-section`, `/__edit-prompt` | **`passed`** |
+| `/__export` | **`ok`** — a gate failure returns HTTP 200 + `{ok:false}`, which `job-worker.ts:1123` maps to a `succeeded` job |
+| `generate` | **neither** — result is `{ stdout }`; a gate failure surfaces as a `failed` job |
+
+So `result.passed !== false` is *vacuously true* for an export that failed its gates. Check the right field for the endpoint you called.
+
 **Also corrected: `result.passed` does not exist on a `generate` job** — its result is `{ stdout }` only, so `result.passed !== false` is vacuously true there. THE TRAP is real for the five **proxied** kinds (Tasks 3 and 4) and inapplicable to V1/V4. For `generate`, a gate failure surfaces as a `failed` job instead, because `acceptance.py` raises on a non-zero exporter exit.
 
 ---

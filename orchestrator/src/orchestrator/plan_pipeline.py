@@ -26,7 +26,24 @@ BRIEF_PROPERTIES = {
     "brand": {
         "type": "object",
         "properties": {
-            "name": {"type": "string"},
+            # F3 (round 1 live verification): this was a bare {"type": "string"}
+            # and a brief naming no brand produced the literal "<UNKNOWN>",
+            # which shell_pipeline.brand_scaffold then wrote into
+            # `<title>` and, via brand_slug, into package.json's "name" -- both
+            # shipped into the handover export while the generated nav showed a
+            # real invented name. The model had no instruction for the case, so
+            # it invented a placeholder instead of a brand.
+            "name": {
+                "type": "string",
+                "description": (
+                    "The brand/product name, exactly as it should appear in the browser tab "
+                    "and the site header. If the brief does not name one, INVENT a specific, "
+                    "plausible name that suits the brief and record that you did so in "
+                    "assumptions. NEVER emit a placeholder such as <UNKNOWN>, UNKNOWN, TBD, "
+                    "N/A, 'the brand' or 'Company Name': this string ships verbatim into the "
+                    "exported site's <title> and package.json."
+                ),
+            },
             "tone": {"type": "string"},
             "audience": {"type": "string"},
             "oneLiner": {"type": "string"},
@@ -46,7 +63,7 @@ INTAKE_TOOL_FIRST = {
         "clarifyingQuestions": {
             "type": "array",
             "items": {"type": "string"},
-            "description": "ONLY when the brief lacks a product name or purpose; one round max",
+            "description": "ONLY when the brief has no discernible PURPOSE; one round max. A missing brand NAME is never grounds for a question -- invent one (see brand.name)",
         },
         "brief": {"type": "object", "properties": BRIEF_PROPERTIES, "required": list(BRIEF_PROPERTIES)},
     },
@@ -98,10 +115,15 @@ INTAKE_SYSTEM = (
     "user's freeform brief into the structured brief. Every downstream agent "
     "consumes only your output, never the raw text. creativity is always "
     '"low" in v1. If (and only if) the brief is too thin to plan a site — no '
-    "product name or no discernible purpose — ask a SINGLE round of short "
+    "discernible purpose — ask a SINGLE round of short "
     "clarifying questions instead of emitting the brief. Otherwise emit the "
     "brief directly; when you must assume something material, record it in "
-    "assumptions (plain sentences shown to the user)."
+    "assumptions (plain sentences shown to the user).\n\n"
+    "A MISSING BRAND NAME IS NOT GROUNDS FOR A CLARIFYING QUESTION. Invent a "
+    "specific, plausible name that suits the brief and record the invention in "
+    "assumptions. Never emit a placeholder: brand.name ships verbatim into the "
+    "exported site's <title> and package.json, and web-triggered generation has "
+    "nobody to answer a question — a clarifying round there fails the whole run."
 )
 
 PLANNER_SYSTEM = (
@@ -191,6 +213,72 @@ def require_plan_approval(project_dir: str | Path) -> None:
 # ---------- checkpointed steps ----------
 
 
+#: Brand names that must never reach `shell_pipeline.brand_scaffold`, which
+#: writes this string into the exported `<title>` and (slugged) into
+#: package.json's "name". Lowercased for comparison. `acme` is deliberately
+#: ABSENT: it is a perfectly plausible invented brand, and the fixture's own
+#: "Acme Analytics" is a legitimate name rather than a placeholder.
+PLACEHOLDER_BRAND_NAMES = frozenset(
+    {
+        "",
+        "unknown",
+        "n/a",
+        "na",
+        "tbd",
+        "tba",
+        "placeholder",
+        "none",
+        "null",
+        "undefined",
+        "brand",
+        "the brand",
+        "your brand",
+        "brand name",
+        "company",
+        "company name",
+        "your company",
+        "site",
+        "website",
+        "untitled",
+        "example",
+    }
+)
+
+
+def assert_brand_name_usable(name: object) -> None:
+    """Refuse a placeholder brand name at the CHEAPEST possible stage.
+
+    F3, found by round 1's live verification: intake emitted the literal
+    ``"<UNKNOWN>"`` for a brief that named no brand, and every downstream stage
+    faithfully carried it until it shipped as ``<title>&lt;UNKNOWN&gt;</title>``
+    and ``"name": "unknown"`` inside a handover export — the product's one
+    stated promise being developer-handover quality.
+
+    Raising here costs the price of the intake call (~$0.003, measured) instead
+    of a whole ~$1.74 generation that ends in a visibly broken artifact. With
+    the prompt and schema guidance added alongside this, it should essentially
+    never fire; it exists so that a model that ignores them cannot ship, rather
+    than as the mechanism for getting a name.
+
+    Angle brackets are rejected on sight, whatever they contain: no real brand
+    name carries them, and ``<UNKNOWN>``-shaped inventions are exactly the
+    failure observed.
+    """
+    if not isinstance(name, str):
+        raise ValueError(f"brand.name must be a string, got {type(name).__name__}")
+    stripped = name.strip()
+    if "<" in stripped or ">" in stripped:
+        raise ValueError(
+            f"brand.name {stripped!r} looks like a placeholder (angle brackets); it would ship "
+            "into the exported <title> and package.json"
+        )
+    if stripped.lower() in PLACEHOLDER_BRAND_NAMES:
+        raise ValueError(
+            f"brand.name {stripped!r} is a placeholder; it would ship into the exported "
+            "<title> and package.json. Intake must invent a specific name instead."
+        )
+
+
 @checkpoint
 def intake_step(run_id: str, user_brief: str, clarification_answers: str) -> dict:
     followup = bool(clarification_answers)
@@ -221,6 +309,14 @@ def intake_step(run_id: str, user_brief: str, clarification_answers: str) -> dic
         raw_output=json.dumps(result["data"], indent=2),
         checkpoint_ref=f"{kitaru.current_execution_id()}/intake_step",
     )
+    # Validated AFTER the run-log append, deliberately: a refused brand name is
+    # a model-output problem, and the raw output that caused it must be on the
+    # record before the raise, or the failure is undiagnosable from the log.
+    # Only when a brief was actually emitted -- a clarifying-questions response
+    # legitimately carries no brand at all.
+    brief = result["data"].get("brief")
+    if isinstance(brief, dict):
+        assert_brand_name_usable(brief.get("brand", {}).get("name"))
     return result["data"]
 
 

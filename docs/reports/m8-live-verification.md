@@ -933,3 +933,109 @@ V2's 52.6 s single add) and $0.5626, 41 % over the brief's estimate.
 
 The project is released to V4 in its **pre-V3 state**: 6 sections on `home`, 205
 nodes, empty `home.overrides.json`, no `.regen-backup/` slot.
+
+---
+
+## V4 — Fan-out-subprocess resume, live
+
+**VERIFIED.** The feature works. The blocking scenario the brief named — Kitaru
+caching the *failure* so a resume replays it forever, making the feature inert —
+**did not occur.**
+
+Run id `web-32ceed17-d145-44ea-8a63-0ddedbd99761` · project `073d0747` ·
+Kitaru **0.21.0** (pinned exactly in `orchestrator/uv.lock`; `pyproject.toml`
+declares only `>=0.21.0`, and nothing in CI re-verifies this behaviour against a
+future upgrade).
+
+### The fault
+
+`POST /api/generate`, then the orchestrator process **tree** killed mid-fan-out
+(`taskkill /T`, required — page workers are subprocesses and killing only the
+parent leaves them running).
+
+| | Job | Status | Duration |
+|---|---|---|---|
+| Attempt 1 | `eb3cc481` | **failed** | 474.4s |
+| Resume | `4aafd6ff` | **succeeded** | 210.9s |
+
+**Step 4's decision point passed:** the killed job landed `failed`, not
+`interrupted` and not stuck `running`. Had it landed otherwise, a real
+orchestrator crash in production would not be resumable either — the brief
+called for stopping and reporting, and that was not needed.
+
+### Assertions
+
+1. **Same `run_id`** — PASS. Both job rows carry
+   `web-32ceed17-d145-44ea-8a63-0ddedbd99761`, and `resumed_from_job_id` links
+   the resume to `eb3cc481`. Reusing the run id *is* the mechanism; no new
+   Kitaru API was needed.
+2. **Completed checkpoints replayed, not re-executed** — PASS, two independent ways.
+   Splitting the append-only run log at the kill (07:59:14.205Z) and resume start
+   (08:00:02.411Z):
+   - attempt 1: 6 `section.generated` events / **6 distinct checkpoints**
+   - resume: 6 events / **3 distinct checkpoints**
+   - **overlap: 0.** No checkpoint that completed in attempt 1 was regenerated.
+   - **prelude events in the resume window: 0** — intake, plan, tokens, both
+     primitives steps and shell emitted nothing.
+   Kitaru says so itself in the resume's own stdout: `Checkpoint intake_step
+   cached.` / `Checkpoint planner_step cached.`
+3. **Only incomplete work ran again** — PASS. 3 further section checkpoints, 8
+   sections on disk at the end.
+4. **The resume's cost is far below the first attempt's** — PASS, and this is the
+   assertion a log line cannot fake.
+
+| | Cost |
+|---|---|
+| Attempt 1 | $1.1842 |
+| **Resume** | **$0.3621** |
+| V4 total | $1.5463 |
+
+**31% of the first attempt.** The prelude — which V1 measured at ~$0.74, over
+40% of a full generation — cost **$0.00** on the resume. Assertions 2 and 4
+agree; had they disagreed, the standing instruction was to trust the cost.
+
+5. **Code-version guard** — PASS. Restarted with
+   `WEBGEN_CODE_VERSION=deliberately-different-for-step-7`; resuming
+   `eb3cc481` returned **409**: *"the server code has changed since this job ran;
+   it cannot be resumed — start a fresh job instead."*
+
+### F19 — the mechanism is NOT fully attributed, and this is the honest limit
+
+The brief asked which of two independent mechanisms carries the replay. **It
+cannot be answered from this run**, and saying so is worth more than guessing:
+
+- The **prelude** replay is Kitaru's checkpoint cache, proven — but those
+  checkpoints run in the **parent** process (`acceptance.py`), which was never
+  the thing in doubt. Single-process Kitaml caching was already verified.
+- The **section-level** skip is what the subprocess question is about, and the
+  evidence establishes only the *outcome* (0 overlap, 31% cost), not the cause.
+  **No `progress.json` exists anywhere in the finished project**, so
+  `page_worker.py`'s file-based skip cannot be confirmed to have run — and it
+  cannot be ruled out either, since the file may have existed mid-run and been
+  cleaned up.
+
+What is proven: **fan-out-subprocess resume works end to end, across a real
+multi-process crash, at 31% of the original cost.** What remains open: whether
+Kitaru's cache or the `progress.json` skip is load-bearing. Instrumenting that
+needs a run that inspects the filesystem *during* fan-out, not after.
+
+### F20 — nine section checkpoints produced eight sections
+
+6 distinct in attempt 1 plus 3 in the resume is 9, against 8 sections on disk.
+One section's attempt-1 work therefore did not survive into the final site and
+was redone under a new checkpoint id. Not explained here; recorded because a
+resume that silently discards completed work would be a cost bug, and the
+arithmetic is the only place it showed up.
+
+### F21 — spend attribution lags the response
+
+`user.ts usage` read `$3.58` while `usage_event` summed to `$3.94`. Not a cap
+defect: ingest runs *after* the response completes, so a figure read
+mid-completion is stale. Worth knowing because the cap is a money control and a
+stale read looks exactly like an undercount. After ingest the two agreed
+exactly, and `unpricedEvents` stayed 0 throughout.
+
+### Also observed
+
+Server-side sessions survived the deliberate restart — the same cookie returned
+**200** from `/api/me` afterwards.

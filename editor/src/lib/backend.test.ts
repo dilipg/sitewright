@@ -7,6 +7,9 @@ import {
   generateUrl,
   hostedMode,
   isHostedMode,
+  jobProgressUrl,
+  jobResumeUrl,
+  jobUrl,
   loginUrl,
   meUrl,
   neutralizeDotSegments,
@@ -247,6 +250,42 @@ describe("session-scoped URLs (no ?project=)", () => {
     expect(generateUrl()).toBe("/api/generate");
     expect(projectsUrl()).not.toContain("project=");
     expect(generateUrl()).not.toContain("project=");
+  });
+
+  it("TASK 4: the three job endpoints are session-only and name the job in the path", () => {
+    // A job belongs to the USER who queued it, not to a project — a generate
+    // job's `project_id` is `ON DELETE SET NULL`, so a project-scoped check
+    // would have nothing to compare for exactly the jobs most worth looking up.
+    expect(jobUrl("j1")).toBe("/api/jobs/j1");
+    expect(jobProgressUrl("j1")).toBe("/api/jobs/j1/progress");
+    expect(jobResumeUrl("j1")).toBe("/api/jobs/j1/resume");
+    for (const url of [jobUrl("j1"), jobProgressUrl("j1"), jobResumeUrl("j1")]) {
+      expect(url).not.toContain("project=");
+    }
+  });
+
+  it("TASK 4: a job id of '..' cannot walk out of /api/jobs/ into another endpoint", () => {
+    // THE FIFTH `..`. This codebase has shipped four at four layers, and
+    // CLAUDE.md's standing instruction is to assume the next one exists. This
+    // is a genuine candidate rather than a theoretical one: the job id reaching
+    // these paths now comes from `localStorage` as well as from a 202 body, and
+    // localStorage is writable by any script on this origin. `fetch()` resolves
+    // a relative URL against the document and normalizes dot segments exactly
+    // as the URL parser does, INCLUDING their percent-encoded spellings.
+    for (const evil of ["../..", "..%2f..", "..", "%2e%2e/%2e%2e"]) {
+      const resolved = new URL(jobUrl(evil), "http://localhost:5173/");
+      expect(resolved.pathname.startsWith("/api/jobs/"), evil).toBe(true);
+      expect(resolved.pathname, evil).not.toBe("/api/");
+      const progress = new URL(jobProgressUrl(evil), "http://localhost:5173/");
+      expect(progress.pathname.startsWith("/api/jobs/"), evil).toBe(true);
+    }
+  });
+
+  it("TASK 4: a real job id (a v4 UUID) round-trips unchanged", () => {
+    // The escaping must not corrupt the value it protects: every real job id is
+    // a `randomUUID()`, which contains no character `encodePathSegment` touches.
+    const id = "ed1b5088-eebf-44c9-967c-294ddc3f9705";
+    expect(jobUrl(id)).toBe(`/api/jobs/${id}`);
   });
 });
 

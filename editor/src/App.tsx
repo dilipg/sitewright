@@ -16,6 +16,12 @@ import { AddSectionPanel } from "./components/AddSection";
 import type { EditPromptState } from "./components/EditPrompt";
 import EditPrompt from "./components/EditPrompt";
 import LoginScreen from "./components/LoginScreen";
+import GenerationProgress, {
+  forgetPersistedRun,
+  localRunStorage,
+  persistRun,
+  restorePersistedRun,
+} from "./components/GenerationProgress";
 import type { StartedGeneration } from "./components/ProjectPicker";
 import ProjectPicker from "./components/ProjectPicker";
 import type { RegenPhase } from "./components/Regen";
@@ -93,12 +99,28 @@ const JOB_INTERRUPTED_MESSAGE =
 
 const SESSION_EXPIRED_MESSAGE = "Your session expired — sign in again.";
 
-/** What `GET /api/me` gives back for a valid session. Only the two fields
- *  this task needs are read; the endpoint also returns spend-cap figures,
- *  which the project picker (task 3) will want. */
+/**
+ * What `GET /api/me` gives back for a valid session.
+ *
+ * TASK 4 added the three money fields. They are read here rather than in a
+ * second request from the picker because this is already the one call made
+ * before a project exists, and the numbers matter at exactly one moment: beside
+ * a button that spends ~$1.74. A tester who cannot see what is left finds out
+ * they are over the cap by being refused 402 after typing a brief.
+ *
+ * All three are OPTIONAL at the type level even though the server always sends
+ * them: this is a parsed network response, and a build talking to an older
+ * server must render a picker without a budget line rather than `$NaN`.
+ */
 interface AccountSummary {
   id: string;
   email: string;
+  spendCapUsd?: number;
+  spentUsd24h?: number;
+  /** Non-zero means `spentUsd24h` is a FLOOR, not an exact figure — a model
+   *  with no published rate contributed tokens it could not price. Both other
+   *  surfaces that show this number already caveat it; this one must too. */
+  unpricedEvents?: number;
 }
 
 /**
@@ -246,12 +268,25 @@ export default function App() {
   // identity the project picker (task 3) renders.
   const [account, setAccount] = useState<AccountSummary | null>(null);
   // TASK 3. A generation that has STARTED — both ids, held together, because
-  // they name different things: `jobId` is what task 4's progress view polls,
-  // `projectId` is what the editor opens once the job succeeds. `null` means
-  // "none started in this tab", which is not the same as "none running": a
-  // generation survives a reload and this state does not, so a reload
-  // legitimately returns to the picker with a real run still in flight.
-  const [startedGeneration, setStartedGeneration] = useState<StartedGeneration | null>(null);
+  // they name different things: `jobId` is what the progress view polls,
+  // `projectId` is what the editor opens once the job succeeds.
+  //
+  // TASK 4 made it survive a reload, and that is a MONEY fix rather than a
+  // polish one. Held only in tab state, a reload during an ~11-minute run
+  // returned the tester to the picker with a real run still going; they
+  // conclude it failed and press Generate again — $1.74 each, and the per-user
+  // bound is 2, so the second one SUCCEEDS. The initializer restores the pair
+  // from localStorage, and `GenerationProgress` immediately re-reads
+  // `GET /api/jobs/:id` (session-only, owner-checked) to decide whether that
+  // run is still going, already over, or gone entirely — a stale entry lands
+  // on `onAbandon` and the picker, never on a stuck screen.
+  //
+  // Guarded on `hostedShellWithoutProject` so LOCAL mode never reads this key
+  // at all: there is no session, no job table and no worker there, and local
+  // mode must stay byte-identical.
+  const [startedGeneration, setStartedGeneration] = useState<StartedGeneration | null>(() =>
+    hostedShellWithoutProject ? restorePersistedRun(localRunStorage()) : null,
+  );
 
   const manifestRef = useRef<Manifest | null>(null);
   const historyRef = useRef<History | null>(null);
@@ -401,6 +436,28 @@ export default function App() {
         setSessionExpired(true);
       });
   }, []);
+
+  /**
+   * TASK 4 — the write half of reload survival. ONE write path, driven by the
+   * state itself rather than by the handler that set it, so both ways a run can
+   * begin are covered by the same line: `ProjectPicker`'s `onGenerationStarted`
+   * (a first generation) and `GenerationProgress`'s `onResumed` (a resume,
+   * which produces a NEW job id for the same project and would otherwise leave
+   * the persisted entry pointing at the failed original).
+   *
+   * It deliberately never CLEARS. Clearing belongs to whoever knows the run is
+   * over, which is `GenerationProgress` — it calls `forgetPersistedRun` when a
+   * job reaches a terminal status and when the server says the job is gone. An
+   * `else` branch here would clear on the render where `startedGeneration` is
+   * reset to null after the tester has already left the screen, which is the
+   * same instant, but it would ALSO clear on the very first render in local
+   * mode and on every hosted render before a run exists — writing to storage in
+   * paths that must not touch it.
+   */
+  useEffect(() => {
+    if (!hostedShellWithoutProject || startedGeneration === null) return;
+    persistRun(localRunStorage(), startedGeneration);
+  }, [startedGeneration]);
 
   /* ---------- shim messages (multiple cross-origin iframes, one per route) ---------- */
 
@@ -1470,31 +1527,47 @@ export default function App() {
       );
     }
     if (startedGeneration !== null) {
-      // TASK 4 replaces this with the live progress view (stage, sections
-      // done, elapsed, and `degraded_sections` on completion). Until then it
-      // is deliberately a plain statement of the one thing that is certainly
-      // true — the run started — rather than anything resembling progress.
+      // TASK 4. The live progress view: stage, prelude steps, sections done,
+      // an elapsed clock against the measured ~11 minutes, and — on a
+      // `succeeded` job — the `degraded_sections` that were buried in
+      // `result.stdout` and read by nothing until now.
       //
-      // It deliberately offers NO "open the project" button. `POST
-      // /api/generate` creates the project row and its directory BEFORE
-      // queueing the job, so the project genuinely exists from the first
-      // moment while its directory stays empty for ~11 minutes; opening it
-      // now would bootstrap a canvas against a manifest that does not exist
-      // yet. And no "back to the list" either, because that would put the
-      // Generate button back in front of a user whose run is already
-      // costing money.
+      // `startedGeneration` reaches here two ways and the screen cannot tell
+      // them apart, which is the point: the tester pressed Generate in this
+      // tab, or this tab reloaded mid-run and the initializer restored the
+      // pair from storage.
+      //
+      // The two deliberate omissions from task 3's placeholder are preserved
+      // INSIDE the component and are asserted there: no "open the project"
+      // while running (the project row and directory exist from the first
+      // moment, but the directory stays empty for ~11 minutes, so opening it
+      // bootstraps a canvas against a manifest that does not exist yet), and
+      // no "back to your sites" while running (it would put the Generate
+      // button back in front of a user whose run is already costing money).
+      // Both appear once the run is over, which is a different screen.
       return (
         <div className="editor-root">
-          <div className="account-gate" data-testid="generation-started">
-            <p>
-              Generation started — job <code>{startedGeneration.jobId}</code>.
-            </p>
-            <p className="account-gate-hint">
-              It takes about 11 minutes and cannot be cancelled. Live progress arrives with the next
-              step; for now, reload this page when it has had time to finish and open the new site
-              from your list.
-            </p>
-          </div>
+          <GenerationProgress
+            // Keyed so a resume, which produces a NEW job id for the same
+            // project, remounts the screen rather than leaving the previous
+            // job's terminal state on it.
+            key={startedGeneration.jobId}
+            jobId={startedGeneration.jobId}
+            projectId={startedGeneration.projectId}
+            onDone={openProject}
+            onAbandon={() => {
+              // Belt and braces: the component already forgets the entry on a
+              // terminal status and on a vanished job, but this is the one
+              // path that leaves the screen, and a persisted entry outliving
+              // it would re-enter a finished run on the next reload.
+              forgetPersistedRun(localRunStorage());
+              setStartedGeneration(null);
+            }}
+            onSessionExpired={() => setSessionExpired(true)}
+            // The persisted entry follows automatically: the write effect
+            // above keys on `startedGeneration` itself.
+            onResumed={(jobId) => setStartedGeneration({ ...startedGeneration, jobId })}
+          />
         </div>
       );
     }
@@ -1502,6 +1575,14 @@ export default function App() {
       <div className="editor-root">
         <ProjectPicker
           accountEmail={account.email}
+          // TASK 4. The remaining budget, beside the button that spends it.
+          // Already in hand from the `/api/me` call the session gate makes —
+          // no second request, and no new endpoint.
+          spend={{
+            spendCapUsd: account.spendCapUsd,
+            spentUsd24h: account.spentUsd24h,
+            unpricedEvents: account.unpricedEvents,
+          }}
           onOpen={openProject}
           onGenerationStarted={setStartedGeneration}
           // The single "the session is not usable" flag, reused rather than

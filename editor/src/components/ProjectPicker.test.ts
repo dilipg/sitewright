@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  describeRemainingBudget,
   EMPTY_BRIEF_MESSAGE,
   loadProjects,
   startGeneration,
@@ -355,5 +356,59 @@ describe("ProjectPicker.tsx: the component cannot render a directory", () => {
     expect(pickerSource.indexOf("new-site-form")).toBeLessThan(
       pickerSource.indexOf("picker-footnote"),
     );
+  });
+
+  it("shows the remaining budget beside the button that spends it", async () => {
+    // TASK 4. `requireBudget` refuses an over-cap request with 402, not 429,
+    // because retrying cannot help until the 24h window rolls. A tester who
+    // cannot see what is left finds that out by typing a brief.
+    const form = pickerSource.slice(pickerSource.indexOf("new-site-form"));
+    expect(form).toContain('data-testid="picker-budget"');
+    expect(pickerSource.indexOf("generate-button")).toBeLessThan(
+      pickerSource.indexOf("picker-budget"),
+    );
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Remaining budget (task 4)
+ * ------------------------------------------------------------------ */
+
+describe("describeRemainingBudget: the number beside a $1.74 button", () => {
+  it("names what is left, the cap, and what has been spent", () => {
+    expect(describeRemainingBudget({ spendCapUsd: 20, spentUsd24h: 1.7396 })).toBe(
+      "$18.26 of your $20.00 daily budget is left ($1.74 spent in the last 24 hours).",
+    );
+  });
+
+  it("clamps the remainder at zero rather than rendering a negative budget", () => {
+    // The cap gates ENQUEUE. A run that started under it bills whatever it
+    // bills, so `spentUsd24h` legitimately exceeds `spendCapUsd` — "-$0.42
+    // left" reads as a bug in the UI rather than as a spent budget.
+    expect(describeRemainingBudget({ spendCapUsd: 2, spentUsd24h: 2.42 })).toBe(
+      "$0.00 of your $2.00 daily budget is left ($2.42 spent in the last 24 hours).",
+    );
+  });
+
+  it("says the figure is a floor when some calls could not be priced", () => {
+    // Under the gemini escape hatch a user can see `spentUsd24h: 0` while
+    // genuinely burning budget. Both other surfaces already caveat this; this
+    // would otherwise be the only one presenting it as exact.
+    expect(describeRemainingBudget({ spendCapUsd: 20, spentUsd24h: 1, unpricedEvents: 3 })).toBe(
+      "$19.00 of your $20.00 daily budget is left ($1.00 spent in the last 24 hours). At least — 3 call(s) used a model with no published rate, so the real spend is higher.",
+    );
+  });
+
+  it("renders nothing at all rather than $NaN when a figure is missing", () => {
+    // An absent cap is not a cap of zero, and a build talking to an older
+    // server must show no line rather than a fabricated one.
+    expect(describeRemainingBudget(undefined)).toBeUndefined();
+    expect(describeRemainingBudget({})).toBeUndefined();
+    expect(describeRemainingBudget({ spendCapUsd: 20 })).toBeUndefined();
+    expect(describeRemainingBudget({ spentUsd24h: 1 })).toBeUndefined();
+    expect(describeRemainingBudget({ spendCapUsd: Number.NaN, spentUsd24h: 1 })).toBeUndefined();
+    expect(
+      describeRemainingBudget({ spendCapUsd: 20, spentUsd24h: Number.POSITIVE_INFINITY }),
+    ).toBeUndefined();
   });
 });

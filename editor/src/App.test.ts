@@ -135,24 +135,52 @@ describe("App.tsx: every read goes through the session-aware layer (finding B)",
   });
 
   it("holds BOTH ids a started generation produced, since they name different things", () => {
-    // `jobId` is what task 4's progress view polls; `projectId` is what the
-    // editor opens once it succeeds. Storing the whole object rather than
-    // one field is what keeps the second available when the first finishes.
-    expect(appSource).toContain("useState<StartedGeneration | null>(null)");
+    // `jobId` is what the progress view polls; `projectId` is what the editor
+    // opens once it succeeds. Storing the whole object rather than one field
+    // is what keeps the second available when the first finishes — and, since
+    // task 4, what makes a persisted run restorable at all: a jobId alone
+    // could be polled but never opened.
+    expect(appSource).toContain("useState<StartedGeneration | null>(");
     expect(appSource).toContain("onGenerationStarted={setStartedGeneration}");
+    // Both fields survive a resume, which replaces only the job id.
+    expect(appSource).toContain("onResumed={(jobId) => setStartedGeneration({ ...startedGeneration, jobId })}");
   });
 
-  it("does not offer to open a project whose generation has only just started", () => {
-    // `POST /api/generate` creates the project row AND its directory before
-    // queueing the job, so a project legitimately exists with an empty
-    // directory for the ~11 minutes the run takes. Opening it then
-    // bootstraps a canvas against a manifest that does not exist yet.
-    const started = appSource.slice(
-      appSource.indexOf('data-testid="generation-started"'),
-      appSource.indexOf('<ProjectPicker'),
+  /**
+   * TASK 4 — the progress view replaces task 3's `generation-started`
+   * placeholder. The property that placeholder's test named ("does not offer to
+   * open a project whose generation has only just started") did not go away: it
+   * moved INTO `GenerationProgress.tsx`, where `GenerationProgress.test.ts`
+   * asserts it against the running block's own source text, and it is now
+   * stronger there — it bans "back to your sites" during a paid run as well.
+   * `POST /api/generate` creates the project row AND its directory before
+   * queueing the job, so a project legitimately exists with an empty directory
+   * for the ~11 minutes the run takes; opening it then bootstraps a canvas
+   * against a manifest that does not exist yet.
+   */
+  it("hands a started generation to the progress view, which owns the ~11-minute wait", () => {
+    expect(appSource).toContain("<GenerationProgress");
+    // `openProject` is reachable only as the SUCCESS callback. The component
+    // invokes it from its terminal screen; App never renders an open
+    // affordance of its own beside a running job.
+    expect(appSource).toContain("onDone={openProject}");
+    const branchIndex = appSource.indexOf("if (hostedShellWithoutProject) {");
+    expect(branchIndex).toBeGreaterThan(-1);
+    expect(appSource.indexOf("<GenerationProgress")).toBeGreaterThan(branchIndex);
+  });
+
+  it("restores a run that outlived its tab, because starting a second costs $1.74", () => {
+    // THE money requirement. Held only in tab state, a reload during an
+    // ~11-minute run returned the tester to the picker with a real run still
+    // going; they conclude it failed and press Generate again — and the
+    // per-user bound is 2, so the second one succeeds and is billed.
+    expect(appSource).toContain("restorePersistedRun(localRunStorage())");
+    expect(appSource).toContain("persistRun(localRunStorage(), startedGeneration)");
+    // Local mode must not read or write this key at all: no session, no job
+    // table, no worker, and the milestone-7 Playwright suite runs there.
+    expect(appSource).toContain(
+      "hostedShellWithoutProject ? restorePersistedRun(localRunStorage()) : null",
     );
-    expect(started.length).toBeGreaterThan(0);
-    expect(started).not.toContain("openProject(");
   });
 
   it("approvePlan dismisses the plan gate only after the write actually landed", () => {

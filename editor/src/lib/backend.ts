@@ -185,6 +185,47 @@ export function generateUrl(): string {
 }
 
 /**
+ * TASK 4. The three job endpoints the progress view polls and acts on. All
+ * three are SESSION-only in `server/src/project-registry.ts` — a job belongs to
+ * the user who queued it, not to a project, and a `generate` job's `project_id`
+ * is `ON DELETE SET NULL` — so none of them takes a `?project=`.
+ *
+ * THE JOB ID GOES IN THE PATH, so it is escaped, and this is not theatre. This
+ * codebase has shipped FOUR `..` defects at four layers (an unvalidated proxied
+ * `route` joined with `path.join`; a `runId` rail whose `^[A-Za-z0-9._-]+$`
+ * matched `..` because `.` is in the class; a project id needing two
+ * `encodeURIComponent` passes; model-generated route slugs spliced into URL
+ * paths), and CLAUDE.md's standing instruction is "assume the fifth exists."
+ * This is a candidate for the fifth: the job id reaching these paths comes from
+ * a 202 body OR — new in this task — from **`localStorage`**, which is
+ * client-writable by anyone with a devtools console or a stored-XSS foothold on
+ * this origin. `fetch("/api/jobs/../../api/key/reveal")` is normalized by the
+ * WHATWG URL parser exactly as a literal `..` path would be, so an unescaped id
+ * is a request-forgery primitive aimed at this app's own authenticated origin.
+ * `encodePathSegment` (not a bare `encodeURIComponent`, which leaves `.`
+ * untouched) is what closes it — see that function's own comment for why one
+ * pass is insufficient.
+ *
+ * Relative, like `loginUrl`/`meUrl`/`projectsUrl` and for the same reason:
+ * nothing derives a further URL from these (unlike `apiUrl`, whose result feeds
+ * `new URL(path, base)` and must therefore be absolute), and a plain `fetch()`
+ * resolves a relative URL against the current document — the one origin the
+ * Vite dev server proxies to the hosted server, which is what keeps the session
+ * cookie flowing under `SameSite=Lax` with no CORS.
+ */
+export function jobUrl(jobId: string): string {
+  return `/api/jobs/${encodePathSegment(jobId)}`;
+}
+
+export function jobProgressUrl(jobId: string): string {
+  return `${jobUrl(jobId)}/progress`;
+}
+
+export function jobResumeUrl(jobId: string): string {
+  return `${jobUrl(jobId)}/resume`;
+}
+
+/**
  * The editor's OWN url for a chosen project — what the picker navigates to,
  * and the one place a project id supplied by the server re-enters this app.
  *

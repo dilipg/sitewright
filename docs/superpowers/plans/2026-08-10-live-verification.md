@@ -32,16 +32,10 @@ Verified against the code on 2026-08-10. Use these shapes verbatim.
 
 | What | Shape |
 |---|---|
-| Create user | `npm run -w server user -- create --email <email> --db "$DB"` → prints a generated password once |
-| Set spend cap | `npm run -w server user -- set-cap --email <email> --cap 20 --db "$DB"` |
-| Read spend | `npm run -w server user -- usage --email <email> --db "$DB"` |
+| Create user | `node server/scripts/user.ts create --email <email> --db "$DB"` → prints a generated password once |
+| Set spend cap | `node server/scripts/user.ts set-cap --email <email> --usd 20 --db "$DB"` |
+| Read spend | `node server/scripts/user.ts usage --email <email> --db "$DB"` |
 | Boot server | `WEBGEN_MASTER_KEY=<64 hex> node server/scripts/serve.ts --port 4000 --db "$DB" --projects-root ./generated` |
-
-**`$DB` MUST be an absolute path, and every command above must be given it explicitly.** `npm run -w server user` executes with cwd `server/`, while `node server/scripts/serve.ts` executes from the repo root — so the *same* relative `--db` string resolves to two different files. The failure is quiet and expensive: the CLI creates the user in one database, the server reads another, and login returns the uniform auth failure with no hint that two files exist. Set it once at the repo root and reuse it:
-
-```bash
-export DB="$PWD/server/data/identity.db"
-```
 | Login | `POST /api/login` `{ "email", "password" }` — **`Content-Type: application/json` is required** (it is what closes login-CSRF) |
 | Store key | `PUT /api/key` `{ "apiKey": "sk-ant-…" }` → `{ fingerprint }` |
 | Generate | `POST /api/generate` `{ "brief": "…" }` → **202** `{ jobId, projectId }` |
@@ -53,6 +47,16 @@ export DB="$PWD/server/data/identity.db"
 | Resume | `POST /api/jobs/:id/resume` → 202; **409 if the job is not `failed`**; 409 on a `code_version` mismatch |
 | Run report | `uv run --directory orchestrator python -m orchestrator.run_report <run_id> -o <out>.html` |
 | Run log path | `uv run --directory orchestrator python -c "from orchestrator.runlog import default_run_log_path; print(default_run_log_path('<run_id>'))"` |
+
+**Two traps in that table, both found by reading the code rather than assuming.**
+
+`set-cap` takes **`--usd`**, not `--cap` (`server/src/user-cli.ts:101`). A wrong flag name throws `--usd must be a non-negative number`, which reads like a bad *value* rather than a bad *name*.
+
+**`$DB` must be an absolute path, given explicitly to every command.** `user.ts` defaults to `./data/identity.db` **relative to cwd** (`server/scripts/user.ts:15`), so invoking it via `npm run -w server` (cwd `server/`) and running the server from the repo root resolve the *same* default string to two different files. The failure is quiet and expensive: the CLI creates the user in one database, the server reads another, and login returns the deliberately uniform auth failure with no hint that two files exist. Invoke both with `node` from the repo root, and set the path once:
+
+```bash
+export DB="$PWD/server/data/identity.db"
+```
 
 **THE TRAP, repeated from `CLAUDE.md` because it will bite:** `succeeded` means *the request completed*, not that the work passed. A gate failure arrives as a `succeeded` job whose `result.passed` is `false`. Every assertion below that says "succeeded" means **`status === "succeeded"` AND `result.passed !== false`**.
 
@@ -88,9 +92,9 @@ If an identity database already exists from earlier work, **a fresh master key c
 - [ ] **Step 3: Create the user and raise the cap above the round's budget**
 
 ```bash
-npm run -w server user -- create --email verify-round1@local.test
+node server/scripts/user.ts create --email verify-round1@local.test --db "$DB"
 # capture the printed password into the scratchpad, NOT into the repo
-npm run -w server user -- set-cap --email verify-round1@local.test --cap 20
+node server/scripts/user.ts set-cap --email verify-round1@local.test --usd 20 --db "$DB"
 ```
 
 The cap must exceed ~$6 or a later run is refused with **402** partway through and the round stalls with money already spent.
@@ -98,7 +102,7 @@ The cap must exceed ~$6 or a later run is refused with **402** partway through a
 - [ ] **Step 4: Boot the server in the background**
 
 ```bash
-node server/scripts/serve.ts --port 4000 --db ./server/data/identity.db --projects-root ./generated
+node server/scripts/serve.ts --port 4000 --db "$DB" --projects-root ./generated
 ```
 
 `--projects-root` must resolve to the orchestrator's own `generated/` or the worker **refuses to boot** by design. A non-zero exit here is the guard working, not a bug.
@@ -127,7 +131,7 @@ Expected: `{ "fingerprint": "…" }`. **Only the fingerprint may be echoed into 
 - [ ] **Step 7: Confirm zero spend before any run**
 
 ```bash
-npm run -w server user -- usage --email verify-round1@local.test
+node server/scripts/user.ts usage --email verify-round1@local.test --db "$DB"
 ```
 
 Expected: `$0.00 spent of $20.00`. This is the baseline every later delta is measured against.
@@ -161,7 +165,7 @@ Expected: **202** with `{ jobId, projectId }`. Record both. Note the wall-clock 
 - [ ] **Step 2: Confirm the project row and directory exist immediately**
 
 ```bash
-npm run -w server user -- list-projects --email verify-round1@local.test
+node server/scripts/user.ts list-projects --email verify-round1@local.test --db "$DB"
 ls "generated/$PROJECT_ID"
 ```
 
@@ -178,7 +182,7 @@ Poll every 15s. Expected terminal state: `status === "succeeded"` **and** `resul
 - [ ] **Step 4: Read actual spend, not an estimate**
 
 ```bash
-npm run -w server user -- usage --email verify-round1@local.test
+node server/scripts/user.ts usage --email verify-round1@local.test --db "$DB"
 ```
 
 Record the delta from Task 1's baseline. **If the `unpriced events` note appears, the figure is a floor** — say so in the report rather than quoting it as the total.
@@ -278,7 +282,7 @@ Poll to terminal. Expected `succeeded` with `result.passed === true`. Gate 1 now
 - [ ] **Step 6: Read spend and append to the report**
 
 ```bash
-npm run -w server user -- usage --email verify-round1@local.test
+node server/scripts/user.ts usage --email verify-round1@local.test --db "$DB"
 ```
 
 Append a V2 section recording every assertion above with its result, the actual cost delta, and the archetype chosen.
@@ -347,7 +351,7 @@ Expected: **byte-identical to Step 1**, from the single route-wide snapshot take
 - [ ] **Step 5: Read spend and append to the report**
 
 ```bash
-npm run -w server user -- usage --email verify-round1@local.test
+node server/scripts/user.ts usage --email verify-round1@local.test --db "$DB"
 ```
 
 - [ ] **Step 6: Commit**
@@ -466,7 +470,7 @@ git commit -m "docs(report): V4 fan-out-subprocess resume, live"
 - [ ] **Step 1: Report total actual spend against the authorisation**
 
 ```bash
-npm run -w server user -- usage --email verify-round1@local.test
+node server/scripts/user.ts usage --email verify-round1@local.test --db "$DB"
 ```
 
 State the total against the ~$6 ceiling and the ~$2.72 estimate. If the `unpriced events` note appeared at any point, say the figure is a floor.

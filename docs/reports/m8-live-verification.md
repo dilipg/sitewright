@@ -1138,3 +1138,69 @@ fix's blast radius. Recorded as a cosmetic follow-up.
 | **F20** nine section checkpoints produced eight sections | Unexplained |
 | **H1** the orphaned orchestrator grandchild | **No evidence gained.** V4 killed the orchestrator tree directly, not a preview child — that path remains untested |
 | **F9, F15 (status), F17, F18, F21** | Recorded above; none blocking |
+
+---
+
+## Independent review of the F13 fix
+
+Dispatched because the F13 fix was authored by the session coordinator rather
+than an implementer, so it had had **no independent review** — and because it
+touches a destructive filesystem path. Verdict: **APPROVED_WITH_FINDINGS**,
+0 Critical, 4 Important, 3 Minor.
+
+### The review disproved the fix's own justification
+
+The recorded reason for keeping ONE snapshot slot was that per-route slots would
+trade cross-route *file* loss for cross-route *manifest* loss. **The reviewer
+reproduced that manifest loss in the shipped single-slot design.**
+`MAX_ACTIVE_JOBS_PER_USER` bounds concurrency per **user** (2), never per
+project, so two regens on one project run together, share one preview child and
+one unlocked slot; the second `snapshotRoute` wipes the first's slot, and a later
+revert restores a manifest predating the first route's commit while that route's
+code stays regenerated.
+
+So it was never a trade-off. It is a defect under **both** designs, and per-route
+slots would have been strictly better on the axis used to reject them. The
+`docs/decisions.md` row carrying the wrong reasoning was **corrected rather than
+rewritten**, because it was recorded as load-bearing and a future reader would
+otherwise re-derive the same wrong conclusion.
+
+**The shipped fix remains correct as far as it goes** — it closes the reproduced,
+user-reachable file loss. It does **not** close manifest/code divergence under
+concurrency, which needs a lock on the slot (the manifest service has a
+cross-process file lock; the snapshot slot has none), per-project serialisation
+of regen jobs, or per-route slots plus a manifest-merge strategy. **Open and
+structural.**
+
+### The same defect shape existed twice more in the same two functions
+
+The pattern F13 *was* — a destructive step ahead of its validation — was fixed in
+one place and left in two:
+
+| | |
+|---|---|
+| **Finding 4** | `snapshotRoute` wiped the pending slot **before** checking the route had a page directory, so `{"route":"contact"}` — a valid slug with no directory — destroyed a legitimate snapshot and then threw, leaving the revert answering "no regeneration to revert" |
+| **Finding 3** | `restoreSnapshot` checked that `.regen-backup/` existed but never `.regen-backup/page`, then deleted the target route before copying — destroying it with nothing left to restore from |
+| **Finding 5** | The owner slug was `.trim()`ed on read with no matching write-side normalisation, so `" home"` and `"home"` compared equal |
+
+**Finding one instance is not finding the pattern.** All three fixed; all four new
+tests confirmed to fail with their guards disabled.
+
+### Finding 2 — the only client could not see the refusal
+
+`App.tsx`'s `revertRegen` used a bare `fetch` with no `.ok` check and not
+`sessionAwareFetch`, so a guard refusal rendered as a **successful** revert:
+affordance cleared, orphan list cleared, preview reloaded, nothing changed on
+disk. The same class of lie as the autosave "Saved" bug — and made reachable by
+the guard itself, since a failed regen on another route reassigns the slot while
+leaving `revertSection` pointing here. Fixed; `revertSection` and the orphan list
+are deliberately **left in place** on failure so the affordance does not vanish.
+
+### Minor findings, recorded not fixed
+
+- **6** Exporting both helpers for tests dropped the structural guarantee that
+  every caller validates first; `snapshotRoute` can still copy from outside the
+  project root, with the destructive half protected only incidentally by
+  `.split(".")[0]` yielding `""` for `..`.
+- **7** An unowned or foreign-owned slot can only be cleared by another billable
+  regen — no discard endpoint, and a hosted user has no filesystem access.

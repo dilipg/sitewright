@@ -262,13 +262,29 @@ function snapshotOwnerFile(root: string): string {
 }
 
 export function snapshotRoute(root: string, routeSlug: string): void {
+  const source = join(root, "src", "pages", routeSlug);
+  // Validated BEFORE the existing slot is destroyed (F13 review, finding 4).
+  // The old order wiped the slot and only then discovered it had nothing to
+  // copy, so `POST /__regen-page {"route":"contact"}` — a VALID slug with no
+  // such directory — destroyed whatever legitimate pre-regen copy was pending
+  // and left the revert answering "no regeneration to revert". Same
+  // destructive-step-ahead-of-validation shape this module was just fixed for;
+  // it existed twice more, and this is one of them.
+  if (!existsSync(source)) {
+    throw new Error(
+      `route ${JSON.stringify(routeSlug)} has no page directory; nothing was snapshotted`,
+    );
+  }
   const backup = snapshotDir(root);
   rmSync(backup, { recursive: true, force: true });
-  cpSync(join(root, "src", "pages", routeSlug), join(backup, "page"), { recursive: true });
+  cpSync(source, join(backup, "page"), { recursive: true });
   cpSync(join(root, "manifest.json"), join(backup, "manifest.json"));
   // Written LAST, so a crash mid-copy leaves an unowned slot that the restore
   // below refuses rather than a slot that lies about what it contains.
-  writeFileSync(snapshotOwnerFile(root), routeSlug, "utf8");
+  // `.trim()`ed on the way IN as well as on the way out, so the two sides of
+  // the comparison normalise identically (F13 review, finding 5): a read-side
+  // trim alone accepted `"home"` for a snapshot recorded as `" home"`.
+  writeFileSync(snapshotOwnerFile(root), routeSlug.trim(), "utf8");
 }
 
 /**
@@ -304,9 +320,23 @@ export function restoreSnapshot(root: string, sectionOrRoute: string): void {
     );
   }
 
+  // Both halves of the snapshot must be present BEFORE the target route is
+  // deleted (F13 review, finding 3). Checking only that `.regen-backup/` exists
+  // was not enough: with `page/` or `manifest.json` missing, the old order
+  // deleted `src/pages/<route>` and then threw on the copy, destroying the
+  // route with nothing left to restore it from. The third instance of the same
+  // destructive-step-ahead-of-validation shape.
+  const page = join(backup, "page");
+  const manifestCopy = join(backup, "manifest.json");
+  if (!existsSync(page) || !existsSync(manifestCopy)) {
+    throw new Error(
+      "the pending regeneration snapshot is incomplete (missing page or manifest); nothing was changed",
+    );
+  }
+
   rmSync(join(root, "src", "pages", routeSlug), { recursive: true, force: true });
-  cpSync(join(backup, "page"), join(root, "src", "pages", routeSlug), { recursive: true });
-  cpSync(join(backup, "manifest.json"), join(root, "manifest.json"));
+  cpSync(page, join(root, "src", "pages", routeSlug), { recursive: true });
+  cpSync(manifestCopy, join(root, "manifest.json"));
   rmSync(backup, { recursive: true, force: true });
 }
 

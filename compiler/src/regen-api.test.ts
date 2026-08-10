@@ -12,7 +12,7 @@
  */
 import { afterEach, describe, expect, it } from "vitest";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -506,5 +506,79 @@ describe("snapshot/restore: a snapshot may only restore the route it came from (
 
     expect(() => restoreSnapshot(root, "home")).toThrow(/belongs to route null/);
     expect(existsSync(join(root, "src", "pages", "home", "home-only.tsx"))).toBe(true);
+  });
+});
+
+/**
+ * F13 REVIEW findings 3, 4 and 5. The independent review of the F13 fix found
+ * that the same defect shape being fixed — a destructive step ahead of its
+ * validation — existed in TWO more places in these same two functions. One
+ * instance was fixed and two were left.
+ */
+describe("snapshot/restore: no destructive step may precede its validation (F13 review)", () => {
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
+    dirs.length = 0;
+  });
+
+  function twoRouteProject(): string {
+    const dir = mkdtempSync(join(tmpdir(), "regen-f13r-"));
+    dirs.push(dir);
+    for (const route of ["home", "about"]) {
+      mkdirSync(join(dir, "src", "pages", route), { recursive: true });
+      writeFileSync(join(dir, "src", "pages", route, `${route}-only.tsx`), `// ${route}\n`, "utf8");
+    }
+    writeFileSync(join(dir, "manifest.json"), JSON.stringify({ nodes: {} }), "utf8");
+    return dir;
+  }
+
+  it("finding 4: a valid slug with no page directory must not destroy the pending snapshot", () => {
+    const root = twoRouteProject();
+    snapshotRoute(root, "home");
+
+    // "contact" passes ROUTE_SLUG but has no directory. The old order wiped the
+    // slot first and only then threw on the copy.
+    expect(() => snapshotRoute(root, "contact")).toThrow(/no page directory/);
+
+    // home's snapshot must have survived, and must still be restorable.
+    expect(existsSync(join(root, ".regen-backup", "route.txt"))).toBe(true);
+    rmSync(join(root, "src", "pages", "home"), { recursive: true, force: true });
+    restoreSnapshot(root, "home");
+    expect(existsSync(join(root, "src", "pages", "home", "home-only.tsx"))).toBe(true);
+  });
+
+  it("finding 3: an incomplete snapshot must not delete the target route first", () => {
+    const root = twoRouteProject();
+    snapshotRoute(root, "home");
+    // Simulate a slot whose page half is gone but whose owner record is intact.
+    rmSync(join(root, ".regen-backup", "page"), { recursive: true, force: true });
+
+    expect(() => restoreSnapshot(root, "home")).toThrow(/incomplete/);
+
+    // The route must still be there. The old order deleted it and then threw on
+    // the copy, leaving nothing to restore it from.
+    expect(existsSync(join(root, "src", "pages", "home", "home-only.tsx"))).toBe(true);
+  });
+
+  it("finding 3: a missing manifest half is refused too, non-destructively", () => {
+    const root = twoRouteProject();
+    snapshotRoute(root, "home");
+    rmSync(join(root, ".regen-backup", "manifest.json"), { force: true });
+
+    expect(() => restoreSnapshot(root, "home")).toThrow(/incomplete/);
+    expect(existsSync(join(root, "src", "pages", "home", "home-only.tsx"))).toBe(true);
+  });
+
+  it("finding 5: the owner record is normalised on write, not only on read", () => {
+    const root = twoRouteProject();
+    // A read-side `.trim()` alone made `" home"` and `"home"` compare equal, so
+    // a snapshot of one could be restored into the other. Normalising both
+    // sides makes the stored value canonical instead.
+    mkdirSync(join(root, "src", "pages", " home"), { recursive: true });
+    writeFileSync(join(root, "src", "pages", " home", "spaced.tsx"), "// spaced\n", "utf8");
+    snapshotRoute(root, " home");
+
+    expect(readFileSync(join(root, ".regen-backup", "route.txt"), "utf8")).toBe("home");
   });
 });

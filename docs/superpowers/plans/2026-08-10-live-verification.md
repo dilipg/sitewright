@@ -35,7 +35,7 @@ Verified against the code on 2026-08-10. Use these shapes verbatim.
 | Create user | `node server/scripts/user.ts create --email <email> --db "$DB"` → prints a generated password once |
 | Set spend cap | `node server/scripts/user.ts set-cap --email <email> --usd 20 --db "$DB"` |
 | Read spend | `node server/scripts/user.ts usage --email <email> --db "$DB"` |
-| Boot server | `WEBGEN_MASTER_KEY=<64 hex> node server/scripts/serve.ts --port 4000 --db "$DB" --projects-root ./generated` |
+| Boot server | `WEBGEN_MASTER_KEY=<canonical padded base64, 32 bytes> node server/scripts/serve.ts --port 4000 --db "$DB" --projects-root ./generated` |
 | Login | `POST /api/login` `{ "email", "password" }` — **`Content-Type: application/json` is required** (it is what closes login-CSRF) |
 | Store key | `PUT /api/key` `{ "apiKey": "sk-ant-…" }` → `{ fingerprint }` |
 | Generate | `POST /api/generate` `{ "brief": "…" }` → **202** `{ jobId, projectId }` |
@@ -83,9 +83,13 @@ uv --version
 - [ ] **Step 2: Generate a master key and record its provenance, not its value**
 
 ```bash
-export WEBGEN_MASTER_KEY=$(node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))")
-echo "master key: generated fresh for this round, 32 random bytes, never written to disk" >> "$SCRATCH/harness.md"
+export WEBGEN_MASTER_KEY=$(node -e "console.log(require('node:crypto').randomBytes(32).toString('base64'))")
+echo "master key: generated fresh for this round, 32 random bytes, base64" >> "$SCRATCH/harness.md"
 ```
+
+**It must be `base64`, not `hex`** (`server/src/master-key.ts:40`) — and a hex string fails in a way worth understanding, because the same shape will catch anyone who guesses. Hex characters are all inside the base64 alphabet and 64 of them need no padding, so a 64-char hex key **passes** the canonical-base64 check at line 41 and is caught only by the length check at line 48, reporting `got 48` rather than "that's hex". Exactly what that function's own comment says it is for.
+
+The key must **persist for the whole round**: once the Anthropic key is encrypted under it, a restart with a different one cannot decrypt it, and Task 5 Step 7 restarts the server deliberately. Keep it in a session-scoped scratchpad env file (never the repo), and record in the journal that you did.
 
 If an identity database already exists from earlier work, **a fresh master key cannot decrypt its stored keys.** Either reuse the original key or start a fresh `--db` path. Record which you did.
 
@@ -374,6 +378,8 @@ git commit -m "docs(report): V3 page regeneration and revert, live"
 - Produces: the answer to the one open question with genuine doubt
 
 **Why the fault must hit the orchestrator, not the server:** resume requires `original.status === "failed"` ([job-routes.ts:348](../../../server/src/job-routes.ts#L348)), and a `generate` job reaches `failed` only when `orchestrator.acceptance` exits non-zero. Killing the **server** produces `interrupted`, which is deliberately never retried and not resumable.
+
+> **DO NOT COMMIT ANYTHING BETWEEN STEP 1 AND STEP 6 OF THIS TASK.** `resolveCodeVersion` falls back to `git rev-parse HEAD` (confirmed live: the server logs `code version: <sha>` at boot). A commit changes HEAD, so the resume would be refused **409** by the code-version guard — the guard working exactly as designed, but indistinguishable at a glance from the feature being broken. Batch every commit for this task into Step 10, after the resume has been observed.
 
 - [ ] **Step 1: Start a second generation**
 

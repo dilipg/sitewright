@@ -238,6 +238,25 @@ progress is advisory** — a failed progress read must never turn a running job
 into a reported failure. Render the current stage, sections done, and elapsed
 time.
 
+**A RUN MUST SURVIVE A RELOAD, and this is a money requirement, not a polish
+one.** Task 3 found that `startedGeneration` lives only in tab state, so
+reloading during an ~11-minute generation returns the tester to the picker with
+a real run still going. They conclude it failed and press Generate again —
+**$1.74 each, and the per-user bound is 2, so it succeeds.** Persist
+`{jobId, projectId}` (localStorage is sufficient and needs no server change);
+on mount, if an entry exists, read `GET /api/jobs/:id` — which is session-only
+and owner-checked — and either resume the progress view or clear a terminal
+entry. A stale entry must never strand the UI.
+
+**Preserve two deliberate omissions from Task 3's placeholder:** no "open
+project" during a run (the project exists with an empty directory for ~11
+minutes, so opening it shows nothing), and no "back to list" (it re-exposes the
+Generate button during a paid run).
+
+**Show the remaining budget beside the Generate affordance.** `/api/me` already
+returns `spendCapUsd` and `spentUsd24h`; a tester about to spend ~$1.74 should
+see what is left, and it costs one field.
+
 **Three states must read honestly, and all three are load-bearing:**
 - `succeeded` → open the project.
 - `failed` → say it failed, show the error, and offer **Resume** (`POST /api/jobs/:id/resume`) — but note a resume is refused **409** after a restart, since `code_version` is read once at boot.

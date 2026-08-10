@@ -1006,7 +1006,7 @@ cannot be answered from this run**, and saying so is worth more than guessing:
 
 - The **prelude** replay is Kitaru's checkpoint cache, proven — but those
   checkpoints run in the **parent** process (`acceptance.py`), which was never
-  the thing in doubt. Single-process Kitaml caching was already verified.
+  the thing in doubt. Single-process Kitaru caching was already verified.
 - The **section-level** skip is what the subprocess question is about, and the
   evidence establishes only the *outcome* (0 overlap, 31% cost), not the cause.
   **No `progress.json` exists anywhere in the finished project**, so
@@ -1039,3 +1039,63 @@ exactly, and `unpricedEvents` stayed 0 throughout.
 
 Server-side sessions survived the deliberate restart — the same cookie returned
 **200** from `/api/me` afterwards.
+
+---
+
+## Round summary
+
+| | Result | Cost |
+|---|---|---|
+| **V1** control generation | **VERIFIED** with findings | $1.7396 |
+| **V2** add-section, live (7.6) | **VERIFIED** with findings | $0.0899 |
+| **V3** page regen + revert, live (7.9) | **VERIFIED**, both claims | $0.5626 |
+| **V4** fan-out-subprocess resume | **VERIFIED**; mechanism open (F19) | $1.5463 |
+| | **Total** | **$3.9383** |
+
+Against a ~$6 authorisation and a $2.72 estimate. 43 `usage_event` rows, **0
+unpriced**, so the total is exact rather than a floor. The $5.00 stop-and-report
+threshold was never approached.
+
+**All three previously-unverified features work against a real model.** None of
+the three was a false confidence: add-section produced a valid new section that
+passed all seven gates including a real `tsc --noEmit`; page regeneration
+regenerated every section and one revert restored the page byte-identically; and
+a resume across a real multi-process crash completed at 31% of the original cost
+without re-executing a single completed checkpoint.
+
+### Defects found in the product
+
+| | Severity | Status |
+|---|---|---|
+| **F13** `.regen-backup` is one global slot, not per-route — reverting route B after regenerating route A **deletes B and replaces it with A's files**, reachable over the authenticated HTTP surface | **Data loss** | Confirmed in code; fix queued |
+| **F3** Every site ships `<title><UNKNOWN></title>` and `"name": "unknown"` into the handover export while the nav shows the real brand | Handover quality | Recorded; escalated |
+| **F9** `add_section.py` writes no `sectionOrder` override and the HTTP API has **no position parameter at all**, so an API-only consumer can only append | Feature gap | Recorded |
+| **F15** `regen-api.ts:7` documents `{ section \| route }`; line 215 destructures only `{ section }` | Doc/code mismatch in one file | Recorded |
+| **F17** `manifest.json` key order is unstable across a regen — same keys, same byte count, different hash | Defeats hash-based change detection | Recorded |
+| **F18** Zero prompt-cache reuse across the sequential page-regen loop | Cost is linear in sections | Recorded |
+| **F20** Nine section checkpoints produced eight sections | Unexplained | Recorded |
+
+### What this round says about the process, not the product
+
+**Four of the errors found were in the verification plan itself**, and one would
+have inverted a result: the plan's `md5sum home/*.tsx` matches only `index.tsx`
+(components live in `home/sections/`), and on a tone-only instruction **no
+component file changes at all** because copy lives in `mock/*.data.ts`. A worker
+following the brief literally would have filed 7.9 as **broken**. It was caught
+only because the assertion was re-derived from three independent signals —
+distinct data files, mtimes in section order, and six billing rows with six
+different token counts — rather than trusted.
+
+The other three: `set-cap` takes `--usd` not `--cap`; `user.ts` resolves `--db`
+relative to cwd (so the CLI and the server can silently use different
+databases); and `WEBGEN_MASTER_KEY` is base64, not hex — where a hex key
+*passes* the canonicality check and fails only on length, reporting `got 48`.
+
+### Not done, deliberately
+
+Wall clock (676.8s vs 349s predicted, over the 10-minute product ceiling) and
+cost (58% over estimate on V1) are **measured and reported, not remediated** —
+71% of the wall-clock miss is the sequential prelude, including a discarded
+primitives retry worth 152.7s and $0.36. Per-section latency matched
+`m7-wall-clock.md`'s model closely (29.2s vs 27.1s), so the earlier diagnosis
+still holds and the lever is the prelude, not fan-out.

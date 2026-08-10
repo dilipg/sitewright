@@ -69,8 +69,9 @@ design and all three look like bugs:
 
 | # | Item | Notes |
 |---|---|---|
-| **H2** | **The fifth `..`.** A systematic audit of every place a client- or model-influenced string reaches a path, a URL, or a spawn argument | Four found at four layers, each by a different mechanism. Never done. Cheap, and hunts unknowns rather than confirming knowns |
+| **H2** | **The fifth `..`.** A systematic audit of every place a client- or model-influenced string reaches a path, a URL, or a spawn argument | Four found at four layers, each by a different mechanism. Never done. Cheap, and hunts unknowns rather than confirming knowns. **First concrete lead, found 2026-08-10:** `editor/src/lib/jobs.ts:178` builds `new URL(\`/api/jobs/${jobId}\`, url)` with the id interpolated raw. **Not currently exploitable** — that id always arrives from a server 202 and is a `randomUUID()` — so it is latent, not live; but it is the same shape as all four shipped defects, and it goes live the moment any path lets that value be influenced |
 | **F19** | Which mechanism carries fan-out resume — Kitaru's cache or `page_worker.py`'s `progress.json` skip | Round 1 proved the *outcome* (0 re-execution, 31% cost) but not the cause; no `progress.json` survives a finished project. Needs a run that inspects the filesystem *during* fan-out |
+| **U1** | **`degraded_sections` is a one-shot notice.** The persisted job entry is cleared the instant a terminal status is observed, so a tester who reloads twice after a generation completes never learns a section shipped as a placeholder | Fixing it properly needs a per-project server-side record of the degraded set. Cosmetic for a trial, misleading at scale |
 | **F17** | `manifest.json` key order is unstable across a regen — same keys, same byte count, different hash | Defeats hash-based change detection. Worth checking against 6.2's byte-identical export-zip guarantee |
 
 ## OPEN — cost and latency (measured, never remediated)

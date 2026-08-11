@@ -38,6 +38,13 @@ this list said `dev` while the hosted shell needs `dev:hosted`.)
 
 ---
 
+## OPEN — BLOCKING for Docker and for every non-Windows developer
+
+| # | Item | Notes |
+|---|---|---|
+| **X1** | **Generation cannot complete on Linux or macOS — the product is Windows-only.** `design_pipeline.py:478,501`, `shell_pipeline.py:231,253` and `soak.py:45,56` spawn `["cmd", "/c", …]` for `npx tsc` and `mklink /J`. Measured inside the container: `FileNotFoundError: 'cmd'` | Discovered by task 3 while verifying the Docker image. `design_pipeline`'s call is inside a `@checkpoint`, so **a run dies after partial spend**. This makes the Docker workflow unable to do the one thing it exists for, and it is why the README must not promise generation under Docker until this is fixed |
+| **X2** | **Export is also broken on Linux**: `compiler/src/exporter.ts:1224,1231` call `rmdirSync` on what is a junction on Windows and a symlink elsewhere → `ENOTDIR` | Two sites, both measured. `unlinkSync` is the portable call for a symlink; the comment at 1231 explicitly reasons about junctions |
+
 ## OPEN — data integrity
 
 | # | Item | Notes |

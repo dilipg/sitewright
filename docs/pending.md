@@ -5,7 +5,7 @@ deferred with the reason. When an item closes, move it to "Recently closed"
 with the commit, then prune that section once it is stale. Do not delete an
 open item without recording why.
 
-**Last updated:** 2026-08-10, after round 1 (live verification) merged as `95068c3`.
+**Last updated:** 2026-08-11, after the local-tester-onboarding plan closed B1–B4.
 
 ## The deployment model this list assumes
 
@@ -25,27 +25,15 @@ blocking immediately** and this section must be revisited first.
 
 ## E2E-BLOCKING — required before anyone can test end to end
 
-| # | Item | Why it blocks |
-|---|---|---|
-| **B1** | **Login screen in the editor.** `POST /api/login` exists; there is **no UI for it anywhere** (zero matches for `api/login` in `editor/src`). Every project-scoped route composes over `requireSession`, so without this there is no way to authenticate from a browser at all | A tester cannot get past the first request |
-| **B2** | **Project list + "new site" brief form.** `GET /api/projects` and `POST /api/generate` both exist and are unused by any UI. Today a project id must be read out of `user-cli list-projects` and pasted into the URL as `?project=<uuid>` | A tester cannot create or choose a site |
-| **B3** | **Progress for a running generation.** A generation takes ~11 minutes and there is **no progress signal of any kind** — no `progress` column, nothing between `queued` and `succeeded` | Without it, most feedback will be "it seemed stuck", which wastes the trial rather than testing the product |
-| **B4** | **A root `README.md`.** None exists. Needs: prerequisites, `WEBGEN_MASTER_KEY` (base64, not hex), `orchestrator/.env`, the operator CLI to create the first account, both dev servers, and the three caveats below | A tester cannot start |
-
-**Three things the README must tell testers plainly**, because all three are by
-design and all three look like bugs:
-
-1. **There is no cancellation.** A mistyped brief costs ~$1.74 and ~11 minutes
-   (spec decision 13: the subprocess cannot be safely killed mid-run).
-2. **`interrupted` means the outcome is genuinely unknown**, not failed — it is
-   what a restart during a run produces, and the server cannot know whether the
-   child finished.
-3. **A generation costs real money on their own key** — ~$1.74 measured, ~11
-   minutes, and the per-user spend cap defaults are worth setting.
+**All four (B1–B4) are closed** — see "Recently closed" below. The three
+things the README had to say plainly are said in its "What to expect" section,
+and the section on rough edges links here rather than restating this file.
 
 **Not needed:** production static serving of the editor. Testers run
-`npm run dev -w editor` from source, and its Vite proxy already carries `/api`,
-`/__*` and `/preview` same-origin to the server.
+`npm run dev:hosted -w editor` from source, and its Vite proxy already carries
+`/api`, `/__*` and `/preview` same-origin to the server. (The plain `dev`
+script is LOCAL mode and shows no login screen at all — corrected here because
+this list said `dev` while the hosted shell needs `dev:hosted`.)
 
 ---
 
@@ -105,6 +93,12 @@ design and all three look like bugs:
 
 | Item | Commit |
 |---|---|
+| **B3** progress for a running generation: `GET /api/jobs/:id/progress`, read from the orchestrator's own run log rather than a second write path | `d6da8f0` |
+| **B1** login screen in the editor (hosted mode only; no sign-up link, no reset link — both would be dead ends) | `4ccf01b` |
+| **B2** project picker + new-site brief form; a project is reached by opening it, not by pasting a UUID into `?project=` | `0b1bd54` |
+| **B3 (UI half)** live generation progress: stage, sections done, elapsed against the measured ~11 minutes, `degraded_sections`, and `interrupted` rendered as an unknown outcome | `7c39be7` |
+| **P1 (in-process half)** a second concurrent snapshot is refused instead of replacing the first | `8390cfa` |
+| **B4** a root `README.md`, written and then followed literally from a clean shell against a fresh database and a fresh master key | this commit |
 | **F13** cross-route data loss: a global snapshot slot let reverting one route delete another | `ab5f349` |
 | **F13 review findings 2–5**: the same destructive-before-validated shape twice more in the same two functions; owner slug normalised on write; the editor's `revertRegen` had no `.ok` check so a refusal rendered as success | `31454f8` |
 | **F3** every generated site shipped `<title><UNKNOWN></title>` + `"name": "unknown"` into the handover export | `8b7d66c` |

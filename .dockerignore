@@ -1,0 +1,65 @@
+# Build context exclusions.
+#
+# Two jobs, and the first one matters more than the size saving: NOTHING HOLDING
+# A SECRET MAY ENTER A BUILD CONTEXT. An image layer is readable by anyone who
+# can `docker save` or `docker run` it, and a secret copied in and deleted in a
+# later layer is still there. `orchestrator/.env` holds a live
+# ANTHROPIC_API_KEY on any machine that has run the Python CLIs directly, and
+# `.env.docker` holds WEBGEN_MASTER_KEY — the key every stored API key is
+# encrypted under. Both are excluded by name, not by a broad glob, so the
+# exclusion is legible rather than incidental.
+
+# ---- secrets ----
+.env
+.env.*
+orchestrator/.env
+# NOTE: deliberately NOT `**/.env*`. `editor/.env.hosted` must stay IN the
+# context: it is what makes `npm run dev:hosted` hosted mode
+# (VITE_WEBGEN_HOSTED=1), it holds no secret, and it is committed on purpose.
+
+# ---- installed trees ----
+# Reinstalled inside the image for linux-x64. Copying a Windows or macOS tree in
+# would ship the wrong native binaries for @node-rs/argon2, esbuild, rolldown
+# and lightningcss — and would then be shadowed by an anonymous volume anyway.
+node_modules
+**/node_modules
+orchestrator/.venv
+
+# ---- the tester's data ----
+# Bind-mounted at runtime (compose.yaml), never baked in. `generated/` is 382MB
+# of prior runs on the machine this was written on; `server/data/` is accounts,
+# argon2 hashes, live sessions and encrypted API keys.
+generated
+server/data
+data
+
+# ---- local caches / run state ----
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+orchestrator/.kitaru
+orchestrator/runlog
+
+# ---- build & test artifacts ----
+**/dist
+**/test-results
+**/playwright-report
+coverage
+
+# ---- VCS and tooling ----
+# `.git` is excluded to keep the context small. The consequence is deliberate
+# and recorded: `server/src/code-version.ts` shells out to `git rev-parse HEAD`
+# and falls back to the "unknown" sentinel without a repo, which makes every
+# job RESUME refuse with 409. compose.yaml bind-mounts the repo (so `.git` is
+# present at runtime and the sha resolves for real); an image run WITHOUT that
+# mount degrades to "unknown" — fresh jobs still run, only resume is lost.
+.git
+.gitignore
+.github
+.claude
+.superpowers
+
+# ---- docker's own files ----
+Dockerfile
+compose.yaml
+.dockerignore

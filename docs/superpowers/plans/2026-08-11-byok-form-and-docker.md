@@ -150,6 +150,68 @@ One image carrying Node, Python 3.12 and `uv`. Install dependencies in a layer a
 
 ---
 
+### Task 3b: Make generation and export work off Windows
+
+**Files:**
+- Modify: `orchestrator/src/orchestrator/design_pipeline.py` (478, 501), `orchestrator/src/orchestrator/shell_pipeline.py` (231, 253), `orchestrator/src/orchestrator/soak.py` (45, 56), `compiler/src/exporter.ts` (1224, 1231)
+- Test: `orchestrator/tests/`, `compiler/src/exporter.test.ts`
+
+**Why:** task 3 measured `FileNotFoundError: 'cmd'` inside the container. Six
+spawn sites hardcode `["cmd", "/c", …]`, so **generation cannot complete on
+Linux or macOS** — and `design_pipeline`'s is inside a `@checkpoint`, so a run
+dies *after partial spend*. Export fails too: `rmdirSync` on a symlink is
+`ENOTDIR`. Docker delivers a login screen and nothing else until this is fixed,
+and no non-Windows developer can run the repo at all.
+
+#### THIS IS BRANCHING, NOT SUBSTITUTION — read before writing code
+
+The naive fix breaks the only platform that currently works. Two reasons the
+existing code is the way it is:
+
+1. **`mklink /J` creates a junction, and junctions need no elevation.**
+   `os.symlink` on Windows requires Developer Mode or admin, so replacing the
+   junction with a symlink would break every ordinary Windows checkout. Branch:
+   junction on Windows, `os.symlink(..., target_is_directory=True)` on POSIX.
+2. **`npx` on Windows is `npx.cmd`**, which is why `cmd /c` was used at all. A
+   bare `["npx", …]` raises `FileNotFoundError` on Windows. Resolve the
+   executable (`shutil.which`) and spawn it directly, so both platforms work
+   without a shell — and **keep `shell=False`**, because these argv arrays carry
+   model-influenced paths and a shell would reintroduce an injection surface
+   this repo has already fixed once.
+3. **`compiler/src/exporter.ts`:** a junction is removed with `rmdirSync`, a
+   POSIX symlink with `unlinkSync`. Detect with `lstatSync` rather than assuming
+   the platform, and keep the comment at 1231 explaining why the link is removed
+   rather than the source tree.
+
+- [ ] **Step 1: Write the failing tests**
+
+Per platform, using a scratch directory: the link helper creates a working
+directory link that resolves to the source, and the typecheck helper actually
+invokes the real `tsc`. Assert on **behaviour** (the link resolves; the command
+ran) rather than on the argv shape, or the test pins the bug instead of the fix.
+
+- [ ] **Step 2: Run them on this host (Windows) and watch them fail**
+
+- [ ] **Step 3: Implement the branching**
+
+- [ ] **Step 4: Prove BOTH platforms, and Windows first**
+
+Windows is the platform that currently works and must not regress: full
+`npm run check` plus `uv run --directory orchestrator pytest` green on the host.
+Then the same suites **inside the container** (`docker compose exec`).
+
+- [ ] **Step 5: The live proof — ONE generation inside Docker (~$1.74, ~11 min)**
+
+Authorised explicitly. Drive it through the browser like a tester: log in, save a
+key in the form, submit a brief, watch progress, and confirm the site lands with
+sections on disk. Then **export it** — that exercises X2. Report actual cost from
+`usage_event`, not an estimate. **If it fails, stop and report; do not retry**, a
+second attempt is another $1.74.
+
+- [ ] **Step 6: Commit** — `fix: run generation and export off Windows`
+
+---
+
 ### Task 4: A Docker-first README that someone has followed
 
 **Files:**

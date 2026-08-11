@@ -245,6 +245,74 @@ describe("App.tsx: every read goes through the session-aware layer (finding B)",
     );
   });
 
+  /**
+   * BYOK FORM — the key screen shows itself when there is no key, and the picker
+   * is not rendered until the key state is known.
+   *
+   * Source-text again, for the same structural reason as everything around it:
+   * this is JSX inside a component that cannot be mounted here. The BEHAVIOUR
+   * (`submitKey`, `toKeyState`, `describeKeyStatus`, `loadStoredKey`) is tested
+   * directly in `components/KeySettings.test.ts`; what these assert is the half a
+   * library test structurally cannot — that App reaches the screen at all, that it
+   * reaches it BEFORE the button that spends money, and that a failed probe does
+   * not become a claim in either direction.
+   */
+  it("shows the key screen by itself when no key is stored, before any button can spend $1.74", () => {
+    expect(appSource).toContain("<KeySettings");
+    expect(appSource).toContain(
+      'if (keyScreen === "open" || (keyScreen === "auto" && storedKey.kind === "absent")) {',
+    );
+    // Hosted shell only — local mode has no `/api/*` route at all, and the
+    // milestone-7 Playwright suite navigates a bare `/` with the flag unset.
+    const branchIndex = appSource.indexOf("if (hostedShellWithoutProject) {");
+    expect(branchIndex).toBeGreaterThan(-1);
+    expect(appSource.indexOf("<KeySettings")).toBeGreaterThan(branchIndex);
+    // ...and AFTER the progress view: a run in flight proves a key was stored
+    // when it started, so interrupting a paid ~11-minute run with a settings
+    // screen would hide the one screen that matters.
+    expect(appSource.indexOf("<KeySettings")).toBeGreaterThan(appSource.indexOf("<GenerationProgress"));
+    // ...and BEFORE the picker, which is what makes it show itself rather than
+    // waiting to be found.
+    expect(appSource.indexOf("<KeySettings")).toBeLessThan(appSource.indexOf("<ProjectPicker"));
+  });
+
+  it("waits for the key probe as well as the session before rendering the picker", () => {
+    // `POST /api/generate` refuses 400 with no stored key. Rendering the picker
+    // first would put a tester in front of the one button whose precondition this
+    // app has not finished checking.
+    expect(appSource).toContain("if (account === null || storedKey === null) {");
+  });
+
+  it("keeps the key screen up after a save, so the stored fingerprint can be checked", () => {
+    // FOUND LIVE, and invisible to every unit test here: the auto-show condition
+    // stops holding the instant `storedKey` becomes `stored`, so a first-time
+    // saver was thrown to the picker in the same tick and never saw the
+    // fingerprint they had just stored — while a REPLACE (reached with
+    // `keyScreen === "open"`) stayed and showed it. Two entry paths, two
+    // behaviours, neither designed. The fingerprint is the only thing a user can
+    // check their key against.
+    const start = appSource.indexOf("onSaved={(next) => {");
+    expect(start, "App.tsx no longer handles the key screen's onSaved").toBeGreaterThan(-1);
+    const handler = appSource.slice(start, start + 200);
+    expect(handler).toContain("setStoredKey(next)");
+    expect(handler).toContain('setKeyScreen("open")');
+  });
+
+  it("treats a failed key probe as UNKNOWN, never as 'no key' and never as a lapsed session", () => {
+    // Guessing "no key" pushes a needless form at a user who has one; guessing
+    // "stored" lets them press a $1.74 button that refuses; leaving it null holds
+    // the gate on "Checking your session…" forever, which is the silent-hang class
+    // of bug this codebase has now fixed three times.
+    const start = appSource.indexOf("void loadStoredKey()");
+    expect(start, "App.tsx no longer probes /api/key").toBeGreaterThan(-1);
+    const effect = appSource.slice(start, start + 500);
+    expect(effect).toContain('setStoredKey({ kind: "unknown" })');
+    // Its own effect, with its own catch: `/api/me`'s catch sends ANY failure to
+    // the login screen, and a key probe that 500s is not evidence that a session
+    // has lapsed.
+    expect(effect).not.toContain("setAccount");
+  });
+
   it("approvePlan dismisses the plan gate only after the write actually landed", () => {
     const body = functionBody("approvePlan");
     expect(body).toContain("sessionAwareFetch(");

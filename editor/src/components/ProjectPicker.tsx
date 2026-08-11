@@ -32,6 +32,7 @@
 import { useEffect, useState } from "react";
 import { generateUrl, projectsUrl } from "../lib/backend";
 import { SessionExpiredError } from "../lib/session-fetch";
+import { describeSpend, type SpendSummary } from "../lib/spend";
 
 /** What the picker renders per project. Deliberately NOT the wire shape — see
  *  this module's header comment for why the on-disk directory is absent. */
@@ -56,15 +57,6 @@ export interface RequestOptions {
   readonly fetchImpl?: typeof fetch;
 }
 
-/** The money half of `GET /api/me`, as the picker needs it. Every field is
- *  optional because this is a parsed network response — see App's own
- *  `AccountSummary`. */
-export interface SpendSummary {
-  readonly spendCapUsd?: number;
-  readonly spentUsd24h?: number;
-  readonly unpricedEvents?: number;
-}
-
 export interface ProjectPickerProps {
   /** Open an existing project. Receives the project's ID — never its
    *  directory (see the header comment). */
@@ -82,6 +74,15 @@ export interface ProjectPickerProps {
    *  server refuses 402 over the cap. Absent means the line is not rendered at
    *  all — never a `$NaN`. */
   readonly spend?: SpendSummary;
+  /** BYOK FORM. Which key is stored, in one honest line for all three states
+   *  (`describeKeyStatus`) — never a provider for a key that does not exist.
+   *  Absent means the caller has no key screen to offer, which is what keeps
+   *  this component usable from a caller that does not have one. */
+  readonly keyStatus?: string;
+  /** BYOK FORM. Opens the key screen. The picker is the one place a tester who
+   *  already has a key can get back to it: with a key stored, the screen no
+   *  longer appears by itself. */
+  readonly onOpenKeySettings?: () => void;
 }
 
 /**
@@ -101,50 +102,6 @@ export const EMPTY_BRIEF_MESSAGE = "Enter a brief before generating.";
  *  safely killed — so a mistyped brief spends anyway. */
 const GENERATION_COST_USD = "$1.74";
 const GENERATION_MINUTES = "11 minutes";
-
-/* ------------------------------------------------------------------ *
- * Remaining budget
- * ------------------------------------------------------------------ */
-
-function usd(amount: number): string {
-  return `$${amount.toFixed(2)}`;
-}
-
-/**
- * TASK 4. What is left of the 24-hour spend cap, in words, or `undefined` when
- * there is nothing honest to say.
- *
- * Rendered beside a button that spends ~$1.74. `requireBudget` refuses an
- * over-cap request with **402, not 429** — because retrying cannot help until
- * the window rolls — so a tester who cannot see the number finds out by typing
- * a brief and being refused.
- *
- * Three properties, each of which would be a lie if dropped:
- *
- *  - **A missing or non-finite figure renders NOTHING**, never `$NaN` and never
- *    a fabricated zero. An absent cap is not a cap of zero.
- *  - **The remainder is clamped at zero.** `spentUsd24h` can exceed the cap:
- *    the cap gates ENQUEUE, and a run that started under it bills whatever it
- *    bills. "-$0.42 left" reads as a bug; "$0.00 left" is the truth.
- *  - **`unpricedEvents > 0` makes the spend a FLOOR**, not an exact figure — a
- *    model with no published rate contributed tokens that could not be priced,
- *    so the remainder is an over-estimate. Both other surfaces that show this
- *    number already caveat it (`describeSpendCap`, the `usage` CLI); this one
- *    would otherwise be the only place it looks exact.
- */
-export function describeRemainingBudget(spend: SpendSummary | undefined): string | undefined {
-  if (spend === undefined) return undefined;
-  const { spendCapUsd: cap, spentUsd24h: spent } = spend;
-  if (typeof cap !== "number" || !Number.isFinite(cap)) return undefined;
-  if (typeof spent !== "number" || !Number.isFinite(spent)) return undefined;
-  const remaining = Math.max(0, cap - spent);
-  const base = `${usd(remaining)} of your ${usd(cap)} daily budget is left (${usd(spent)} spent in the last 24 hours).`;
-  const unpriced = spend.unpricedEvents;
-  if (typeof unpriced === "number" && Number.isFinite(unpriced) && unpriced > 0) {
-    return `${base} At least — ${String(unpriced)} call(s) used a model with no published rate, so the real spend is higher.`;
-  }
-  return base;
-}
 
 /* ------------------------------------------------------------------ *
  * List shaping
@@ -359,13 +316,18 @@ export default function ProjectPicker({
   onSessionExpired,
   accountEmail,
   spend,
+  keyStatus,
+  onOpenKeySettings,
 }: ProjectPickerProps) {
   const [rows, setRows] = useState<ProjectRow[] | null>(null);
   const [loadError, setLoadError] = useState<string | undefined>(undefined);
   const [brief, setBrief] = useState("");
   const [starting, setStarting] = useState(false);
   const [startError, setStartError] = useState<string | undefined>(undefined);
-  const budgetLine = describeRemainingBudget(spend);
+  // The SAME function the key screen renders its own spend line from, so neither
+  // surface can present a floor as an exact figure — see `lib/spend.ts` for the
+  // accepted risk that makes this the mitigation rather than a nicety.
+  const budgetLine = describeSpend(spend);
 
   useEffect(() => {
     let cancelled = false;
@@ -420,6 +382,24 @@ export default function ProjectPicker({
         {accountEmail !== undefined && (
           <p className="picker-account" data-testid="picker-account">
             Signed in as <strong>{accountEmail}</strong>
+          </p>
+        )}
+        {/* BYOK FORM. Which key is stored, and the way back to the screen that
+            changes it. Rendered in the header rather than beside Generate because
+            it is an account fact, not a per-run one — and because with a key
+            already stored the screen never appears on its own, so this link is
+            the only route to it. */}
+        {onOpenKeySettings !== undefined && (
+          <p className="picker-account" data-testid="picker-key">
+            <span data-testid="picker-key-status">{keyStatus ?? "API key status unknown"}</span>{" "}
+            <button
+              type="button"
+              className="picker-key-button"
+              data-testid="picker-key-button"
+              onClick={onOpenKeySettings}
+            >
+              Change API key
+            </button>
           </p>
         )}
       </header>

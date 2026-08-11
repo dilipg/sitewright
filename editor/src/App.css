@@ -1032,6 +1032,144 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+/* The API-key form (BYOK) — hosted mode only, shown by itself when no key is
+   stored and reachable from the picker's header otherwise. It borrows
+   `.picker-panel`, `.picker-generate`, `.picker-budget`, `.picker-error` and
+   `.progress-secondary` deliberately: the two screens are one flow, and a
+   settings screen with its own visual vocabulary reads as a different app.
+
+   Note there is no rule for a sign-up or password-reset affordance, because the
+   markup has neither — account creation exists only in the operator CLI. And
+   note there is nothing here that could reveal the field's contents: the key
+   input is `type="password"`, and no rule sets `-webkit-text-security` or any
+   other property that would undo that. */
+.key-settings {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 22px;
+  flex: 1;
+  overflow-y: auto;
+  padding: 40px 24px;
+}
+
+.key-header {
+  width: 100%;
+  max-width: 560px;
+}
+
+.key-header h1 {
+  margin: 0 0 4px;
+  font-size: 20px;
+}
+
+.key-intro {
+  margin: 0;
+  color: #9a9aa8;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+/* The stored key, as `Provider · ••••fingerprint`. Monospaced so the four
+   disclosed characters can be compared against the provider's own console
+   without misreading an l for a 1. */
+.key-stored {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 14px;
+  color: #e8e8ee;
+}
+
+.key-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.key-form {
+  display: flex;
+  flex-direction: column;
+}
+
+.key-providers {
+  border: 1px solid #3a3a46;
+  border-radius: 6px;
+  margin: 0 0 14px;
+  padding: 10px 12px;
+}
+
+.key-providers legend {
+  color: #9a9aa8;
+  font-size: 12px;
+  padding: 0 4px;
+}
+
+.key-provider-option {
+  display: grid;
+  grid-template-columns: auto auto 1fr;
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 0;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.key-provider-name {
+  color: #e8e8ee;
+}
+
+.key-provider-hint {
+  color: #9a9aa8;
+  font-size: 12px;
+}
+
+.key-form label {
+  font-size: 12px;
+  color: #9a9aa8;
+  margin-bottom: 4px;
+}
+
+.key-form input[type="password"] {
+  background: #14141a;
+  border: 1px solid #3a3a46;
+  color: #e8e8ee;
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 14px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  margin-bottom: 14px;
+}
+
+.key-footnote {
+  margin: 12px 0 0;
+  color: #9a9aa8;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+/* The accepted risk, stated where the provider is chosen. Amber rather than
+   muted: on a Gemini key the spend figure is a FLOOR and the daily budget does
+   not bound it, which a tester needs to read rather than skim. */
+.key-warning {
+  margin: 10px 0 0;
+  color: #ffce8a;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+/* The picker's own link to the screen above. A button, not an anchor: it changes
+   which screen renders, it does not navigate. */
+.picker-key-button {
+  background: none;
+  border: none;
+  color: #4f8ef7;
+  font-family: inherit;
+  font-size: 13px;
+  padding: 0;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
 /* Generation progress (task 4) — the screen a tester watches for ~11 minutes
    while a run spends their own money. Same panel vocabulary as the picker, so
    the two read as one flow rather than two apps. */

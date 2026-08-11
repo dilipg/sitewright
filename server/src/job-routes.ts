@@ -112,14 +112,25 @@ const BAD_BRIEF = { error: "a brief is required" };
  * press Generate. Without this they got **202**, a project row, a directory, a
  * job, an eleven-minute progress screen and then a `failed` job reading "no
  * model-provider API key: save one in settings, or supply one with this request" —
- * where "settings" names nothing that exists (there is no key UI anywhere in
- * `editor/src`), the only action the screen then offers is Resume (which
- * re-enters `buildAgentEnv` and fails identically), and every attempt left
- * another permanent, undeletable project row in the picker.
+ * where "settings" named nothing that existed, the only action the screen then
+ * offers is Resume (which re-enters `buildAgentEnv` and fails identically), and
+ * every attempt left another permanent, undeletable project row in the picker.
  *
  * The MESSAGE names the thing that actually works. It reaches the user
  * verbatim: `ProjectPicker`'s `refusalMessage` reads `.error` off a non-202 and
  * renders it, deliberately, because this endpoint words its own refusals.
+ *
+ * REWRITTEN NOW THAT BOTH OF ITS CLAIMS ARE FALSE, and both were reaching the
+ * browser verbatim. It said "no **Anthropic** API key", which stopped being the
+ * only kind the moment a key could be stored per provider — a tester holding a
+ * Google AI Studio key was told to go and get a different one. And it said
+ * "**There is no settings screen yet**", which was true when it was written and is
+ * the single most misleading half-sentence a user could now read: there is one,
+ * `editor/src/components/KeySettings.tsx`, it shows itself when no key is stored,
+ * and it is reachable from the picker's header the rest of the time. So this now
+ * names the screen FIRST (what a browser user does) and keeps `PUT /api/key` after
+ * it (what the from-source README path and any script does), rather than offering
+ * only the raw endpoint to someone sitting in front of a form.
  *
  * `getApiKeyFingerprint` rather than `resolveApiKey`/`assertApiKeyUsable`, and
  * that is a deliberate limit, not an oversight: it takes NO master key, so this
@@ -134,9 +145,10 @@ const BAD_BRIEF = { error: "a brief is required" };
  */
 const NO_API_KEY = {
   error:
-    "no Anthropic API key is stored for this account, and a generation cannot run without one. " +
-    "There is no settings screen yet: store one with PUT /api/key (README step 7, \"Give the " +
-    "server your Anthropic API key\"), then generate again. Nothing was created and nothing was charged.",
+    "no API key is stored for this account, and a generation cannot run without one. " +
+    "Save one on the API key screen (\"Change API key\", beside your email on the sites list), or " +
+    "with PUT /api/key, then generate again. An Anthropic or a Google Gemini key both work. " +
+    "Nothing was created and nothing was charged.",
 };
 /** Same shape router.ts's own readJsonBody-failure responses use elsewhere (compiler-routes.ts's enqueueHandler) — a malformed body is a body problem, not a missing-field problem, and deserves its own message rather than being folded into BAD_BRIEF. */
 const BAD_JSON_BODY = { error: "request body must be valid JSON within the size limit" };

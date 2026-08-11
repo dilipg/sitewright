@@ -193,18 +193,30 @@ describe("POST /api/generate", () => {
     expect(readdirSync(projectsRoot)).toEqual([]);
   });
 
-  it("names PUT /api/key in the refusal, because there is no settings screen to send anyone to", async () => {
+  it("names the API key screen AND PUT /api/key, and no longer claims there is no screen", async () => {
     const { db, alice, call, aliceCookie } = harness();
     deleteApiKey(db, alice.id);
 
     const result = await call("POST", "/api/generate", aliceCookie, { brief: "a bakery landing page" });
 
     // The wording IS the fix: this reaches the tester verbatim through
-    // `ProjectPicker`'s `refusalMessage`, and the previous message ("save one
-    // in settings") named nothing that exists in `editor/src`.
+    // `ProjectPicker`'s `refusalMessage`. Both of the previous message's claims
+    // have since become false, and both were reaching the browser: it named
+    // ANTHROPIC as though it were the only storable provider, and it stated
+    // "There is no settings screen yet" — which is now the most misleading thing
+    // a user could read, since `editor/src/components/KeySettings.tsx` shows
+    // itself precisely when this refusal is possible.
     const body = result.json as { error: string };
+    expect(body.error).toContain("API key screen");
+    // The endpoint stays named, for the from-source README path and for scripts.
     expect(body.error).toContain("PUT /api/key");
-    expect(body.error).not.toContain("in settings");
+    expect(body.error).not.toMatch(/no settings screen|settings screen yet/i);
+    // Neither provider is presented as the only one that works.
+    expect(body.error).toContain("Gemini");
+    expect(body.error).not.toMatch(/no Anthropic API key/i);
+    // Unchanged and still load-bearing: the refusal happens before anything is
+    // created, and the message has to say so or a tester assumes they were billed.
+    expect(body.error).toContain("Nothing was created and nothing was charged");
   });
 
   it("checks the key before the body is read, so a keyless caller with a malformed body still gets the key message", async () => {

@@ -166,6 +166,26 @@ export function meUrl(): string {
 }
 
 /**
+ * BYOK FORM. All three methods (`GET`, `PUT`, `DELETE`) address ONE resource, so
+ * there is one function rather than three — the method is the verb, the URL is
+ * the noun.
+ *
+ * Session-only in `server/src/project-registry.ts`, and takes no `?project=` for
+ * a stronger reason than `loginUrl`/`meUrl` do: a stored key belongs to the
+ * SESSION'S OWN USER and there is no user id anywhere in the path, which is what
+ * makes it structurally impossible to point any of the three at somebody else's
+ * key. Adding a project (or any other) parameter here would be the first step
+ * toward a route that could be.
+ *
+ * Interpolates nothing, so — unlike `jobUrl` or `previewUrl` — it is not a `..`
+ * site at all. Worth stating rather than leaving as an accident, since this
+ * codebase has shipped four such defects at four layers.
+ */
+export function keyUrl(): string {
+  return "/api/key";
+}
+
+/**
  * TASK 3. Both are session-only in `server/src/project-registry.ts` and take
  * no `?project=` for the same reason `loginUrl`/`meUrl` do not: they are what
  * a caller uses when there is no project yet. `POST /api/generate` is

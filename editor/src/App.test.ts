@@ -44,7 +44,10 @@ describe("App.tsx: every read goes through the session-aware layer (finding B)",
     // after the job already succeeded, the same 401 was reported as a regen
     // FAILURE for work that landed.
     const body = functionBody("refreshManifest");
-    expect(body).toContain("fetchJson<Manifest>(");
+    // `<unknown>` since C2: the value is not a `Manifest` until
+    // `isManifestShaped` says so, and a cast that asserts the shape is what
+    // let a `{error}` body through in the first place.
+    expect(body).toContain('fetchJson<unknown>(backend.previewUrl("/manifest.json")');
     expect(body).not.toMatch(/[^a-zA-Z]fetch\(/);
   });
 
@@ -52,9 +55,68 @@ describe("App.tsx: every read goes through the session-aware layer (finding B)",
     const body = functionBody("refreshManifest");
     // A 200 carrying something that is not a manifest is a DIFFERENT failure
     // from a 401 carrying something that parses, and it is the one that
-    // actually reached the DOM.
-    expect(body).toContain("loaded.nodes");
+    // actually reached the DOM. The check itself now lives in
+    // `lib/canvas.ts` (C2) and is unit-tested there; what this asserts is that
+    // this reader still runs it, and still throws rather than storing.
+    expect(body).toContain("isManifestShaped(loaded)");
     expect(body).toContain("throw new Error");
+  });
+
+  /**
+   * WHOLE-BRANCH REVIEW, C2 — the OTHER reader of `manifest.json`.
+   *
+   * The finding-B fix above was applied to `refreshManifest` and not to the
+   * canvas bootstrap four hundred lines above it in the same file, which read
+   * `.json()` straight into state. Task 3's picker then made that reader
+   * reachable in one click, on a project whose directory is legitimately empty
+   * for the ~11 minutes a generation takes (and forever, if it failed): the
+   * preview pool's JSON failure body became `manifest = {error}`, and
+   * `routesFromManifest` threw inside a `useMemo` DURING RENDER with no error
+   * boundary above it — a blank page, and no route back, because the picker
+   * renders only when `?project=` is absent.
+   */
+  it("the bootstrap validates the manifest before it reaches state, like refreshManifest", () => {
+    const body = functionBody("bootstrap");
+    // A status check first, so a 503/401 body is never parsed as a manifest...
+    expect(body).toContain('fetchJson<unknown>(backend.previewUrl("/manifest.json"))');
+    expect(body).not.toMatch(/\.json\(\) as Promise<Manifest>/);
+    // ...and the same shape guard as the other reader, BEFORE setManifest.
+    expect(body).toContain("if (!isManifestShaped(manifestJson)) throw new Error");
+    const guardIndex = body.indexOf("isManifestShaped(manifestJson)");
+    const storeIndex = body.indexOf("setManifest(manifestJson)");
+    expect(guardIndex).toBeGreaterThan(-1);
+    expect(storeIndex).toBeGreaterThan(guardIndex);
+  });
+
+  it("a bootstrap failure leaves a way back to the project list, not a blank page", () => {
+    // The state is held, not merely logged...
+    expect(appSource).toContain("setBootstrapError(");
+    // ...and rendered as its own screen, in hosted mode only (local mode keeps
+    // today's console.error-and-sit-on-Loading behaviour, and the milestone-7
+    // Playwright suite runs there).
+    expect(appSource).toContain("if (hostedMode && bootstrapError !== null) {");
+    // The way back is a real navigation that drops `?project=`, which is what
+    // makes the picker render again — a reload alone reproduced the dead end.
+    expect(appSource).toContain("editorUrlWithoutProject(window.location.href)");
+    const branchIndex = appSource.indexOf("if (hostedMode && bootstrapError !== null) {");
+    expect(appSource.indexOf('data-testid="bootstrap-error-back"')).toBeGreaterThan(branchIndex);
+  });
+
+  /**
+   * WHOLE-BRANCH REVIEW, I1. `/api/me` carries the money fields the picker
+   * renders beside the Generate button, and it was read once per tab: after a
+   * ~$1.74 run the tester was told "$10.00 of your $10.00 daily budget is left
+   * ($0.00 spent)" beside the button that had just spent it. Five runs later it
+   * still said $10.00 and the next Generate was refused 402 — the precise
+   * failure that line was added to prevent.
+   */
+  it("re-reads /api/me when a generation ends, so the budget line is not stale money", () => {
+    const start = appSource.indexOf("void fetchJson<AccountSummary>(meUrl()");
+    expect(start, "App.tsx no longer reads /api/me through fetchJson").toBeGreaterThan(-1);
+    // The dependency IS the fix: `startedGeneration` returns to null on the one
+    // path back to the picker, so this fires on exactly that edge.
+    const effectTail = appSource.slice(start, start + 600);
+    expect(effectTail).toContain("}, [startedGeneration]);");
   });
 
   /**

@@ -35,12 +35,20 @@ import {
   isEditableWidth,
   PREVIEW_WIDTHS,
   isFrameNearViewport,
+  isManifestShaped,
   renderedSections,
   routesFromManifest,
   splitOverridesByRoute,
   zoomAt,
 } from "./lib/canvas";
-import { backend, editorUrlForProject, encodePathSegment, hostedMode, meUrl } from "./lib/backend";
+import {
+  backend,
+  editorUrlForProject,
+  editorUrlWithoutProject,
+  encodePathSegment,
+  hostedMode,
+  meUrl,
+} from "./lib/backend";
 import { applyEditOperations, interpretEditResult, validateEditOperations } from "./lib/edit-ops";
 import type { EditPromptResponse } from "./lib/edit-ops";
 import { expandStyleValue } from "./lib/inventory";
@@ -98,6 +106,14 @@ const JOB_INTERRUPTED_MESSAGE =
   "The server restarted while this was running, so the outcome is unknown. Check the page to see whether the change went through before trying again.";
 
 const SESSION_EXPIRED_MESSAGE = "Your session expired — sign in again.";
+
+/**
+ * WHOLE-BRANCH REVIEW, C2. One message, thrown by BOTH readers of
+ * `manifest.json` (bootstrap and `refreshManifest`) when a 200 carries
+ * something that is not a manifest — a different failure from a non-2xx, and
+ * the one that actually reached the DOM.
+ */
+const MANIFEST_SHAPE_ERROR = "manifest.json did not have the expected shape";
 
 /**
  * What `GET /api/me` gives back for a valid session.
@@ -267,6 +283,15 @@ export default function App() {
   // branch below. NOT a login flag (that is `sessionExpired`) -- it is the
   // identity the project picker (task 3) renders.
   const [account, setAccount] = useState<AccountSummary | null>(null);
+  // WHOLE-BRANCH REVIEW, C2. Why the bootstrap failed, when it failed for a
+  // reason that is not a session expiry (that has its own state, above). Held
+  // rather than only logged, because it is the difference between a blank page
+  // and a screen with a way back: the picker renders ONLY when `?project=` is
+  // absent, so without this a project that cannot be opened is a dead end that
+  // survives a reload. Rendered in hosted mode only — local mode keeps today's
+  // console.error-and-sit-on-"Loading…" behaviour byte-identically, and the
+  // milestone-7 Playwright suite runs there.
+  const [bootstrapError, setBootstrapError] = useState<string | null>(null);
   // TASK 3. A generation that has STARTED — both ids, held together, because
   // they name different things: `jobId` is what the progress view polls,
   // `projectId` is what the editor opens once the job succeeds.
@@ -370,12 +395,21 @@ export default function App() {
         setPendingPlan({ brief: plan.brief, routes: plan.siteplan.routes });
       }
 
+      // WHOLE-BRANCH REVIEW, C2 — the other reader of the same resource.
+      // `refreshManifest` (below) was given a status check and a shape check by
+      // this branch's own finding-B fix; THIS reader kept `.json()`-straight-
+      // into-state, and task 3's picker then made it reachable in one click on
+      // a project whose directory is still empty. `fetchJson` throws on any
+      // non-2xx before `.json()` is called (so the preview pool's 503 body is
+      // never parsed as a manifest at all), and `isManifestShaped` refuses a
+      // 200 that is not one — both BEFORE anything reaches state, because
+      // `routes` is a `useMemo` over `manifest` and a bad value there throws
+      // inside render, where nothing catches it.
       const [manifestJson, tokensJson] = await Promise.all([
-        sessionAwareFetch(backend.previewUrl("/manifest.json")).then((r) => r.json() as Promise<Manifest>),
-        sessionAwareFetch(backend.previewUrl("/src/tokens/tokens.json")).then(
-          (r) => r.json() as Promise<TokensJson>,
-        ),
+        fetchJson<unknown>(backend.previewUrl("/manifest.json")),
+        fetchJson<TokensJson>(backend.previewUrl("/src/tokens/tokens.json")),
       ]);
+      if (!isManifestShaped(manifestJson)) throw new Error(MANIFEST_SHAPE_ERROR);
       manifestRef.current = manifestJson;
       setManifest(manifestJson);
       setTokens(tokensJson);
@@ -404,11 +438,12 @@ export default function App() {
         setSessionExpired(true);
         return;
       }
-      // Not a session expiry -- outside this task's scope to design a full
-      // bootstrap-failure UI (there was none before this task either), but
-      // this keeps the failure from being a completely silent, unhandled
-      // rejection.
+      // Not a session expiry. Logged, as before -- and, since the whole-branch
+      // review's C2, also HELD, so hosted mode can render a screen with a way
+      // back instead of a canvas that never arrives. Local mode is unchanged:
+      // nothing reads this state there.
       console.error("[bootstrap] failed", error);
+      setBootstrapError(error instanceof Error ? error.message : String(error));
     });
   }, []);
 
@@ -426,6 +461,25 @@ export default function App() {
    * a "Checking…" screen forever is the silent-hang bug this codebase has
    * now fixed three times, and the real cause surfaces the moment they press
    * Sign in (`submitLogin` reports it verbatim). One flag, no third state.
+   *
+   * WHOLE-BRANCH REVIEW, I1 — IT RE-READS WHEN `startedGeneration` CHANGES,
+   * and that dependency is the whole fix. `/api/me` carries the money fields
+   * the picker renders beside the Generate button, and it was read exactly once
+   * per tab: a tester who generated a site (~$1.74), pressed "Back to your
+   * sites" and looked at the budget line was told "$10.00 of your $10.00 daily
+   * budget is left ($0.00 spent in the last 24 hours)" — beside the button that
+   * had just spent it. After five runs in one tab it still said $10.00 and the
+   * next Generate was refused 402, which is the precise failure the line was
+   * added to prevent. `startedGeneration` transitions to `null` on exactly the
+   * one path back to the picker (`onAbandon`), and to a value when a run
+   * starts, so this fires on both edges. `account` is NOT cleared first: the
+   * picker would otherwise flash "Checking your session…" on every return.
+   *
+   * The `catch` above applies to the re-reads too, which is deliberate and was
+   * considered: a re-read that fails (the server restarted mid-run) shows the
+   * login screen rather than a stale budget. That is recoverable rather than
+   * lossy — the persisted `{jobId, projectId}` survives a 401 by design, so
+   * signing back in returns to the run, which task 4 confirmed live.
    */
   useEffect(() => {
     if (!hostedShellWithoutProject) return;
@@ -435,7 +489,7 @@ export default function App() {
         if (!(error instanceof SessionExpiredError)) console.error("[session] /api/me failed", error);
         setSessionExpired(true);
       });
-  }, []);
+  }, [startedGeneration]);
 
   /**
    * TASK 4 — the write half of reload survival. ONE write path, driven by the
@@ -1084,12 +1138,15 @@ export default function App() {
    *  The shape check is deliberately separate from the status check: a 200
    *  carrying something that is not a manifest is a different failure from a
    *  401 carrying something that parses, and it is the one that actually
-   *  reached the DOM. */
+   *  reached the DOM.
+   *
+   *  WHOLE-BRANCH REVIEW, C2: that shape check was written out inline here and
+   *  nowhere else, while the bootstrap read the same resource with no check at
+   *  all. It is now `isManifestShaped` in `lib/canvas.ts` — beside the function
+   *  it protects, called by both readers, and unit-tested there. */
   async function refreshManifest(): Promise<Manifest> {
-    const loaded = await fetchJson<Manifest>(backend.previewUrl("/manifest.json"), { cache: "no-store" });
-    if (loaded === null || typeof loaded !== "object" || typeof loaded.nodes !== "object" || loaded.nodes === null) {
-      throw new Error("manifest.json did not have the expected shape");
-    }
+    const loaded = await fetchJson<unknown>(backend.previewUrl("/manifest.json"), { cache: "no-store" });
+    if (!isManifestShaped(loaded)) throw new Error(MANIFEST_SHAPE_ERROR);
     manifestRef.current = loaded;
     setManifest(loaded);
     return loaded;
@@ -1509,6 +1566,52 @@ export default function App() {
     return (
       <div className="editor-root">
         <LoginScreen onAuthenticated={onAuthenticated} />
+      </div>
+    );
+  }
+
+  /**
+   * WHOLE-BRANCH REVIEW, C2 — THE WAY BACK.
+   *
+   * A project can legitimately exist with an empty directory: `POST
+   * /api/generate` creates the row and the directory before queueing the job,
+   * so for the ~11 minutes a run takes there is nothing to bootstrap — and a
+   * generation that FAILED leaves that row permanently (there is no
+   * `DELETE /api/projects/:id` and no status column, so the picker cannot even
+   * mark it). Task 4 withholds "open the project" during a run for exactly this
+   * reason; task 3's picker lists the same project and opens it in one click.
+   *
+   * Before this, that click ended on a blank page: the pool's JSON failure body
+   * became `manifest = {error}`, `routesFromManifest` threw inside a `useMemo`
+   * during render, the tree unmounted, and a reload reproduced it — the picker
+   * renders only when `?project=` is absent, so there was no route back short
+   * of editing the URL by hand. The shape check above stops the crash; this
+   * screen is what makes the state recoverable.
+   *
+   * Hosted mode only, and above the picker branch rather than inside it: this
+   * state is reachable only WITH a `?project=`, which is precisely when the
+   * picker does not render.
+   */
+  if (hostedMode && bootstrapError !== null) {
+    return (
+      <div className="editor-root">
+        <div className="bootstrap-error" data-testid="bootstrap-error" role="alert">
+          <h1>This site could not be opened</h1>
+          <p>
+            Its files could not be loaded. The usual reason is that its generation is still
+            running — a new site has no files until the run finishes — or that the generation
+            failed. Nothing was changed by opening it.
+          </p>
+          <p className="bootstrap-error-detail">{bootstrapError}</p>
+          <button
+            type="button"
+            className="picker-generate"
+            data-testid="bootstrap-error-back"
+            onClick={() => window.location.assign(editorUrlWithoutProject(window.location.href))}
+          >
+            Back to your sites
+          </button>
+        </div>
       </div>
     );
   }

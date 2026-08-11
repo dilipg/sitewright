@@ -1604,3 +1604,39 @@ body {
   width: 100%;
   height: 5px;
 }
+
+
+/* WHOLE-BRANCH REVIEW, C2 — the screen that replaced a dead-end blank page for
+   a project whose files are not there (its generation is still running, or it
+   failed). Class-prefixed like every other selector added by this branch, so it
+   cannot reach the milestone-7 suite. */
+.bootstrap-error {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  gap: 12px;
+  padding: 32px;
+  text-align: center;
+}
+
+.bootstrap-error h1 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+  color: #e8e8f0;
+}
+
+.bootstrap-error p {
+  margin: 0;
+  max-width: 520px;
+  font-size: 13px;
+  color: #9a9aa8;
+}
+
+.bootstrap-error-detail {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  color: #ff9a9a;
+}

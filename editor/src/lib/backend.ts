@@ -254,6 +254,35 @@ export function editorUrlForProject(projectId: string, currentHref: string): str
   return url.toString();
 }
 
+/**
+ * THE WAY BACK — `editorUrlForProject`'s exact counterpart, and the whole of
+ * the C2 fix's escape hatch (whole-branch review).
+ *
+ * The picker renders only when `?project=` is absent, so a project that cannot
+ * be bootstrapped (its directory is still empty because its generation is
+ * running, or it failed and the row is permanent) used to be a dead end: a
+ * reload reproduced the same broken state and the only exit was hand-editing
+ * the URL. Removing the parameter is what returns the tester to their own list.
+ *
+ * Same URL discipline as `editorUrlForProject`, for the same reasons: built
+ * from the current href so nothing else on the URL is silently dropped, and
+ * pure (the href arrives as a string) so it is testable in a windowless vitest
+ * environment.
+ *
+ * WORTH KNOWING, since it follows from `isHostedMode`'s two disjuncts rather
+ * than from anything here: with `VITE_WEBGEN_HOSTED=1` set (what
+ * `npm run dev:hosted` does, and what the README tells a tester to run) this
+ * lands on the picker. With the flag UNSET and hosted mode reached only by a
+ * pasted `?project=`, removing it lands in local mode — which is where a bare
+ * `/` would have landed in that setup anyway, so it is still coherent, just
+ * not the picker.
+ */
+export function editorUrlWithoutProject(currentHref: string): string {
+  const url = new URL(currentHref);
+  url.searchParams.delete(PROJECT_QUERY_PARAM);
+  return url.toString();
+}
+
 export interface Backend {
   readonly mode: BackendMode["kind"];
   /** `undefined` in local mode — there is no project, only the fixed local

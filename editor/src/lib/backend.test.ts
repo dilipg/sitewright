@@ -3,6 +3,7 @@ import {
   backend,
   createBackend,
   editorUrlForProject,
+  editorUrlWithoutProject,
   encodePathSegment,
   generateUrl,
   hostedMode,
@@ -344,6 +345,42 @@ describe("editorUrlForProject", () => {
     const url = new URL(href);
     expect(url.pathname).toBe("/editor/");
     expect(url.searchParams.get("project")).toBe("../../api/key");
+  });
+});
+
+/**
+ * WHOLE-BRANCH REVIEW, C2 — the way back out of a project that cannot be
+ * opened. The picker renders only when `?project=` is absent, so dropping the
+ * parameter is the whole mechanism; a reload alone reproduced the dead end.
+ */
+describe("editorUrlWithoutProject", () => {
+  it("drops ?project=, which is what makes the picker render again", () => {
+    const href = editorUrlWithoutProject("http://localhost:5173/?project=proj-1");
+    expect(new URL(href).searchParams.has("project")).toBe(false);
+    // The property that matters, asserted through the real resolver rather
+    // than by reading the string: this must land back in a mode with no
+    // project, which is what the hosted shell shows the picker for.
+    expect(resolveMode(new URL(href).search, EDITOR_ORIGIN).kind).toBe("local");
+    expect(isHostedMode(new URL(href).search, "1")).toBe(true);
+  });
+
+  it("is a no-op for a URL that carries no project", () => {
+    expect(editorUrlWithoutProject("http://localhost:5173/")).toBe("http://localhost:5173/");
+  });
+
+  it("drops EVERY project value, not just the first", () => {
+    // `URLSearchParams.get` reads the first, so leaving a second behind would
+    // put the tester straight back on the project they could not open.
+    const href = editorUrlWithoutProject("http://localhost:5173/?project=a&project=b");
+    expect(new URL(href).searchParams.getAll("project")).toEqual([]);
+  });
+
+  it("keeps every other query parameter, exactly like editorUrlForProject", () => {
+    const url = new URL(
+      editorUrlWithoutProject("http://localhost:5173/?project=p&preview=http%3A%2F%2Fx&debug=1"),
+    );
+    expect(url.searchParams.get("preview")).toBe("http://x");
+    expect(url.searchParams.get("debug")).toBe("1");
   });
 });
 

@@ -12,6 +12,34 @@ export interface RouteInfo {
   path: string;
 }
 
+/**
+ * Is this parsed JSON actually a manifest? ONE definition, shared by BOTH
+ * readers of `manifest.json`.
+ *
+ * WHOLE-BRANCH REVIEW, C2. The branch's own finding-B fix added this check to
+ * `App.tsx`'s `refreshManifest` and left the OTHER reader — the canvas
+ * bootstrap, four hundred lines above in the same file — reading `.json()`
+ * straight into state; task 3's project picker then made that reader reachable
+ * in one click. A project whose directory is still empty (`POST /api/generate`
+ * creates the row and the directory ~11 minutes before the files exist, and a
+ * failed generation leaves one forever) answers with the preview pool's own
+ * JSON failure body, so `manifest` became `{error: "…"}`: non-null, with no
+ * `nodes`. `routesFromManifest` below then threw `TypeError: Cannot convert
+ * undefined or null to object` inside a `useMemo` DURING RENDER, with no error
+ * boundary anywhere above it — a blank page with no route back, since the
+ * picker only renders when `?project=` is absent.
+ *
+ * It lives here, immediately beside the one function that indexes
+ * `manifest.nodes`, so the guard and the code it protects cannot drift apart.
+ * A type predicate rather than a boolean helper so a caller cannot forget to
+ * narrow: the value is `unknown` until this says otherwise.
+ */
+export function isManifestShaped(value: unknown): value is Manifest {
+  if (value === null || typeof value !== "object") return false;
+  const nodes = (value as { nodes?: unknown }).nodes;
+  return typeof nodes === "object" && nodes !== null;
+}
+
 /** Routes are derived from the manifest, not fetched separately — every
  * active node's id is prefixed with its route slug, and carries the route's
  * real path, so the full route list is already implied by data the editor

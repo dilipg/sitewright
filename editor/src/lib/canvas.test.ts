@@ -7,6 +7,7 @@ import {
   frameOffsetX,
   isEditableWidth,
   isFrameNearViewport,
+  isManifestShaped,
   MAX_ZOOM,
   MIN_ZOOM,
   PREVIEW_WIDTHS,
@@ -15,6 +16,51 @@ import {
   splitOverridesByRoute,
   zoomAt,
 } from "./canvas";
+
+/**
+ * WHOLE-BRANCH REVIEW, C2. `routesFromManifest` is called from a `useMemo`
+ * during render with no error boundary above it, so anything that is not a
+ * manifest must be refused BEFORE it reaches state — a blank page with no
+ * route back is the failure this guard exists to prevent, and the value it
+ * guards against is a real one: the preview pool answers a project whose
+ * directory is still empty with `{error: "…"}`, which is JSON, parses fine,
+ * and is not null.
+ */
+describe("isManifestShaped", () => {
+  it("accepts a real manifest", () => {
+    const manifest: Manifest = {
+      version: 1,
+      nodes: {
+        "home.hero": { route: "/", file: "", component: "", element: "", editable: [], status: "active" },
+      },
+    };
+    expect(isManifestShaped(manifest)).toBe(true);
+  });
+
+  it("accepts a manifest with no nodes yet, which is a real (if empty) project", () => {
+    expect(isManifestShaped({ version: 1, nodes: {} })).toBe(true);
+  });
+
+  it("REJECTS the preview pool's own JSON error body, the exact value that reached the DOM", () => {
+    // `server/src/preview-forward.ts` answers 503/500 with `{error}`; a
+    // 401's body (`{error: "not authenticated"}`) has the same shape.
+    expect(isManifestShaped({ error: "the preview for this project is not available" })).toBe(false);
+  });
+
+  it("rejects every other shape that parses but has no node registry", () => {
+    for (const value of [null, undefined, "", "{}", 0, [], { nodes: null }, { nodes: "home.hero" }, {}]) {
+      expect(isManifestShaped(value), `expected ${JSON.stringify(value ?? null)} to be rejected`).toBe(
+        false,
+      );
+    }
+  });
+
+  it("throws where the guard is missing, which is why the guard exists", () => {
+    // Not a test of the guard — a test of the CONSEQUENCE, so the cost of
+    // removing the guard is written down beside it and stays measurable.
+    expect(() => routesFromManifest({ error: "nope" } as unknown as Manifest)).toThrow(TypeError);
+  });
+});
 
 describe("routesFromManifest", () => {
   it("derives the unique route list (slug + path) from manifest node ids and their route field", () => {

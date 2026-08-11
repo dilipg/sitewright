@@ -18,9 +18,9 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { Plugin } from "vite";
 import { MAX_BODY_BYTES } from "./max-body-bytes.ts";
+import type { SnapshotClaim } from "./regen-api.ts";
 import {
   regenApiPlugin,
-  releaseSnapshotClaim,
   restoreSnapshot,
   runProcess,
   snapshotRoute,
@@ -467,9 +467,24 @@ describe("snapshot/restore: a snapshot may only restore the route it came from (
     return dir;
   }
 
+  /**
+   * A snapshot whose regeneration has FINISHED — the endpoint's own `finally`
+   * releases the claim before the response is even flushed, and that is the
+   * only state in which a revert is ever offered.
+   *
+   * Written out here (rather than a bare `snapshotRoute`) since the
+   * whole-branch review's C1: a revert while the run is still going is now
+   * REFUSED, so leaving these snapshots claimed would make every test below
+   * assert C1's message instead of the ownership rule it names. The refusal
+   * itself has its own tests in the C1 block at the bottom of this file.
+   */
+  function finishedSnapshot(root: string, route: string): void {
+    snapshotRoute(root, route).release();
+  }
+
   it("refuses to restore `home`'s snapshot into `about`, leaving `about` untouched", () => {
     const root = twoRouteProject();
-    snapshotRoute(root, "home");
+    finishedSnapshot(root, "home");
 
     expect(() => restoreSnapshot(root, "about")).toThrow(/belongs to route "home"/);
 
@@ -480,7 +495,7 @@ describe("snapshot/restore: a snapshot may only restore the route it came from (
 
   it("does not consume the snapshot, so the legitimate revert still works after a refused one", () => {
     const root = twoRouteProject();
-    snapshotRoute(root, "home");
+    finishedSnapshot(root, "home");
     try {
       restoreSnapshot(root, "about");
     } catch {
@@ -502,7 +517,7 @@ describe("snapshot/restore: a snapshot may only restore the route it came from (
 
   it("still restores the route the snapshot WAS taken from", () => {
     const root = twoRouteProject();
-    snapshotRoute(root, "home");
+    finishedSnapshot(root, "home");
     rmSync(join(root, "src", "pages", "home"), { recursive: true, force: true });
 
     restoreSnapshot(root, "home");
@@ -512,13 +527,13 @@ describe("snapshot/restore: a snapshot may only restore the route it came from (
 
   it("accepts a section id for the owning route, not just a bare slug", () => {
     const root = twoRouteProject();
-    snapshotRoute(root, "home");
+    finishedSnapshot(root, "home");
     expect(() => restoreSnapshot(root, "home.hero")).not.toThrow();
   });
 
   it("refuses a snapshot slot with no owner record (taken before this guard)", () => {
     const root = twoRouteProject();
-    snapshotRoute(root, "home");
+    finishedSnapshot(root, "home");
     rmSync(join(root, ".regen-backup", "route.txt"), { force: true });
 
     expect(() => restoreSnapshot(root, "home")).toThrow(/belongs to route null/);
@@ -550,9 +565,16 @@ describe("snapshot/restore: no destructive step may precede its validation (F13 
     return dir;
   }
 
+  /** See the identically-named helper in the F13 block above: a snapshot whose
+   *  regeneration has finished, which is the only state a revert is offered
+   *  in (C1). */
+  function finishedSnapshot(root: string, route: string): void {
+    snapshotRoute(root, route).release();
+  }
+
   it("finding 4: a valid slug with no page directory must not destroy the pending snapshot", () => {
     const root = twoRouteProject();
-    snapshotRoute(root, "home");
+    finishedSnapshot(root, "home");
 
     // "contact" passes ROUTE_SLUG but has no directory. The old order wiped the
     // slot first and only then threw on the copy.
@@ -567,7 +589,7 @@ describe("snapshot/restore: no destructive step may precede its validation (F13 
 
   it("finding 3: an incomplete snapshot must not delete the target route first", () => {
     const root = twoRouteProject();
-    snapshotRoute(root, "home");
+    finishedSnapshot(root, "home");
     // Simulate a slot whose page half is gone but whose owner record is intact.
     rmSync(join(root, ".regen-backup", "page"), { recursive: true, force: true });
 
@@ -580,7 +602,7 @@ describe("snapshot/restore: no destructive step may precede its validation (F13 
 
   it("finding 3: a missing manifest half is refused too, non-destructively", () => {
     const root = twoRouteProject();
-    snapshotRoute(root, "home");
+    finishedSnapshot(root, "home");
     rmSync(join(root, ".regen-backup", "manifest.json"), { force: true });
 
     expect(() => restoreSnapshot(root, "home")).toThrow(/incomplete/);
@@ -594,7 +616,7 @@ describe("snapshot/restore: no destructive step may precede its validation (F13 
     // sides makes the stored value canonical instead.
     mkdirSync(join(root, "src", "pages", " home"), { recursive: true });
     writeFileSync(join(root, "src", "pages", " home", "spaced.tsx"), "// spaced\n", "utf8");
-    snapshotRoute(root, " home");
+    finishedSnapshot(root, " home");
 
     expect(readFileSync(join(root, ".regen-backup", "route.txt"), "utf8")).toBe("home");
   });
@@ -618,14 +640,26 @@ describe("snapshot/restore: no destructive step may precede its validation (F13 
  * then regenerate `about` — with no way out but reverting the kept work. The
  * tests below pin both halves: the concurrent case is refused, the sequential
  * case is not.
+ *
+ * WHOLE-BRANCH REVIEW, C1: the first version of this guard did not actually
+ * hold that property, and the review reproduced the full P1 corruption through
+ * it with a probe test. Two holes: `releaseSnapshotClaim(root)` decremented
+ * whatever claim the PROJECT had rather than the one the caller took, and
+ * `restoreSnapshot` deleted the claim outright — so an ungated
+ * `POST /__regen-revert` from a second tab freed a running regeneration's
+ * claim and let the next request clobber its snapshot. The permanent version
+ * of that probe is the "C1" block at the bottom of this describe.
  */
 describe("snapshotRoute: a second CONCURRENT regeneration may not replace the pending slot (P1)", () => {
   const dirs: string[] = [];
+  const held: SnapshotClaim[] = [];
   afterEach(() => {
-    for (const dir of dirs) {
-      releaseSnapshotClaim(dir); // a test that never "finished" its regen still holds one
-      rmSync(dir, { recursive: true, force: true });
-    }
+    // A test that never "finished" its regeneration still holds a live claim;
+    // released by handle, since a claim can no longer be freed by root alone
+    // (C1). Module state, so a leak would follow the process, not the dir.
+    for (const claim of held) claim.release();
+    held.length = 0;
+    for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
     dirs.length = 0;
     delete process.env.WG_REGEN_MOCK;
   });
@@ -642,21 +676,29 @@ describe("snapshotRoute: a second CONCURRENT regeneration may not replace the pe
     return dir;
   }
 
+  /** Snapshots a route and remembers the claim for cleanup — a regeneration
+   *  that is STILL RUNNING, which is what makes the slot claimed at all. */
+  function running(root: string, route: string): SnapshotClaim {
+    const claim = snapshotRoute(root, route);
+    held.push(claim);
+    return claim;
+  }
+
   /* ---------- the two functions directly ---------- */
 
   it("refuses a second concurrent snapshot rather than silently replacing the first", () => {
     const root = twoRouteProject();
-    snapshotRoute(root, "home");
+    running(root, "home");
 
     // `about`'s regen must not be allowed to discard `home`'s pending snapshot.
-    expect(() => snapshotRoute(root, "about")).toThrow(/pending regeneration/i);
+    expect(() => snapshotRoute(root, "about")).toThrow(/is still running/i);
     expect(readFileSync(join(root, ".regen-backup", "route.txt"), "utf8")).toBe("home");
   });
 
   it("leaves the refused-against snapshot fully intact and still restorable", () => {
     const root = twoRouteProject();
-    snapshotRoute(root, "home");
-    expect(() => snapshotRoute(root, "about")).toThrow(/pending regeneration/i);
+    const first = running(root, "home");
+    expect(() => snapshotRoute(root, "about")).toThrow(/is still running/i);
 
     // Asserting on the CONTENTS, not just on route.txt: the failure this
     // guards against wiped `page/` and `manifest.json` and then wrote a new
@@ -665,47 +707,56 @@ describe("snapshotRoute: a second CONCURRENT regeneration may not replace the pe
     expect(existsSync(join(root, ".regen-backup", "page", "home-only.tsx"))).toBe(true);
     expect(existsSync(join(root, ".regen-backup", "manifest.json"))).toBe(true);
     rmSync(join(root, "src", "pages", "home"), { recursive: true, force: true });
+    // `home`'s own run finishes (the endpoint's `finally`) and only THEN is the
+    // revert offered — reverting while it runs is refused, C1 below.
+    first.release();
     restoreSnapshot(root, "home");
     expect(existsSync(join(root, "src", "pages", "home", "home-only.tsx"))).toBe(true);
   });
 
-  it("names the pending route and says what to do about it", () => {
+  it("names the running route and the only action that actually works (I2)", () => {
     const root = twoRouteProject();
-    snapshotRoute(root, "home");
+    running(root, "home");
 
     // Exact wording, not a loose substring: a message that merely says "busy"
     // leaves the user with nothing to act on, and the endpoint's only channel
     // for this is the 500 body (the handler's existing catch).
+    //
+    // It used to say "revert or discard that regeneration before regenerating
+    // …", and the whole-branch review's I2 found both halves wrong: a revert is
+    // step 2 of C1's corruption sequence (and is now refused outright), and
+    // "discard" named a control the editor has never had. Waiting is the only
+    // correct action, so the message says exactly that.
     expect(() => snapshotRoute(root, "about")).toThrow(
-      'a pending regeneration of route "home" still holds this project\'s single snapshot slot; ' +
-        'revert or discard that regeneration before regenerating "about". Nothing was changed.',
+      'a regeneration of route "home" is still running and holds this project\'s single ' +
+        'snapshot slot; wait for it to finish, then regenerate "about". It cannot be cancelled, ' +
+        "and it cannot be reverted while it runs. Nothing was changed.",
     );
   });
 
   it("allows the SAME route to re-snapshot (the retry and page-regen paths)", () => {
     const root = twoRouteProject();
-    snapshotRoute(root, "home");
+    running(root, "home");
 
     // The editor re-runs a failed regen against the same section, and the page
     // path snapshots the route it is about to loop over. Refusing here would
     // break both — this is the regression the second required perturbation
     // (make the refusal reject the same route too) must make fail.
-    expect(() => snapshotRoute(root, "home")).not.toThrow();
-    expect(() => snapshotRoute(root, "home.hero".split(".")[0]!)).not.toThrow();
+    expect(() => running(root, "home")).not.toThrow();
+    expect(() => running(root, "home.hero".split(".")[0]!)).not.toThrow();
     expect(readFileSync(join(root, ".regen-backup", "route.txt"), "utf8")).toBe("home");
   });
 
   it("allows a fresh snapshot once the pending one has been consumed", () => {
     const root = twoRouteProject();
-    snapshotRoute(root, "home");
+    running(root, "home").release(); // the run finishes, then the user reverts
     restoreSnapshot(root, "home");
     expect(() => snapshotRoute(root, "about")).not.toThrow();
   });
 
   it("allows another route once the pending regeneration has FINISHED, not only once reverted", () => {
     const root = twoRouteProject();
-    snapshotRoute(root, "home");
-    releaseSnapshotClaim(root); // what the endpoint's `finally` does
+    running(root, "home").release(); // what the endpoint's `finally` does
 
     // The slot still exists on disk and still says "home" — a user who kept
     // their regeneration never reverts, and nothing else clears it. Refusing
@@ -718,7 +769,7 @@ describe("snapshotRoute: a second CONCURRENT regeneration may not replace the pe
 
   it("still reports a missing page directory rather than the claim, so finding 4 keeps its message", () => {
     const root = twoRouteProject();
-    snapshotRoute(root, "home");
+    running(root, "home");
     // Ordering, pinned: the page-directory check must stay AHEAD of the claim
     // check. Both are non-destructive, but the F13-review finding-4 test reads
     // the message, and a claim-first order silently changes what that test is
@@ -753,7 +804,7 @@ describe("snapshotRoute: a second CONCURRENT regeneration may not replace the pe
     const second = await call("POST", "/__regen-page", { route: "about", instruction: "x" });
 
     expect(second.status).toBe(500);
-    expect(second.body).toContain("pending regeneration");
+    expect(second.body).toContain("is still running");
     // The in-flight run's snapshot is still its own.
     expect(readFileSync(join(root, ".regen-backup", "route.txt"), "utf8")).toBe("home");
     expect(await first).toMatchObject({ status: 200 });
@@ -780,7 +831,7 @@ describe("snapshotRoute: a second CONCURRENT regeneration may not replace the pe
     expect(first.body).toContain("no active sections");
 
     const second = await call("POST", "/__regen-page", { route: "about", instruction: "x" });
-    expect(second.body).not.toContain("pending regeneration");
+    expect(second.body).not.toContain("is still running");
     expect(readFileSync(join(root, ".regen-backup", "route.txt"), "utf8")).toBe("about");
   });
 
@@ -800,8 +851,120 @@ describe("snapshotRoute: a second CONCURRENT regeneration may not replace the pe
 
     expect(second.status).toBe(500);
     expect(third.status).toBe(500);
-    expect(third.body).toContain("pending regeneration");
+    expect(third.body).toContain("is still running");
     expect(readFileSync(join(root, ".regen-backup", "route.txt"), "utf8")).toBe("home");
     await first;
+  }, 30_000);
+
+  /* ---------- C1: the claim may only be freed by its own holder ---------- */
+
+  /**
+   * WHOLE-BRANCH REVIEW, C1 — the permanent version of the review's probe test.
+   *
+   * The P1 guard above was real but did not hold, because a THIRD party could
+   * delete the claim between the `snapshotRoute` that took it and the `finally`
+   * that frees it. `/__regen-revert` was exactly that third party: gated by no
+   * claim at all, it deleted `.regen-backup/` and, with it, the in-flight run's
+   * claim. The reproduced sequence, in two browser tabs:
+   *
+   *   1. `POST /__regen-page {route:"home"}` — takes the claim, runs for minutes.
+   *   2. `POST /__regen-revert {section:"home"}` from tab 2 — SUCCEEDED. It
+   *      destroyed the only pre-regen copy of the files the orchestrator was
+   *      still writing, and freed the claim.
+   *   3. `POST /__regen-page {route:"about"}` — allowed, claim gone.
+   *   4. Tab 1's request finally ends and its `finally` decrements — `about`'s
+   *      claim — to zero.
+   *   5. The next regeneration wipes `about`'s pending snapshot mid-run: the P1
+   *      corruption, verbatim.
+   *
+   * Two changes close it, and each of the four tests below fails if either is
+   * undone: a claim is released only by the handle that took it (never by
+   * root), and a revert is refused outright while a claim is live.
+   */
+  it("C1 step 2: refuses a revert while that route's regeneration is still running", () => {
+    const root = twoRouteProject();
+    running(root, "home");
+
+    expect(() => restoreSnapshot(root, "home")).toThrow(/is still running/i);
+
+    // Nothing was changed: not the slot the running regen will need to be
+    // revertable from, and not the live route the orchestrator is writing into.
+    expect(readFileSync(join(root, ".regen-backup", "route.txt"), "utf8")).toBe("home");
+    expect(existsSync(join(root, ".regen-backup", "page", "home-only.tsx"))).toBe(true);
+    expect(existsSync(join(root, "src", "pages", "home", "home-only.tsx"))).toBe(true);
+  });
+
+  it("C1 step 3: a refused revert leaves the claim held, so another route is still refused", () => {
+    const root = twoRouteProject();
+    running(root, "home");
+    expect(() => restoreSnapshot(root, "home")).toThrow();
+
+    // This is the step that turned a bad revert into data loss: with the claim
+    // gone, `about` took the slot while `home` was still writing.
+    expect(() => snapshotRoute(root, "about")).toThrow(/is still running/i);
+    expect(readFileSync(join(root, ".regen-backup", "route.txt"), "utf8")).toBe("home");
+  });
+
+  it("C1 step 4: a finished run's release cannot free a LATER run's claim", () => {
+    const root = twoRouteProject();
+    const first = running(root, "home");
+    first.release(); // tab 1's own `finally`
+    const second = running(root, "about"); // tab 2 legitimately takes the slot
+    expect(second.route).toBe("about");
+
+    // The old release was keyed by project root, so ANY second call decremented
+    // whatever claim the project currently had — here, `about`'s. A handle can
+    // only ever free its own claim, so this frees nothing.
+    first.release();
+
+    expect(() => snapshotRoute(root, "home")).toThrow(/is still running/i);
+    expect(readFileSync(join(root, ".regen-backup", "route.txt"), "utf8")).toBe("about");
+  });
+
+  it("C1: a revert works once the run it was refused for has finished", () => {
+    // The refusal message tells the user to wait and then revert, so that
+    // sequence must actually work — otherwise the fix trades corruption for a
+    // dead end (`pending.md` C-2: no endpoint clears a slot).
+    const root = twoRouteProject();
+    const claim = running(root, "home");
+    expect(() => restoreSnapshot(root, "home")).toThrow(/is still running/i);
+
+    claim.release();
+    rmSync(join(root, "src", "pages", "home"), { recursive: true, force: true });
+    restoreSnapshot(root, "home");
+    expect(existsSync(join(root, "src", "pages", "home", "home-only.tsx"))).toBe(true);
+  });
+
+  it("C1: the whole two-tab sequence, through the real middleware", async () => {
+    const root = twoRouteProject({
+      "home.hero": { status: "active", component: "Hero" },
+      "about.hero": { status: "active", component: "Hero" },
+    });
+    process.env.WG_REGEN_MOCK = "1";
+    const { call } = mountRegenApi(root);
+
+    // 1. tab 1 starts a page regeneration of `home` and stays in flight.
+    const first = call("POST", "/__regen-page", { route: "home", instruction: "x" });
+    await waitForSlot(root);
+
+    // 2. tab 2 reverts `home` — refused, loudly, at the endpoint.
+    const revert = await call("POST", "/__regen-revert", { section: "home" });
+    expect(revert.status).toBe(500);
+    expect(revert.body).toContain("is still running");
+    expect(existsSync(join(root, ".regen-backup", "page", "home-only.tsx"))).toBe(true);
+
+    // 3. ...so `about` is still refused, which is the step that used to succeed.
+    const other = await call("POST", "/__regen-page", { route: "about", instruction: "x" });
+    expect(other.status).toBe(500);
+    expect(other.body).toContain("is still running");
+
+    // 4. tab 1 finishes and releases its own claim.
+    expect(await first).toMatchObject({ status: 200 });
+
+    // 5. and only now does the revert the message asked the user to wait for
+    //    actually run.
+    const afterwards = await call("POST", "/__regen-revert", { section: "home" });
+    expect(afterwards.status).toBe(200);
+    expect(existsSync(join(root, ".regen-backup"))).toBe(false);
   }, 30_000);
 });

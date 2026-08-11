@@ -27,11 +27,13 @@
  * last section while claiming to undo the page.
  *
  * There is ONE snapshot slot per project, and for as long as an operation that
- * took it is still RUNNING it is claimed: a concurrent regeneration of a
- * DIFFERENT route is refused rather than silently replacing it. Two browser
- * tabs is all that takes — `MAX_ACTIVE_JOBS_PER_USER` is 2 and bounds
- * concurrency per user, never per project. See `claimedSlots` for what that
- * does and does not close.
+ * took it is still RUNNING it is claimed. Two things are then refused rather
+ * than allowed to destroy it: a regeneration of a DIFFERENT route (which would
+ * silently replace the slot), and a REVERT of any route (which would delete
+ * the slot and rewrite the very files the running regeneration is writing).
+ * Two browser tabs is all that takes — `MAX_ACTIVE_JOBS_PER_USER` is 2 and
+ * bounds concurrency per user, never per project. See `claimedSlots` for what
+ * that does and does not close.
  *
  * Real mode spawns the orchestrator CLI (Kitaru replay fork, 4.1). Mock mode
  * (WG_REGEN_MOCK=1) applies deterministic file transformations mirroring the
@@ -113,19 +115,20 @@ export function regenApiPlugin(projectRoot: string): Plugin {
         if (req.method === "POST" && url === "/__regen") {
           void readBody(req, res).then(async (body) => {
             if (body === BODY_TOO_LARGE) return; // readBody already answered 413
-            // Whether THIS request took the snapshot claim. A request refused
-            // by someone else's claim must not release it in the `finally`
-            // below — that would hand the slot to the very clobberer the
-            // refusal exists to stop.
-            let claimed = false;
+            // THIS request's own claim on the snapshot slot, or `undefined` if
+            // it never took one (refused by someone else's claim, or refused
+            // before the snapshot). A handle rather than a boolean: the
+            // `finally` below can then only ever free the claim this request
+            // actually holds, which is the property the whole-branch review's
+            // C1 found missing — see `SnapshotClaim`.
+            let claim: SnapshotClaim | undefined;
             try {
               const { section, instruction } = body as { section: string; instruction: string };
               if (!isValidRouteSlug(routeSlugOfSection(section))) {
                 respondInvalidRouteSlug(res);
                 return;
               }
-              snapshotSection(root, section);
-              claimed = true;
+              claim = snapshotSection(root, section);
               const result =
                 process.env.WG_REGEN_MOCK === "1"
                   ? await mockRegen(root, section, instruction)
@@ -141,7 +144,7 @@ export function regenApiPlugin(projectRoot: string): Plugin {
               // Released whether the run passed, failed or threw: the claim
               // means "still running", and it is not running any more. A leak
               // here refuses every later regeneration on this project.
-              if (claimed) releaseSnapshotClaim(root);
+              claim?.release();
             }
           });
           return;
@@ -149,7 +152,7 @@ export function regenApiPlugin(projectRoot: string): Plugin {
         if (req.method === "POST" && url === "/__regen-page") {
           void readBody(req, res).then(async (body) => {
             if (body === BODY_TOO_LARGE) return; // readBody already answered 413
-            let claimed = false; // see /__regen above
+            let claim: SnapshotClaim | undefined; // see /__regen above
             try {
               const { route, instruction } = body as { route: string; instruction: string };
               if (!isValidRouteSlug(route)) {
@@ -157,8 +160,7 @@ export function regenApiPlugin(projectRoot: string): Plugin {
                 return;
               }
               // once, before any section runs — see the header comment
-              snapshotRoute(root, route);
-              claimed = true;
+              claim = snapshotRoute(root, route);
               const result =
                 process.env.WG_REGEN_MOCK === "1"
                   ? await mockRegenPage(root, route, instruction)
@@ -168,7 +170,7 @@ export function regenApiPlugin(projectRoot: string): Plugin {
             } catch (error) {
               respondJson(res, 500, { error: String(error) });
             } finally {
-              if (claimed) releaseSnapshotClaim(root);
+              claim?.release();
             }
           });
           return;
@@ -182,7 +184,7 @@ export function regenApiPlugin(projectRoot: string): Plugin {
         if (req.method === "POST" && url === "/__add-section") {
           void readBody(req, res).then(async (body) => {
             if (body === BODY_TOO_LARGE) return; // readBody already answered 413
-            let claimed = false; // see /__regen above
+            let claim: SnapshotClaim | undefined; // see /__regen above
             try {
               const { route, archetype, instruction } = body as {
                 route: string;
@@ -197,8 +199,7 @@ export function regenApiPlugin(projectRoot: string): Plugin {
               // revertable by the same one step — adding one is as much a
               // change to the page as regenerating it (PRD 4.4). It therefore
               // takes, and must release, the same claim.
-              snapshotRoute(root, route);
-              claimed = true;
+              claim = snapshotRoute(root, route);
               const result =
                 process.env.WG_REGEN_MOCK === "1"
                   ? await mockAddSection(root, route, archetype, instruction)
@@ -208,7 +209,7 @@ export function regenApiPlugin(projectRoot: string): Plugin {
             } catch (error) {
               respondJson(res, 500, { error: String(error) });
             } finally {
-              if (claimed) releaseSnapshotClaim(root);
+              claim?.release();
             }
           });
           return;
@@ -270,8 +271,8 @@ function snapshotDir(root: string): string {
   return join(root, ".regen-backup");
 }
 
-function snapshotSection(root: string, section: string): void {
-  snapshotRoute(root, section.split(".")[0]!);
+function snapshotSection(root: string, section: string): SnapshotClaim {
+  return snapshotRoute(root, section.split(".")[0]!);
 }
 
 /**
@@ -325,24 +326,48 @@ function snapshotOwnerFile(root: string): string {
  * operator running the local preview server against a hosted project's
  * directory). Those need the cross-process file lock the manifest service
  * already has, or per-project serialisation of regen jobs.
+ *
+ * `holders` is a SET OF TOKENS, not a count, and that is the whole-branch
+ * review's C1 fix. A count could only ever be decremented by "whoever asks",
+ * so any caller holding a stale idea of the claim — a finished request, or (as
+ * shipped) a revert that deleted the map entry outright — freed somebody
+ * ELSE's protection. One token per `snapshotRoute` call, released only by the
+ * handle that call returned, makes "release only what you hold" structural
+ * instead of conventional.
  */
-const claimedSlots = new Map<string, { route: string; holders: number }>();
+const claimedSlots = new Map<string, { route: string; holders: Set<object> }>();
 
 /**
- * Releases a claim taken by `snapshotRoute`. MUST be called only by the caller
- * that actually took one — a request REFUSED by someone else's claim must not
- * run this, or the refusal hands the slot straight to the next clobberer.
- * Exported for the same reason `runProcess` is: so it can be driven directly.
+ * A LIVE claim on one project's single snapshot slot, handed to the one caller
+ * that took it (`snapshotRoute`'s return value). `release()` frees exactly
+ * this claim and nothing else: called twice, or called after the slot has
+ * moved on to a later route, it frees nothing at all.
+ *
+ * WHOLE-BRANCH REVIEW, C1 — why this is a handle and not `release(root)`.
+ * The shipped version was keyed by project root only, so
+ * `releaseSnapshotClaim(root)` decremented whatever claim the project happened
+ * to have, and `restoreSnapshot` deleted the entry wholesale. Reproduced with
+ * two browser tabs: tab A regenerates `home` (claim taken, ~11 minutes), tab B
+ * reverts `home` — which deleted A's live claim — then tab B regenerates
+ * `about`, which was allowed because the claim was gone, and finally A's own
+ * `finally` decremented `about`'s claim to zero. The next regeneration then
+ * wiped `about`'s pending snapshot mid-run: verbatim the P1 corruption both
+ * `docs/decisions.md` and `docs/pending.md` had recorded as closed.
  */
-export function releaseSnapshotClaim(root: string): void {
-  const key = resolve(root);
-  const claim = claimedSlots.get(key);
-  if (claim === undefined) return;
-  claim.holders -= 1;
-  if (claim.holders <= 0) claimedSlots.delete(key);
+export interface SnapshotClaim {
+  /** The route this claim protects. Normalised (`.trim()`ed) exactly as
+   *  `route.txt` is, so the two can never disagree about "the same route". */
+  readonly route: string;
+  /** Frees THIS claim. Idempotent, and inert for any other claim. */
+  release(): void;
 }
 
-export function snapshotRoute(root: string, routeSlug: string): void {
+/** The live claim on `root`'s slot, if a still-running operation holds one. */
+function liveClaim(root: string): { route: string; holders: Set<object> } | undefined {
+  return claimedSlots.get(resolve(root));
+}
+
+export function snapshotRoute(root: string, routeSlug: string): SnapshotClaim {
   const source = join(root, "src", "pages", routeSlug);
   // Validated BEFORE the existing slot is destroyed (F13 review, finding 4).
   // The old order wiped the slot and only then discovered it had nothing to
@@ -366,15 +391,25 @@ export function snapshotRoute(root: string, routeSlug: string): void {
   //
   // The SAME route may re-claim: the editor retries a failed regen against the
   // same section, and the page path snapshots the route it is about to loop
-  // over. Counted rather than flagged, so two overlapping same-route runs
+  // over. Multi-holder rather than a flag, so two overlapping same-route runs
   // cannot have the first one's completion free the slot out from under the
-  // second.
-  const claim = claimedSlots.get(resolve(root));
+  // second — one token per holder, so the LAST one out closes it.
+  //
+  // The message names the only action that actually works, which is the
+  // whole-branch review's I2: it used to say "revert or discard that
+  // regeneration first", and BOTH halves of that advice were wrong. "Revert"
+  // was step 2 of C1's corruption sequence (it destroyed the running run's
+  // only pre-regen copy and freed its claim), and is now refused outright by
+  // `restoreSnapshot`; "discard" named a control the editor has never had
+  // (`regen-api.ts` said so itself, two comments down). Waiting is the only
+  // correct action, so waiting is what it says.
+  const claim = liveClaim(root);
   if (claim !== undefined && claim.route !== owner) {
     throw new Error(
-      `a pending regeneration of route ${JSON.stringify(claim.route)} still holds this ` +
-        `project's single snapshot slot; revert or discard that regeneration before ` +
-        `regenerating ${JSON.stringify(owner)}. Nothing was changed.`,
+      `a regeneration of route ${JSON.stringify(claim.route)} is still running and holds this ` +
+        `project's single snapshot slot; wait for it to finish, then regenerate ` +
+        `${JSON.stringify(owner)}. It cannot be cancelled, and it cannot be reverted while it ` +
+        `runs. Nothing was changed.`,
     );
   }
   const backup = snapshotDir(root);
@@ -388,11 +423,28 @@ export function snapshotRoute(root: string, routeSlug: string): void {
   // trim alone accepted `"home"` for a snapshot recorded as `" home"`.
   writeFileSync(snapshotOwnerFile(root), owner, "utf8");
   // Claimed only once the slot is genuinely written: a snapshot that threw
-  // mid-copy holds nothing worth protecting, and its caller never reaches the
-  // `claimed = true` that would release it.
+  // mid-copy holds nothing worth protecting, and its caller never receives a
+  // handle to release.
   const key = resolve(root);
+  const token = {};
   const existing = claimedSlots.get(key);
-  claimedSlots.set(key, { route: owner, holders: (existing?.holders ?? 0) + 1 });
+  // Same route only — a different route threw above, so `existing` here is
+  // always the same-route retry/page-loop case the comment above describes.
+  const holders = existing?.holders ?? new Set<object>();
+  holders.add(token);
+  claimedSlots.set(key, { route: owner, holders });
+  return {
+    route: owner,
+    release() {
+      const current = claimedSlots.get(key);
+      // `delete` returning false means this token is not in the CURRENT
+      // claim's holder set — either already released, or the slot has since
+      // moved on to another route's run. Either way there is nothing of ours
+      // to free, and freeing someone else's is exactly the C1 defect.
+      if (current === undefined || !current.holders.delete(token)) return;
+      if (current.holders.size === 0) claimedSlots.delete(key);
+    },
+  };
 }
 
 /**
@@ -410,6 +462,20 @@ export function snapshotRoute(root: string, routeSlug: string): void {
  * The ownership check runs BEFORE the `rmSync`, because the old ordering
  * destroyed the target route first and could not have been undone even if the
  * copy had then failed.
+ *
+ * WHOLE-BRANCH REVIEW, C1 — a revert is REFUSED while a regeneration of the
+ * route still holds the slot, and this function no longer touches
+ * `claimedSlots` at all. The shipped version ended with
+ * `claimedSlots.delete(root)`, justified as "the slot is gone, so any claim on
+ * it is stale by construction". That justification was wrong in the one case
+ * that matters: `/__regen-revert` is gated by nothing, so a second browser tab
+ * could revert a route whose regeneration was STILL RUNNING — deleting the only
+ * pre-regen copy of the files the orchestrator was in the middle of writing,
+ * AND freeing the claim, after which a third request happily took the slot for
+ * a different route. Refusing is the correct answer rather than the
+ * conservative one: there is nothing coherent to restore mid-run (the run's own
+ * output is half-written), and the user's own next action — wait, then revert —
+ * works.
  */
 export function restoreSnapshot(root: string, sectionOrRoute: string): void {
   const routeSlug = sectionOrRoute.split(".")[0]!;
@@ -425,6 +491,22 @@ export function restoreSnapshot(root: string, sectionOrRoute: string): void {
     throw new Error(
       `the pending regeneration snapshot belongs to route ${JSON.stringify(owner)}, ` +
         `not ${JSON.stringify(routeSlug)}; nothing was changed`,
+    );
+  }
+
+  // C1. Refused while the run that took the slot is still going — checked
+  // AFTER the owner comparison above so a cross-route revert keeps answering
+  // with F13's own message (which its tests read), and BEFORE every
+  // destructive step below. A live claim can only ever name the route this
+  // revert targets by the time it gets here: `route.txt` and the claim are
+  // written by the same `snapshotRoute` call, so the owner check has already
+  // rejected any other route.
+  const claim = liveClaim(root);
+  if (claim !== undefined) {
+    throw new Error(
+      `a regeneration of route ${JSON.stringify(claim.route)} is still running, and reverting ` +
+        `now would delete the files it is still writing; wait for it to finish, then revert. ` +
+        `Nothing was changed.`,
     );
   }
 
@@ -446,10 +528,9 @@ export function restoreSnapshot(root: string, sectionOrRoute: string): void {
   cpSync(page, join(root, "src", "pages", routeSlug), { recursive: true });
   cpSync(manifestCopy, join(root, "manifest.json"));
   rmSync(backup, { recursive: true, force: true });
-  // The slot is gone, so any claim on it is stale by construction — dropped
-  // wholesale rather than decremented. A revert IS the consumption the P1
-  // refusal tells the user to perform, so it must leave the next route free.
-  claimedSlots.delete(resolve(root));
+  // No claim is touched here, deliberately: by the check above there is no live
+  // claim to touch, and the only claims that could exist belong to runs this
+  // function has no business freeing (C1, above).
 }
 
 /* ---------- real mode: orchestrator CLI (Kitaru replay fork) ---------- */

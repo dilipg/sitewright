@@ -1114,6 +1114,51 @@ describe("JobWorker: generate", () => {
     expect(finished?.error).not.toContain("sk-ant-ANOTHERSECRET987654321");
   });
 
+  it("reports STDOUT as well as stderr, because the failure report is on stdout", async () => {
+    // Measured during task 3b: a generation failed after 11s inside Docker and
+    // its reason was UNRECOVERABLE. The message used to prefer stderr whenever
+    // it was non-empty — and `uv run` writes its own chatter there (e.g.
+    // "Bytecode compiled ..." on a first run in a fresh container), so stderr is
+    // essentially never empty, while `acceptance.py` prints its structured
+    // failed_stage report to STDOUT. The preference therefore reported noise and
+    // discarded the only thing that says what broke.
+    // A key must be stored, or the claim-time `assertApiKeyUsable` check refuses
+    // before the orchestrator is ever spawned and the message under test never
+    // gets built. (This is exactly what the first draft of this test got wrong.)
+    setApiKey(db, MASTER_KEY, user.id, "sk-ant-STREAMTESTKEY0123456789");
+    const genProject = createProject(db, user.id, "run-gen-both-streams", "Both Streams");
+    const child = fakeOrchestratorChild();
+    const orchestratorSpawnFn = vi.fn(() => {
+      setImmediate(() => {
+        // Exactly the shape that defeated the old code: useless stderr, the real
+        // reason on stdout.
+        child.stderr.emit("data", Buffer.from("Bytecode compiled 1234 files in 2.10s"));
+        child.stdout.emit("data", Buffer.from('{"failed_stage": "design", "reason": "primitives exhausted retries"}'));
+        child.emit("exit", 1);
+      });
+      return child;
+    });
+    const requestJson = JSON.stringify({ brief: "a site whose design stage fails" });
+    const job = createJob(db, { userId: user.id, projectId: genProject.id, kind: "generate", requestJson, now: NOW });
+    const worker = new JobWorker({
+      db, pool: fakePool(), masterKey: MASTER_KEY, projectsRoot: FAKE_PROJECTS_ROOT, now: () => NOW,
+      orchestratorDir: FAKE_ORCHESTRATOR_DIR,
+      orchestratorSpawnFn,
+    });
+
+    await worker.runOnce();
+
+    const finished = findJobById(db, job.id);
+    expect(finished?.status).toBe("failed");
+    // The point of the fix: the reason a user can act on must be present.
+    expect(finished?.error).toContain("primitives exhausted retries");
+    expect(finished?.error).toContain("failed_stage");
+    // And the noise is kept alongside it rather than swapped for it, labelled so
+    // a reader can tell which stream said what.
+    expect(finished?.error).toContain("stdout:");
+    expect(finished?.error).toContain("stderr:");
+  });
+
   it("fails cleanly (never throws out of runOnce) when the request payload has no brief", async () => {
     const genProject = createProject(db, user.id, "run-gen-nobrief", "Run Gen No Brief");
     const job = createJob(db, {

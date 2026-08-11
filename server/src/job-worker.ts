@@ -1223,7 +1223,25 @@ export class JobWorker {
     const safeStdout = redactSecrets(spawned.stdout);
     const safeStderr = redactSecrets(spawned.stderr);
     if (spawned.code !== 0) {
-      const tail = (safeStderr.trim() !== "" ? safeStderr : safeStdout).slice(-2000);
+      // BOTH streams, always, and stdout FIRST.
+      //
+      // This used to be `stderr.trim() !== "" ? stderr : stdout`, which made
+      // every failure undiagnosable in practice: `uv run` writes its own chatter
+      // to stderr (e.g. `Bytecode compiled ...` on a first run in a fresh
+      // container), so stderr is essentially never empty — while
+      // `acceptance.py` prints its structured `{"failed_stage": ...}` report to
+      // STDOUT. The preference therefore reported noise and discarded the one
+      // thing that says what broke. Measured during task 3b: a generation failed
+      // after 11s inside Docker and the reason was unrecoverable, which cost a
+      // whole diagnostic cycle and, indirectly, a wasted run.
+      //
+      // stdout first because it carries the report; both labelled so a reader
+      // can tell which stream said what; and the budget split so a chatty
+      // stderr cannot crowd out the report.
+      const parts: string[] = [];
+      if (safeStdout.trim() !== "") parts.push(`stdout: ${safeStdout.slice(-1500)}`);
+      if (safeStderr.trim() !== "") parts.push(`stderr: ${safeStderr.slice(-1500)}`);
+      const tail = parts.length > 0 ? parts.join("\n---\n") : "(no output on either stream)";
       return { kind: "failed", error: `orchestrator exited with code ${String(spawned.code)}: ${tail}` };
     }
     return { kind: "succeeded", resultJson: JSON.stringify({ stdout: safeStdout.slice(-4000) }) };

@@ -20,18 +20,23 @@ import subprocess
 import time
 from pathlib import Path
 
+from orchestrator import portable
 from orchestrator.section_pipeline import GENERATED_DIR, REPO_ROOT, _run_compiler_cli, ensure_route_page_dirs
 
 
 def spawn_worker(run_id: str, route_slug: str) -> subprocess.Popen:
-    return subprocess.Popen(
+    # NO shell. `shell=True` here was silently Windows-only in the other
+    # direction from the `cmd /c` sites: on POSIX, Popen(list, shell=True)
+    # hands `sh -c` ONLY argv[0] and turns the rest into the shell's own
+    # positional parameters, so this ran a bare `uv`, printed its help, exited
+    # non-zero -- and every page worker "crashed" with nothing in its log.
+    return portable.spawn(
         ["uv", "run", "python", "-m", "orchestrator.page_worker", "--run-id", run_id, "--route-slug", route_slug],
         cwd=REPO_ROOT / "orchestrator",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
-        shell=True,
     )
 
 

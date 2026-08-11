@@ -16,13 +16,13 @@ import html
 import json
 import re
 import shutil
-import subprocess
 from pathlib import Path
 
 import kitaru
 from kitaru import checkpoint, flow
 
 from orchestrator.model_call import call_model_structured_impl
+from orchestrator.portable import link_directory, run_project_typecheck
 from orchestrator.runlog import append_run_event, default_run_log_path
 from orchestrator.section_pipeline import COMPILER_DIR, MAX_ATTEMPTS, _run_compiler_cli, materialize
 
@@ -227,9 +227,7 @@ def write_shell(
         brand_scaffold(project_dir, brand_name)
 
     ensure_node_modules(project)
-    tsc = subprocess.run(
-        ["cmd", "/c", "npx", "tsc", "--noEmit"], cwd=project, capture_output=True, text=True, encoding="utf-8", timeout=300
-    )
+    tsc = run_project_typecheck(project)
     issues: list[str] = []
     if tsc.returncode != 0:
         issues.extend(f"typecheck: {line}" for line in tsc.stdout.splitlines() if line.strip())
@@ -249,11 +247,7 @@ def ensure_node_modules(project_dir: Path) -> None:
 
     target = project_dir / "node_modules"
     if not target.exists():
-        subprocess.run(
-            ["cmd", "/c", "mklink", "/J", str(target), str(FIXTURE_DIR / "node_modules")],
-            check=True,
-            capture_output=True,
-        )
+        link_directory(target, FIXTURE_DIR / "node_modules")
 
 
 # ---------- the flow ----------

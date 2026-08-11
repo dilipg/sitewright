@@ -11,11 +11,11 @@ Usage: uv run python -m orchestrator.soak
 
 import json
 import os
-import subprocess
 from pathlib import Path
 
 from orchestrator.fixture_context import FIXTURE_DIR
 from orchestrator.generate import DEFAULT_SECTION_BRIEF
+from orchestrator.portable import link_directory, run_npx
 from orchestrator.runlog import default_run_log_path, read_run_events
 from orchestrator.section_pipeline import GENERATED_DIR, REPO_ROOT, generate_section_flow
 
@@ -37,28 +37,22 @@ BRIEFS: list[tuple[str, str]] = [
 
 
 def ensure_node_modules(project_dir: Path) -> None:
-    """Junction the fixture's node_modules so the preview server and export
-    verification build can run against the generated project."""
+    """Link the fixture's node_modules so the preview server and export
+    verification build can run against the generated project. A junction on
+    Windows, a symlink elsewhere -- see orchestrator.portable."""
     target = project_dir / "node_modules"
     if not target.exists():
-        subprocess.run(
-            ["cmd", "/c", "mklink", "/J", str(target), str(FIXTURE_DIR / "node_modules")],
-            check=True,
-            capture_output=True,
-        )
+        link_directory(target, FIXTURE_DIR / "node_modules")
 
 
 def run_invariant(project_dir: Path, export_dir: Path) -> bool:
     env = dict(os.environ)
     env["WG_PROJECT_DIR"] = str(project_dir)
     env["WG_EXPORT_DIR"] = str(export_dir)
-    result = subprocess.run(
-        ["cmd", "/c", "npx", "playwright", "test", "invariant"],
+    result = run_npx(
+        ["playwright", "test", "invariant"],
         cwd=REPO_ROOT / "editor",
         env=env,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
         timeout=900,
     )
     return result.returncode == 0

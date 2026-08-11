@@ -111,7 +111,7 @@ const BAD_BRIEF = { error: "a brief is required" };
  * The ordinary first-run sequence for a new tester is: log in, type a brief,
  * press Generate. Without this they got **202**, a project row, a directory, a
  * job, an eleven-minute progress screen and then a `failed` job reading "no
- * Anthropic API key: save one in settings, or supply one with this request" —
+ * model-provider API key: save one in settings, or supply one with this request" —
  * where "settings" names nothing that exists (there is no key UI anywhere in
  * `editor/src`), the only action the screen then offers is Resume (which
  * re-enters `buildAgentEnv` and fails identically), and every attempt left

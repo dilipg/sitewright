@@ -166,6 +166,29 @@ export function openDatabase(path: string): DatabaseSync {
   // longer than any single write transaction this schema ever holds open.
   db.exec("PRAGMA busy_timeout = 5000");
   for (const migration of MIGRATIONS) db.exec(migration);
+  // BYOK task 1: which provider an already-shipped `api_key` row belongs to.
+  // Appended here rather than edited into the `CREATE TABLE api_key` above,
+  // for the reason `MIGRATIONS`'s own comment gives — an existing database's
+  // table is already created, so a changed CREATE would apply to new
+  // installations only and the two would silently diverge.
+  //
+  // `NOT NULL DEFAULT 'anthropic'` is what makes this backward-compatible
+  // without rewriting a single row: every key stored before this column
+  // existed IS an Anthropic key, because that was the only kind the code could
+  // store. Existing rows are backfilled by SQLite itself as part of the ALTER.
+  //
+  // The CHECK makes `api-keys.ts`'s `ApiKeyProvider` union structural rather
+  // than conventional — an unrecognised provider cannot be written at all, by
+  // any caller, including one that bypasses `setApiKey`. Widening the union
+  // therefore needs a further migration (SQLite cannot alter a CHECK in
+  // place); that is the intended cost, and it fails loudly at the write rather
+  // than quietly at the model API.
+  ensureColumn(
+    db,
+    "api_key",
+    "provider",
+    "provider TEXT NOT NULL DEFAULT 'anthropic' CHECK (provider IN ('anthropic', 'gemini'))",
+  );
   ensureColumn(db, "job", "run_id", "run_id TEXT");
   ensureColumn(db, "job", "code_version", "code_version TEXT");
   ensureColumn(db, "job", "resumed_from_job_id", "resumed_from_job_id TEXT REFERENCES job(id) ON DELETE SET NULL");

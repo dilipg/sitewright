@@ -6,6 +6,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { Worker } from "node:worker_threads";
 import { afterAll, describe, expect, it } from "vitest";
 import { openDatabase } from "./db.ts";
@@ -182,6 +183,79 @@ setTimeout(() => {
       const path = tempDbPath();
       openDatabase(path).close();
       expect(() => openDatabase(path).close()).not.toThrow();
+    },
+  );
+
+  it("adds provider to the api_key table, defaulting to anthropic (BYOK task 1)", () => {
+    const db = openDatabase(tempDbPath());
+    const provider = (db.prepare("PRAGMA table_info(api_key)").all() as Array<{
+      name: string; type: string; notnull: number; dflt_value: string | null;
+    }>).find((c) => c.name === "provider");
+    expect(provider).toBeDefined();
+    // The DEFAULT is the whole backward-compatibility mechanism, so it is
+    // pinned exactly rather than merely "is not null".
+    expect(provider?.dflt_value).toBe("'anthropic'");
+    expect(provider?.notnull).toBe(1);
+    db.close();
+  });
+
+  it(
+    "migrates a PRE-EXISTING database that already holds an Anthropic key, and the key still decrypts",
+    async () => {
+      // The worst outcome available in this task is a migration that breaks
+      // stored keys, so this does not test a fresh database with the column
+      // already in its CREATE — it builds the schema slice 3 ACTUALLY shipped
+      // (no provider column at all), stores a real sealed key through it, and
+      // only then opens it with the migration in place.
+      const { seal, open } = await import("./secrets.ts");
+      const { getApiKeyFingerprint, getApiKeyPlaintext } = await import("./api-keys.ts");
+      const { randomBytes } = await import("node:crypto");
+      const masterKey = randomBytes(32);
+      const KEY = "sk-ant-api03-a-real-looking-stored-key-XY9z";
+      const path = tempDbPath();
+
+      // --- Slice 3's schema, verbatim: api_key with FIVE columns. ---
+      const legacy = new DatabaseSync(path);
+      legacy.exec("PRAGMA foreign_keys = ON");
+      legacy.exec(`CREATE TABLE user (
+        id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL,
+        spend_cap_usd REAL NOT NULL DEFAULT 10, created_at INTEGER NOT NULL, disabled_at INTEGER)`);
+      legacy.exec(`CREATE TABLE api_key (
+        user_id TEXT PRIMARY KEY REFERENCES user(id) ON DELETE CASCADE,
+        ciphertext BLOB NOT NULL, nonce BLOB NOT NULL, fingerprint TEXT NOT NULL,
+        created_at INTEGER NOT NULL)`);
+      legacy.prepare("INSERT INTO user (id, email, password_hash, created_at) VALUES (?, ?, ?, ?)")
+        .run("u1", "a@example.com", "h", 1);
+      const sealed = seal(masterKey, KEY);
+      legacy.prepare(
+        "INSERT INTO api_key (user_id, ciphertext, nonce, fingerprint, created_at) VALUES (?, ?, ?, ?, ?)",
+      ).run("u1", sealed.ciphertext, sealed.nonce, "XY9z", 1);
+      expect((legacy.prepare("PRAGMA table_info(api_key)").all() as Array<{ name: string }>))
+        .toHaveLength(5); // no provider column yet — the premise of this test
+      legacy.close();
+
+      // --- Boot the real server code against that file. ---
+      const migrated = openDatabase(path);
+      // The row was NOT rewritten: same ciphertext, same nonce, same fingerprint.
+      const row = migrated.prepare("SELECT * FROM api_key WHERE user_id = ?").get("u1") as {
+        ciphertext: Uint8Array; nonce: Uint8Array; fingerprint: string; provider: string;
+      };
+      expect(Buffer.from(row.ciphertext).equals(sealed.ciphertext)).toBe(true);
+      expect(Buffer.from(row.nonce).equals(sealed.nonce)).toBe(true);
+      expect(row.fingerprint).toBe("XY9z");
+      expect(row.provider).toBe("anthropic");
+      // And it still DECRYPTS — the assertion this test exists for. Checked
+      // both through the module and through the raw cipher, so a change to
+      // api-keys.ts cannot mask a genuinely corrupted row.
+      expect(open(masterKey, { ciphertext: Buffer.from(row.ciphertext), nonce: Buffer.from(row.nonce) })).toBe(KEY);
+      expect(getApiKeyPlaintext(migrated, masterKey, "u1")).toEqual({ apiKey: KEY, provider: "anthropic" });
+      expect(getApiKeyFingerprint(migrated, "u1")).toEqual({ fingerprint: "XY9z", provider: "anthropic" });
+      migrated.close();
+
+      // --- And a SECOND boot is a no-op, not "duplicate column name". ---
+      const again = openDatabase(path);
+      expect(getApiKeyPlaintext(again, masterKey, "u1")).toEqual({ apiKey: KEY, provider: "anthropic" });
+      again.close();
     },
   );
 

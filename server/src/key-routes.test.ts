@@ -20,6 +20,10 @@ import { keyRoutes } from "./key-routes.ts";
 
 const masterKey = randomBytes(32);
 const KEY = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz-XY9z";
+/** `AIza` + exactly 35 characters (39 total) — a real Google standard key's verified shape. */
+const GEMINI_KEY = "AIzaSyIsNotARealKeyJustTheRightShape123";
+/** The format AI Studio issues TODAY. Length deliberately unpinned; see api-keys.ts. */
+const GEMINI_AUTH_KEY = "AQ.AbNotARealAuthKeyJustTheRightShape";
 
 const dirs: string[] = [];
 const dbs: DatabaseSync[] = [];
@@ -78,9 +82,12 @@ describe("PUT /api/key", () => {
     // a leak before this line ever ran. If toEqual is ever loosened to
     // toMatchObject/objectContaining, this is the assertion that still holds.
     expect(result.raw).not.toContain(KEY);
-    expect(result.json).toEqual({ fingerprint: "XY9z" });
+    // BOTH fields, exactly: a fingerprint with no provider is what a UI
+    // renders as the wrong provider's key, and a provider with no fingerprint
+    // leaves the user unable to tell which key is stored.
+    expect(result.json).toEqual({ fingerprint: "XY9z", provider: "anthropic" });
     // ...but it really was stored.
-    expect(getApiKeyPlaintext(db, masterKey, user.id)).toBe(KEY);
+    expect(getApiKeyPlaintext(db, masterKey, user.id)).toEqual({ apiKey: KEY, provider: "anthropic" });
   });
 
   it("401s without a session and stores nothing", async () => {
@@ -152,7 +159,87 @@ describe("PUT /api/key", () => {
     const { call, cookie, db, user } = harness();
     await call("PUT", "/api/key", { apiKey: KEY }, cookie);
     await call("PUT", "/api/key", { apiKey: "sk-ant-api03-second-value-here-AAAA" }, cookie);
-    expect(getApiKeyPlaintext(db, masterKey, user.id)).toBe("sk-ant-api03-second-value-here-AAAA");
+    expect(getApiKeyPlaintext(db, masterKey, user.id))
+      .toEqual({ apiKey: "sk-ant-api03-second-value-here-AAAA", provider: "anthropic" });
+  });
+});
+
+describe("PUT /api/key, provider choice", () => {
+  it("stores a Gemini key when the body declares gemini", async () => {
+    const { call, cookie, db, user } = harness();
+    const result = await call("PUT", "/api/key", { apiKey: GEMINI_KEY, provider: "gemini" }, cookie);
+    expect(result.status).toBe(200);
+    expect(result.raw).not.toContain(GEMINI_KEY);
+    expect(result.json).toEqual({ fingerprint: "e123", provider: "gemini" });
+    expect(getApiKeyPlaintext(db, masterKey, user.id)).toEqual({ apiKey: GEMINI_KEY, provider: "gemini" });
+  });
+
+  it("accepts the AQ. auth-key format AI Studio issues today", async () => {
+    // The format check that actually decides whether a new tester can onboard:
+    // AI Studio no longer issues AIza keys at all.
+    const { call, cookie, db, user } = harness();
+    const result = await call("PUT", "/api/key", { apiKey: GEMINI_AUTH_KEY, provider: "gemini" }, cookie);
+    expect(result.status).toBe(200);
+    expect(getApiKeyPlaintext(db, masterKey, user.id)).toEqual({ apiKey: GEMINI_AUTH_KEY, provider: "gemini" });
+  });
+
+  it("treats an absent provider as anthropic, so a pre-existing {apiKey} caller still works", async () => {
+    // The README's own curl, and slice 3's every client, send no provider.
+    const { call, cookie } = harness();
+    expect((await call("PUT", "/api/key", { apiKey: KEY }, cookie)).json)
+      .toEqual({ fingerprint: "XY9z", provider: "anthropic" });
+  });
+
+  it("rejects an Anthropic key declared as gemini, and a Gemini key declared as anthropic", async () => {
+    // The mismatch this whole task exists to prevent: stored the wrong way
+    // round, it fails 401 only AFTER a job is queued and the money committed.
+    const { call, cookie, db, user } = harness();
+    expect((await call("PUT", "/api/key", { apiKey: KEY, provider: "gemini" }, cookie)).status).toBe(400);
+    expect((await call("PUT", "/api/key", { apiKey: GEMINI_KEY, provider: "anthropic" }, cookie)).status).toBe(400);
+    expect(getApiKeyPlaintext(db, masterKey, user.id)).toBeNull();
+  });
+
+  it("says WHICH field is wrong, exactly, rather than blaming the key for a bad provider", async () => {
+    // Exact strings, not substrings: a user told "your key is malformed" when
+    // the selector is what is wrong goes and changes the wrong field. Both
+    // messages reach the browser verbatim.
+    const { call, cookie } = harness();
+    const badProvider = await call("PUT", "/api/key", { apiKey: KEY, provider: "openai" }, cookie);
+    expect(badProvider.status).toBe(400);
+    expect(badProvider.json).toEqual({ error: "provider must be one of: anthropic, gemini" });
+
+    const badAnthropic = await call("PUT", "/api/key", { apiKey: "hunter2" }, cookie);
+    expect(badAnthropic.json).toEqual({ error: "apiKey must be an Anthropic API key (sk-ant-…)" });
+
+    const badGemini = await call("PUT", "/api/key", { apiKey: "hunter2", provider: "gemini" }, cookie);
+    expect(badGemini.json).toEqual({ error: "apiKey must be a Google AI Studio API key (AQ.… or AIza…)" });
+  });
+
+  it("rejects a non-string provider without storing anything", async () => {
+    const { call, cookie, db, user } = harness();
+    for (const provider of [42, null, ["gemini"], { name: "gemini" }, ""]) {
+      const result = await call("PUT", "/api/key", { apiKey: KEY, provider }, cookie);
+      expect(result.status).toBe(400);
+      expect(result.json).toEqual({ error: "provider must be one of: anthropic, gemini" });
+    }
+    expect(getApiKeyPlaintext(db, masterKey, user.id)).toBeNull();
+  });
+
+  it("never echoes a rejected key back, whichever provider was declared", async () => {
+    const { call, cookie } = harness();
+    const gemini = await call("PUT", "/api/key", { apiKey: "AIzaMistypedButRealLooking", provider: "gemini" }, cookie);
+    expect(gemini.raw).not.toContain("AIzaMistypedButRealLooking");
+    const mismatched = await call("PUT", "/api/key", { apiKey: GEMINI_KEY, provider: "anthropic" }, cookie);
+    expect(mismatched.raw).not.toContain(GEMINI_KEY);
+  });
+
+  it("switches provider on replace, leaving no trace of the old one", async () => {
+    const { call, cookie, db, user } = harness();
+    await call("PUT", "/api/key", { apiKey: KEY }, cookie);
+    await call("PUT", "/api/key", { apiKey: GEMINI_KEY, provider: "gemini" }, cookie);
+    expect(getApiKeyPlaintext(db, masterKey, user.id)).toEqual({ apiKey: GEMINI_KEY, provider: "gemini" });
+    expect((await call("GET", "/api/key", undefined, cookie)).json)
+      .toEqual({ fingerprint: "e123", provider: "gemini" });
   });
 });
 
@@ -161,17 +248,26 @@ describe("GET /api/key", () => {
     const { call, cookie } = harness();
     await call("PUT", "/api/key", { apiKey: KEY }, cookie);
     const result = await call("GET", "/api/key", undefined, cookie);
-    expect(result.json).toEqual({ fingerprint: "XY9z" });
+    expect(result.json).toEqual({ fingerprint: "XY9z", provider: "anthropic" });
     expect(result.raw).not.toContain(KEY);
+  });
+
+  it("reports the provider alongside the fingerprint, so the form can render both", async () => {
+    const { call, cookie } = harness();
+    await call("PUT", "/api/key", { apiKey: GEMINI_KEY, provider: "gemini" }, cookie);
+    const result = await call("GET", "/api/key", undefined, cookie);
+    expect(result.json).toEqual({ fingerprint: "e123", provider: "gemini" });
+    expect(result.raw).not.toContain(GEMINI_KEY);
   });
 
   it("reports null rather than 404 when no key is stored", async () => {
     // "You have no key" is a normal state the settings screen must render, not
-    // an error condition.
+    // an error condition. BOTH fields are null: defaulting the provider here
+    // would let the form claim a choice the user never made.
     const { call, cookie } = harness();
     const result = await call("GET", "/api/key", undefined, cookie);
     expect(result.status).toBe(200);
-    expect(result.json).toEqual({ fingerprint: null });
+    expect(result.json).toEqual({ fingerprint: null, provider: null });
   });
 
   it("401s without a session", async () => {
@@ -216,9 +312,26 @@ describe("tenancy", () => {
     await call("PUT", "/api/key", { apiKey: "sk-ant-api03-second-users-key-BB22" }, secondCookie);
 
     expect((await call("GET", "/api/key", undefined, secondCookie)).json)
-      .toEqual({ fingerprint: "BB22" });
+      .toEqual({ fingerprint: "BB22", provider: "anthropic" });
     expect((await call("GET", "/api/key", undefined, firstCookie)).json)
-      .toEqual({ fingerprint: "XY9z" });
+      .toEqual({ fingerprint: "XY9z", provider: "anthropic" });
+  });
+
+  it("keeps each session's PROVIDER separate too, not only the key", async () => {
+    // One user on Gemini and one on Anthropic is the ordinary case once both
+    // providers exist. Crossing the providers would send one user's key to the
+    // other's API — a 401 after the money is committed, per tenant.
+    const { db, call, cookie: firstCookie } = harness();
+    const second = createUser(db, "b@example.com", "hash");
+    const secondCookie = `${SESSION_COOKIE}=${createSession(db, second.id).id}`;
+
+    await call("PUT", "/api/key", { apiKey: KEY }, firstCookie);
+    await call("PUT", "/api/key", { apiKey: GEMINI_KEY, provider: "gemini" }, secondCookie);
+
+    expect((await call("GET", "/api/key", undefined, firstCookie)).json)
+      .toEqual({ fingerprint: "XY9z", provider: "anthropic" });
+    expect((await call("GET", "/api/key", undefined, secondCookie)).json)
+      .toEqual({ fingerprint: "e123", provider: "gemini" });
   });
 });
 

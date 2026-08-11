@@ -18,7 +18,14 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { Plugin } from "vite";
 import { MAX_BODY_BYTES } from "./max-body-bytes.ts";
-import { regenApiPlugin, restoreSnapshot, runProcess, snapshotRoute, usageEnvFor } from "./regen-api.ts";
+import {
+  regenApiPlugin,
+  releaseSnapshotClaim,
+  restoreSnapshot,
+  runProcess,
+  snapshotRoute,
+  usageEnvFor,
+} from "./regen-api.ts";
 import { USAGE_ID_HEADER, usageLogPathFor } from "./usage-log-path.ts";
 
 const REPO_ROOT = resolve(import.meta.dirname, "..", "..");
@@ -152,6 +159,68 @@ describe("usageEnvFor + runProcess (end to end)", () => {
  * project directory need not even be a working Vite project for these
  * cases — only `startPreviewServer`-level tests (preview.test.ts) need that.
  */
+type Middleware = (req: IncomingMessage, res: ServerResponse, next: () => void) => void;
+interface FakeViteServer {
+  middlewares: { use: (fn: Middleware) => void };
+  moduleGraph: { invalidateAll: () => void };
+}
+
+/**
+ * Extracts and drives the real middleware `regenApiPlugin(root)` registers.
+ *
+ * At module scope rather than inside the FIX 1 describe below, because the P1
+ * concurrency block at the bottom of this file drives the same middleware and
+ * needs the identical harness — a third copy of it (there is already a second,
+ * for raw bodies, whose `req` genuinely differs) would be a copy that can drift
+ * from the thing under test. `call` returns a promise deliberately: the P1
+ * block does NOT await the first request, which is what makes two requests
+ * overlap the way two browser tabs do.
+ */
+function mountRegenApi(root: string) {
+  const plugin: Plugin = regenApiPlugin(root);
+  let handler: Middleware | undefined;
+  const fakeServer: FakeViteServer = {
+    middlewares: { use: (fn) => { handler = fn; } },
+    moduleGraph: { invalidateAll: () => { /* not under test here */ } },
+  };
+  // configureServer is a plain function on this plugin (not the
+  // {handler, order} object form Vite's typing also allows), so it can be
+  // invoked directly once cast past ViteDevServer's much larger shape —
+  // the same "give it only what it actually reads" idiom
+  // compiler-routes.test.ts uses for its own fake `res`.
+  (plugin.configureServer as unknown as (server: FakeViteServer) => void)(fakeServer);
+  if (handler === undefined) throw new Error("regenApiPlugin never registered its middleware");
+  const middleware = handler;
+
+  function call(method: string, url: string, body?: unknown): Promise<{ status: number; body: string }> {
+    return new Promise((resolveCall) => {
+      const chunks: string[] = [];
+      const res = {
+        statusCode: 200,
+        setHeader() { /* no-op */ },
+        end(chunk?: string) {
+          if (chunk !== undefined) chunks.push(String(chunk));
+          resolveCall({ status: res.statusCode, body: chunks.join("") });
+        },
+      } as unknown as ServerResponse;
+
+      const req = new EventEmitter() as unknown as IncomingMessage;
+      Object.assign(req, { method, url, headers: {} });
+
+      middleware(req, res, () => resolveCall({ status: 404, body: "" }));
+
+      // readBody's req.on("data"/"end") listeners are attached
+      // SYNCHRONOUSLY inside the middleware call above — safe to emit
+      // right away, in the same tick.
+      const emitter = req as unknown as EventEmitter;
+      if (body !== undefined) emitter.emit("data", Buffer.from(JSON.stringify(body)));
+      emitter.emit("end");
+    });
+  }
+
+  return { call };
+}
+
 describe("regenApiPlugin: route-slug validation on proxied route/section fields (FIX 1)", () => {
   const dirs: string[] = [];
   afterEach(() => {
@@ -164,58 +233,6 @@ describe("regenApiPlugin: route-slug validation on proxied route/section fields 
     const dir = mkdtempSync(join(tmpdir(), "regen-traversal-"));
     dirs.push(dir);
     return dir;
-  }
-
-  type Middleware = (req: IncomingMessage, res: ServerResponse, next: () => void) => void;
-  interface FakeViteServer {
-    middlewares: { use: (fn: Middleware) => void };
-    moduleGraph: { invalidateAll: () => void };
-  }
-
-  /** Extracts and drives the real middleware `regenApiPlugin(root)` registers. */
-  function mountRegenApi(root: string) {
-    const plugin: Plugin = regenApiPlugin(root);
-    let handler: Middleware | undefined;
-    const fakeServer: FakeViteServer = {
-      middlewares: { use: (fn) => { handler = fn; } },
-      moduleGraph: { invalidateAll: () => { /* not under test here */ } },
-    };
-    // configureServer is a plain function on this plugin (not the
-    // {handler, order} object form Vite's typing also allows), so it can be
-    // invoked directly once cast past ViteDevServer's much larger shape —
-    // the same "give it only what it actually reads" idiom
-    // compiler-routes.test.ts uses for its own fake `res`.
-    (plugin.configureServer as unknown as (server: FakeViteServer) => void)(fakeServer);
-    if (handler === undefined) throw new Error("regenApiPlugin never registered its middleware");
-    const middleware = handler;
-
-    function call(method: string, url: string, body?: unknown): Promise<{ status: number; body: string }> {
-      return new Promise((resolveCall) => {
-        const chunks: string[] = [];
-        const res = {
-          statusCode: 200,
-          setHeader() { /* no-op */ },
-          end(chunk?: string) {
-            if (chunk !== undefined) chunks.push(String(chunk));
-            resolveCall({ status: res.statusCode, body: chunks.join("") });
-          },
-        } as unknown as ServerResponse;
-
-        const req = new EventEmitter() as unknown as IncomingMessage;
-        Object.assign(req, { method, url, headers: {} });
-
-        middleware(req, res, () => resolveCall({ status: 404, body: "" }));
-
-        // readBody's req.on("data"/"end") listeners are attached
-        // SYNCHRONOUSLY inside the middleware call above — safe to emit
-        // right away, in the same tick.
-        const emitter = req as unknown as EventEmitter;
-        if (body !== undefined) emitter.emit("data", Buffer.from(JSON.stringify(body)));
-        emitter.emit("end");
-      });
-    }
-
-    return { call };
   }
 
   // Any section id whose route component (`.split(".")[0]`) starts with a
@@ -581,4 +598,210 @@ describe("snapshot/restore: no destructive step may precede its validation (F13 
 
     expect(readFileSync(join(root, ".regen-backup", "route.txt"), "utf8")).toBe("home");
   });
+});
+
+/**
+ * P1 (docs/decisions.md 2026-08-10, "F13 review, finding 1"): there is ONE
+ * snapshot slot per project and it had no lock of any kind, while
+ * `MAX_ACTIVE_JOBS_PER_USER` bounds concurrency per USER (2) and never per
+ * project. So ONE tester with two browser tabs can start two regenerations of
+ * two different routes on the same project; they share one preview child and
+ * one slot, the second `snapshotRoute` wiped the first's, and a later revert
+ * restored a manifest predating the first route's commit while that route's
+ * CODE stayed regenerated. Silent, and reported as "my page broke".
+ *
+ * "Pending" here means a regeneration is STILL RUNNING — not merely that a
+ * slot exists on disk. Nothing frees the slot except a revert or the next
+ * snapshot (the editor sets `revertSection` after a successful regen and
+ * offers no discard), so refusing on the mere EXISTENCE of another route's
+ * slot would 500 the ordinary SEQUENTIAL flow — regenerate `home`, keep it,
+ * then regenerate `about` — with no way out but reverting the kept work. The
+ * tests below pin both halves: the concurrent case is refused, the sequential
+ * case is not.
+ */
+describe("snapshotRoute: a second CONCURRENT regeneration may not replace the pending slot (P1)", () => {
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const dir of dirs) {
+      releaseSnapshotClaim(dir); // a test that never "finished" its regen still holds one
+      rmSync(dir, { recursive: true, force: true });
+    }
+    dirs.length = 0;
+    delete process.env.WG_REGEN_MOCK;
+  });
+
+  /** Two routes, each with a uniquely-named file, so a swap is unmistakable. */
+  function twoRouteProject(nodes: Record<string, unknown> = {}): string {
+    const dir = mkdtempSync(join(tmpdir(), "regen-p1-"));
+    dirs.push(dir);
+    for (const route of ["home", "about"]) {
+      mkdirSync(join(dir, "src", "pages", route), { recursive: true });
+      writeFileSync(join(dir, "src", "pages", route, `${route}-only.tsx`), `// ${route}\n`, "utf8");
+    }
+    writeFileSync(join(dir, "manifest.json"), JSON.stringify({ nodes }), "utf8");
+    return dir;
+  }
+
+  /* ---------- the two functions directly ---------- */
+
+  it("refuses a second concurrent snapshot rather than silently replacing the first", () => {
+    const root = twoRouteProject();
+    snapshotRoute(root, "home");
+
+    // `about`'s regen must not be allowed to discard `home`'s pending snapshot.
+    expect(() => snapshotRoute(root, "about")).toThrow(/pending regeneration/i);
+    expect(readFileSync(join(root, ".regen-backup", "route.txt"), "utf8")).toBe("home");
+  });
+
+  it("leaves the refused-against snapshot fully intact and still restorable", () => {
+    const root = twoRouteProject();
+    snapshotRoute(root, "home");
+    expect(() => snapshotRoute(root, "about")).toThrow(/pending regeneration/i);
+
+    // Asserting on the CONTENTS, not just on route.txt: the failure this
+    // guards against wiped `page/` and `manifest.json` and then wrote a new
+    // owner record, so a route.txt-only assertion would not discriminate
+    // between "refused" and "replaced but mislabelled".
+    expect(existsSync(join(root, ".regen-backup", "page", "home-only.tsx"))).toBe(true);
+    expect(existsSync(join(root, ".regen-backup", "manifest.json"))).toBe(true);
+    rmSync(join(root, "src", "pages", "home"), { recursive: true, force: true });
+    restoreSnapshot(root, "home");
+    expect(existsSync(join(root, "src", "pages", "home", "home-only.tsx"))).toBe(true);
+  });
+
+  it("names the pending route and says what to do about it", () => {
+    const root = twoRouteProject();
+    snapshotRoute(root, "home");
+
+    // Exact wording, not a loose substring: a message that merely says "busy"
+    // leaves the user with nothing to act on, and the endpoint's only channel
+    // for this is the 500 body (the handler's existing catch).
+    expect(() => snapshotRoute(root, "about")).toThrow(
+      'a pending regeneration of route "home" still holds this project\'s single snapshot slot; ' +
+        'revert or discard that regeneration before regenerating "about". Nothing was changed.',
+    );
+  });
+
+  it("allows the SAME route to re-snapshot (the retry and page-regen paths)", () => {
+    const root = twoRouteProject();
+    snapshotRoute(root, "home");
+
+    // The editor re-runs a failed regen against the same section, and the page
+    // path snapshots the route it is about to loop over. Refusing here would
+    // break both — this is the regression the second required perturbation
+    // (make the refusal reject the same route too) must make fail.
+    expect(() => snapshotRoute(root, "home")).not.toThrow();
+    expect(() => snapshotRoute(root, "home.hero".split(".")[0]!)).not.toThrow();
+    expect(readFileSync(join(root, ".regen-backup", "route.txt"), "utf8")).toBe("home");
+  });
+
+  it("allows a fresh snapshot once the pending one has been consumed", () => {
+    const root = twoRouteProject();
+    snapshotRoute(root, "home");
+    restoreSnapshot(root, "home");
+    expect(() => snapshotRoute(root, "about")).not.toThrow();
+  });
+
+  it("allows another route once the pending regeneration has FINISHED, not only once reverted", () => {
+    const root = twoRouteProject();
+    snapshotRoute(root, "home");
+    releaseSnapshotClaim(root); // what the endpoint's `finally` does
+
+    // The slot still exists on disk and still says "home" — a user who kept
+    // their regeneration never reverts, and nothing else clears it. Refusing
+    // on the slot's mere existence would wedge every multi-route site behind
+    // an undo the editor gives no button for.
+    expect(readFileSync(join(root, ".regen-backup", "route.txt"), "utf8")).toBe("home");
+    expect(() => snapshotRoute(root, "about")).not.toThrow();
+    expect(readFileSync(join(root, ".regen-backup", "route.txt"), "utf8")).toBe("about");
+  });
+
+  it("still reports a missing page directory rather than the claim, so finding 4 keeps its message", () => {
+    const root = twoRouteProject();
+    snapshotRoute(root, "home");
+    // Ordering, pinned: the page-directory check must stay AHEAD of the claim
+    // check. Both are non-destructive, but the F13-review finding-4 test reads
+    // the message, and a claim-first order silently changes what that test is
+    // actually exercising.
+    expect(() => snapshotRoute(root, "contact")).toThrow(/no page directory/);
+  });
+
+  /* ---------- through the real middleware, the way two tabs reach it ---------- */
+
+  /** Waits for a request that is still in flight to have taken its snapshot. */
+  async function waitForSlot(root: string): Promise<void> {
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      if (existsSync(join(root, ".regen-backup", "route.txt"))) return;
+      await new Promise((tick) => setTimeout(tick, 5));
+    }
+    throw new Error("the first request never took its snapshot");
+  }
+
+  it("refuses the second of two OVERLAPPING page regenerations, then frees the slot when the first ends", async () => {
+    // One active section per route: enough for mockRegenPage to do real work
+    // (its 1.5s per-section delay is what keeps request one genuinely in
+    // flight while request two arrives — exactly the two-tab race).
+    const root = twoRouteProject({
+      "home.hero": { status: "active", component: "Hero" },
+      "about.hero": { status: "active", component: "Hero" },
+    });
+    process.env.WG_REGEN_MOCK = "1";
+    const { call } = mountRegenApi(root);
+
+    const first = call("POST", "/__regen-page", { route: "home", instruction: "x" });
+    await waitForSlot(root);
+    const second = await call("POST", "/__regen-page", { route: "about", instruction: "x" });
+
+    expect(second.status).toBe(500);
+    expect(second.body).toContain("pending regeneration");
+    // The in-flight run's snapshot is still its own.
+    expect(readFileSync(join(root, ".regen-backup", "route.txt"), "utf8")).toBe("home");
+    expect(await first).toMatchObject({ status: 200 });
+
+    // ...and the claim is released by the request that took it, so the refusal
+    // lasts exactly as long as the run does. Without the release this third
+    // call would be refused too, and the editor would be wedged for the rest
+    // of the session.
+    const third = await call("POST", "/__regen-page", { route: "about", instruction: "x" });
+    expect(third.status).toBe(200);
+    expect(readFileSync(join(root, ".regen-backup", "route.txt"), "utf8")).toBe("about");
+  }, 30_000);
+
+  it("frees the slot when the first regeneration FAILS, not only when it succeeds", async () => {
+    // An empty manifest makes mockRegenPage throw ("no active sections"), so
+    // the handler answers 500 — the path where a `finally`-less release would
+    // leak the claim and refuse every later regeneration on the project.
+    const root = twoRouteProject();
+    process.env.WG_REGEN_MOCK = "1";
+    const { call } = mountRegenApi(root);
+
+    const first = await call("POST", "/__regen-page", { route: "home", instruction: "x" });
+    expect(first.status).toBe(500);
+    expect(first.body).toContain("no active sections");
+
+    const second = await call("POST", "/__regen-page", { route: "about", instruction: "x" });
+    expect(second.body).not.toContain("pending regeneration");
+    expect(readFileSync(join(root, ".regen-backup", "route.txt"), "utf8")).toBe("about");
+  });
+
+  it("does not release a claim it never took, when a request is the one being refused", async () => {
+    // The trap in wiring the release: a request refused by SOMEONE ELSE's
+    // claim must not run the release in its own `finally`, or the refusal
+    // hands the slot straight to the next clobberer — the second of three
+    // tabs would fail and the third would succeed.
+    const root = twoRouteProject({ "home.hero": { status: "active", component: "Hero" } });
+    process.env.WG_REGEN_MOCK = "1";
+    const { call } = mountRegenApi(root);
+
+    const first = call("POST", "/__regen-page", { route: "home", instruction: "x" });
+    await waitForSlot(root);
+    const second = await call("POST", "/__regen-page", { route: "about", instruction: "x" });
+    const third = await call("POST", "/__regen-page", { route: "about", instruction: "x" });
+
+    expect(second.status).toBe(500);
+    expect(third.status).toBe(500);
+    expect(third.body).toContain("pending regeneration");
+    expect(readFileSync(join(root, ".regen-backup", "route.txt"), "utf8")).toBe("home");
+    await first;
+  }, 30_000);
 });

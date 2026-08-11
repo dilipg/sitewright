@@ -58,6 +58,10 @@ const EXPECTED_ROUTES: Array<[string, string]> = [
   ["GET", "/api/jobs/:id"],
   // Task 7, resume.
   ["POST", "/api/jobs/:id/resume"],
+  // Local tester onboarding, task 1: progress read from the run log
+  // (progress-routes.ts). Mounted unconditionally — unlike the rest of the job
+  // endpoints it needs neither a projects root nor a pool.
+  ["GET", "/api/jobs/:id/progress"],
   ["GET", "/api/jobs"],
   ["GET", "/preview/:projectId/*"],
   ...PROJECT_SCOPED_ENDPOINTS

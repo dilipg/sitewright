@@ -83,6 +83,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdirSync, rmSync } from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
+import { getApiKeyFingerprint } from "./api-keys.ts";
 import { codeVersionsIncompatible, resolveCodeVersion } from "./code-version.ts";
 import {
   BILLABLE_JOB_KINDS, countActiveBillableJobsForUser, createBillableJobIfUnderBound, createJob,
@@ -102,6 +103,41 @@ import { checkSpendCap, describeSpendCap } from "./spend-cap.ts";
 const PROJECT_JOB_LIST_LIMIT = 50;
 
 const BAD_BRIEF = { error: "a brief is required" };
+
+/**
+ * WHOLE-BRANCH REVIEW, I3 — the one precondition a generation cannot proceed
+ * without, checked at the boundary instead of in the worker.
+ *
+ * The ordinary first-run sequence for a new tester is: log in, type a brief,
+ * press Generate. Without this they got **202**, a project row, a directory, a
+ * job, an eleven-minute progress screen and then a `failed` job reading "no
+ * Anthropic API key: save one in settings, or supply one with this request" —
+ * where "settings" names nothing that exists (there is no key UI anywhere in
+ * `editor/src`), the only action the screen then offers is Resume (which
+ * re-enters `buildAgentEnv` and fails identically), and every attempt left
+ * another permanent, undeletable project row in the picker.
+ *
+ * The MESSAGE names the thing that actually works. It reaches the user
+ * verbatim: `ProjectPicker`'s `refusalMessage` reads `.error` off a non-202 and
+ * renders it, deliberately, because this endpoint words its own refusals.
+ *
+ * `getApiKeyFingerprint` rather than `resolveApiKey`/`assertApiKeyUsable`, and
+ * that is a deliberate limit, not an oversight: it takes NO master key, so this
+ * route stays structurally incapable of decrypting a stored credential (the
+ * property `api-keys.ts`'s own comment exists to protect), and `jobRoutes` gains
+ * no `masterKey` dependency. The cost, stated: a stored-but-UNDECRYPTABLE key
+ * (the server booted under a different `WEBGEN_MASTER_KEY`) passes this check
+ * and still fails in the worker, which maps it to a job error and logs it for
+ * the operator — unchanged from today, and not something a user can act on
+ * anyway. A DISABLED account cannot reach here at all: `requireSession` rejects
+ * one, and `disable` hard-deletes its sessions.
+ */
+const NO_API_KEY = {
+  error:
+    "no Anthropic API key is stored for this account, and a generation cannot run without one. " +
+    "There is no settings screen yet: store one with PUT /api/key (README step 7, \"Give the " +
+    "server your Anthropic API key\"), then generate again. Nothing was created and nothing was charged.",
+};
 /** Same shape router.ts's own readJsonBody-failure responses use elsewhere (compiler-routes.ts's enqueueHandler) — a malformed body is a body problem, not a missing-field problem, and deserves its own message rather than being folded into BAD_BRIEF. */
 const BAD_JSON_BODY = { error: "request body must be valid JSON within the size limit" };
 
@@ -209,6 +245,14 @@ export function jobRoutes(deps: { db: DatabaseSync; projectsRoot: string; codeVe
       // cap) is enforced further down, inside the transaction — see this
       // module's own top comment for why it can no longer be a wrapper here.
       handler: requireSession(db, requireBudget(db, async (req, res, ctx) => {
+        // I3: before the body is read, before the directory, before the
+        // transaction — the same "an over-cap request creates nothing" rule
+        // `requireBudget` above enforces, applied to the other precondition
+        // this endpoint cannot proceed without. See NO_API_KEY.
+        if (getApiKeyFingerprint(db, ctx.user.id) === null) {
+          sendJson(res, 400, NO_API_KEY);
+          return;
+        }
         let parsed: unknown;
         try {
           parsed = await readJsonBody(req);

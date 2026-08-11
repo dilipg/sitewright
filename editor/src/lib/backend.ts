@@ -79,11 +79,208 @@ export type BackendMode =
  */
 export function resolveMode(search: string, origin: string): BackendMode {
   const params = new URLSearchParams(search);
-  const projectId = params.get("project");
-  if (projectId !== null && projectId !== "") {
+  const projectId = projectIdFrom(search);
+  if (projectId !== null) {
     return { kind: "hosted", projectId, origin };
   }
   return { kind: "local", previewOrigin: params.get("preview") ?? DEFAULT_LOCAL_ORIGIN };
+}
+
+/**
+ * The one reading of `?project=`, shared by `resolveMode` and `isHostedMode`
+ * so the two can never disagree about what counts as a project. `null` means
+ * "no project", which includes the present-but-valueless `?project=` case (see
+ * `resolveMode`'s KNOWN HAZARD note above — unchanged behaviour, just no
+ * longer written out twice).
+ */
+function projectIdFrom(search: string): string | null {
+  const value = new URLSearchParams(search).get(PROJECT_QUERY_PARAM);
+  return value === null || value === "" ? null : value;
+}
+
+/**
+ * HOSTED-SHELL MODE — a DIFFERENT question from `resolveMode`'s, and the two
+ * must not be collapsed.
+ *
+ * `resolveMode` answers "which project's URLs do I build?", which only a
+ * `?project=<id>` can answer. This answers "is this editor talking to the
+ * hosted server at all?", which has to be answerable BEFORE a project exists:
+ * a tester following the README opens a bare `http://localhost:5173/` with no
+ * project yet and must land on the login screen, not on a canvas pointed at a
+ * local preview server that is not running.
+ *
+ * Signalled by a BUILD-TIME env var (`VITE_WEBGEN_HOSTED=1`, set by
+ * `npm run dev:hosted` via `editor/.env.hosted`), OR by a `?project=` on the
+ * URL. Three properties follow from that choice, and each was the reason for it:
+ *
+ * 1. **Local mode stays byte-identical STRUCTURALLY, not by convention.**
+ *    Playwright's `webServer` runs the plain `dev` script (`npm run dev --
+ *    --port 5174`, playwright.config.ts), which never loads `.env.hosted`, so
+ *    the variable is absent for the entire milestone-7 suite and `isHostedMode`
+ *    is false for every one of its bare-`/` navigations. Nothing in a test has
+ *    to remember to unset anything.
+ * 2. **Every existing hosted URL and test keeps working unchanged**, because
+ *    `?project=` remains sufficient on its own — that is the second disjunct.
+ * 3. **A runtime probe of `/api/me` was considered and REJECTED.** In local
+ *    mode the Vite dev server still proxies `/api` to port 4000
+ *    (vite.config.ts), so the probe's answer would depend on whether an
+ *    unrelated hosted server happens to be running on this machine — the mode
+ *    the editor boots into would be nondeterministic, and a local-mode
+ *    Playwright run would pass or fail based on a background process.
+ *
+ * Pure, like `resolveMode`, and for the same reason: the singleton below is
+ * computed exactly once at import time, so a test that could only reach it
+ * through the singleton could not exercise both answers.
+ */
+export function isHostedMode(search: string, hostedFlag: string | undefined): boolean {
+  // Exactly "1" — not "truthy". `VITE_WEBGEN_HOSTED=0` and
+  // `VITE_WEBGEN_HOSTED=false` are strings, and both are truthy in JS; an
+  // operator who writes either of them means OFF, and silently reading them
+  // as ON would drop a tester into hosted mode with no way back.
+  return hostedFlag === "1" || projectIdFrom(search) !== null;
+}
+
+/**
+ * SESSION-scoped endpoints: no `?project=`, because both are session-only in
+ * `server/src/project-registry.ts` — they are what a caller uses when there is
+ * no project yet, which is the entire point of the hosted shell.
+ *
+ * Relative, unlike `apiUrl`'s absolute results. That asymmetry is deliberate
+ * and load-bearing in one direction only: `apiUrl` must be absolute because
+ * `jobs.ts`'s `enqueueAndPoll` feeds it to `new URL(pollPath, base)`, which
+ * throws on a relative base. Nothing derives a URL from these two, and a
+ * plain `fetch()` resolves a relative URL against the current document — the
+ * same origin the Vite dev server proxies to the hosted server, which is what
+ * keeps the session cookie flowing under `SameSite=Lax` with no CORS.
+ *
+ * Functions rather than constants so Task 3's `projectsUrl()`/`generateUrl()`
+ * sit beside them in the same shape, and so this module keeps owning every URL
+ * the editor constructs.
+ */
+export function loginUrl(): string {
+  return "/api/login";
+}
+
+export function meUrl(): string {
+  return "/api/me";
+}
+
+/**
+ * TASK 3. Both are session-only in `server/src/project-registry.ts` and take
+ * no `?project=` for the same reason `loginUrl`/`meUrl` do not: they are what
+ * a caller uses when there is no project yet. `POST /api/generate` is
+ * additionally the one route in this codebase that CREATES a project, so
+ * "which project?" is not a question it could answer.
+ *
+ * Neither interpolates anything, which is worth stating rather than leaving
+ * as an accident: no client- or server-supplied string reaches either path,
+ * so neither is a `..` site.
+ */
+export function projectsUrl(): string {
+  return "/api/projects";
+}
+
+export function generateUrl(): string {
+  return "/api/generate";
+}
+
+/**
+ * TASK 4. The three job endpoints the progress view polls and acts on. All
+ * three are SESSION-only in `server/src/project-registry.ts` — a job belongs to
+ * the user who queued it, not to a project, and a `generate` job's `project_id`
+ * is `ON DELETE SET NULL` — so none of them takes a `?project=`.
+ *
+ * THE JOB ID GOES IN THE PATH, so it is escaped, and this is not theatre. This
+ * codebase has shipped FOUR `..` defects at four layers (an unvalidated proxied
+ * `route` joined with `path.join`; a `runId` rail whose `^[A-Za-z0-9._-]+$`
+ * matched `..` because `.` is in the class; a project id needing two
+ * `encodeURIComponent` passes; model-generated route slugs spliced into URL
+ * paths), and CLAUDE.md's standing instruction is "assume the fifth exists."
+ * This is a candidate for the fifth: the job id reaching these paths comes from
+ * a 202 body OR — new in this task — from **`localStorage`**, which is
+ * client-writable by anyone with a devtools console or a stored-XSS foothold on
+ * this origin. `fetch("/api/jobs/../../api/key/reveal")` is normalized by the
+ * WHATWG URL parser exactly as a literal `..` path would be, so an unescaped id
+ * is a request-forgery primitive aimed at this app's own authenticated origin.
+ * `encodePathSegment` (not a bare `encodeURIComponent`, which leaves `.`
+ * untouched) is what closes it — see that function's own comment for why one
+ * pass is insufficient.
+ *
+ * Relative, like `loginUrl`/`meUrl`/`projectsUrl` and for the same reason:
+ * nothing derives a further URL from these (unlike `apiUrl`, whose result feeds
+ * `new URL(path, base)` and must therefore be absolute), and a plain `fetch()`
+ * resolves a relative URL against the current document — the one origin the
+ * Vite dev server proxies to the hosted server, which is what keeps the session
+ * cookie flowing under `SameSite=Lax` with no CORS.
+ */
+export function jobUrl(jobId: string): string {
+  return `/api/jobs/${encodePathSegment(jobId)}`;
+}
+
+export function jobProgressUrl(jobId: string): string {
+  return `${jobUrl(jobId)}/progress`;
+}
+
+export function jobResumeUrl(jobId: string): string {
+  return `${jobUrl(jobId)}/resume`;
+}
+
+/**
+ * The editor's OWN url for a chosen project — what the picker navigates to,
+ * and the one place a project id supplied by the server re-enters this app.
+ *
+ * The id goes in the QUERY, never the path, and that is what decides the
+ * escaping. `previewUrl` double-escapes its id (`%2E` then
+ * `encodeURIComponent`) because a path segment is subject to the WHATWG URL
+ * parser's dot-segment normalization, which treats `%2e`/`%2e%2e` as
+ * equivalent to `.`/`..` and collapses them. A query VALUE is subject to no
+ * such step: `URLSearchParams` percent-encodes it once, `resolveMode`'s own
+ * `URLSearchParams.get` decodes it once, and the round trip is exact. Running
+ * `encodePathSegment` here would not be "extra safety" — it would corrupt the
+ * value, turning an id containing a dot into a different id (`%252E`) that no
+ * project has.
+ *
+ * Built from the CURRENT href rather than from a bare origin so nothing else
+ * on the URL is silently dropped: `?preview=` still round-trips (hosted wins
+ * over it in `resolveMode`, but discarding a query parameter as a side effect
+ * of opening a project would be a surprise), and so does anything a future
+ * link carries. Pure — it takes the href as a string instead of reading
+ * `window` — so a test can exercise it in the windowless vitest environment,
+ * the same shape `resolveMode` and `isHostedMode` already have.
+ */
+export function editorUrlForProject(projectId: string, currentHref: string): string {
+  const url = new URL(currentHref);
+  url.searchParams.set(PROJECT_QUERY_PARAM, projectId);
+  return url.toString();
+}
+
+/**
+ * THE WAY BACK — `editorUrlForProject`'s exact counterpart, and the whole of
+ * the C2 fix's escape hatch (whole-branch review).
+ *
+ * The picker renders only when `?project=` is absent, so a project that cannot
+ * be bootstrapped (its directory is still empty because its generation is
+ * running, or it failed and the row is permanent) used to be a dead end: a
+ * reload reproduced the same broken state and the only exit was hand-editing
+ * the URL. Removing the parameter is what returns the tester to their own list.
+ *
+ * Same URL discipline as `editorUrlForProject`, for the same reasons: built
+ * from the current href so nothing else on the URL is silently dropped, and
+ * pure (the href arrives as a string) so it is testable in a windowless vitest
+ * environment.
+ *
+ * WORTH KNOWING, since it follows from `isHostedMode`'s two disjuncts rather
+ * than from anything here: with `VITE_WEBGEN_HOSTED=1` set (what
+ * `npm run dev:hosted` does, and what the README tells a tester to run) this
+ * lands on the picker. With the flag UNSET and hosted mode reached only by a
+ * pasted `?project=`, removing it lands in local mode — which is where a bare
+ * `/` would have landed in that setup anyway, so it is still coherent, just
+ * not the picker.
+ */
+export function editorUrlWithoutProject(currentHref: string): string {
+  const url = new URL(currentHref);
+  url.searchParams.delete(PROJECT_QUERY_PARAM);
+  return url.toString();
 }
 
 export interface Backend {
@@ -222,4 +419,19 @@ export const backend: Backend = createBackend(
   typeof window === "undefined"
     ? { kind: "local", previewOrigin: DEFAULT_LOCAL_ORIGIN }
     : resolveMode(window.location.search, window.location.origin),
+);
+
+/**
+ * The one place `import.meta.env` is read (task-2 brief: do not scatter it
+ * across components). Computed once at import time, exactly like `backend`
+ * above, and windowless-guarded for the same reason.
+ *
+ * `import.meta.env.VITE_WEBGEN_HOSTED` is a BUILD-time substitution, so it is
+ * `undefined` under `vitest` and under Playwright's `webServer` (both run
+ * without `.env.hosted`) — which is what makes `hostedMode === false` the
+ * structural default rather than something a test has to arrange.
+ */
+export const hostedMode: boolean = isHostedMode(
+  typeof window === "undefined" ? "" : window.location.search,
+  import.meta.env.VITE_WEBGEN_HOSTED as string | undefined,
 );

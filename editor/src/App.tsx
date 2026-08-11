@@ -15,6 +15,15 @@ import type { AddSectionState, Archetype } from "./components/AddSection";
 import { AddSectionPanel } from "./components/AddSection";
 import type { EditPromptState } from "./components/EditPrompt";
 import EditPrompt from "./components/EditPrompt";
+import LoginScreen from "./components/LoginScreen";
+import GenerationProgress, {
+  forgetPersistedRun,
+  localRunStorage,
+  persistRun,
+  restorePersistedRun,
+} from "./components/GenerationProgress";
+import type { StartedGeneration } from "./components/ProjectPicker";
+import ProjectPicker from "./components/ProjectPicker";
 import type { RegenPhase } from "./components/Regen";
 import { OrphanDialog, RegenControls } from "./components/Regen";
 import type { PreviewWidth, RouteInfo, Viewport } from "./lib/canvas";
@@ -26,12 +35,20 @@ import {
   isEditableWidth,
   PREVIEW_WIDTHS,
   isFrameNearViewport,
+  isManifestShaped,
   renderedSections,
   routesFromManifest,
   splitOverridesByRoute,
   zoomAt,
 } from "./lib/canvas";
-import { backend, encodePathSegment } from "./lib/backend";
+import {
+  backend,
+  editorUrlForProject,
+  editorUrlWithoutProject,
+  encodePathSegment,
+  hostedMode,
+  meUrl,
+} from "./lib/backend";
 import { applyEditOperations, interpretEditResult, validateEditOperations } from "./lib/edit-ops";
 import type { EditPromptResponse } from "./lib/edit-ops";
 import { expandStyleValue } from "./lib/inventory";
@@ -89,6 +106,53 @@ const JOB_INTERRUPTED_MESSAGE =
   "The server restarted while this was running, so the outcome is unknown. Check the page to see whether the change went through before trying again.";
 
 const SESSION_EXPIRED_MESSAGE = "Your session expired — sign in again.";
+
+/**
+ * WHOLE-BRANCH REVIEW, C2. One message, thrown by BOTH readers of
+ * `manifest.json` (bootstrap and `refreshManifest`) when a 200 carries
+ * something that is not a manifest — a different failure from a non-2xx, and
+ * the one that actually reached the DOM.
+ */
+const MANIFEST_SHAPE_ERROR = "manifest.json did not have the expected shape";
+
+/**
+ * What `GET /api/me` gives back for a valid session.
+ *
+ * TASK 4 added the three money fields. They are read here rather than in a
+ * second request from the picker because this is already the one call made
+ * before a project exists, and the numbers matter at exactly one moment: beside
+ * a button that spends ~$1.74. A tester who cannot see what is left finds out
+ * they are over the cap by being refused 402 after typing a brief.
+ *
+ * All three are OPTIONAL at the type level even though the server always sends
+ * them: this is a parsed network response, and a build talking to an older
+ * server must render a picker without a budget line rather than `$NaN`.
+ */
+interface AccountSummary {
+  id: string;
+  email: string;
+  spendCapUsd?: number;
+  spentUsd24h?: number;
+  /** Non-zero means `spentUsd24h` is a FLOOR, not an exact figure — a model
+   *  with no published rate contributed tokens it could not price. Both other
+   *  surfaces that show this number already caveat it; this one must too. */
+  unpricedEvents?: number;
+}
+
+/**
+ * HOSTED SHELL WITH NO PROJECT YET — the state a tester following the README
+ * boots into: `npm run dev:hosted`, a bare `http://localhost:5173/`, no
+ * `?project=`. There is no project to bootstrap a canvas for, so the canvas
+ * bootstrap must NOT run (its URLs would point at the local preview server on
+ * :5273, which a hosted tester is not running — a silent hang, not an error).
+ * Instead the app asks who the user is and shows either the login screen or,
+ * from task 3, the project picker.
+ *
+ * `backend.projectId` rather than a second query-string read: `backend.ts`
+ * owns that parse, and `hostedMode` deliberately answers a different question
+ * (it is true for BOTH the flag and `?project=`).
+ */
+const hostedShellWithoutProject = hostedMode && backend.projectId === undefined;
 
 /** Nearest active manifest node at or above the given ID. */
 function selectableId(nodeId: string, manifest: Manifest | null): string | undefined {
@@ -207,7 +271,47 @@ export default function App() {
   // have landed) and any flow's own "failed" phase (the work definitely did
   // not land) -- there is no login page to send the user to (task-8 brief),
   // so this only ever surfaces, it never auto-recovers.
+  //
+  // TASK 2 changes what it RENDERS in hosted mode, not what it means: there
+  // IS a login screen now, so hosted mode shows it in place of the canvas.
+  // Local mode keeps today's banner byte-identically. This stays the single
+  // "the session is not usable" flag -- a parallel "not logged in yet" state
+  // would be the same fact recorded twice, free to disagree.
   const [sessionExpired, setSessionExpired] = useState(false);
+  // The signed-in account, once known. `null` means "not asked yet, or still
+  // asking", and it is only ever consulted in the hosted-shell-without-project
+  // branch below. NOT a login flag (that is `sessionExpired`) -- it is the
+  // identity the project picker (task 3) renders.
+  const [account, setAccount] = useState<AccountSummary | null>(null);
+  // WHOLE-BRANCH REVIEW, C2. Why the bootstrap failed, when it failed for a
+  // reason that is not a session expiry (that has its own state, above). Held
+  // rather than only logged, because it is the difference between a blank page
+  // and a screen with a way back: the picker renders ONLY when `?project=` is
+  // absent, so without this a project that cannot be opened is a dead end that
+  // survives a reload. Rendered in hosted mode only — local mode keeps today's
+  // console.error-and-sit-on-"Loading…" behaviour byte-identically, and the
+  // milestone-7 Playwright suite runs there.
+  const [bootstrapError, setBootstrapError] = useState<string | null>(null);
+  // TASK 3. A generation that has STARTED — both ids, held together, because
+  // they name different things: `jobId` is what the progress view polls,
+  // `projectId` is what the editor opens once the job succeeds.
+  //
+  // TASK 4 made it survive a reload, and that is a MONEY fix rather than a
+  // polish one. Held only in tab state, a reload during an ~11-minute run
+  // returned the tester to the picker with a real run still going; they
+  // conclude it failed and press Generate again — $1.74 each, and the per-user
+  // bound is 2, so the second one SUCCEEDS. The initializer restores the pair
+  // from localStorage, and `GenerationProgress` immediately re-reads
+  // `GET /api/jobs/:id` (session-only, owner-checked) to decide whether that
+  // run is still going, already over, or gone entirely — a stale entry lands
+  // on `onAbandon` and the picker, never on a stuck screen.
+  //
+  // Guarded on `hostedShellWithoutProject` so LOCAL mode never reads this key
+  // at all: there is no session, no job table and no worker there, and local
+  // mode must stay byte-identical.
+  const [startedGeneration, setStartedGeneration] = useState<StartedGeneration | null>(() =>
+    hostedShellWithoutProject ? restorePersistedRun(localRunStorage()) : null,
+  );
 
   const manifestRef = useRef<Manifest | null>(null);
   const historyRef = useRef<History | null>(null);
@@ -267,6 +371,12 @@ export default function App() {
   /* ---------- bootstrap: manifest, tokens, persisted overrides + history ---------- */
 
   useEffect(() => {
+    // TASK 2: with no project there is nothing to bootstrap, and every URL
+    // below would resolve against the LOCAL preview server on :5273 that a
+    // hosted tester is not running -- a hang with no banner, which is exactly
+    // the failure class the bootstrap `.catch` was added to end. The
+    // `/api/me` gate below owns this case instead.
+    if (hostedShellWithoutProject) return;
     async function bootstrap() {
       // Every fetch here goes through `sessionAwareFetch` (task-8 review):
       // an already-expired session hit on the very FIRST load (a bookmarked
@@ -285,12 +395,21 @@ export default function App() {
         setPendingPlan({ brief: plan.brief, routes: plan.siteplan.routes });
       }
 
+      // WHOLE-BRANCH REVIEW, C2 — the other reader of the same resource.
+      // `refreshManifest` (below) was given a status check and a shape check by
+      // this branch's own finding-B fix; THIS reader kept `.json()`-straight-
+      // into-state, and task 3's picker then made it reachable in one click on
+      // a project whose directory is still empty. `fetchJson` throws on any
+      // non-2xx before `.json()` is called (so the preview pool's 503 body is
+      // never parsed as a manifest at all), and `isManifestShaped` refuses a
+      // 200 that is not one — both BEFORE anything reaches state, because
+      // `routes` is a `useMemo` over `manifest` and a bad value there throws
+      // inside render, where nothing catches it.
       const [manifestJson, tokensJson] = await Promise.all([
-        sessionAwareFetch(backend.previewUrl("/manifest.json")).then((r) => r.json() as Promise<Manifest>),
-        sessionAwareFetch(backend.previewUrl("/src/tokens/tokens.json")).then(
-          (r) => r.json() as Promise<TokensJson>,
-        ),
+        fetchJson<unknown>(backend.previewUrl("/manifest.json")),
+        fetchJson<TokensJson>(backend.previewUrl("/src/tokens/tokens.json")),
       ]);
+      if (!isManifestShaped(manifestJson)) throw new Error(MANIFEST_SHAPE_ERROR);
       manifestRef.current = manifestJson;
       setManifest(manifestJson);
       setTokens(tokensJson);
@@ -319,13 +438,80 @@ export default function App() {
         setSessionExpired(true);
         return;
       }
-      // Not a session expiry -- outside this task's scope to design a full
-      // bootstrap-failure UI (there was none before this task either), but
-      // this keeps the failure from being a completely silent, unhandled
-      // rejection.
+      // Not a session expiry. Logged, as before -- and, since the whole-branch
+      // review's C2, also HELD, so hosted mode can render a screen with a way
+      // back instead of a canvas that never arrives. Local mode is unchanged:
+      // nothing reads this state there.
       console.error("[bootstrap] failed", error);
+      setBootstrapError(error instanceof Error ? error.message : String(error));
     });
   }, []);
+
+  /* ---------- the session gate (task 2): hosted shell, no project yet ---------- */
+
+  /**
+   * The one request made before a project exists. `GET /api/me` is
+   * session-only (`project-registry.ts`), so it is answerable with no project
+   * at all — which is precisely why the login screen can be reached from a
+   * bare URL.
+   *
+   * ANY failure lands on the login screen, not only a 401. A 401 is the
+   * ordinary case (no cookie, or a lapsed one). A network error means the
+   * hosted server is not running — different cause, but leaving the user on
+   * a "Checking…" screen forever is the silent-hang bug this codebase has
+   * now fixed three times, and the real cause surfaces the moment they press
+   * Sign in (`submitLogin` reports it verbatim). One flag, no third state.
+   *
+   * WHOLE-BRANCH REVIEW, I1 — IT RE-READS WHEN `startedGeneration` CHANGES,
+   * and that dependency is the whole fix. `/api/me` carries the money fields
+   * the picker renders beside the Generate button, and it was read exactly once
+   * per tab: a tester who generated a site (~$1.74), pressed "Back to your
+   * sites" and looked at the budget line was told "$10.00 of your $10.00 daily
+   * budget is left ($0.00 spent in the last 24 hours)" — beside the button that
+   * had just spent it. After five runs in one tab it still said $10.00 and the
+   * next Generate was refused 402, which is the precise failure the line was
+   * added to prevent. `startedGeneration` transitions to `null` on exactly the
+   * one path back to the picker (`onAbandon`), and to a value when a run
+   * starts, so this fires on both edges. `account` is NOT cleared first: the
+   * picker would otherwise flash "Checking your session…" on every return.
+   *
+   * The `catch` above applies to the re-reads too, which is deliberate and was
+   * considered: a re-read that fails (the server restarted mid-run) shows the
+   * login screen rather than a stale budget. That is recoverable rather than
+   * lossy — the persisted `{jobId, projectId}` survives a 401 by design, so
+   * signing back in returns to the run, which task 4 confirmed live.
+   */
+  useEffect(() => {
+    if (!hostedShellWithoutProject) return;
+    void fetchJson<AccountSummary>(meUrl(), { cache: "no-store" })
+      .then(setAccount)
+      .catch((error: unknown) => {
+        if (!(error instanceof SessionExpiredError)) console.error("[session] /api/me failed", error);
+        setSessionExpired(true);
+      });
+  }, [startedGeneration]);
+
+  /**
+   * TASK 4 — the write half of reload survival. ONE write path, driven by the
+   * state itself rather than by the handler that set it, so both ways a run can
+   * begin are covered by the same line: `ProjectPicker`'s `onGenerationStarted`
+   * (a first generation) and `GenerationProgress`'s `onResumed` (a resume,
+   * which produces a NEW job id for the same project and would otherwise leave
+   * the persisted entry pointing at the failed original).
+   *
+   * It deliberately never CLEARS. Clearing belongs to whoever knows the run is
+   * over, which is `GenerationProgress` — it calls `forgetPersistedRun` when a
+   * job reaches a terminal status and when the server says the job is gone. An
+   * `else` branch here would clear on the render where `startedGeneration` is
+   * reset to null after the tester has already left the screen, which is the
+   * same instant, but it would ALSO clear on the very first render in local
+   * mode and on every hosted render before a run exists — writing to storage in
+   * paths that must not touch it.
+   */
+  useEffect(() => {
+    if (!hostedShellWithoutProject || startedGeneration === null) return;
+    persistRun(localRunStorage(), startedGeneration);
+  }, [startedGeneration]);
 
   /* ---------- shim messages (multiple cross-origin iframes, one per route) ---------- */
 
@@ -579,6 +765,38 @@ export default function App() {
     if (failed !== undefined) {
       throw new Error(`override write failed: HTTP ${String(failed.status)}`);
     }
+  }
+
+  /**
+   * TASK 2. Every session-dependent load in this component runs exactly once,
+   * on mount — `bootstrap` and the `/api/me` gate — and the one that failed
+   * is what put the user in front of the login screen. Reloading re-derives
+   * all of them from the new cookie in one step, instead of growing a second
+   * entry point into each that only this path would ever use (and that only
+   * this path would ever exercise, i.e. never, until it was wrong).
+   */
+  function onAuthenticated() {
+    window.location.reload();
+  }
+
+  /**
+   * TASK 3. Opening a project is a full NAVIGATION, not a state change.
+   *
+   * `backend` and `hostedMode` are module-scope singletons computed exactly
+   * once at import time from `window.location.search` (backend.ts says so, and
+   * says why: a test could not otherwise exercise both modes). Every URL the
+   * canvas builds — the preview iframe's `src`, every `/__*` endpoint's
+   * `?project=` — comes from that singleton, so setting `?project=` without
+   * reloading would leave the whole app pointed at the previous project, or in
+   * this case at a local preview server that a hosted tester is not running.
+   * Same reasoning as `onAuthenticated`'s reload, one step further along.
+   *
+   * `projectId` is the API's id, never the on-disk directory — see
+   * ProjectPicker's header comment for why the two are not interchangeable and
+   * why confusing them produces a 404 that reads as a deleted project.
+   */
+  function openProject(projectId: string) {
+    window.location.assign(editorUrlForProject(projectId, window.location.href));
   }
 
   /* ---------- edits ---------- */
@@ -920,12 +1138,15 @@ export default function App() {
    *  The shape check is deliberately separate from the status check: a 200
    *  carrying something that is not a manifest is a different failure from a
    *  401 carrying something that parses, and it is the one that actually
-   *  reached the DOM. */
+   *  reached the DOM.
+   *
+   *  WHOLE-BRANCH REVIEW, C2: that shape check was written out inline here and
+   *  nowhere else, while the bootstrap read the same resource with no check at
+   *  all. It is now `isManifestShaped` in `lib/canvas.ts` — beside the function
+   *  it protects, called by both readers, and unit-tested there. */
   async function refreshManifest(): Promise<Manifest> {
-    const loaded = await fetchJson<Manifest>(backend.previewUrl("/manifest.json"), { cache: "no-store" });
-    if (loaded === null || typeof loaded !== "object" || typeof loaded.nodes !== "object" || loaded.nodes === null) {
-      throw new Error("manifest.json did not have the expected shape");
-    }
+    const loaded = await fetchJson<unknown>(backend.previewUrl("/manifest.json"), { cache: "no-store" });
+    if (!isManifestShaped(loaded)) throw new Error(MANIFEST_SHAPE_ERROR);
     manifestRef.current = loaded;
     setManifest(loaded);
     return loaded;
@@ -1323,6 +1544,157 @@ export default function App() {
   // Narrow widths are read-only (PRD 7 P1): an override carries no
   // breakpoint, so an edit made at 390px would silently apply everywhere.
   const widthEditable = isEditableWidth(previewWidth);
+
+  /**
+   * LOCAL MODE MUST NOT RENDER THE LOGIN SCREEN AT ALL — that is what the
+   * `hostedMode &&` is doing, and it is the whole reason the mode decision is
+   * a build-time flag rather than a runtime probe. `compiler/scripts/
+   * preview.ts` is unauthenticated and local, never answers 401, and the
+   * milestone-7 Playwright suite navigates to a bare `/` asserting today's
+   * behaviour (including, in `hosted-mode.spec.ts`, that a faked 401 raises
+   * the DISMISSIBLE BANNER below). Both stay true because Playwright's
+   * `webServer` runs the plain `dev` script, which never sets
+   * `VITE_WEBGEN_HOSTED`.
+   *
+   * In hosted mode the login screen REPLACES the canvas rather than sitting
+   * over it as a banner: with the session gone, nothing on the canvas can be
+   * saved, regenerated or exported, so leaving it interactive would invite
+   * work that silently cannot land.
+   */
+  const showLogin = hostedMode && sessionExpired;
+  if (showLogin) {
+    return (
+      <div className="editor-root">
+        <LoginScreen onAuthenticated={onAuthenticated} />
+      </div>
+    );
+  }
+
+  /**
+   * WHOLE-BRANCH REVIEW, C2 — THE WAY BACK.
+   *
+   * A project can legitimately exist with an empty directory: `POST
+   * /api/generate` creates the row and the directory before queueing the job,
+   * so for the ~11 minutes a run takes there is nothing to bootstrap — and a
+   * generation that FAILED leaves that row permanently (there is no
+   * `DELETE /api/projects/:id` and no status column, so the picker cannot even
+   * mark it). Task 4 withholds "open the project" during a run for exactly this
+   * reason; task 3's picker lists the same project and opens it in one click.
+   *
+   * Before this, that click ended on a blank page: the pool's JSON failure body
+   * became `manifest = {error}`, `routesFromManifest` threw inside a `useMemo`
+   * during render, the tree unmounted, and a reload reproduced it — the picker
+   * renders only when `?project=` is absent, so there was no route back short
+   * of editing the URL by hand. The shape check above stops the crash; this
+   * screen is what makes the state recoverable.
+   *
+   * Hosted mode only, and above the picker branch rather than inside it: this
+   * state is reachable only WITH a `?project=`, which is precisely when the
+   * picker does not render.
+   */
+  if (hostedMode && bootstrapError !== null) {
+    return (
+      <div className="editor-root">
+        <div className="bootstrap-error" data-testid="bootstrap-error" role="alert">
+          <h1>This site could not be opened</h1>
+          <p>
+            Its files could not be loaded. The usual reason is that its generation is still
+            running — a new site has no files until the run finishes — or that the generation
+            failed. Nothing was changed by opening it.
+          </p>
+          <p className="bootstrap-error-detail">{bootstrapError}</p>
+          <button
+            type="button"
+            className="picker-generate"
+            data-testid="bootstrap-error-back"
+            onClick={() => window.location.assign(editorUrlWithoutProject(window.location.href))}
+          >
+            Back to your sites
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // Signed in, hosted, but no project selected yet — TASK 3's picker, which
+  // replaces task 2's placeholder. Reaching a project no longer means reading
+  // a UUID out of `user-cli list-projects` and pasting it into the URL.
+  if (hostedShellWithoutProject) {
+    if (account === null) {
+      return (
+        <div className="editor-root">
+          <div className="account-gate" data-testid="account-gate">
+            <p>Checking your session…</p>
+          </div>
+        </div>
+      );
+    }
+    if (startedGeneration !== null) {
+      // TASK 4. The live progress view: stage, prelude steps, sections done,
+      // an elapsed clock against the measured ~11 minutes, and — on a
+      // `succeeded` job — the `degraded_sections` that were buried in
+      // `result.stdout` and read by nothing until now.
+      //
+      // `startedGeneration` reaches here two ways and the screen cannot tell
+      // them apart, which is the point: the tester pressed Generate in this
+      // tab, or this tab reloaded mid-run and the initializer restored the
+      // pair from storage.
+      //
+      // The two deliberate omissions from task 3's placeholder are preserved
+      // INSIDE the component and are asserted there: no "open the project"
+      // while running (the project row and directory exist from the first
+      // moment, but the directory stays empty for ~11 minutes, so opening it
+      // bootstraps a canvas against a manifest that does not exist yet), and
+      // no "back to your sites" while running (it would put the Generate
+      // button back in front of a user whose run is already costing money).
+      // Both appear once the run is over, which is a different screen.
+      return (
+        <div className="editor-root">
+          <GenerationProgress
+            // Keyed so a resume, which produces a NEW job id for the same
+            // project, remounts the screen rather than leaving the previous
+            // job's terminal state on it.
+            key={startedGeneration.jobId}
+            jobId={startedGeneration.jobId}
+            projectId={startedGeneration.projectId}
+            onDone={openProject}
+            onAbandon={() => {
+              // Belt and braces: the component already forgets the entry on a
+              // terminal status and on a vanished job, but this is the one
+              // path that leaves the screen, and a persisted entry outliving
+              // it would re-enter a finished run on the next reload.
+              forgetPersistedRun(localRunStorage());
+              setStartedGeneration(null);
+            }}
+            onSessionExpired={() => setSessionExpired(true)}
+            // The persisted entry follows automatically: the write effect
+            // above keys on `startedGeneration` itself.
+            onResumed={(jobId) => setStartedGeneration({ ...startedGeneration, jobId })}
+          />
+        </div>
+      );
+    }
+    return (
+      <div className="editor-root">
+        <ProjectPicker
+          accountEmail={account.email}
+          // TASK 4. The remaining budget, beside the button that spends it.
+          // Already in hand from the `/api/me` call the session gate makes —
+          // no second request, and no new endpoint.
+          spend={{
+            spendCapUsd: account.spendCapUsd,
+            spentUsd24h: account.spentUsd24h,
+            unpricedEvents: account.unpricedEvents,
+          }}
+          onOpen={openProject}
+          onGenerationStarted={setStartedGeneration}
+          // The single "the session is not usable" flag, reused rather than
+          // duplicated — `showLogin` above turns it into the login screen.
+          onSessionExpired={() => setSessionExpired(true)}
+        />
+      </div>
+    );
+  }
 
   if (pendingPlan !== null) {
     return (

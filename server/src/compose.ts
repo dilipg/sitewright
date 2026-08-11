@@ -16,6 +16,7 @@ import { jobRoutes } from "./job-routes.ts";
 import { keyRoutes } from "./key-routes.ts";
 import type { PreviewPool } from "./preview-pool.ts";
 import { previewRoutes } from "./preview-routes.ts";
+import { progressRoutes } from "./progress-routes.ts";
 import { projectRoutes } from "./project-routes.ts";
 import type { Route } from "./router.ts";
 
@@ -59,6 +60,12 @@ export function buildRoutes(args: {
     ...keyRoutes({ db, masterKey }),
     ...projectRoutes({ db }),
     ...(projectsRoot === undefined ? [] : jobRoutes({ db, projectsRoot, ...(codeVersion === undefined ? {} : { codeVersion }) })),
+    // NOT gated on `projectsRoot`, unlike jobRoutes above: reading a job's
+    // progress needs no projects root at all (it reads the orchestrator's own
+    // run-log directory, derived from this package's location) and no preview
+    // pool, so gating it would only make the route absent from a table a test
+    // builds — while it is always present in production.
+    ...progressRoutes({ db }),
     ...(pool === undefined ? [] : previewRoutes({ db, pool })),
     ...(pool === undefined ? [] : compilerRoutes({ db, pool })),
   ];

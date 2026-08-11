@@ -788,6 +788,469 @@ body {
   font-size: 12px;
 }
 
+/* Login screen (task 2) — hosted mode only. Note there is no rule here for a
+   sign-up or password-reset link, because the markup has neither: account
+   creation exists only in the operator CLI. */
+.login-screen {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  padding: 24px;
+}
+
+.login-card {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-width: 360px;
+  background: #1e1e26;
+  border: 1px solid #333340;
+  border-radius: 10px;
+  padding: 28px 26px 22px;
+}
+
+.login-card h1 {
+  margin: 0 0 4px;
+  font-size: 20px;
+}
+
+.login-intro {
+  margin: 0 0 20px;
+  color: #9a9aa8;
+  font-size: 13px;
+}
+
+.login-card label {
+  font-size: 12px;
+  color: #9a9aa8;
+  margin-bottom: 4px;
+}
+
+.login-card input {
+  background: #14141a;
+  border: 1px solid #3a3a46;
+  color: #e8e8ee;
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 14px;
+  font-family: inherit;
+  margin-bottom: 14px;
+}
+
+.login-error {
+  margin: 0 0 12px;
+  color: #ff9a9a;
+  font-size: 13px;
+}
+
+.login-submit {
+  background: #4f8ef7;
+  border: none;
+  color: white;
+  border-radius: 8px;
+  padding: 10px 16px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.login-submit:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.login-footnote {
+  margin: 18px 0 0;
+  color: #9a9aa8;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+/* Project picker + new-site form (task 3) — hosted mode only, shown when
+   there is no ?project= yet. Note there is no rule for a "directory" column,
+   because the markup has none: a project's id and its on-disk directory are
+   different UUIDs and only the id is ever shown or acted on. */
+.project-picker {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 22px;
+  flex: 1;
+  overflow-y: auto;
+  padding: 40px 24px;
+}
+
+.picker-header {
+  width: 100%;
+  max-width: 560px;
+}
+
+.picker-header h1 {
+  margin: 0 0 4px;
+  font-size: 20px;
+}
+
+.picker-account {
+  margin: 0;
+  color: #9a9aa8;
+  font-size: 13px;
+}
+
+.picker-panel {
+  width: 100%;
+  max-width: 560px;
+  background: #1e1e26;
+  border: 1px solid #333340;
+  border-radius: 10px;
+  padding: 20px 22px;
+}
+
+.picker-panel h2 {
+  margin: 0 0 12px;
+  font-size: 14px;
+  font-weight: 600;
+  color: #c8c8d4;
+}
+
+.picker-muted {
+  margin: 0;
+  color: #9a9aa8;
+  font-size: 13px;
+}
+
+.picker-error {
+  margin: 0 0 12px;
+  color: #ff9a9a;
+  font-size: 13px;
+}
+
+.picker-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  /* Bounded, because the list is unbounded: observed live against a real
+     server with 53 adopted projects, where the "Generate a new site" form was
+     pushed entirely below the fold and read as absent. The list scrolls
+     inside its own panel instead, so both affordances stay reachable no
+     matter how many sites an account has. */
+  max-height: 44vh;
+  overflow-y: auto;
+}
+
+.picker-project {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  text-align: left;
+  background: #14141a;
+  border: 1px solid #3a3a46;
+  border-radius: 6px;
+  color: #e8e8ee;
+  padding: 10px 12px;
+  font-size: 13px;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.picker-project:hover {
+  border-color: #4f8ef7;
+}
+
+.picker-project-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.picker-project-date {
+  flex: none;
+  color: #9a9aa8;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.new-site-form {
+  display: flex;
+  flex-direction: column;
+}
+
+.new-site-form label {
+  font-size: 12px;
+  color: #9a9aa8;
+  margin-bottom: 4px;
+}
+
+.new-site-brief {
+  background: #14141a;
+  border: 1px solid #3a3a46;
+  color: #e8e8ee;
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 14px;
+  font-family: inherit;
+  resize: vertical;
+  margin-bottom: 14px;
+}
+
+.picker-generate {
+  align-self: flex-start;
+  background: #4f8ef7;
+  border: none;
+  color: white;
+  border-radius: 8px;
+  padding: 10px 16px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.picker-generate:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.picker-footnote {
+  margin: 14px 0 0;
+  color: #9a9aa8;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+/* The remaining 24h budget, deliberately immediately under the button that
+   spends it rather than on a settings screen (task 4). */
+.picker-budget {
+  margin: 10px 0 0;
+  color: #c8c8d4;
+  font-size: 12px;
+  line-height: 1.5;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Generation progress (task 4) — the screen a tester watches for ~11 minutes
+   while a run spends their own money. Same panel vocabulary as the picker, so
+   the two read as one flow rather than two apps. */
+.generation-progress {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 14px;
+  width: 100%;
+  max-width: 560px;
+  margin: 0 auto;
+  padding: 48px 24px;
+  overflow-y: auto;
+}
+
+.progress-heading {
+  margin: 0;
+  font-size: 20px;
+}
+
+.progress-stage {
+  margin: 0;
+  color: #4f8ef7;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+/* The stage names arrive from the server (`PROGRESS_STAGES`) in lower case
+   ("generating sections"). `text-transform: capitalize` was tried first and
+   rendered "Generating Sections" — title case on a sentence fragment, which
+   reads as a label rather than as a description of what is happening. This
+   raises only the first letter and leaves the server's own words otherwise
+   untouched. */
+.progress-stage::first-letter {
+  text-transform: uppercase;
+}
+
+.progress-body {
+  margin: 0;
+  color: #c8c8d4;
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.progress-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.progress-row-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  margin-bottom: 6px;
+}
+
+.progress-row-label {
+  font-size: 13px;
+  color: #c8c8d4;
+}
+
+.progress-row-detail {
+  font-size: 12px;
+  color: #9a9aa8;
+  font-variant-numeric: tabular-nums;
+}
+
+.progress-track {
+  height: 6px;
+  border-radius: 3px;
+  background: #14141a;
+  border: 1px solid #333340;
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  background: #4f8ef7;
+  /* Width is already clamped to 0–100% in `completionFraction`; `max-width`
+     is the second line of defence, because 12 sections against a plan of 11
+     is a MEASURED case, not a hypothetical one. */
+  max-width: 100%;
+  transition: width 400ms ease-out;
+}
+
+.progress-elapsed {
+  margin: 0;
+  color: #9a9aa8;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.progress-footnote {
+  margin: 0;
+  color: #9a9aa8;
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.progress-jobid {
+  word-break: break-all;
+}
+
+.progress-trouble,
+.progress-degraded {
+  background: #1e1e26;
+  border: 1px solid #333340;
+  border-radius: 10px;
+  padding: 16px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: #c8c8d4;
+}
+
+.progress-trouble p,
+.progress-degraded p {
+  margin: 0;
+}
+
+/* Amber, not red: a degraded section is not an error — the run genuinely
+   succeeded and the page renders. It is a thing the tester needs to know
+   about before they meet a grey placeholder box and file it as a bug. */
+.progress-degraded {
+  border-color: #6b5a2a;
+  background: #241f14;
+}
+
+.progress-degraded-list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+}
+
+.progress-trouble-line {
+  margin: 0;
+  color: #e0c07a;
+  font-size: 12px;
+}
+
+.progress-error {
+  margin: 0;
+  background: #14141a;
+  border: 1px solid #4a2a2a;
+  border-radius: 8px;
+  padding: 12px;
+  color: #ff9a9a;
+  font-size: 12px;
+  line-height: 1.5;
+  /* The orchestrator's own tail, which is long and newline-heavy. Wrapped and
+     scrolled rather than truncated: the message is the whole diagnostic. */
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.progress-error-line {
+  margin: 0;
+  color: #ff9a9a;
+  font-size: 13px;
+}
+
+.progress-primary {
+  align-self: flex-start;
+  background: #4f8ef7;
+  border: none;
+  color: white;
+  border-radius: 8px;
+  padding: 10px 16px;
+  font-size: 14px;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.progress-primary:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.progress-secondary {
+  align-self: flex-start;
+  background: transparent;
+  border: 1px solid #3a3a46;
+  color: #c8c8d4;
+  border-radius: 8px;
+  padding: 8px 14px;
+  font-size: 13px;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.progress-secondary:hover {
+  border-color: #4f8ef7;
+}
+
+/* Hosted, signed in, but not yet at the picker: the session check, and the
+   interim "generation started" statement task 4 replaces with live progress. */
+.account-gate {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  gap: 6px;
+  font-size: 14px;
+}
+
+.account-gate-hint {
+  margin: 0;
+  color: #9a9aa8;
+  font-size: 12px;
+}
+
 .pad-band {
   position: absolute;
   background: rgba(99, 189, 138, 0.28);
@@ -1140,4 +1603,40 @@ body {
 .archetype-preview .preview-stack-3 i {
   width: 100%;
   height: 5px;
+}
+
+
+/* WHOLE-BRANCH REVIEW, C2 — the screen that replaced a dead-end blank page for
+   a project whose files are not there (its generation is still running, or it
+   failed). Class-prefixed like every other selector added by this branch, so it
+   cannot reach the milestone-7 suite. */
+.bootstrap-error {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  gap: 12px;
+  padding: 32px;
+  text-align: center;
+}
+
+.bootstrap-error h1 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+  color: #e8e8f0;
+}
+
+.bootstrap-error p {
+  margin: 0;
+  max-width: 520px;
+  font-size: 13px;
+  color: #9a9aa8;
+}
+
+.bootstrap-error-detail {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  color: #ff9a9a;
 }

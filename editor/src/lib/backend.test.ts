@@ -1,5 +1,22 @@
 import { describe, expect, it } from "vitest";
-import { backend, createBackend, encodePathSegment, neutralizeDotSegments, resolveMode } from "./backend";
+import {
+  backend,
+  createBackend,
+  editorUrlForProject,
+  editorUrlWithoutProject,
+  encodePathSegment,
+  generateUrl,
+  hostedMode,
+  isHostedMode,
+  jobProgressUrl,
+  jobResumeUrl,
+  jobUrl,
+  loginUrl,
+  meUrl,
+  neutralizeDotSegments,
+  projectsUrl,
+  resolveMode,
+} from "./backend";
 
 const LOCAL_ORIGIN = "http://localhost:5273";
 const EDITOR_ORIGIN = "http://localhost:5174";
@@ -164,7 +181,219 @@ describe("a malicious project id cannot corrupt the resulting URL", () => {
   });
 });
 
+/**
+ * TASK 2 — hosted-shell mode, which is a DIFFERENT question from
+ * `resolveMode`'s and must stay one.
+ *
+ * `resolveMode` answers "whose URLs do I build?", and only `?project=<id>` can
+ * answer that. `isHostedMode` answers "am I talking to the hosted server at
+ * all?", which has to be answerable before any project exists — a tester
+ * following the README opens a bare `/` and must land on the login screen.
+ */
+describe("isHostedMode", () => {
+  it("a bare URL with the flag unset is LOCAL — the state every existing test runs in", () => {
+    // This is the assertion that makes local mode structural. Playwright's
+    // webServer runs the plain `dev` script (never `.env.hosted`), so the flag
+    // is absent for the entire milestone-7 suite and every one of its bare-`/`
+    // navigations lands here.
+    expect(isHostedMode("", undefined)).toBe(false);
+    expect(isHostedMode("?preview=http://localhost:9999", undefined)).toBe(false);
+  });
+
+  it("VITE_WEBGEN_HOSTED=1 selects hosted mode with no ?project= at all", () => {
+    // The whole point: a tester's very first page load has no project yet.
+    expect(isHostedMode("", "1")).toBe(true);
+  });
+
+  it("only the exact string \"1\" turns it on", () => {
+    // "0" and "false" are non-empty strings, and every non-empty string is
+    // truthy — an operator who writes either means OFF, and reading them as ON
+    // would drop a tester into hosted mode with no way back to local.
+    for (const flag of ["0", "false", "", "yes", "true", "2"]) {
+      expect(isHostedMode("", flag)).toBe(false);
+    }
+  });
+
+  it("?project=<id> still selects hosted mode on its own, so every existing hosted URL is unchanged", () => {
+    expect(isHostedMode("?project=proj-1", undefined)).toBe(true);
+  });
+
+  it("agrees with resolveMode about what counts as a project", () => {
+    // The two read `?project=` through one shared helper precisely so they
+    // cannot drift: an empty `?project=` is "no project" to both.
+    for (const search of ["", "?project=", "?project=proj-1", "?preview=http://x"]) {
+      const hostedByResolve = resolveMode(search, EDITOR_ORIGIN).kind === "hosted";
+      expect(isHostedMode(search, undefined)).toBe(hostedByResolve);
+    }
+  });
+});
+
+describe("session-scoped URLs (no ?project=)", () => {
+  it("login and me are relative, same-origin paths", () => {
+    // Same-origin is what keeps the session cookie flowing under
+    // `SameSite=Lax` with no CORS: the Vite dev server proxies `/api` to the
+    // hosted server, so the browser only ever sees one origin.
+    expect(loginUrl()).toBe("/api/login");
+    expect(meUrl()).toBe("/api/me");
+  });
+
+  it("neither carries a project id — both routes are session-only on the server", () => {
+    expect(loginUrl()).not.toContain("project=");
+    expect(meUrl()).not.toContain("project=");
+  });
+
+  it("TASK 3: the project list and generate are session-only too", () => {
+    // `GET /api/projects` answers the CALLER's own projects (scoped by the
+    // server's SQL, not by a parameter), and `POST /api/generate` is the one
+    // route that CREATES a project — "which project?" is not a question
+    // either could answer.
+    expect(projectsUrl()).toBe("/api/projects");
+    expect(generateUrl()).toBe("/api/generate");
+    expect(projectsUrl()).not.toContain("project=");
+    expect(generateUrl()).not.toContain("project=");
+  });
+
+  it("TASK 4: the three job endpoints are session-only and name the job in the path", () => {
+    // A job belongs to the USER who queued it, not to a project — a generate
+    // job's `project_id` is `ON DELETE SET NULL`, so a project-scoped check
+    // would have nothing to compare for exactly the jobs most worth looking up.
+    expect(jobUrl("j1")).toBe("/api/jobs/j1");
+    expect(jobProgressUrl("j1")).toBe("/api/jobs/j1/progress");
+    expect(jobResumeUrl("j1")).toBe("/api/jobs/j1/resume");
+    for (const url of [jobUrl("j1"), jobProgressUrl("j1"), jobResumeUrl("j1")]) {
+      expect(url).not.toContain("project=");
+    }
+  });
+
+  it("TASK 4: a job id of '..' cannot walk out of /api/jobs/ into another endpoint", () => {
+    // THE FIFTH `..`. This codebase has shipped four at four layers, and
+    // CLAUDE.md's standing instruction is to assume the next one exists. This
+    // is a genuine candidate rather than a theoretical one: the job id reaching
+    // these paths now comes from `localStorage` as well as from a 202 body, and
+    // localStorage is writable by any script on this origin. `fetch()` resolves
+    // a relative URL against the document and normalizes dot segments exactly
+    // as the URL parser does, INCLUDING their percent-encoded spellings.
+    for (const evil of ["../..", "..%2f..", "..", "%2e%2e/%2e%2e"]) {
+      const resolved = new URL(jobUrl(evil), "http://localhost:5173/");
+      expect(resolved.pathname.startsWith("/api/jobs/"), evil).toBe(true);
+      expect(resolved.pathname, evil).not.toBe("/api/");
+      const progress = new URL(jobProgressUrl(evil), "http://localhost:5173/");
+      expect(progress.pathname.startsWith("/api/jobs/"), evil).toBe(true);
+    }
+  });
+
+  it("TASK 4: a real job id (a v4 UUID) round-trips unchanged", () => {
+    // The escaping must not corrupt the value it protects: every real job id is
+    // a `randomUUID()`, which contains no character `encodePathSegment` touches.
+    const id = "ed1b5088-eebf-44c9-967c-294ddc3f9705";
+    expect(jobUrl(id)).toBe(`/api/jobs/${id}`);
+  });
+});
+
+/**
+ * TASK 3 — the editor's own URL for a chosen project, and the one place a
+ * project id supplied by the SERVER re-enters this app.
+ */
+describe("editorUrlForProject", () => {
+  it("sets ?project=<id> on the current URL", () => {
+    expect(editorUrlForProject("proj-1", "http://localhost:5173/")).toBe(
+      "http://localhost:5173/?project=proj-1",
+    );
+  });
+
+  it("replaces an existing ?project= rather than appending a second one", () => {
+    // Two `project` values would make `URLSearchParams.get` (and therefore
+    // `resolveMode`) pick the first — i.e. the project the user just navigated
+    // AWAY from — while the URL bar showed both.
+    const url = new URL(editorUrlForProject("proj-2", "http://localhost:5173/?project=proj-1"));
+    expect(url.searchParams.getAll("project")).toEqual(["proj-2"]);
+  });
+
+  it("keeps every other query parameter the URL already carried", () => {
+    const url = new URL(
+      editorUrlForProject("proj-1", "http://localhost:5173/?preview=http%3A%2F%2Fx&debug=1"),
+    );
+    expect(url.searchParams.get("preview")).toBe("http://x");
+    expect(url.searchParams.get("debug")).toBe("1");
+  });
+
+  it("round-trips through resolveMode — the id that goes in is the id that comes out", () => {
+    // The property that actually matters: this is the ONLY handoff between
+    // the picker and the mode resolver, and a mismatch would open the wrong
+    // project (or none) with no error anywhere.
+    for (const id of ["proj-1", "3f8c1a54-0000-4000-8000-000000000001", "a b", "a&b=c", "a/b", "a?b"]) {
+      const href = editorUrlForProject(id, "http://localhost:5173/");
+      const mode = resolveMode(new URL(href).search, EDITOR_ORIGIN);
+      expect(mode).toEqual({ kind: "hosted", projectId: id, origin: EDITOR_ORIGIN });
+    }
+  });
+
+  it("does NOT apply previewUrl's double-escape — a query value is not a path segment", () => {
+    // `encodePathSegment` exists because the WHATWG parser normalizes
+    // `%2e`/`%2e%2e` dot SEGMENTS away, so a path needs `%2E` escaped a
+    // second time (`%252E`). A query VALUE is subject to no such step:
+    // `URLSearchParams` encodes once and `resolveMode` decodes once. Running
+    // the double-escape here would not be extra safety, it would corrupt the
+    // id into one no project has — which is what this asserts.
+    const href = editorUrlForProject("a.b..c", "http://localhost:5173/");
+    expect(new URL(href).searchParams.get("project")).toBe("a.b..c");
+    expect(href).not.toContain("%252E");
+  });
+
+  it("a '..' id cannot climb the path, because it never reaches the path at all", () => {
+    const href = editorUrlForProject("../../api/key", "http://localhost:5173/editor/");
+    const url = new URL(href);
+    expect(url.pathname).toBe("/editor/");
+    expect(url.searchParams.get("project")).toBe("../../api/key");
+  });
+});
+
+/**
+ * WHOLE-BRANCH REVIEW, C2 — the way back out of a project that cannot be
+ * opened. The picker renders only when `?project=` is absent, so dropping the
+ * parameter is the whole mechanism; a reload alone reproduced the dead end.
+ */
+describe("editorUrlWithoutProject", () => {
+  it("drops ?project=, which is what makes the picker render again", () => {
+    const href = editorUrlWithoutProject("http://localhost:5173/?project=proj-1");
+    expect(new URL(href).searchParams.has("project")).toBe(false);
+    // The property that matters, asserted through the real resolver rather
+    // than by reading the string: this must land back in a mode with no
+    // project, which is what the hosted shell shows the picker for.
+    expect(resolveMode(new URL(href).search, EDITOR_ORIGIN).kind).toBe("local");
+    expect(isHostedMode(new URL(href).search, "1")).toBe(true);
+  });
+
+  it("is a no-op for a URL that carries no project", () => {
+    expect(editorUrlWithoutProject("http://localhost:5173/")).toBe("http://localhost:5173/");
+  });
+
+  it("drops EVERY project value, not just the first", () => {
+    // `URLSearchParams.get` reads the first, so leaving a second behind would
+    // put the tester straight back on the project they could not open.
+    const href = editorUrlWithoutProject("http://localhost:5173/?project=a&project=b");
+    expect(new URL(href).searchParams.getAll("project")).toEqual([]);
+  });
+
+  it("keeps every other query parameter, exactly like editorUrlForProject", () => {
+    const url = new URL(
+      editorUrlWithoutProject("http://localhost:5173/?project=p&preview=http%3A%2F%2Fx&debug=1"),
+    );
+    expect(url.searchParams.get("preview")).toBe("http://x");
+    expect(url.searchParams.get("debug")).toBe("1");
+  });
+});
+
 describe("the default export singleton", () => {
+  it("hostedMode is false in a windowless, flag-less environment", () => {
+    // The structural guarantee for local mode, asserted on the real singleton
+    // rather than inferred from `isHostedMode`: `import.meta.env.
+    // VITE_WEBGEN_HOSTED` is a build-time substitution, and neither vitest nor
+    // Playwright's webServer loads `.env.hosted`, so nothing has to remember
+    // to unset anything.
+    expect(hostedMode).toBe(false);
+  });
+
   it("resolves to local mode when imported with no window (this test file's own environment)", () => {
     // vitest.config.ts runs src/**/*.test.ts in Node, not jsdom (matching
     // App.test.ts's own "windowless environment" guard comment) -- so the

@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
 import type { DatabaseSync } from "node:sqlite";
+import { deleteApiKey, setApiKey } from "./api-keys.ts";
 import { UNKNOWN_CODE_VERSION } from "./code-version.ts";
 import { openDatabase } from "./db.ts";
 import {
@@ -44,6 +45,13 @@ vi.mock("node:fs", async (importOriginal) => {
 
 const dirs: string[] = [];
 const dbs: DatabaseSync[] = [];
+/**
+ * Any 32 bytes: `setApiKey` seals with it and `getApiKeyFingerprint` (all
+ * `POST /api/generate` reads) never opens the ciphertext, so nothing in this
+ * file needs the real one.
+ */
+const TEST_MASTER_KEY = Buffer.alloc(32, 7);
+
 function harness(opts: { codeVersion?: string } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "server-jobroutes-"));
   dirs.push(dir);
@@ -53,6 +61,11 @@ function harness(opts: { codeVersion?: string } = {}) {
   dirs.push(projectsRoot);
   const alice = createUser(db, "a@example.com", "h");
   const bob = createUser(db, "b@example.com", "h");
+  // WHOLE-BRANCH REVIEW, I3: `POST /api/generate` now refuses a caller with no
+  // stored key BEFORE creating anything, so the default harness user has one —
+  // the keyless case is its own test below, where the absence is the point.
+  setApiKey(db, TEST_MASTER_KEY, alice.id, "sk-ant-alice-key");
+  setApiKey(db, TEST_MASTER_KEY, bob.id, "sk-ant-bob-key");
   const listener = createRequestListener(jobRoutes({ db, projectsRoot, ...opts }));
 
   async function call(method: string, path: string, cookie?: string, body?: unknown, raw?: Buffer) {
@@ -155,6 +168,64 @@ describe("POST /api/generate", () => {
     const { db, call, alice, aliceCookie } = harness();
     overCap(db, alice.id);
     const result = await call("POST", "/api/generate", aliceCookie, undefined, Buffer.from("not json at all"));
+    expect(result.status).toBe(402);
+  });
+
+  /**
+   * WHOLE-BRANCH REVIEW, I3. A tester who has logged in but not yet stored a
+   * BYOK key — the ordinary first-run sequence — used to get 202, a project
+   * row, a directory, a job, an eleven-minute progress screen, and then a
+   * `failed` job pointing at a settings screen that does not exist, with Resume
+   * as the only offered action (it fails identically). Every attempt left
+   * another permanent, undeletable project row in the picker.
+   */
+  it("refuses with 400 when the caller has no stored API key, creating NEITHER a project NOR a job NOR a directory", async () => {
+    const { db, projectsRoot, alice, call, aliceCookie } = harness();
+    deleteApiKey(db, alice.id); // a brand-new tester who skipped README step 7
+
+    const result = await call("POST", "/api/generate", aliceCookie, { brief: "a bakery landing page" });
+
+    expect(result.status).toBe(400);
+    expect((db.prepare("SELECT COUNT(*) AS c FROM project").get() as { c: number }).c).toBe(0);
+    expect((db.prepare("SELECT COUNT(*) AS c FROM job").get() as { c: number }).c).toBe(0);
+    // The directory half matters as much as the row: the whole point of
+    // refusing here rather than in the worker is that nothing is left behind.
+    expect(readdirSync(projectsRoot)).toEqual([]);
+  });
+
+  it("names PUT /api/key in the refusal, because there is no settings screen to send anyone to", async () => {
+    const { db, alice, call, aliceCookie } = harness();
+    deleteApiKey(db, alice.id);
+
+    const result = await call("POST", "/api/generate", aliceCookie, { brief: "a bakery landing page" });
+
+    // The wording IS the fix: this reaches the tester verbatim through
+    // `ProjectPicker`'s `refusalMessage`, and the previous message ("save one
+    // in settings") named nothing that exists in `editor/src`.
+    const body = result.json as { error: string };
+    expect(body.error).toContain("PUT /api/key");
+    expect(body.error).not.toContain("in settings");
+  });
+
+  it("checks the key before the body is read, so a keyless caller with a malformed body still gets the key message", async () => {
+    // Same ordering property the 402 test above pins for the spend cap: the
+    // preconditions that create nothing are checked before anything is read.
+    const { db, alice, call, aliceCookie } = harness();
+    deleteApiKey(db, alice.id);
+    const result = await call("POST", "/api/generate", aliceCookie, undefined, Buffer.from("not json at all"));
+    expect(result.status).toBe(400);
+    expect((result.json as { error: string }).error).toContain("PUT /api/key");
+  });
+
+  it("checks the SPEND CAP before the key, so an over-cap keyless caller is told about the money", async () => {
+    // Deliberate ordering, recorded rather than incidental: `requireBudget` is
+    // the wrapper and runs first. Both refuse with no side effect, so the only
+    // thing at stake is which message a user in both states sees — and the cap
+    // is the one they cannot fix by pasting a key.
+    const { db, alice, call, aliceCookie } = harness();
+    deleteApiKey(db, alice.id);
+    overCap(db, alice.id);
+    const result = await call("POST", "/api/generate", aliceCookie, { brief: "a bakery landing page" });
     expect(result.status).toBe(402);
   });
 

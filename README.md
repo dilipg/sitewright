@@ -72,16 +72,18 @@ export WEBGEN_DB="$WEBGEN_REPO/server/data/identity.db"
 > fails with the deliberately uniform `invalid email or password` — which tells
 > you nothing about there being two files.
 >
-> The CLI does not protect you here. `node server/scripts/user.ts create --email
-> you@example.com --db` — with the value left off by accident — does **not**
-> error. It falls back to the default path, creates a brand-new database at
-> `./data/identity.db`, and reports success. (`serve.ts` *does* refuse a
-> valueless `--db`; the account CLI does not.) Worse, a `data/` directory at the
-> repo root is **not** gitignored — only `server/data/` is — so an identity
-> database created that way is a file git will happily offer to commit.
+> Both commands **do** refuse a `--db` whose value was left off (`--db requires
+> a value`, exit 1), including the easy-to-miss case of another flag following it
+> (`--db --email you@example.com`), which counts as no value rather than as a
+> path — so the accidental-empty-flag version of this cannot happen silently. A
+> `data/` directory is also gitignored **anywhere** in the tree, not only under
+> `server/`, so a database created in the wrong place cannot be committed by
+> accident either.
 >
-> Always pass the absolute path, to every command, and the whole class of
-> problem disappears.
+> What is still entirely possible is passing a *relative* path — or none at all —
+> from two different directories, which is exactly how the two-files problem
+> happens. Always pass the absolute path, to every command, and the whole class
+> of problem disappears.
 
 ### 2. Warm up the Python toolchain
 
@@ -208,9 +210,10 @@ Three things about this command:
 ### 7. Give the server your Anthropic API key
 
 **There is currently no settings screen for this**, so it is two `curl` calls.
-Do it now: `POST /api/generate` does *not* check for a key, so without this step
-your first generation is accepted, queued, and only then fails with
-`no Anthropic API key: save one in settings, or supply one with this request`.
+Do it now — you cannot generate at all without it. `POST /api/generate` checks
+for a stored key before it creates anything and refuses with a 400 naming this
+step, so a skipped key costs you nothing but a click; but that also means the
+Generate button will simply refuse until this is done.
 
 In a **second terminal** (the server is occupying the first), from the repo
 root:
@@ -388,11 +391,12 @@ node server/scripts/user.ts list-projects --db "$WEBGEN_DB"
 | `Unknown file extension ".ts"` | Node is older than 22.18. |
 | `could not listen on port 4000: … EADDRINUSE` | Something else has the port. Add `--port 4001` and start the editor with `WEBGEN_HOSTED_SERVER_URL=http://localhost:4001 npm run dev:hosted -w editor`, so its proxy follows. |
 | The editor shows a canvas, or an endless spinner, instead of a login form | You started it with `npm run dev -w editor` (local mode). Use `dev:hosted`. |
-| `no Anthropic API key: save one in settings, or supply one with this request` | Step 7 was skipped, or was run against a different database. |
+| `no Anthropic API key is stored for this account…` when you press Generate | Step 7 was skipped, or was run against a different database. Nothing was created and nothing was charged. |
+| `no Anthropic API key: save one in settings, or supply one with this request` | The same cause, from a regenerate / add-section / edit-by-prompt request rather than from a generation. (Its "in settings" wording is the one screen that does not exist yet — read it as step 7.) |
 | A generation job fails immediately with an authentication error from Anthropic | The stored key is wrong or has no credit. Re-run step 7 with a good key. |
 | `the stored API key can no longer be read and must be re-entered` | The server booted with a different `WEBGEN_MASTER_KEY` than the one your key was stored under. Either put the original key back, or re-run step 7. |
-| `--db requires a value` (from the **server**) | You passed `--db` with nothing after it, or with another flag straight after. `serve.ts` refuses rather than falling back. |
-| Nothing at all, from `user.ts`, but the account "does not exist" afterwards | The account CLI has **no** such guard: a valueless `--db` silently uses `./data/identity.db` instead. Check `ls data/` at the repo root. |
+| `--db requires a value` | You passed `--db` with nothing after it, or with another flag straight after. **Both** `serve.ts` and `user.ts` refuse rather than falling back to the default path. |
+| The account "does not exist" afterwards, though the CLI reported success | Not a dropped `--db` value (both CLIs refuse that outright) — a *relative* one, resolved against two different working directories. Compare the path the server logs on its `server listening on …` line with the `--db` you gave the CLI. |
 
 Useful CLI commands, all needing `--db "$WEBGEN_DB"`:
 

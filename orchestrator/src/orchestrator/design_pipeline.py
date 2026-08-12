@@ -98,7 +98,25 @@ _COMMON = (
     "element: aria-* (declared as `'aria-label'?: string` etc. or via "
     "`AriaAttributes`), role, title, tabIndex, draggable, and the handlers "
     "onClick/onDragStart/onDragOver/onDrop/onFocus/onBlur. Never widen this into "
-    "a full DOM props spread"
+    "a full DOM props spread. "
+    # This sentence exists because its absence cost a real run. A generation
+    # died at the design stage with
+    #   `Icon.tsx: error TS2322: Property 'draggable' does not exist on type
+    #    SVGProps<SVGSVGElement>`
+    # -- ~$1.00 spent, zero of 18 sections generated. The model had done exactly
+    # what it was told: forward `draggable` to the root element. But `Icon` is
+    # specified as "inline SVG", and React's SVGProps genuinely does not declare
+    # `draggable` OR `title` (verified empirically: `tabIndex`, `role`,
+    # `onClick` and the drag handlers ARE present, those two are not). So the
+    # instruction was UNSATISFIABLE for the one primitive whose root is an
+    # <svg>, and no amount of retrying could have fixed it -- each attempt
+    # re-derived the same impossible requirement. Platform-independent:
+    # reproduced identically on Windows and Linux.
+    "DECLARE EACH PASSTHROUGH PROP EXPLICITLY in your own props type (e.g. "
+    "`draggable?: boolean; title?: string;`) rather than relying on React's "
+    "element prop types to contain it. This is REQUIRED, not stylistic: "
+    "`SVGProps` has no `draggable` and no `title`, so a primitive whose root is "
+    "an <svg> cannot typecheck if it assumes otherwise"
 )
 
 PRIMITIVE_SPECS: dict[str, str] = {

@@ -79,6 +79,15 @@ services:
       # watchdog < grace) derives from this one number. Kept equal to
       # stop_grace_period below so the two cannot drift.
       WEBGEN_SHUTDOWN_GRACE_MS: "30000"
+      # Fan-out spawns one page worker per route, and unset means "all at once"
+      # — which is fine on a developer machine and fatal here. Measured in this
+      # image (3.8 GB VM, 4 routes): two of the four workers were killed with
+      # EMPTY stdout AND stderr, surfacing only as `manifest CLI produced no
+      # result`, which reads like a compiler bug rather than the memory
+      # exhaustion it was. Each worker is a whole Python process that shells out
+      # to `tsc`, so the binding constraint is memory, not CPU. Raise it if you
+      # give Docker more RAM; the run gets slower, never wrong.
+      WEBGEN_FANOUT_MAX_WORKERS: "2"
       # Optional. Set it to your account's address to have existing directories
       # in `generated/` adopted on boot so they appear in the picker. It cannot
       # create a user: an address matching no account is a logged skip.

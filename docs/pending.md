@@ -38,13 +38,6 @@ this list said `dev` while the hosted shell needs `dev:hosted`.)
 
 ---
 
-## OPEN — BLOCKING for Docker and for every non-Windows developer
-
-| # | Item | Notes |
-|---|---|---|
-| **X1** | **Generation cannot complete on Linux or macOS — the product is Windows-only.** `design_pipeline.py:478,501`, `shell_pipeline.py:231,253` and `soak.py:45,56` spawn `["cmd", "/c", …]` for `npx tsc` and `mklink /J`. Measured inside the container: `FileNotFoundError: 'cmd'` | Discovered by task 3 while verifying the Docker image. `design_pipeline`'s call is inside a `@checkpoint`, so **a run dies after partial spend**. This makes the Docker workflow unable to do the one thing it exists for, and it is why the README must not promise generation under Docker until this is fixed |
-| **X2** | **Export is also broken on Linux**: `compiler/src/exporter.ts:1224,1231` call `rmdirSync` on what is a junction on Windows and a symlink elsewhere → `ENOTDIR` | Two sites, both measured. `unlinkSync` is the portable call for a symlink; the comment at 1231 explicitly reasons about junctions |
-
 ## OPEN — data integrity
 
 | # | Item | Notes |
@@ -105,6 +98,12 @@ this list said `dev` while the hosted shell needs `dev:hosted`.)
 | **D3** | Production static serving of the editor | Not needed: testers run the Vite dev server from source. Becomes real only for a hosted instance |
 
 ## Recently closed
+
+| **X1 CLOSED — the product is no longer Windows-only.** Seven spawn sites (`design_pipeline`, `shell_pipeline`, `soak`, and `fanout`'s `Popen(list, shell=True)`, found only after the other six) now go through `orchestrator/portable.py`, which BRANCHES rather than substitutes: a junction on Windows (no elevation needed), `os.symlink` on POSIX, `shutil.which` for `npx`, and never a list with `shell=True`. **Proven live: a complete site generated inside Docker** — $1.4516689 over 18 `usage_event` rows, 9m09s, 2 routes, 8 of 9 sections, browser export 60 files. A regression guard (`test_portability_guard.py`) fails CI on an eighth site | `96ca50c`, `18118c9`, `e96f9ac` |
+| **X2 CLOSED — export works off Windows.** `exporter.ts` branches on `lstatSync` instead of assuming a junction; `rmdirSync` on a POSIX symlink was `ENOTDIR`, thrown from a `finally`, which turned a SUCCESSFUL export into a failure and masked any real `ExportError`. Verified in Linux from the CLI and through the browser UI | `96ca50c` |
+| **Docker workflow**: one image with Node + Python + uv, volumes for `generated/` and the identity DB, master-key persistence verified with a negative control (a different key gives `UndecryptableApiKeyError`), and `WEBGEN_FANOUT_MAX_WORKERS` so unbounded fan-out stops OOMing a small VM | `c5aa7c7`, `18118c9` |
+| **BYOK form** with provider choice, replacing two curl commands; spend says "at least" whenever `unpricedEvents > 0`, so the accepted Gemini cap-degradation is visible rather than silent | `254b8af`, `4d787d0`, `9265b24` |
+| **README is Docker-first** and was followed literally from `docker compose down -v` by the coordinator: **every step worked verbatim, zero corrections forced** | this commit |
 
 | Item | Commit |
 |---|---|

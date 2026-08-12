@@ -935,8 +935,11 @@ export default function GenerationProgress({
             ))}
           </ul>
           <p className="progress-footnote">
-            Everything else generated normally. Select the placeholder on the canvas and use
-            Regenerate to try that one section again — it does not re-run the whole site.
+            Everything else generated normally. The placeholder itself{" "}
+            <strong>cannot be clicked</strong> — it carries no node id by design, because no agent
+            ever produced a valid section to register. Regenerate the <em>page</em> it sits on
+            instead: the part of the id before the dot is the route. That re-runs only that page,
+            not the whole site.
           </p>
         </div>
       )}
@@ -944,7 +947,8 @@ export default function GenerationProgress({
       {outcome.status === "succeeded" && degraded.kind === "unknown" && (
         <p className="progress-footnote" data-testid="degraded-unknown">
           The run summary could not be read, so any section that failed all 3 attempts is not listed
-          here. If a page shows a grey placeholder box, regenerate that one section from the canvas.
+          here. If a page shows a grey placeholder box, regenerate that whole page — the placeholder
+          cannot be clicked, because it carries no node id.
         </p>
       )}
 

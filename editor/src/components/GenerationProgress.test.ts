@@ -795,4 +795,23 @@ describe("GenerationProgress.tsx: the wiring a library test structurally cannot 
     // paying.
     expect(progressSource).toMatch(/cannot be cancelled/i);
   });
+
+  it("never tells the user to click a placeholder, because a placeholder cannot be clicked", () => {
+    // Found in the live Linux proof run, in the DOM rather than in a test: this
+    // screen used to say "Select the placeholder on the canvas and use
+    // Regenerate". `<FailedSectionPlaceholder />` is emitted with NO nodeId
+    // (section_pipeline.py: a stray one fails gate 4, because no agent ever
+    // produced a valid section to register), so it carries no `data-node-id`
+    // and is not selectable. The advice was impossible to follow, which is
+    // worse than terse advice — a tester spends their time hunting for a click
+    // target that does not exist.
+    //
+    // Asserting the ABSENCE of the instruction, not just the presence of the
+    // replacement: a screen can perfectly well say both.
+    expect(progressSource).not.toMatch(/select the placeholder/i);
+    expect(progressSource).not.toMatch(/regenerate that one section from the canvas/i);
+    // And the achievable route must actually be named.
+    expect(progressSource).toMatch(/cannot be clicked/i);
+    expect(progressSource).toMatch(/regenerate the (whole )?<?em>?page/i);
+  });
 });

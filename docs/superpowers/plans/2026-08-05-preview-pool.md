@@ -815,6 +815,7 @@ The unit tests all use a fake spawn, so nothing so far proves a real Vite child 
 
 1. Create a user with the CLI, store no API key.
 2. Start the server with `--projects-root` pointing at a real generated project (or `fixtures/`, if a generated one is not available — say which you used).
+   > **CORRECTION, 2026-08-13 (fix round B, D-3).** This choice no longer exists, and the `fixtures/` alternative **cannot be followed today** — appended rather than rewritten, per the convention the 2026-08-10 F13 retraction set. Since slice 5 (decisions.md, 2026-08-09) the worker **refuses to boot** unless `--projects-root` resolves to the orchestrator's own `generated/`, because `section_pipeline.py`'s `GENERATED_DIR` is a hardcoded module constant; a non-zero exit here is the guard, not a bug. Point it at the repo's own `generated/` and put a project inside it. `--out-dir` is the recorded follow-up (`pending.md` H6).
 3. Log in with `curl -c` to get a session cookie.
 4. `curl -b` the project's `/preview/<id>/` and confirm HTML comes back.
 5. Confirm a nested asset resolves — request whatever `<script src>` the HTML references and confirm 200, not 404. **This is the test of the `base` path**; if assets 404, the base is wrong and the proxy is useless.

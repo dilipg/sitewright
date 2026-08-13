@@ -1,0 +1,168 @@
+# Run the whole stack with `docker compose up`.
+#
+# Two services, ONE image. They are two processes rather than one because that is
+# what the architecture already is: `server/` is the authenticated composition
+# root on 4000, and the editor is served by its own Vite dev server on 5173 whose
+# proxy forwards `/api`, `/__*` and `/preview` to the server so the browser only
+# ever sees one origin (cookies flow, SameSite=Lax survives, no CORS, and slice
+# 2's CSRF posture is untouched).
+#
+# THE PREVIEW CHILDREN GET NO PORT. `server/src/preview-pool.ts` spawns one Vite
+# child process per open project INSIDE the server container and reverse-proxies
+# it at `/preview/<projectId>/*` behind `requireProject`. Publishing a port for
+# them would not just be unnecessary, it would route around that authorization.
+
+x-webgen-image: &webgen-image
+  build:
+    context: .
+    dockerfile: Dockerfile
+  # Named so both services resolve the SAME built image and the second build is a
+  # pure cache hit rather than a second install of everything.
+  image: website-generator:local
+
+x-webgen-volumes: &webgen-volumes
+  # The repo itself, so the code running is the code the tester cloned and a
+  # `git pull` takes effect without a rebuild. It also carries the two things
+  # that must survive a container: `generated/` (382MB of prior runs on the
+  # machine this was written on) and `server/data/` (accounts, argon2 hashes,
+  # live sessions, encrypted API keys). Both stay ordinary host directories —
+  # visible, backup-able with a file copy, shared with the from-source path, and
+  # crucially NOT destroyed by `docker compose down -v`.
+  #
+  # SQLite's WAL mode was the risk here and it was measured, not assumed: the
+  # server and `scripts/user.ts` are two processes on one file, and a filesystem
+  # without mmap support degrades or fails WAL outright. Verified on this
+  # machine's Docker Desktop bind mount — `journal_mode=wal` in both processes
+  # and a cross-process write read back correctly.
+  - .:/app
+
+  # SECRETS THE BIND MOUNT WOULD OTHERWISE HAND TO MODEL-GENERATED CODE.
+  #
+  # `serve.ts:109` deletes `WEBGEN_MASTER_KEY` from `process.env` the moment it
+  # is read, precisely because `compiler/`'s spawn sites pass no `env` and would
+  # inherit it into a generated project's own `vite.config.ts` — which is
+  # model-authored from a free-text brief and then EXECUTED by Vite. The mount
+  # above defeats that entirely: the same value sits at `/app/.env.docker` where
+  # any generated file can simply read it. Found by the whole-branch review.
+  #
+  # `orchestrator/.env` is worse and the review did not name it: it holds the
+  # OPERATOR's real ANTHROPIC_API_KEY and GEMINI_API_KEY. Shadowing it also
+  # closes the fall-through that has produced the "operator pays" bug twice —
+  # python-dotenv's `override=False` means an absent injected key silently
+  # reaches for this file, so under Docker a user's run could bill the operator.
+  # Nothing in the container needs it: `agent-env.ts` injects the user's own key
+  # from the database, and compose reads `.env.docker` HOST-side for `env_file`,
+  # never from inside the container.
+  #
+  # `/dev/null` rather than a tmpfs or an anonymous volume because both of those
+  # mount a DIRECTORY, and these two paths are files.
+  - /dev/null:/app/.env.docker:ro
+  - /dev/null:/app/orchestrator/.env:ro
+
+  # ANONYMOUS VOLUMES OVER EVERY node_modules — the Windows/macOS trap the bind
+  # mount above would otherwise walk straight into. The host tree holds
+  # win32/darwin native binaries (@node-rs/argon2, esbuild, rolldown,
+  # lightningcss); mounting it over the image's linux-x64 install replaces every
+  # one of them with a binary this container cannot load. An anonymous volume is
+  # initialised from the IMAGE's directory contents, so each of these keeps the
+  # tree `npm ci` built during the build.
+  #
+  # Consequence worth knowing: compose REUSES anonymous volumes when it recreates
+  # a container, so after changing a dependency the refresh is
+  # `docker compose down -v && docker compose up --build` — safe here precisely
+  # because `generated/` and the database are bind mounts, not volumes, so `-v`
+  # cannot touch them.
+  - /app/node_modules
+  - /app/compiler/node_modules
+  - /app/editor/node_modules
+  - /app/server/node_modules
+  - /app/fixtures/acme-landing/node_modules
+  # orchestrator's venv needs no entry here: the Dockerfile sets
+  # UV_PROJECT_ENVIRONMENT=/opt/venv, outside /app entirely, so the host's
+  # Windows `.venv` is never consulted.
+
+services:
+  server:
+    <<: *webgen-image
+    working_dir: /app/server # so `docker compose exec server node scripts/user.ts …` lands here
+    command: ["server"]
+    env_file:
+      # `required: false` on purpose: a missing file must produce the
+      # entrypoint's own explanation of where WEBGEN_MASTER_KEY comes from and
+      # why it must be generated exactly once, not compose's "env file not
+      # found".
+      - path: .env.docker
+        required: false
+    environment:
+      # Drops the Secure flag from the session cookie. Correct for plain HTTP;
+      # never set on a real deployment.
+      INSECURE_COOKIES: "1"
+      # Docker IS the supervisor here, and `serve.ts` asks to be told its grace
+      # rather than guess: every shutdown deadline (proxied-job wait < preview
+      # watchdog < grace) derives from this one number. Kept equal to
+      # stop_grace_period below so the two cannot drift.
+      WEBGEN_SHUTDOWN_GRACE_MS: "30000"
+      # Fan-out spawns one page worker per route, and unset means "all at once"
+      # — which is fine on a developer machine and fatal here. Measured in this
+      # image (3.8 GB VM, 4 routes): two of the four workers were killed with
+      # EMPTY stdout AND stderr, surfacing only as `manifest CLI produced no
+      # result`, which reads like a compiler bug rather than the memory
+      # exhaustion it was. Each worker is a whole Python process that shells out
+      # to `tsc`, so the binding constraint is memory, not CPU. Raise it if you
+      # give Docker more RAM; the run gets slower, never wrong.
+      #
+      # THIS BOUND IS PER RUN, NOT PER CONTAINER, and the whole-branch review was
+      # right to name it: `MAX_ACTIVE_JOBS_PER_USER` is 2, so one tester running
+      # two generations at once reaches 2 x 2 = 4 concurrent page workers —
+      # exactly the count measured to OOM here. It is documented rather than
+      # lowered to 1 because that would serialise fan-out for the ordinary
+      # single-generation case to protect against a case the tester has to opt
+      # into deliberately (two briefs, ~$3-5, and the progress screen now
+      # recovers a running job on reload specifically so a second is not started
+      # by accident). If you intend to run two at once, give Docker ~8 GB or set
+      # this to 1.
+      WEBGEN_FANOUT_MAX_WORKERS: "2"
+      # Optional. Set it to your account's address to have existing directories
+      # in `generated/` adopted on boot so they appear in the picker. It cannot
+      # create a user: an address matching no account is a logged skip.
+      WEBGEN_BOOTSTRAP_EMAIL: "${WEBGEN_BOOTSTRAP_EMAIL:-}"
+    volumes: *webgen-volumes
+    ports:
+      # 127.0.0.1, not 0.0.0.0: this is a single-user local tool with a session
+      # cookie carrying no Secure flag. Binding it to every interface would put
+      # it on the tester's LAN.
+      - "127.0.0.1:4000:4000"
+    stop_grace_period: 30s
+    healthcheck:
+      # /api/me unauthenticated answers 401, which proves the route table is
+      # live rather than merely that a socket is open. `node -e` because the
+      # slim image has no curl and adding one to buy a healthcheck is not worth
+      # a layer.
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:4000/api/me').then(r=>process.exit(r.status===401?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  editor:
+    <<: *webgen-image
+    working_dir: /app
+    command: ["editor"]
+    environment:
+      # Inside the editor container `localhost` is the EDITOR, not the server, so
+      # vite.config.ts's default of http://localhost:4000 would proxy to nothing.
+      # That file already reads this variable, so this is configuration rather
+      # than a code change.
+      WEBGEN_HOSTED_SERVER_URL: "http://server:4000"
+    volumes: *webgen-volumes
+    ports:
+      - "127.0.0.1:5173:5173"
+    depends_on:
+      server:
+        condition: service_healthy

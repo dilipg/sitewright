@@ -23,6 +23,18 @@ playwright-report/
 # Secrets — never committed
 .env
 *.env
+# The Docker env file (compose.yaml's `env_file`). It holds WEBGEN_MASTER_KEY,
+# the AES-256-GCM key every stored API key is encrypted under. Needs its own
+# line: `.env` matches only that exact name and `*.env` matches only names
+# ENDING in `.env`, so `.env.docker` slipped past both and `git status` offered
+# it for commit. `/.env.*` covers any future sibling (.env.local, …) too.
+#
+# ANCHORED with a leading slash, and that matters: an unanchored `.env.*` matches
+# at every level, which would cover `editor/.env.hosted` — a file that is
+# committed on purpose (it is what makes `npm run dev:hosted` hosted mode, and it
+# holds no secret). Being already tracked, it would not actually have been
+# dropped, but the rule would be lying about intent.
+/.env.*
 
 # Identity database (argon2 hashes, live session ids, and — from slice 3 —
 # encrypted API keys). Ignore the directory, not just the filename: WAL mode

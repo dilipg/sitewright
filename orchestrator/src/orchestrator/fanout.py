@@ -16,23 +16,55 @@ Usage: uv run python -m orchestrator.fanout --run-id X
 
 import argparse
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
 
+from orchestrator import portable
 from orchestrator.section_pipeline import GENERATED_DIR, REPO_ROOT, _run_compiler_cli, ensure_route_page_dirs
 
 
 def spawn_worker(run_id: str, route_slug: str) -> subprocess.Popen:
-    return subprocess.Popen(
+    # NO shell. `shell=True` here was silently Windows-only in the other
+    # direction from the `cmd /c` sites: on POSIX, Popen(list, shell=True)
+    # hands `sh -c` ONLY argv[0] and turns the rest into the shell's own
+    # positional parameters, so this ran a bare `uv`, printed its help, exited
+    # non-zero -- and every page worker "crashed" with nothing in its log.
+    return portable.spawn(
         ["uv", "run", "python", "-m", "orchestrator.page_worker", "--run-id", run_id, "--route-slug", route_slug],
         cwd=REPO_ROOT / "orchestrator",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
-        shell=True,
     )
+
+
+def max_parallel_workers() -> int:
+    """How many page workers may run at once.
+
+    Unset means "all of them", which is what fan-out has always done — so an
+    existing invocation behaves identically and none of the measured wall-clock
+    profile changes. A container sets it low because the binding constraint
+    there is MEMORY, not CPU: each worker is a whole Python process that shells
+    out to `tsc`.
+
+    Refuses a bad value rather than clamping, the same call `loadMasterKey` and
+    `shutdown-budget.ts` already make: a silently-ignored limit produces a
+    concurrency nobody chose, and its failure surfaces minutes later as workers
+    dying with no output.
+    """
+    raw = os.environ.get("WEBGEN_FANOUT_MAX_WORKERS", "").strip()
+    if raw == "":
+        return 1_000_000
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"WEBGEN_FANOUT_MAX_WORKERS must be a positive integer; got {raw!r}") from exc
+    if value < 1:
+        raise ValueError(f"WEBGEN_FANOUT_MAX_WORKERS must be at least 1; got {value}")
+    return value
 
 
 def collect_written_files(project_dir: Path, route_slug: str) -> list[str]:
@@ -58,24 +90,36 @@ def run_fanout(run_id: str) -> dict:
         str(project_dir), routes=[{"slug": r["slug"], "path": r["path"]} for r in plan["routes"]]
     )
 
-    print(f"=== fan-out: spawning {len(route_slugs)} page workers in parallel: {route_slugs}", flush=True)
+    max_parallel = max_parallel_workers()
+    print(
+        f"=== fan-out: {len(route_slugs)} page workers, at most {max_parallel} at a time: {route_slugs}",
+        flush=True,
+    )
     started_at: dict[str, float] = {}
-    procs: dict[str, subprocess.Popen] = {}
-    for slug in route_slugs:
-        started_at[slug] = time.monotonic()
-        procs[slug] = spawn_worker(run_id, slug)
-
     workers: dict[str, dict] = {}
-    for slug, proc in procs.items():
-        stdout, stderr = proc.communicate()
-        workers[slug] = {
-            "returncode": proc.returncode,
-            "started_at": round(started_at[slug], 3),
-            "duration_s": round(time.monotonic() - started_at[slug], 2),
-            "stdout_tail": stdout[-1500:],
-            "stderr_tail": stderr[-1500:],
-        }
-        print(f"=== {slug}: exit={proc.returncode} duration={workers[slug]['duration_s']}s", flush=True)
+    # Batched rather than all-at-once. Every route used to be spawned
+    # simultaneously with no cap: fine on a developer machine, fatal in a small
+    # container. Measured in Docker (3.8 GB VM, 4 routes): two of the four
+    # workers were killed with EMPTY stdout AND stderr, surfacing only as
+    # `manifest CLI produced no result` — which reads like a compiler bug rather
+    # than the memory exhaustion it was. The DEFAULT is unchanged behaviour (all
+    # at once), so no existing invocation and none of the measured wall-clock
+    # profile moves; a container sets a small value.
+    for batch_start in range(0, len(route_slugs), max_parallel):
+        procs: dict[str, subprocess.Popen] = {}
+        for slug in route_slugs[batch_start : batch_start + max_parallel]:
+            started_at[slug] = time.monotonic()
+            procs[slug] = spawn_worker(run_id, slug)
+        for slug, proc in procs.items():
+            stdout, stderr = proc.communicate()
+            workers[slug] = {
+                "returncode": proc.returncode,
+                "started_at": round(started_at[slug], 3),
+                "duration_s": round(time.monotonic() - started_at[slug], 2),
+                "stdout_tail": stdout[-1500:],
+                "stderr_tail": stderr[-1500:],
+            }
+            print(f"=== {slug}: exit={proc.returncode} duration={workers[slug]['duration_s']}s", flush=True)
 
     written_files = {f"page:{slug}": collect_written_files(project_dir, slug) for slug in route_slugs}
     written_files["shell"] = sorted(

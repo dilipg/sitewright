@@ -104,6 +104,36 @@ function respondInvalidRouteSlug(res: ServerResponse): void {
   respondJson(res, 400, { error: "invalid route slug" });
 }
 
+/**
+ * FIX ROUND B, C-1 — a revert that `restoreSnapshot` REFUSES is a conflict with
+ * the state the client believes it is in, not a server fault.
+ *
+ * Every one of those refusals used to arrive as **500**, because the handler's
+ * `catch` mapped everything alike: "the snapshot belongs to another route",
+ * "a regeneration is still running", "the snapshot is incomplete" and "there is
+ * nothing to revert" all read to a caller as *the server broke*, which is both
+ * untrue and unactionable — the actual fixes are wait, or reload, or accept that
+ * the undo window has closed. **409** says the request conflicts with the
+ * resource's current state, which is exactly what each of them means.
+ *
+ * A TYPE rather than a status argued about at each throw site, so the mapping
+ * cannot drift as guards are added; and deliberately NOT a blanket 409 for
+ * anything `restoreSnapshot` can throw. A genuine failure inside the copy — an
+ * EACCES on `cpSync`, a full disk, a bug — must still surface as 500, because
+ * that one really is the server breaking, and a 409 there would tell the user to
+ * retry something no retry can fix.
+ *
+ * `name` is set for parity with this codebase's other typed errors, but nothing
+ * dispatches on it: `instanceof` is the check, and a name-string comparison would
+ * survive the class being replaced by a plain `Error`.
+ */
+export class RevertConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RevertConflictError";
+  }
+}
+
 export function regenApiPlugin(projectRoot: string): Plugin {
   const root = resolve(projectRoot);
   return {
@@ -254,6 +284,16 @@ export function regenApiPlugin(projectRoot: string): Plugin {
               server.moduleGraph.invalidateAll();
               respondJson(res, 200, { ok: true });
             } catch (error) {
+              // C-1. A REFUSAL is a 409 and carries the guard's own message
+              // (`.message`, not `String(error)`, so the user reads the reason
+              // rather than a class name prefixed to it). Anything else is a
+              // genuine failure and stays a 500, with the same `String(error)`
+              // body it has always had — see `RevertConflictError` for why the
+              // distinction is a type instead of a per-throw decision.
+              if (error instanceof RevertConflictError) {
+                respondJson(res, 409, { error: error.message });
+                return;
+              }
               respondJson(res, 500, { error: String(error) });
             }
           });
@@ -476,11 +516,23 @@ export function snapshotRoute(root: string, routeSlug: string): SnapshotClaim {
  * conservative one: there is nothing coherent to restore mid-run (the run's own
  * output is half-written), and the user's own next action — wait, then revert —
  * works.
+ *
+ * FIX ROUND B, C-1 — every refusal here throws `RevertConflictError`, which the
+ * `/__regen-revert` handler maps to **409**. All of them used to arrive as 500,
+ * telling a user the server had broken when in fact their own client state was
+ * stale, and offering no action. A genuine failure (an EACCES out of `cpSync`, a
+ * full disk) still throws a plain Error and still answers 500, deliberately:
+ * that one IS the server breaking.
  */
 export function restoreSnapshot(root: string, sectionOrRoute: string): void {
   const routeSlug = sectionOrRoute.split(".")[0]!;
   const backup = snapshotDir(root);
-  if (!existsSync(backup)) throw new Error("no regeneration to revert");
+  // C-1: every refusal below is a `RevertConflictError` (409), never a bare
+  // Error (500). Including this one — "there is nothing to revert" is the
+  // client's own state being out of date (a reload, a second tab, a revert
+  // already taken), not a server fault. See that class for the line between the
+  // two.
+  if (!existsSync(backup)) throw new RevertConflictError("no regeneration to revert");
 
   const ownerFile = snapshotOwnerFile(root);
   const owner = existsSync(ownerFile) ? readFileSync(ownerFile, "utf8").trim() : null;
@@ -488,7 +540,7 @@ export function restoreSnapshot(root: string, sectionOrRoute: string): void {
     // An absent owner file means a snapshot taken before this guard existed.
     // Refused rather than trusted: the whole point is that a slot of unknown
     // provenance is exactly what caused the data loss.
-    throw new Error(
+    throw new RevertConflictError(
       `the pending regeneration snapshot belongs to route ${JSON.stringify(owner)}, ` +
         `not ${JSON.stringify(routeSlug)}; nothing was changed`,
     );
@@ -503,7 +555,7 @@ export function restoreSnapshot(root: string, sectionOrRoute: string): void {
   // rejected any other route.
   const claim = liveClaim(root);
   if (claim !== undefined) {
-    throw new Error(
+    throw new RevertConflictError(
       `a regeneration of route ${JSON.stringify(claim.route)} is still running, and reverting ` +
         `now would delete the files it is still writing; wait for it to finish, then revert. ` +
         `Nothing was changed.`,
@@ -519,7 +571,7 @@ export function restoreSnapshot(root: string, sectionOrRoute: string): void {
   const page = join(backup, "page");
   const manifestCopy = join(backup, "manifest.json");
   if (!existsSync(page) || !existsSync(manifestCopy)) {
-    throw new Error(
+    throw new RevertConflictError(
       "the pending regeneration snapshot is incomplete (missing page or manifest); nothing was changed",
     );
   }

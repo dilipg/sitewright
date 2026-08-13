@@ -96,6 +96,12 @@ Bounds, all of which already exist and are simply evaluated at enqueue instead o
 - **Globally: the preview pool's cap of 6** does double duty, because every job needs a child. A seventh concurrent job across all users waits rather than failing, which is *better* than today's 503.
 - **Spend cap: checked at enqueue**, which is what the spec means by "gates starting work only". A job that queues under the cap and starts over it still runs — the spec accepts overshoot for one run, and refusing at start time is the whole point.
 
+> **CORRECTION, 2026-08-13 (fix round B, D-1).** The second bullet above is **false for `generate`**, and is corrected here rather than rewritten, per the convention the 2026-08-10 F13 retraction set — a silently edited spec hides that a review caught it.
+>
+> "Every job needs a child" is true of the five **proxied** kinds and of nothing else. `generate` spawns `orchestrator.acceptance` **directly** and takes no preview child at all, because there is no site for a Vite child to serve until it has run (`server/src/job-worker.ts`'s `runGenerateJob`). So the preview pool's cap of 6 does **not** bound generations, and the sentence above describes a global bound that, for the one kind that costs ~$1 and ~11 minutes, does not exist.
+>
+> What actually bounds it is `MAX_CONCURRENT_JOBS = 6` in the worker itself — added later, when the whole-branch review of slice 5 found the worker was serial and `MAX_ACTIVE_JOBS_PER_USER` therefore unreachable in production. The bullet's *conclusion* still holds (a seventh concurrent job waits rather than 503ing); only its stated mechanism is wrong. Two consequences follow from the correction and are recorded elsewhere: `runOnce()` is uncapped and bypasses `MAX_CONCURRENT_JOBS` (`pending.md` H4), and six concurrent **proxied** jobs can still consume the whole preview pool and 503 a user's live preview (H3).
+
 **Crash recovery, stated because it cannot be solved:** a row left `running` when the server restarts is marked **`interrupted`**, never retried. The server cannot know whether the child finished the work, and a subprocess that was mid-`write_section_only` may have left a half-written page. Retrying could regenerate a section twice and bill twice; assuming success could report work that never happened. `interrupted` says exactly what is known — the UI shows "this may or may not have completed, check the page" — and the operator CLI can list them. **This is the honest answer, not a placeholder.**
 
 ---

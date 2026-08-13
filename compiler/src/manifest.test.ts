@@ -304,3 +304,76 @@ describe("manifest service: commit safety", () => {
     );
   });
 });
+
+/**
+ * THE FIFTH `..` — found by the H2 audit (docs/pending.md), which existed
+ * because `CLAUDE.md` says in as many words to assume one more exists after the
+ * four traversal defects this codebase shipped at four different layers.
+ *
+ * `propose` validated only `nodeId`. `component` and `file` are equally
+ * model-authored — they arrive in an agent's structured output — and were
+ * persisted verbatim, then interpolated into `path.join` at six sites including
+ * the real exporter (`exporter.ts:621,719,933`, `regen-api.ts:760,761,898,927`).
+ * `path.join` normalises `..`, so either field could read or write outside the
+ * project.
+ *
+ * Validated at the proposal boundary rather than at each join: this is the one
+ * place model output becomes persisted state, and every one of those six sites
+ * reads back from the manifest, so guarding the write protects all of them by
+ * construction instead of by six people remembering.
+ */
+describe("manifest service: component and file cannot escape the project (the fifth `..`)", () => {
+  function proposeWith(overrides: { component?: string; file?: string }) {
+    return propose(
+      createManifest(),
+      [{ ...fixtureProposals()[0]!, ...overrides }],
+      homePageConfig,
+    );
+  }
+
+  it("accepts the shapes a real generated manifest actually contains", () => {
+    // Guards the premise: sampled from a live run before the pattern was chosen,
+    // every component was PascalCase and every file a relative POSIX path under
+    // src/pages/. If this fails, the guard is rejecting legitimate output.
+    const ok = proposeWith({ component: "ContactHero", file: "src/pages/home/sections/ContactHero.tsx" });
+    expect(ok.issues).toEqual([]);
+    expect(ok.valid).toBe(true);
+  });
+
+  it("refuses a component name that would traverse out of the project", () => {
+    const result = proposeWith({ component: "../../../../evil" });
+    expect(result.valid).toBe(false);
+    expect(result.issues.map((i) => i.rule)).toContain("unsafe-path");
+  });
+
+  it("refuses a component name containing a path separator or a dot", () => {
+    for (const component of ["Hero/Evil", "Hero\\Evil", "Hero.data", "hero"]) {
+      const result = proposeWith({ component });
+      expect(result.valid, `component ${JSON.stringify(component)} was accepted`).toBe(false);
+    }
+  });
+
+  it("refuses a file path with a `..` segment, in either slash style", () => {
+    for (const file of ["src/../../../etc/passwd", "src\\..\\..\\evil.tsx"]) {
+      const result = proposeWith({ file });
+      expect(result.valid, `file ${JSON.stringify(file)} was accepted`).toBe(false);
+      expect(result.issues.some((i) => i.rule === "unsafe-path")).toBe(true);
+    }
+  });
+
+  it("refuses an absolute file path, POSIX or Windows", () => {
+    for (const file of ["/etc/passwd", "C:/Windows/System32/evil.tsx"]) {
+      const result = proposeWith({ file });
+      expect(result.valid, `file ${JSON.stringify(file)} was accepted`).toBe(false);
+    }
+  });
+
+  it("names the offending value in the message, so a failing run is diagnosable", () => {
+    // A generation that dies on this must say WHICH value broke it: the agent's
+    // output is the thing to fix, and a bare "unsafe path" costs a whole
+    // diagnostic cycle on a run that already spent money.
+    const result = proposeWith({ component: "../evil" });
+    const issue = result.issues.find((i) => i.rule === "unsafe-path");
+    expect(issue?.message).toContain("../evil");
+  });
+});

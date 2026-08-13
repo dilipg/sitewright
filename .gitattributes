@@ -11,3 +11,19 @@
 # file whose whole purpose is byte-level agreement should not have its bytes
 # depend on which OS cloned it.
 fixtures/usage-log-contract.jsonl -text
+
+# Shell scripts MUST check out with LF, on every platform.
+#
+# `docker/entrypoint.sh` is the container's ENTRYPOINT, and `compose.yaml`
+# bind-mounts the repo at `/app` — which SHADOWS the copy the Dockerfile fixed
+# with `sed -i 's/\r$//' && chmod +x`. So the file the container actually execs
+# is the HOST checkout, and with `core.autocrlf=true` (set on the machine this
+# was developed on) a fresh Windows clone gets `#!/bin/sh\r`: `docker compose up`
+# then fails with a shebang error that names no cause.
+#
+# The whole-branch review found this, and it is invisible here because this
+# working tree happens to hold the file with LF and the exec bit already set —
+# the defect only appears on a clone. Two other layers back this up: the
+# ENTRYPOINT now invokes the script through `sh`, so the exec bit cannot matter,
+# and the file's index mode is `100755`.
+*.sh text eol=lf

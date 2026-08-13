@@ -18,12 +18,14 @@ import { spawnSync } from "node:child_process";
 import {
   cpSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
   readdirSync,
   rmdirSync,
   rmSync,
   symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
@@ -1197,13 +1199,47 @@ function readTokenVars(outDir: string): Set<string> {
   return vars;
 }
 
-/** Runs the output project's own typecheck+build, borrowing source node_modules via a junction. */
+/**
+ * Creates a directory link at `linkPath` pointing at `target`.
+ *
+ * `"junction"` is the type argument, and it is right on both platforms: on
+ * Windows it makes a junction, which — unlike a symlink — needs no Developer
+ * Mode and no administrator rights; off Windows the type is ignored and this is
+ * an ordinary symlink to the resolved absolute path.
+ */
+export function linkDirectory(target: string, linkPath: string): void {
+  symlinkSync(target, linkPath, "junction");
+}
+
+/**
+ * Removes a directory LINK, never what it points at.
+ *
+ * Windows junction → `rmdirSync`; POSIX symlink → `unlinkSync`. `rmdirSync` on a
+ * POSIX symlink is `ENOTDIR`, and because the call below sits in a `finally`,
+ * that made an otherwise-SUCCESSFUL export throw — and replaced any genuine
+ * `ExportError` with a misleading one. Export was therefore impossible on Linux
+ * or macOS.
+ *
+ * Branching on `lstatSync` rather than on the platform, because the platform is
+ * not what varies: measured on Windows, a junction lstats as
+ * `isSymbolicLink() === true` / `isDirectory() === false`, so this one branch
+ * covers both and `unlinkSync` provably leaves the junction's target intact.
+ * The `rmdirSync` arm is kept for the case `lstat` reports a real directory,
+ * preserving the previous behaviour exactly (a non-empty one still throws
+ * ENOTEMPTY rather than being silently deleted).
+ */
+export function removeDirectoryLink(linkPath: string): void {
+  if (lstatSync(linkPath).isSymbolicLink()) unlinkSync(linkPath);
+  else rmdirSync(linkPath);
+}
+
+/** Runs the output project's own typecheck+build, borrowing source node_modules via a directory link. */
 function runVerificationBuild(projectRoot: string, outDir: string): void {
   const sourceModules = join(projectRoot, "node_modules");
   const outModules = join(outDir, "node_modules");
   let linked = false;
   if (!existsSync(outModules) && existsSync(sourceModules)) {
-    symlinkSync(sourceModules, outModules, "junction");
+    linkDirectory(sourceModules, outModules);
     linked = true;
   }
   try {
@@ -1212,6 +1248,16 @@ function runVerificationBuild(projectRoot: string, outDir: string): void {
       shell: true,
       encoding: "utf8",
       timeout: 240_000,
+      // NODE_ENV is forced, not inherited. Contract 7.4 calls this a PRODUCTION
+      // build, and vite only treats it as one when NODE_ENV is unset or
+      // "production" (`if (!isNodeEnvSet)` in vite@8.1.5). The Docker image sets
+      // `NODE_ENV=development` for its dev servers, and this spawn passed no
+      // `env` — so every export inside the container silently produced a DEV
+      // bundle while reporting a successful production verification. Found by
+      // the whole-branch review. Fixed here rather than in the Dockerfile
+      // because the guarantee belongs to the exporter on every host, not to one
+      // deployment's environment.
+      env: { ...process.env, NODE_ENV: "production" },
     });
     if (result.status !== 0) {
       throw new ExportError(
@@ -1221,14 +1267,14 @@ function runVerificationBuild(projectRoot: string, outDir: string): void {
       );
     }
   } finally {
-    if (linked) rmdirSync(outModules);
+    if (linked) removeDirectoryLink(outModules);
   }
 }
 
 function removeOutput(outDir: string): void {
   const outModules = join(outDir, "node_modules");
   if (existsSync(outModules)) {
-    rmdirSync(outModules); // junction: removes the link, never the source tree
+    removeDirectoryLink(outModules); // a LINK: removes the link, never the source tree
   }
   rmSync(outDir, { recursive: true, force: true });
 }

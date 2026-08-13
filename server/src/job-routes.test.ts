@@ -193,18 +193,30 @@ describe("POST /api/generate", () => {
     expect(readdirSync(projectsRoot)).toEqual([]);
   });
 
-  it("names PUT /api/key in the refusal, because there is no settings screen to send anyone to", async () => {
+  it("names the API key screen AND PUT /api/key, and no longer claims there is no screen", async () => {
     const { db, alice, call, aliceCookie } = harness();
     deleteApiKey(db, alice.id);
 
     const result = await call("POST", "/api/generate", aliceCookie, { brief: "a bakery landing page" });
 
     // The wording IS the fix: this reaches the tester verbatim through
-    // `ProjectPicker`'s `refusalMessage`, and the previous message ("save one
-    // in settings") named nothing that exists in `editor/src`.
+    // `ProjectPicker`'s `refusalMessage`. Both of the previous message's claims
+    // have since become false, and both were reaching the browser: it named
+    // ANTHROPIC as though it were the only storable provider, and it stated
+    // "There is no settings screen yet" — which is now the most misleading thing
+    // a user could read, since `editor/src/components/KeySettings.tsx` shows
+    // itself precisely when this refusal is possible.
     const body = result.json as { error: string };
+    expect(body.error).toContain("API key screen");
+    // The endpoint stays named, for the from-source README path and for scripts.
     expect(body.error).toContain("PUT /api/key");
-    expect(body.error).not.toContain("in settings");
+    expect(body.error).not.toMatch(/no settings screen|settings screen yet/i);
+    // Neither provider is presented as the only one that works.
+    expect(body.error).toContain("Gemini");
+    expect(body.error).not.toMatch(/no Anthropic API key/i);
+    // Unchanged and still load-bearing: the refusal happens before anything is
+    // created, and the message has to say so or a tester assumes they were billed.
+    expect(body.error).toContain("Nothing was created and nothing was charged");
   });
 
   it("checks the key before the body is read, so a keyless caller with a malformed body still gets the key message", async () => {
@@ -540,7 +552,7 @@ describe("POST /api/jobs/:id/resume", () => {
       userId: alice.id, projectId: project.id, kind: "regen",
       requestJson: JSON.stringify({ section: "home.hero", instruction: "warm the tone" }), now: 1_000,
     });
-    recordJobRun(db, original.id, { runId: "web-known-run-id", codeVersion: "sha-original" });
+    recordJobRun(db, original.id, { runId: "web-known-run-id", codeVersion: "sha-original", provider: "anthropic" });
     finishJob(db, original.id, { status: "failed", error: "gate 3 failed", now: 2_000 });
 
     const result = await call("POST", `/api/jobs/${original.id}/resume`, aliceCookie);
@@ -641,7 +653,7 @@ describe("POST /api/jobs/:id/resume", () => {
     const original = createJob(db, {
       userId: alice.id, projectId: project.id, kind: "regen", requestJson: "{}", now: 1_000,
     });
-    recordJobRun(db, original.id, { runId: "web-x", codeVersion: "OLD-sha-before-a-deploy" });
+    recordJobRun(db, original.id, { runId: "web-x", codeVersion: "OLD-sha-before-a-deploy", provider: "anthropic" });
     finishJob(db, original.id, { status: "failed", error: "boom", now: 2_000 });
 
     const before = jobCount(db);
@@ -656,7 +668,7 @@ describe("POST /api/jobs/:id/resume", () => {
     const original = createJob(db, {
       userId: alice.id, projectId: project.id, kind: "regen", requestJson: "{}", now: 1_000,
     });
-    recordJobRun(db, original.id, { runId: "web-x", codeVersion: "current-sha" });
+    recordJobRun(db, original.id, { runId: "web-x", codeVersion: "current-sha", provider: "anthropic" });
     finishJob(db, original.id, { status: "failed", error: "boom", now: 2_000 });
 
     const result = await call("POST", `/api/jobs/${original.id}/resume`, aliceCookie);
@@ -677,13 +689,123 @@ describe("POST /api/jobs/:id/resume", () => {
     const original = createJob(db, {
       userId: alice.id, projectId: project.id, kind: "regen", requestJson: "{}", now: 1_000,
     });
-    recordJobRun(db, original.id, { runId: "web-x", codeVersion: UNKNOWN_CODE_VERSION });
+    recordJobRun(db, original.id, { runId: "web-x", codeVersion: UNKNOWN_CODE_VERSION, provider: "anthropic" });
     finishJob(db, original.id, { status: "failed", error: "boom", now: 2_000 });
 
     const before = jobCount(db);
     const result = await call("POST", `/api/jobs/${original.id}/resume`, aliceCookie);
     expect(result.status).toBe(409);
     expect(jobCount(db)).toBe(before);
+  });
+
+  /**
+   * FIX ROUND B, I7 — the code-version guard's sibling, for the other thing a
+   * replayed `run_id` cannot survive a change of.
+   *
+   * Nothing pinned a job's provider, and `buildAgentEnv` resolves whichever key
+   * is stored at CLAIM time. So replacing an Anthropic key with a Gemini one
+   * between a failed job and its resume continued the same `run_id` under a
+   * different model family, while Kitaru's cache (keyed on function code plus
+   * args) left every completed checkpoint in place from the old one.
+   */
+  describe("provider changed since the job ran (I7)", () => {
+    /** `AQ.`-prefixed: one of the two shapes `API_KEY_SHAPES.gemini` accepts, and the only kind Google AI Studio now issues. */
+    const GEMINI_KEY = "AQ.a-real-looking-gemini-key-value";
+
+    it("refuses with 409 naming BOTH providers, and creates no new job, when the account's provider changed since the job ran", async () => {
+      const { db, alice, call, aliceCookie } = harness({ codeVersion: "current-sha" });
+      const project = createProject(db, alice.id, "run-resume-provider", "Run Resume Provider");
+      const original = createJob(db, {
+        userId: alice.id, projectId: project.id, kind: "regen", requestJson: "{}", now: 1_000,
+      });
+      // Ran under Anthropic (the harness's default stored key)...
+      recordJobRun(db, original.id, { runId: "web-x", codeVersion: "current-sha", provider: "anthropic" });
+      finishJob(db, original.id, { status: "failed", error: "boom", now: 2_000 });
+      // ...and the user then swapped their key for a Gemini one.
+      setApiKey(db, TEST_MASTER_KEY, alice.id, GEMINI_KEY, "gemini");
+
+      const before = jobCount(db);
+      const result = await call("POST", `/api/jobs/${original.id}/resume`, aliceCookie);
+
+      expect(result.status).toBe(409);
+      expect(jobCount(db)).toBe(before);
+      // The EXACT body, written out here rather than imported from
+      // job-provider.ts: importing the builder would make this pass even if the
+      // message were gutted, and a substring check on "gemini" alone still
+      // passes when the message loses the provider the job came FROM — which is
+      // the half that tells a user what they changed.
+      expect(result.json).toEqual({
+        error:
+          "this job ran with a anthropic key and this account now uses gemini; a resume continues "
+          + "the same run, which cannot switch model providers partway — start a fresh job instead",
+      });
+    });
+
+    it("refuses in the other direction too — gemini job, anthropic account", async () => {
+      const { db, alice, call, aliceCookie } = harness({ codeVersion: "current-sha" });
+      const project = createProject(db, alice.id, "run-resume-provider-rev", "Run Resume Provider Rev");
+      const original = createJob(db, {
+        userId: alice.id, projectId: project.id, kind: "regen", requestJson: "{}", now: 1_000,
+      });
+      recordJobRun(db, original.id, { runId: "web-x", codeVersion: "current-sha", provider: "gemini" });
+      finishJob(db, original.id, { status: "failed", error: "boom", now: 2_000 });
+      // The harness's stored key for alice is Anthropic and is left alone.
+
+      const result = await call("POST", `/api/jobs/${original.id}/resume`, aliceCookie);
+      expect(result.status).toBe(409);
+      expect((result.json as { error: string }).error).toContain("ran with a gemini key");
+      expect((result.json as { error: string }).error).toContain("now uses anthropic");
+    });
+
+    it("does NOT refuse a job whose recorded provider is NULL — nothing ran, so there is nothing to protect", async () => {
+      // THE carve-out, and the reason it is its own named test: making a null
+      // recorded provider refuse would break EVERY legitimate resume of a job
+      // that failed before it started running, plus every row that predates the
+      // column. The account's provider is deliberately different from anything
+      // the job could have used, so only the null carve-out can produce a 202.
+      const { db, alice, call, aliceCookie } = harness({ codeVersion: "current-sha" });
+      const project = createProject(db, alice.id, "run-resume-provider-null", "Run Resume Provider Null");
+      const original = createJob(db, {
+        userId: alice.id, projectId: project.id, kind: "regen", requestJson: "{}", now: 1_000,
+      });
+      // No recordJobRun at all: the job failed before it began (a malformed
+      // payload, a since-deleted project), so provider stays null.
+      finishJob(db, original.id, { status: "failed", error: "boom", now: 2_000 });
+      setApiKey(db, TEST_MASTER_KEY, alice.id, GEMINI_KEY, "gemini");
+
+      const result = await call("POST", `/api/jobs/${original.id}/resume`, aliceCookie);
+      expect(result.status).toBe(202);
+      expect(findJobById(db, original.id)?.provider).toBe(null);
+    });
+
+    it("does NOT refuse when the provider is unchanged — the safe-resume path stays open for both providers", async () => {
+      const { db, alice, call, aliceCookie } = harness({ codeVersion: "current-sha" });
+      const project = createProject(db, alice.id, "run-resume-provider-same", "Run Resume Provider Same");
+      const original = createJob(db, {
+        userId: alice.id, projectId: project.id, kind: "regen", requestJson: "{}", now: 1_000,
+      });
+      setApiKey(db, TEST_MASTER_KEY, alice.id, GEMINI_KEY, "gemini");
+      recordJobRun(db, original.id, { runId: "web-x", codeVersion: "current-sha", provider: "gemini" });
+      finishJob(db, original.id, { status: "failed", error: "boom", now: 2_000 });
+
+      expect((await call("POST", `/api/jobs/${original.id}/resume`, aliceCookie)).status).toBe(202);
+    });
+
+    it("does NOT refuse when the key has been DELETED — the missing-key refusal owns that case, not this one", async () => {
+      // Answering 409 here would name a provider the account does not have and
+      // bury the one actionable fact ("save a key"). The worker refuses this run
+      // with MissingApiKeyError instead.
+      const { db, alice, call, aliceCookie } = harness({ codeVersion: "current-sha" });
+      const project = createProject(db, alice.id, "run-resume-provider-gone", "Run Resume Provider Gone");
+      const original = createJob(db, {
+        userId: alice.id, projectId: project.id, kind: "regen", requestJson: "{}", now: 1_000,
+      });
+      recordJobRun(db, original.id, { runId: "web-x", codeVersion: "current-sha", provider: "anthropic" });
+      finishJob(db, original.id, { status: "failed", error: "boom", now: 2_000 });
+      deleteApiKey(db, alice.id);
+
+      expect((await call("POST", `/api/jobs/${original.id}/resume`, aliceCookie)).status).toBe(202);
+    });
   });
 
   /**

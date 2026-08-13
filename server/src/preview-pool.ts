@@ -18,9 +18,9 @@
  *   - a process with work in flight (`retain`/`release`) is NEVER reaped,
  *     however long it has been running — a page regen takes about five
  *     minutes and looks, from the outside, exactly like an idle tab;
- *   - the child inherits neither the master key nor the host's own
- *     `ANTHROPIC_API_KEY` — a keyless user must get NO key, never the
- *     operator's;
+ *   - the child inherits neither the master key nor ANY of the host's own
+ *     provider keys (`ANTHROPIC_API_KEY`, `GEMINI_API_KEY`) — a keyless user
+ *     must get NO key, never the operator's;
  *   - a child is never `unref()`'d — an orphaned Vite server holding a port
  *     open past the parent's own lifetime is the exact failure this pool
  *     exists to bound.
@@ -52,6 +52,11 @@
  * key on every reuse, and — for a warm, idle entry only — kills and
  * respawns on a mismatch. See `acquire()`'s own comment for the busy-child
  * policy this cannot apply unconditionally.
+ *
+ * BYOK task 1 extended that comparison to the PROVIDER as well as the
+ * fingerprint. Four characters cannot see a switch from an Anthropic key to a
+ * Gemini one ending the same way, and the switch changes which API the child
+ * calls and which environment variable carries the credential.
  */
 import { spawn } from "node:child_process";
 import type { EventEmitter } from "node:events";
@@ -61,12 +66,13 @@ import { fileURLToPath } from "node:url";
 import {
   buildAgentEnv,
   DisabledUserError,
+  injectedCredential,
   MissingApiKeyError,
   resolveApiKey,
   scrubbedEnv,
   UnknownUserError,
 } from "./agent-env.ts";
-import { fingerprintOf, getApiKeyFingerprint } from "./api-keys.ts";
+import { getApiKeyFingerprint, type ApiKeyProvider } from "./api-keys.ts";
 import type { Project } from "./projects.ts";
 import { resolveProjectDirectory } from "./projects.ts";
 import { redactSecrets } from "./redact.ts";
@@ -257,7 +263,7 @@ interface Entry {
   lastUsedAt: number;
   /**
    * A fingerprint (never the raw key — see `fingerprintOf`) of whatever
-   * `ANTHROPIC_API_KEY` this entry's child was actually spawned with, or
+   * provider key this entry's child was actually spawned with, or
    * `null` for a keyless spawn. Set once, at spawn time, and never mutated
    * in place afterward — `acquire()` compares it against the owner's
    * CURRENT fingerprint on every reuse and replaces the whole entry (see
@@ -266,6 +272,19 @@ interface Entry {
    * reference to the old entry object.
    */
   keyFingerprint: string | null;
+  /**
+   * Which provider that key was injected FOR — `null` alongside a null
+   * fingerprint, for a keyless spawn.
+   *
+   * Tracked separately from the fingerprint, and compared alongside it,
+   * because a fingerprint is only the last four characters: switching from an
+   * Anthropic key to a Gemini key that happens to end the same way changes
+   * which API the child calls and which of the two environment variables
+   * carries the credential, while leaving the fingerprint identical. Without
+   * this field that switch would be invisible and the child would keep
+   * calling the old provider until the idle reaper got to it.
+   */
+  keyProvider: ApiKeyProvider | null;
 }
 
 function toPreviewProcess(projectId: string, entry: Entry & { port: number; base: string }): PreviewProcess {
@@ -478,8 +497,13 @@ export class PreviewPool {
       // `installEntry`'s comment for why that is load-bearing: it is what
       // stops a second, concurrent `acquire()` for this SAME project from
       // also deciding to respawn and leaking an untracked second child.
-      const currentFingerprint = getApiKeyFingerprint(this.db, ownerId);
-      const warmAndStale = existing.child !== undefined && existing.keyFingerprint !== currentFingerprint;
+      const current = getApiKeyFingerprint(this.db, ownerId);
+      // Both halves of the credential are compared, not just the fingerprint —
+      // see `Entry.keyProvider` for the same-last-four provider switch that
+      // the fingerprint alone cannot see.
+      const stale = existing.keyFingerprint !== (current === null ? null : current.fingerprint)
+        || existing.keyProvider !== (current === null ? null : current.provider);
+      const warmAndStale = existing.child !== undefined && stale;
       if (warmAndStale && existing.inFlight === 0) {
         return this.installEntry(project, ownerId, existing.child);
       }
@@ -524,11 +548,16 @@ export class PreviewPool {
     // would let a bogus or disabled request evict a legitimate one on its
     // way to being refused anyway.
     const env = this.buildChildEnv(ownerId);
-    // The fingerprint of whatever key THIS env actually carries (or `null`
-    // for a keyless spawn) — derived from the env handed to the child, not
-    // a second, separate database read, so this can never disagree with
-    // what the child was actually given.
-    const keyFingerprint = env.ANTHROPIC_API_KEY !== undefined ? fingerprintOf(env.ANTHROPIC_API_KEY) : null;
+    // The provider and fingerprint of whatever key THIS env actually carries
+    // (or `null`/`null` for a keyless spawn) — derived from the env handed to
+    // the child, not a second, separate database read, so this can never
+    // disagree with what the child was actually given. Reading only
+    // `ANTHROPIC_API_KEY` here (as this line once did) made every Gemini
+    // child look keyless, so it compared unequal to the owner's real
+    // fingerprint and was killed and respawned on EVERY acquire.
+    const injected = injectedCredential(env);
+    const keyFingerprint = injected === null ? null : injected.fingerprint;
+    const keyProvider = injected === null ? null : injected.provider;
 
     // Only a BRAND NEW map entry can trip MAX_PREVIEWS — replacing an
     // existing project's entry (the stale-key respawn path, `priorChild`
@@ -564,7 +593,7 @@ export class PreviewPool {
         }
         throw err;
       });
-    entry = { readyPromise, inFlight: 0, lastUsedAt: this.now(), keyFingerprint };
+    entry = { readyPromise, inFlight: 0, lastUsedAt: this.now(), keyFingerprint, keyProvider };
     // Stored BEFORE awaiting: this is what makes two concurrent first
     // requests for the same project share this one spawn rather than both
     // independently starting a second Vite server on the same directory —

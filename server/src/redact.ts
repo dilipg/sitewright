@@ -17,15 +17,46 @@
  * possibility of a key appearing on a spawned process's command line or in an
  * error message. Three call sites there depend on this function: the per-line
  * stdout logger, the stderr logger, and the malformed-readiness-line logger.
+ * Every provider whose key can be injected into that child must therefore be
+ * covered here — see `KEY_PATTERNS`.
  * If a future call site pipes a child or subprocess's output into a log call,
  * it needs this too — the "never logged" guarantee stopped holding by
  * construction the moment the first such call site was wired in.
  */
 
-// Anthropic keys are `sk-ant-` followed by a run of URL-safe characters. The
-// prefix is what makes this specific enough not to mangle ordinary log text.
-const KEY_PATTERN = /sk-ant-[A-Za-z0-9_-]+/g;
+/**
+ * One entry per provider whose key can reach a child's environment, and so a
+ * child's output. BYOK task 1 added the Gemini pair: a Gemini key now travels
+ * to the same preview child by the same route, so leaving it out of this list
+ * would have meant the "never logged" guarantee held for one provider only.
+ *
+ * These are deliberately NOT `api-keys.ts`'s `API_KEY_SHAPES`. Those are
+ * anchored validators for a whole string; these must match a key EMBEDDED in
+ * arbitrary text, so they are unanchored and open-ended — a key that has been
+ * truncated or concatenated by whatever printed it must still be caught.
+ *
+ * Each pattern carries a minimum run length, and `AQ.` additionally a word
+ * boundary, to keep ordinary log text intact: without `\b`, "FAQ." in a
+ * generated site's own build output would be redacted as if it were a
+ * credential prefix, and a bare "AQ." in prose would too.
+ */
+const KEY_PATTERNS: ReadonlyArray<{ pattern: RegExp; replacement: string }> = [
+  // Anthropic: `sk-ant-` then a run of URL-safe characters. Unchanged from the
+  // original, including its lack of a length floor — the prefix alone is
+  // specific enough that a false positive is not a realistic concern.
+  { pattern: /sk-ant-[A-Za-z0-9_-]+/g, replacement: "sk-ant-[redacted]" },
+  // Google "standard" key: `AIza` + 35 characters. The floor is well under 35
+  // so a truncated key is still caught.
+  { pattern: /AIza[A-Za-z0-9_-]{10,}/g, replacement: "AIza[redacted]" },
+  // Google AI Studio "auth" key: `AQ.` + an unknown-length body that may itself
+  // contain dots.
+  { pattern: /\bAQ\.[A-Za-z0-9._-]{16,}/g, replacement: "AQ.[redacted]" },
+];
 
 export function redactSecrets(text: string): string {
-  return text.replace(KEY_PATTERN, "sk-ant-[redacted]");
+  let output = text;
+  for (const { pattern, replacement } of KEY_PATTERNS) {
+    output = output.replace(pattern, replacement);
+  }
+  return output;
 }

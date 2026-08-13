@@ -1,11 +1,18 @@
 import { describe, expect, it } from "vitest";
 import {
-  describeRemainingBudget,
   EMPTY_BRIEF_MESSAGE,
   loadProjects,
   startGeneration,
   toProjectRows,
 } from "./ProjectPicker";
+// Was `describeRemainingBudget`, exported from `ProjectPicker.tsx` itself. It
+// MOVED to `lib/spend.ts` (unchanged in behaviour — every assertion below is the
+// one it already had, including the exact strings) because the BYOK key screen
+// now shows the same figure, and the accepted risk this plan ships requires
+// `unpricedEvents` to be surfaced wherever spend is shown. Two surfaces wording
+// the same fact independently is precisely how one of them ends up presenting a
+// floor as an exact total.
+import { describeSpend } from "../lib/spend";
 import { SessionExpiredError } from "../lib/session-fetch";
 // Vite's own `?raw` suffix rather than `node:fs` — this workspace's tsconfig
 // has no node types, and adding `@types/node` for one test would be a new
@@ -368,15 +375,75 @@ describe("ProjectPicker.tsx: the component cannot render a directory", () => {
       pickerSource.indexOf("picker-budget"),
     );
   });
+
+  it("renders the budget line through describeSpend, never a figure of its own", async () => {
+    // BYOK FORM. The accepted risk this plan ships is that Gemini spend is not
+    // bounded by the cap (`pricing.py` has no Gemini rates, so those calls record
+    // `cost_usd = NULL`), and the agreed mitigation is that `unpricedEvents` is
+    // surfaced wherever spend is shown. A locally-formatted figure here would
+    // read as exact and satisfy every other assertion in this file.
+    expect(pickerSource).toContain("describeSpend(spend)");
+    expect(pickerSource).not.toMatch(/toFixed\(2\)/);
+  });
+
+  it("offers a SIGN-OUT beside the account line, wired to the real logout request (R-6)", async () => {
+    // FIX ROUND B, R-6. `POST /api/logout` existed since slice 2 with no caller,
+    // so a session could be started from the UI and never ended from it.
+    //
+    // A SOURCE assertion, and worth naming as such: this workspace has no React
+    // testing library, so the only way to bind the BUTTON to the request is to
+    // read the markup. `lib/logout.test.ts` covers what the request does; this
+    // covers that the screen actually makes it. Deleting either the button or its
+    // `onClick` fails here — which a unit test of `submitLogout` alone cannot do.
+    expect(pickerSource).toContain('data-testid="picker-sign-out"');
+    expect(pickerSource).toContain("submitLogout()");
+    expect(pickerSource).toContain("onSignOut()");
+    // Beside the account line specifically — the thing it answers. Asserted by
+    // position, since a sign-out button parked anywhere else (next to Generate,
+    // say) is a different, worse screen.
+    const account = pickerSource.indexOf('data-testid="picker-account"');
+    expect(account).toBeGreaterThan(-1);
+    expect(pickerSource.indexOf('data-testid="picker-sign-out"')).toBeGreaterThan(account);
+    expect(pickerSource.indexOf('data-testid="picker-sign-out"')).toBeLessThan(
+      pickerSource.indexOf("new-site-form"),
+    );
+    // And the callback fires only AFTER the request resolves: an `onSignedOut()`
+    // before the `await` would show the login screen for a sign-out that never
+    // happened.
+    expect(pickerSource.indexOf("await submitLogout()")).toBeLessThan(
+      pickerSource.indexOf("onSignedOut?.()"),
+    );
+    // The failure is SHOWN, not swallowed — otherwise a 500 looks identical to a
+    // successful sign-out from the user's side.
+    expect(pickerSource).toContain('data-testid="picker-sign-out-error"');
+  });
+
+  it("renders no sign-out button for a caller that has no session to end (local mode)", async () => {
+    // Structural, not conventional: the button is inside an
+    // `onSignedOut !== undefined` guard, the same pattern `onOpenKeySettings`
+    // already uses, so a caller with no session cannot render one. Local mode
+    // never mounts this screen at all (App.tsx's `hostedShellWithoutProject`),
+    // and this is the second lock on the same door.
+    expect(pickerSource).toContain("onSignedOut !== undefined &&");
+  });
+
+  it("offers a way to the API-key screen, so a stored key can be replaced without one appearing by itself", async () => {
+    // With a key stored the screen no longer shows itself, so this is the only
+    // route back to it — and the status beside it is honest in all three states
+    // (`describeKeyStatus`), including the one where the probe failed.
+    expect(pickerSource).toContain('data-testid="picker-key-button"');
+    expect(pickerSource).toContain("onOpenKeySettings");
+    expect(pickerSource).toContain('data-testid="picker-key-status"');
+  });
 });
 
 /* ------------------------------------------------------------------ *
  * Remaining budget (task 4)
  * ------------------------------------------------------------------ */
 
-describe("describeRemainingBudget: the number beside a $1.74 button", () => {
+describe("describeSpend: the number beside a $1.74 button", () => {
   it("names what is left, the cap, and what has been spent", () => {
-    expect(describeRemainingBudget({ spendCapUsd: 20, spentUsd24h: 1.7396 })).toBe(
+    expect(describeSpend({ spendCapUsd: 20, spentUsd24h: 1.7396 })).toBe(
       "$18.26 of your $20.00 daily budget is left ($1.74 spent in the last 24 hours).",
     );
   });
@@ -385,7 +452,7 @@ describe("describeRemainingBudget: the number beside a $1.74 button", () => {
     // The cap gates ENQUEUE. A run that started under it bills whatever it
     // bills, so `spentUsd24h` legitimately exceeds `spendCapUsd` — "-$0.42
     // left" reads as a bug in the UI rather than as a spent budget.
-    expect(describeRemainingBudget({ spendCapUsd: 2, spentUsd24h: 2.42 })).toBe(
+    expect(describeSpend({ spendCapUsd: 2, spentUsd24h: 2.42 })).toBe(
       "$0.00 of your $2.00 daily budget is left ($2.42 spent in the last 24 hours).",
     );
   });
@@ -394,7 +461,7 @@ describe("describeRemainingBudget: the number beside a $1.74 button", () => {
     // Under the gemini escape hatch a user can see `spentUsd24h: 0` while
     // genuinely burning budget. Both other surfaces already caveat this; this
     // would otherwise be the only one presenting it as exact.
-    expect(describeRemainingBudget({ spendCapUsd: 20, spentUsd24h: 1, unpricedEvents: 3 })).toBe(
+    expect(describeSpend({ spendCapUsd: 20, spentUsd24h: 1, unpricedEvents: 3 })).toBe(
       "$19.00 of your $20.00 daily budget is left ($1.00 spent in the last 24 hours). At least — 3 call(s) used a model with no published rate, so the real spend is higher.",
     );
   });
@@ -402,13 +469,13 @@ describe("describeRemainingBudget: the number beside a $1.74 button", () => {
   it("renders nothing at all rather than $NaN when a figure is missing", () => {
     // An absent cap is not a cap of zero, and a build talking to an older
     // server must show no line rather than a fabricated one.
-    expect(describeRemainingBudget(undefined)).toBeUndefined();
-    expect(describeRemainingBudget({})).toBeUndefined();
-    expect(describeRemainingBudget({ spendCapUsd: 20 })).toBeUndefined();
-    expect(describeRemainingBudget({ spentUsd24h: 1 })).toBeUndefined();
-    expect(describeRemainingBudget({ spendCapUsd: Number.NaN, spentUsd24h: 1 })).toBeUndefined();
+    expect(describeSpend(undefined)).toBeUndefined();
+    expect(describeSpend({})).toBeUndefined();
+    expect(describeSpend({ spendCapUsd: 20 })).toBeUndefined();
+    expect(describeSpend({ spentUsd24h: 1 })).toBeUndefined();
+    expect(describeSpend({ spendCapUsd: Number.NaN, spentUsd24h: 1 })).toBeUndefined();
     expect(
-      describeRemainingBudget({ spendCapUsd: 20, spentUsd24h: Number.POSITIVE_INFINITY }),
+      describeSpend({ spendCapUsd: 20, spentUsd24h: Number.POSITIVE_INFINITY }),
     ).toBeUndefined();
   });
 });

@@ -20,6 +20,12 @@
  */
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
+// Type-only: the `provider` a job records is the same validated union a stored
+// key carries, and `recordJobRun` refusing anything else at the type level is
+// what keeps the column's CHECK (db.ts) a backstop rather than the only guard.
+// A `import type` adds no runtime dependency, so this does not invert the
+// layering `MAX_ACTIVE_JOBS_PER_USER`'s own comment protects.
+import type { ApiKeyProvider } from "./api-keys.ts";
 
 export type JobKind = "generate" | "regen" | "regen-page" | "add-section" | "edit-prompt" | "export";
 export type JobStatus = "queued" | "running" | "succeeded" | "failed" | "interrupted";
@@ -68,6 +74,28 @@ export interface Job {
    */
   codeVersion: string | null;
   /**
+   * FIX ROUND B, I7. Which model provider this job's own (partial) execution
+   * actually ran under — stamped by the same `recordJobRun` call as `runId` and
+   * `codeVersion`, for the same reason, and never set at creation by any caller
+   * including resume.
+   *
+   * The exact sibling of `codeVersion`: without it, replacing an Anthropic key
+   * with a Gemini one between a failed job and its resume continues the same
+   * `run_id` under a different model family, and Kitaru's cache (keyed on
+   * function code plus args) leaves every completed checkpoint from the old
+   * family in place — half-Anthropic, half-Gemini output. `job-routes.ts`'s
+   * resume handler refuses 409 when this differs from the provider the account
+   * uses now; `job-provider.ts` owns the comparison.
+   *
+   * A bare `string`, not `ApiKeyProvider`: this is what a row HOLDS, and a read
+   * from a hand-editable column cannot be trusted the way `recordJobRun`'s own
+   * validated input can (the same asymmetry `api-keys.ts` keeps between
+   * `setApiKey`'s parameter and `providerOfRow`'s check). Null means no provider
+   * was in play — either the job never reached `recordJobRun`, or it made no
+   * model call at all (`export`).
+   */
+  provider: string | null;
+  /**
    * Set only on a job created by `POST /api/jobs/:id/resume` — the id of
    * the failed job it resumes. Null for every other job. The durable half
    * of "linked to the original, so the audit trail shows two attempts
@@ -90,6 +118,7 @@ interface Row {
   finished_at: number | null;
   run_id: string | null;
   code_version: string | null;
+  provider: string | null;
   resumed_from_job_id: string | null;
 }
 
@@ -108,6 +137,7 @@ function toJob(row: Row): Job {
     finishedAt: row.finished_at,
     runId: row.run_id,
     codeVersion: row.code_version,
+    provider: row.provider,
     resumedFromJobId: row.resumed_from_job_id,
   };
 }
@@ -162,6 +192,13 @@ export function createJob(db: DatabaseSync, input: CreateJobInput): Job {
     finishedAt: null,
     runId: input.runId ?? null,
     codeVersion: null,
+    // I7: never set at creation, by any caller including resume — the same rule
+    // `codeVersion` above follows, and for the same reason (this records what
+    // actually ran, and nothing has run yet). Listed in the INSERT explicitly
+    // rather than left to the column's absence, so a DEFAULT added to the
+    // migration later could not silently start claiming a provider for a job
+    // that has not made a model call.
+    provider: null,
     resumedFromJobId: input.resumedFromJobId ?? null,
   };
   db.prepare(
@@ -169,8 +206,8 @@ export function createJob(db: DatabaseSync, input: CreateJobInput): Job {
        id, user_id, project_id, kind, status,
        request_json, result_json, error,
        created_at, started_at, finished_at,
-       run_id, code_version, resumed_from_job_id
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       run_id, code_version, provider, resumed_from_job_id
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     job.id,
     job.userId,
@@ -185,6 +222,7 @@ export function createJob(db: DatabaseSync, input: CreateJobInput): Job {
     job.finishedAt,
     job.runId,
     job.codeVersion,
+    job.provider,
     job.resumedFromJobId,
   );
   return job;
@@ -464,9 +502,9 @@ function insertIfUnderBound(
        id, user_id, project_id, kind, status,
        request_json, result_json, error,
        created_at, started_at, finished_at,
-       run_id, code_version, resumed_from_job_id
+       run_id, code_version, provider, resumed_from_job_id
      )
-     SELECT ?, ?, ?, ?, 'queued', ?, NULL, NULL, ?, NULL, NULL, ?, NULL, ?
+     SELECT ?, ?, ?, ?, 'queued', ?, NULL, NULL, ?, NULL, NULL, ?, NULL, NULL, ?
      WHERE ${gate.countExpr} < ?`,
   ).run(
     id, input.userId, input.projectId, input.kind, input.requestJson, input.now, runId, resumedFromJobId,
@@ -487,6 +525,8 @@ function insertIfUnderBound(
     finishedAt: null,
     runId,
     codeVersion: null,
+    // I7: null at creation, like `codeVersion` — see `createJob`'s own comment.
+    provider: null,
     resumedFromJobId,
   };
 }
@@ -589,10 +629,10 @@ export function finishJob(db: DatabaseSync, id: string, input: FinishJobInput): 
 }
 
 /**
- * Stamps `run_id` + `code_version` on a job at the moment it actually starts
- * executing — called by `job-worker.ts` right after it resolves the job's
- * project, for BOTH execution strategies (`generate` and the five proxied
- * kinds). This is the ONLY place `code_version` is ever written: a fresh
+ * Stamps `run_id` + `code_version` + `provider` on a job at the moment it
+ * actually starts executing — called by `job-worker.ts` right after it resolves
+ * the job's project, for BOTH execution strategies (`generate` and the five
+ * proxied kinds). This is the ONLY place `code_version` is ever written: a fresh
  * (non-resume) job starts with it null (neither `createJob` nor
  * `createBillableJobIfUnderBound` above ever set it), and it earns a value
  * only once real work actually begins under it — matching the safety rule
@@ -607,6 +647,12 @@ export function finishJob(db: DatabaseSync, id: string, input: FinishJobInput): 
  * keeps this function's contract simple ("this is what actually ran") rather
  * than conditional on whether a value was already present.
  *
+ * `provider` (I7) is REQUIRED rather than optional, and takes `null` explicitly
+ * for a job that will make no model call: an optional field is exactly how one of
+ * the two production call sites ends up not stating a provider, after which every
+ * job that call site starts looks unguarded ("nothing ran") to the resume check.
+ * A caller that genuinely has no provider must say so, in writing, per call.
+ *
  * Throws (a programmer error, not a user-facing failure) if `input.runId`
  * fails `isSafeRunId` — task-7-review finding 5. Unreachable via any path
  * that exists today (`job-worker.ts` pre-checks the identical shape before
@@ -618,11 +664,16 @@ export function finishJob(db: DatabaseSync, id: string, input: FinishJobInput): 
  * seam a future caller (a request body, a script) would have to go through
  * instead of trusting one by convention.
  */
-export function recordJobRun(db: DatabaseSync, id: string, input: { runId: string; codeVersion: string }): void {
+export function recordJobRun(
+  db: DatabaseSync,
+  id: string,
+  input: { runId: string; codeVersion: string; provider: ApiKeyProvider | null },
+): void {
   if (!isSafeRunId(input.runId)) {
     throw new Error(`jobs.ts: recordJobRun called with a runId of unsafe shape: ${JSON.stringify(input.runId)}`);
   }
-  db.prepare("UPDATE job SET run_id = ?, code_version = ? WHERE id = ?").run(input.runId, input.codeVersion, id);
+  db.prepare("UPDATE job SET run_id = ?, code_version = ?, provider = ? WHERE id = ?")
+    .run(input.runId, input.codeVersion, input.provider, id);
 }
 
 /**

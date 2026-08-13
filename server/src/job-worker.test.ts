@@ -1114,6 +1114,51 @@ describe("JobWorker: generate", () => {
     expect(finished?.error).not.toContain("sk-ant-ANOTHERSECRET987654321");
   });
 
+  it("reports STDOUT as well as stderr, because the failure report is on stdout", async () => {
+    // Measured during task 3b: a generation failed after 11s inside Docker and
+    // its reason was UNRECOVERABLE. The message used to prefer stderr whenever
+    // it was non-empty — and `uv run` writes its own chatter there (e.g.
+    // "Bytecode compiled ..." on a first run in a fresh container), so stderr is
+    // essentially never empty, while `acceptance.py` prints its structured
+    // failed_stage report to STDOUT. The preference therefore reported noise and
+    // discarded the only thing that says what broke.
+    // A key must be stored, or the claim-time `assertApiKeyUsable` check refuses
+    // before the orchestrator is ever spawned and the message under test never
+    // gets built. (This is exactly what the first draft of this test got wrong.)
+    setApiKey(db, MASTER_KEY, user.id, "sk-ant-STREAMTESTKEY0123456789");
+    const genProject = createProject(db, user.id, "run-gen-both-streams", "Both Streams");
+    const child = fakeOrchestratorChild();
+    const orchestratorSpawnFn = vi.fn(() => {
+      setImmediate(() => {
+        // Exactly the shape that defeated the old code: useless stderr, the real
+        // reason on stdout.
+        child.stderr.emit("data", Buffer.from("Bytecode compiled 1234 files in 2.10s"));
+        child.stdout.emit("data", Buffer.from('{"failed_stage": "design", "reason": "primitives exhausted retries"}'));
+        child.emit("exit", 1);
+      });
+      return child;
+    });
+    const requestJson = JSON.stringify({ brief: "a site whose design stage fails" });
+    const job = createJob(db, { userId: user.id, projectId: genProject.id, kind: "generate", requestJson, now: NOW });
+    const worker = new JobWorker({
+      db, pool: fakePool(), masterKey: MASTER_KEY, projectsRoot: FAKE_PROJECTS_ROOT, now: () => NOW,
+      orchestratorDir: FAKE_ORCHESTRATOR_DIR,
+      orchestratorSpawnFn,
+    });
+
+    await worker.runOnce();
+
+    const finished = findJobById(db, job.id);
+    expect(finished?.status).toBe("failed");
+    // The point of the fix: the reason a user can act on must be present.
+    expect(finished?.error).toContain("primitives exhausted retries");
+    expect(finished?.error).toContain("failed_stage");
+    // And the noise is kept alongside it rather than swapped for it, labelled so
+    // a reader can tell which stream said what.
+    expect(finished?.error).toContain("stdout:");
+    expect(finished?.error).toContain("stderr:");
+  });
+
   it("fails cleanly (never throws out of runOnce) when the request payload has no brief", async () => {
     const genProject = createProject(db, user.id, "run-gen-nobrief", "Run Gen No Brief");
     const job = createJob(db, {
@@ -1144,7 +1189,7 @@ describe("JobWorker: resumed job safety checks (task-7-review findings 3 and 5)"
     const originalFailedJob = createJob(db, {
       userId: user.id, projectId: project.id, kind: "regen", requestJson: "{}", now: NOW - 1,
     });
-    recordJobRun(db, originalFailedJob.id, { runId: "web-x", codeVersion: "OLD-sha-before-a-deploy" });
+    recordJobRun(db, originalFailedJob.id, { runId: "web-x", codeVersion: "OLD-sha-before-a-deploy", provider: null });
     finishJob(db, originalFailedJob.id, { status: "failed", error: "boom", now: NOW - 1 });
 
     const job = createJob(db, {
@@ -1174,7 +1219,7 @@ describe("JobWorker: resumed job safety checks (task-7-review findings 3 and 5)"
     const originalFailedJob = createJob(db, {
       userId: user.id, projectId: genProject.id, kind: "generate", requestJson, now: NOW - 1,
     });
-    recordJobRun(db, originalFailedJob.id, { runId: "run-gen-guard", codeVersion: "OLD-sha" });
+    recordJobRun(db, originalFailedJob.id, { runId: "run-gen-guard", codeVersion: "OLD-sha", provider: null });
     finishJob(db, originalFailedJob.id, { status: "failed", error: "boom", now: NOW - 1 });
 
     const job = createJob(db, {
@@ -1200,7 +1245,7 @@ describe("JobWorker: resumed job safety checks (task-7-review findings 3 and 5)"
     const originalFailedJob = createJob(db, {
       userId: user.id, projectId: project.id, kind: "regen", requestJson: "{}", now: NOW - 1,
     });
-    recordJobRun(db, originalFailedJob.id, { runId: "web-x", codeVersion: "sha-1" });
+    recordJobRun(db, originalFailedJob.id, { runId: "web-x", codeVersion: "sha-1", provider: null });
     finishJob(db, originalFailedJob.id, { status: "failed", error: "boom", now: NOW - 1 });
 
     const job = createJob(db, {
@@ -1223,6 +1268,88 @@ describe("JobWorker: resumed job safety checks (task-7-review findings 3 and 5)"
       expect(ran).toBe(true);
       expect(pool.acquire).toHaveBeenCalled();
       expect(findJobById(db, job.id)?.status).toBe("succeeded");
+    } finally {
+      await upstream.close();
+    }
+  });
+
+  /**
+   * FIX ROUND B, I7 — the claim-time half of the provider guard, for exactly the
+   * reason finding 3 gives for the code-version re-check above.
+   *
+   * `job-routes.ts` checks the provider at ENQUEUE. A resumed job can then sit
+   * `queued` for minutes (bound of 2 concurrent per user; a `generate` run
+   * measures ~286s) while its owner replaces their key on the settings screen —
+   * the enqueue check has already passed and nothing re-runs it, so the same
+   * half-Anthropic/half-Gemini outcome arrives through a slower door.
+   */
+  it("fails a resumed job at claim time, without touching the pool, when the account's provider changed while it sat queued", async () => {
+    // The job ran under Anthropic...
+    setApiKey(db, MASTER_KEY, user.id, "sk-ant-a-real-looking-key-value", "anthropic");
+    const originalFailedJob = createJob(db, {
+      userId: user.id, projectId: project.id, kind: "regen", requestJson: "{}", now: NOW - 1,
+    });
+    recordJobRun(db, originalFailedJob.id, { runId: "web-x", codeVersion: "sha-1", provider: "anthropic" });
+    finishJob(db, originalFailedJob.id, { status: "failed", error: "boom", now: NOW - 1 });
+
+    // ...the resume was enqueued (passing the endpoint's own check)...
+    const job = createJob(db, {
+      userId: user.id, projectId: project.id, kind: "regen", requestJson: "{}", now: NOW,
+      runId: "web-x", resumedFromJobId: originalFailedJob.id,
+    });
+    // ...and only THEN did the key change, while the job was still queued.
+    setApiKey(db, MASTER_KEY, user.id, "AQ.a-real-looking-gemini-key-value", "gemini");
+
+    const pool = fakePool();
+    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, projectsRoot: PROJECTS_ROOT, now: () => NOW, codeVersion: "sha-1" });
+
+    const ran = await worker.runOnce();
+
+    expect(ran).toBe(true);
+    // Refused BEFORE anything is spawned: no child, so no money.
+    expect(pool.acquire).not.toHaveBeenCalled();
+    const finished = findJobById(db, job.id);
+    expect(finished?.status).toBe("failed");
+    // The same wording the 409 uses, both providers named — asserted in full
+    // rather than by substring, since a message that lost the provider the job
+    // came FROM would still contain "gemini".
+    expect(finished?.error).toBe(
+      "this job ran with a anthropic key and this account now uses gemini; a resume continues "
+      + "the same run, which cannot switch model providers partway — start a fresh job instead",
+    );
+    // Never ran, so recordJobRun never touched this job's own stamp.
+    expect(finished?.provider).toBe(null);
+  });
+
+  it("runs normally when the provider is unchanged — the claim-time check does not refuse a safe resume", async () => {
+    setApiKey(db, MASTER_KEY, user.id, "sk-ant-a-real-looking-key-value", "anthropic");
+    const originalFailedJob = createJob(db, {
+      userId: user.id, projectId: project.id, kind: "regen", requestJson: "{}", now: NOW - 1,
+    });
+    recordJobRun(db, originalFailedJob.id, { runId: "web-x", codeVersion: "sha-1", provider: "anthropic" });
+    finishJob(db, originalFailedJob.id, { status: "failed", error: "boom", now: NOW - 1 });
+
+    const job = createJob(db, {
+      userId: user.id, projectId: project.id, kind: "regen", requestJson: "{}", now: NOW,
+      runId: "web-x", resumedFromJobId: originalFailedJob.id,
+    });
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ passed: true }));
+    });
+    const pool = fakePool({
+      acquire: vi.fn(async (): Promise<PreviewProcess> => ({
+        projectId: project.id, port: upstream.port, base: "/", inFlight: 0, lastUsedAt: Date.now(),
+      })),
+    });
+    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, projectsRoot: PROJECTS_ROOT, now: () => NOW, codeVersion: "sha-1" });
+
+    try {
+      expect(await worker.runOnce()).toBe(true);
+      expect(findJobById(db, job.id)?.status).toBe("succeeded");
+      // And the run stamped the provider it actually used, which is what makes
+      // a LATER resume of this job checkable at all.
+      expect(findJobById(db, job.id)?.provider).toBe("anthropic");
     } finally {
       await upstream.close();
     }

@@ -1,11 +1,11 @@
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { afterAll, describe, expect, it } from "vitest";
 import type { OverrideEntry } from "./exporter";
-import { exportProject } from "./exporter";
+import { exportProject, linkDirectory, removeDirectoryLink } from "./exporter";
 import type { Manifest } from "./manifest";
 
 const fixtureDir = fileURLToPath(new URL("../../fixtures/acme-landing", import.meta.url));
@@ -732,5 +732,52 @@ describe("exportProject: section reorder (PRD 3.3, milestone 7.5)", () => {
     expect(values, "about.values is missing from the reordered page").toBeGreaterThan(-1);
     expect(placeholder, "the placeholder moved up with the section that swapped past it").toBeGreaterThan(values);
     expect(intro, "the placeholder did not stay in its own slot").toBeGreaterThan(placeholder);
+  });
+});
+
+/**
+ * The borrowed node_modules link (task 3b). The verification build runs the
+ * EXPORT's own `npm run build`, which needs dependencies the export does not
+ * ship, so it borrows the source project's tree through a directory link and
+ * removes the link again afterwards.
+ *
+ * Both tests assert BEHAVIOUR — reads resolve through the link; removal leaves
+ * the source tree whole — and neither one may look at `process.platform`. That
+ * is the point: a Windows junction and a POSIX symlink are the same object to
+ * everything above them, and the bug being fixed was `rmdirSync` on a symlink
+ * (ENOTDIR), thrown from a `finally`, which turned a SUCCESSFUL export into a
+ * failure and replaced any genuine ExportError with it.
+ */
+describe("the borrowed node_modules directory link", () => {
+  function sourceTreeWithMarker(): { source: string; link: string } {
+    const dir = tempDir("export-link-");
+    const source = join(dir, "source-node-modules");
+    mkdirSync(join(source, "some-package"), { recursive: true });
+    writeFileSync(join(source, "some-package", "index.js"), "module.exports = 1;\n");
+    return { source, link: join(dir, "node_modules") };
+  }
+
+  it("creates a link that resolves to the source directory", () => {
+    const { source, link } = sourceTreeWithMarker();
+    linkDirectory(source, link);
+    try {
+      expect(readFileSync(join(link, "some-package", "index.js"), "utf8")).toBe("module.exports = 1;\n");
+      expect(realpathSync(link)).toBe(realpathSync(source));
+    } finally {
+      // Removed inside the test, not left to afterAll: a stray link is the
+      // shape of defect that recursively deleted 195 tracked files in task 3.
+      removeDirectoryLink(link);
+    }
+  });
+
+  it("removes the link and leaves every file in the source tree", () => {
+    const { source, link } = sourceTreeWithMarker();
+    linkDirectory(source, link);
+
+    removeDirectoryLink(link);
+
+    expect(existsSync(link)).toBe(false);
+    expect(existsSync(source), "removal followed the link into the source tree").toBe(true);
+    expect(readFileSync(join(source, "some-package", "index.js"), "utf8")).toBe("module.exports = 1;\n");
   });
 });

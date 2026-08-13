@@ -29,7 +29,7 @@ from pathlib import Path
 import kitaru
 
 from orchestrator.design_pipeline import design_system_flow
-from orchestrator.fanout import run_fanout
+from orchestrator.fanout import max_parallel_workers, run_fanout
 from orchestrator.plan_pipeline import plan_flow, require_plan_approval
 from orchestrator.pricing import cost_for_run
 from orchestrator.section_pipeline import GENERATED_DIR, _run_compiler_cli
@@ -102,6 +102,17 @@ def generate_site(brief: str, run_id: str | None = None) -> dict:
     non-zero export exit). Returns per-stage wall-clock timings and a
     dollar-cost breakdown on success."""
     run_id = run_id or fresh_run_id()
+
+    # Validated HERE, before a single token is bought, even though only fan-out
+    # uses it. `max_parallel_workers()` refuses a malformed
+    # WEBGEN_FANOUT_MAX_WORKERS, and it used to be called inside `run_fanout` --
+    # i.e. after intake, plan, design and shell had all been paid for. A typo in
+    # one env var would have thrown away roughly $0.75 of prelude before saying
+    # so, which is exactly the "dies AFTER partial spend" shape `portable.py`'s
+    # own docstring condemns. Cheap to check, and the only honest place for it is
+    # before the money starts. Found by the whole-branch review.
+    max_parallel_workers()
+
     timings: dict[str, float] = {}
     overall_start = time.monotonic()
 

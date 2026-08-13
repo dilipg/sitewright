@@ -47,7 +47,8 @@ export type ValidationRule =
   | "duplicate-id"
   | "ownership"
   | "editable-channel"
-  | "tombstone-resurrection";
+  | "tombstone-resurrection"
+  | "unsafe-path";
 
 export interface ValidationIssue {
   nodeId: string;
@@ -70,6 +71,47 @@ const SLUG = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
  */
 const POSITIONAL_SEGMENT = /^(?:child|children|item|element|node|el|div|span|wrapper)-\d+$/;
 
+/**
+ * A React component name: PascalCase, letters and digits only.
+ *
+ * THE FIFTH `..`, found by the H2 audit (docs/pending.md). `nodeId` was the only
+ * proposal field this function validated, while `component` and `file` — both
+ * MODEL-AUTHORED, arriving from an agent's structured output — were persisted
+ * verbatim and then interpolated straight into `path.join` at six sites,
+ * including the real exporter:
+ *
+ *   regen-api.ts:760,761,898,927   join(root, "src", "pages", slug, "sections", `${component}.tsx`)
+ *   exporter.ts:621,933            join(outDir, dirname(node.file), "..", "mock", `${node.component}.data.ts`)
+ *   exporter.ts:719                join(outDir, node.file)
+ *
+ * `path.join` normalises `..`, so a component named `../../../../evil` escapes
+ * the project root, and `file` can do the same. This is the same shape as the
+ * four traversal defects this codebase has already shipped at four different
+ * layers — and `CLAUDE.md` says in as many words to assume a fifth exists.
+ *
+ * Validated HERE rather than at each join, because this is the single choke
+ * point where model output becomes persisted state: every one of those six
+ * call sites reads back from the manifest, so guarding the write protects all of
+ * them by construction rather than by six people remembering.
+ *
+ * Verified against a real generated manifest before choosing the pattern: every
+ * component was already PascalCase and every file a relative POSIX path under
+ * `src/pages/`, so this rejects nothing legitimate.
+ */
+const COMPONENT_NAME = /^[A-Z][A-Za-z0-9]*$/;
+
+/** Rejects anything that could leave the project when joined. See `COMPONENT_NAME`. */
+function unsafeRelativePath(file: string): string | undefined {
+  if (file === "") return "is empty";
+  // Backslashes first: on Windows `join` treats them as separators too, so a
+  // POSIX-looking check alone would miss `..\\..\\evil`.
+  const segments = file.split(/[/\\]/);
+  if (segments.includes("..")) return "contains a `..` segment";
+  if (file.startsWith("/") || /^[A-Za-z]:/.test(file)) return "is absolute";
+  if (segments.includes("")) return "has an empty path segment";
+  return undefined;
+}
+
 export function createManifest(): Manifest {
   return { version: 1, nodes: {} };
 }
@@ -86,6 +128,7 @@ export function propose(
     const { nodeId } = proposal;
 
     issues.push(...validateIdFormat(nodeId));
+    issues.push(...validateProposalPaths(proposal));
 
     if (seenInBatch.has(nodeId)) {
       issues.push({
@@ -243,6 +286,42 @@ export function tombstone(manifest: Manifest, nodeIds: string[]): Manifest {
     nodes[nodeId] = { ...node, status: "tombstoned" };
   }
   return { version: manifest.version, nodes };
+}
+
+/**
+ * Refuses a `component` or `file` that could escape the project once joined.
+ * See `COMPONENT_NAME` for why this lives at the proposal boundary rather than
+ * at each of the six `path.join` call sites that read these values back.
+ */
+function validateProposalPaths(proposal: ManifestEntryProposal): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+  const { nodeId, component, file } = proposal;
+
+  if (!COMPONENT_NAME.test(component)) {
+    issues.push({
+      nodeId,
+      rule: "unsafe-path",
+      message:
+        `Component name ${JSON.stringify(component)} for node "${nodeId}" is not a PascalCase ` +
+        `identifier (letters and digits, starting uppercase). It is interpolated into a file path, ` +
+        `so anything else — a dot, a slash, a "..", a leading lowercase — is refused here rather ` +
+        `than allowed to reach path.join.`,
+    });
+  }
+
+  const problem = unsafeRelativePath(file);
+  if (problem !== undefined) {
+    issues.push({
+      nodeId,
+      rule: "unsafe-path",
+      message:
+        `File path ${JSON.stringify(file)} for node "${nodeId}" ${problem}. It must be a ` +
+        `project-relative path, because it is joined against the project root and an export ` +
+        `directory; path.join normalises "..", so this would read or write outside the project.`,
+    });
+  }
+
+  return issues;
 }
 
 function validateIdFormat(nodeId: string): ValidationIssue[] {

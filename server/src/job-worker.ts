@@ -141,9 +141,10 @@ import type { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { USAGE_ID_HEADER, usageLogPathFor } from "../../compiler/src/usage-log-path.ts";
 import { buildAgentEnv, DisabledUserError, MissingApiKeyError, UnknownUserError } from "./agent-env.ts";
-import { UndecryptableApiKeyError } from "./api-keys.ts";
+import { UndecryptableApiKeyError, type ApiKeyProvider } from "./api-keys.ts";
 import { codeVersionsIncompatible, resolveCodeVersion } from "./code-version.ts";
 import { ingestUsageLog } from "./ingest-usage.ts";
+import { currentProviderFor, describeProviderMismatch, providersIncompatible } from "./job-provider.ts";
 import {
   BILLABLE_JOB_KINDS, claimNextJob, finishJob, findJobById, isSafeRunId, recordJobRun, requeueJob,
   type Job, type JobKind,
@@ -938,6 +939,14 @@ export class JobWorker {
    * `runOnce()` documents.
    */
   private async runClaimedJob(job: Job): Promise<boolean> {
+    // FIX ROUND B, I7. Resolved ONCE here, at the claim, and threaded into
+    // whichever strategy runs — never re-read inside them. Two reads would
+    // straddle the `await` below, so the provider a resumed job is CHECKED
+    // against could differ from the one it then RECORDS, which is the same
+    // check-then-act gap `createBillableJobIfUnderBound` exists to close for the
+    // enqueue bound. One read, one meaning: "the provider this run will use."
+    const provider = currentProviderFor(this.db, job.userId);
+
     if (job.resumedFromJobId !== null) {
       const original = findJobById(this.db, job.resumedFromJobId);
       // `original === null` is unreachable via any path that exists today
@@ -952,11 +961,31 @@ export class JobWorker {
         });
         return true;
       }
+      // I7's claim-time half, for exactly the reason task-7-review finding 3
+      // gives for the code-version re-check above: `job-routes.ts` checks the
+      // provider at ENQUEUE, and a resumed job can then sit `queued` for
+      // minutes (bound of 2 concurrent per user; a `generate` run measures
+      // ~286s) while its owner replaces their key on the settings screen. The
+      // enqueue check has already passed and nothing re-runs it, so without
+      // this the same half-Anthropic/half-Gemini outcome arrives through a
+      // slower door. Refused BEFORE either strategy runs, so no child is
+      // spawned and no money is spent.
+      if (original !== null && providersIncompatible(original.provider, provider)) {
+        finishJob(this.db, job.id, {
+          status: "failed",
+          // The same wording the 409 uses, from the same builder — a user who
+          // sees this in a job row and a 409 in a response must not have to
+          // work out that they are the same refusal.
+          error: describeProviderMismatch(original.provider!, provider),
+          now: this.now(),
+        });
+        return true;
+      }
     }
 
     const outcome: JobOutcome = isProxiedKind(job.kind)
-      ? await this.runProxiedJob(job, job.kind)
-      : await this.runGenerateJob(job);
+      ? await this.runProxiedJob(job, job.kind, provider)
+      : await this.runGenerateJob(job, provider);
 
     if (outcome.kind === "requeue") {
       // The ONE bound `claimNextJob` cannot see in advance — preview pool
@@ -982,7 +1011,7 @@ export class JobWorker {
    * hand-rolled duck-typed pair, is what stands in for the live browser
    * connection a job does not have.
    */
-  private async runProxiedJob(job: Job, kind: ProxiedJobKind): Promise<JobOutcome> {
+  private async runProxiedJob(job: Job, kind: ProxiedJobKind, provider: ApiKeyProvider | null): Promise<JobOutcome> {
     if (job.projectId === null) {
       return { kind: "failed", error: "job has no project to run against" };
     }
@@ -1067,7 +1096,20 @@ export class JobWorker {
     if (!isSafeRunId(proxiedRunId)) {
       return { kind: "failed", error: "job's run id has an unsafe shape" };
     }
-    recordJobRun(this.db, job.id, { runId: proxiedRunId, codeVersion: this.codeVersion });
+    // I7: `provider` comes from `runClaimedJob`'s single read, never a second
+    // one here — and is recorded as NULL for a non-billable kind, because the
+    // column means "the provider this job's work actually ran under" and
+    // `export` runs a deterministic build that calls no model at all. Recording
+    // the account's stored provider for one would be both untrue and actively
+    // harmful: an export queued while an Anthropic key was stored would then be
+    // REFUSED on resume after the user switched to Gemini, over a family
+    // difference that cannot affect a `vite build`. Same reasoning
+    // `BILLABLE_JOB_KINDS` already carries for the key check above.
+    recordJobRun(this.db, job.id, {
+      runId: proxiedRunId,
+      codeVersion: this.codeVersion,
+      provider: BILLABLE_JOB_KINDS.includes(kind) ? provider : null,
+    });
 
     const handler = forwardToPreview(this.pool, {
       billable: () => {
@@ -1130,7 +1172,7 @@ export class JobWorker {
    * `generate`: spawns `orchestrator.acceptance` directly. See this module's
    * top comment for why this kind cannot reuse `forwardToPreview` at all.
    */
-  private async runGenerateJob(job: Job): Promise<JobOutcome> {
+  private async runGenerateJob(job: Job, provider: ApiKeyProvider | null): Promise<JobOutcome> {
     let requestPayload: unknown;
     try {
       requestPayload = JSON.parse(job.requestJson);
@@ -1164,7 +1206,12 @@ export class JobWorker {
     if (!isSafeRunId(runId)) {
       return { kind: "failed", error: "job's run id has an unsafe shape" };
     }
-    recordJobRun(this.db, job.id, { runId, codeVersion: this.codeVersion });
+    // I7: `generate` is always billable, so the provider threaded from
+    // `runClaimedJob` is recorded as-is. It is the same stored provider
+    // `buildAgentEnv` resolves a few lines below (both read the one `api_key`
+    // row, and nothing awaits in between), which is what makes the stamp a
+    // record of what this run actually used rather than a guess.
+    recordJobRun(this.db, job.id, { runId, codeVersion: this.codeVersion, provider });
 
     let env: NodeJS.ProcessEnv;
     try {
@@ -1223,7 +1270,25 @@ export class JobWorker {
     const safeStdout = redactSecrets(spawned.stdout);
     const safeStderr = redactSecrets(spawned.stderr);
     if (spawned.code !== 0) {
-      const tail = (safeStderr.trim() !== "" ? safeStderr : safeStdout).slice(-2000);
+      // BOTH streams, always, and stdout FIRST.
+      //
+      // This used to be `stderr.trim() !== "" ? stderr : stdout`, which made
+      // every failure undiagnosable in practice: `uv run` writes its own chatter
+      // to stderr (e.g. `Bytecode compiled ...` on a first run in a fresh
+      // container), so stderr is essentially never empty — while
+      // `acceptance.py` prints its structured `{"failed_stage": ...}` report to
+      // STDOUT. The preference therefore reported noise and discarded the one
+      // thing that says what broke. Measured during task 3b: a generation failed
+      // after 11s inside Docker and the reason was unrecoverable, which cost a
+      // whole diagnostic cycle and, indirectly, a wasted run.
+      //
+      // stdout first because it carries the report; both labelled so a reader
+      // can tell which stream said what; and the budget split so a chatty
+      // stderr cannot crowd out the report.
+      const parts: string[] = [];
+      if (safeStdout.trim() !== "") parts.push(`stdout: ${safeStdout.slice(-1500)}`);
+      if (safeStderr.trim() !== "") parts.push(`stderr: ${safeStderr.slice(-1500)}`);
+      const tail = parts.length > 0 ? parts.join("\n---\n") : "(no output on either stream)";
       return { kind: "failed", error: `orchestrator exited with code ${String(spawned.code)}: ${tail}` };
     }
     return { kind: "succeeded", resultJson: JSON.stringify({ stdout: safeStdout.slice(-4000) }) };

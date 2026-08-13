@@ -348,6 +348,47 @@ describe("a warm child's key can go stale", () => {
     }
   });
 
+  it("respawns a warm child when the owner switches PROVIDER, even to a key with the same last four", async () => {
+    // A fingerprint is four characters, so it cannot see a provider switch on
+    // its own — but a switch changes which API the child calls and which of
+    // the two environment variables carries the credential. Without comparing
+    // the provider too, the child would keep calling Anthropic with a key the
+    // user has replaced with a Gemini one, until the idle reaper got to it.
+    const ANTHROPIC_KEY = "sk-ant-api03-aaaaaaaaaaaaaaaaaWXYZ";
+    const GEMINI_KEY = "AIzaSyNotARealKeyJustTheRightShapexWXYZ"; // AIza + 35
+    // The premise, asserted rather than assumed: identical fingerprints, so
+    // only the provider distinguishes the two credentials.
+    expect(fingerprintOf(GEMINI_KEY)).toBe(fingerprintOf(ANTHROPIC_KEY));
+    setApiKey(db, MASTER_KEY, ownerId, ANTHROPIC_KEY, "anthropic");
+    const pool = makePool();
+    await pool.acquire(project, ownerId);
+    expect(spawned[0]!.env.ANTHROPIC_API_KEY).toBe(ANTHROPIC_KEY);
+
+    setApiKey(db, MASTER_KEY, ownerId, GEMINI_KEY, "gemini");
+    await pool.acquire(project, ownerId);
+
+    expect(spawned).toHaveLength(2);
+    expect(children[0]!.killed).toBe(true);
+    expect(spawned[1]!.env.GEMINI_API_KEY).toBe(GEMINI_KEY);
+    expect(spawned[1]!.env.ORCH_MODEL_PROVIDER).toBe("gemini");
+    expect(spawned[1]!.env.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(pool.list()).toHaveLength(1);
+  });
+
+  it("does NOT respawn on repeated requests for a GEMINI child whose key never changes", async () => {
+    // The bug this fix also closes: `keyFingerprint` used to be read from
+    // ANTHROPIC_API_KEY alone, so a Gemini child always looked keyless,
+    // compared unequal to the owner's real fingerprint, and was killed and
+    // respawned on EVERY acquire — a Vite cold start per preview request.
+    setApiKey(db, MASTER_KEY, ownerId, "AIzaSyIsNotARealKeyJustTheRightShape123", "gemini");
+    const pool = makePool();
+    await pool.acquire(project, ownerId);
+    await pool.acquire(project, ownerId);
+    await pool.acquire(project, ownerId);
+    expect(spawned).toHaveLength(1);
+    expect(children[0]!.killed).toBe(false);
+  });
+
   it("never respawns a still-spawning entry out from under its own spawn attempt", async () => {
     // A concurrent acquire() arriving while the FIRST spawn for this project
     // is still in flight (no child yet) must share it, exactly like the

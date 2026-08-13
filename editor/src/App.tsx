@@ -16,6 +16,8 @@ import { AddSectionPanel } from "./components/AddSection";
 import type { EditPromptState } from "./components/EditPrompt";
 import EditPrompt from "./components/EditPrompt";
 import LoginScreen from "./components/LoginScreen";
+import type { KeyState } from "./components/KeySettings";
+import KeySettings, { describeKeyStatus, loadStoredKey } from "./components/KeySettings";
 import GenerationProgress, {
   forgetPersistedRun,
   localRunStorage,
@@ -312,6 +314,25 @@ export default function App() {
   const [startedGeneration, setStartedGeneration] = useState<StartedGeneration | null>(() =>
     hostedShellWithoutProject ? restorePersistedRun(localRunStorage()) : null,
   );
+  // BYOK FORM. Which API key is stored, as `GET /api/key` reported it. `null`
+  // means "not asked yet, or still asking" — the same convention `account` uses,
+  // and it is why the session gate below waits for BOTH before rendering either
+  // screen: the picker's Generate button is refused 400 with no key, so a tester
+  // who lands on it first meets the refusal instead of the form.
+  //
+  // Read only in the hosted shell with no project, like `account`: the local,
+  // unauthenticated preview server has no `/api/*` route at all.
+  const [storedKey, setStoredKey] = useState<KeyState | null>(null);
+  // Which screen the hosted shell shows, when both are available.
+  //
+  //  - "auto"      — the default: the key screen shows itself when no key is
+  //                  stored, because the alternative is discovering that after
+  //                  pressing a button that spends ~$1.74.
+  //  - "open"      — the user asked for it from the picker.
+  //  - "dismissed" — the user chose the project list over saving a key, which is
+  //                  legitimate: opening and editing an existing site costs
+  //                  nothing and needs no key at all.
+  const [keyScreen, setKeyScreen] = useState<"auto" | "open" | "dismissed">("auto");
 
   const manifestRef = useRef<Manifest | null>(null);
   const historyRef = useRef<History | null>(null);
@@ -490,6 +511,43 @@ export default function App() {
         setSessionExpired(true);
       });
   }, [startedGeneration]);
+
+  /**
+   * BYOK FORM — the other precondition a generation cannot proceed without, read
+   * in the same window as the money.
+   *
+   * `GET /api/key` is session-only, so it is answerable with no project, exactly
+   * like `/api/me`. Kept as its OWN effect rather than folded into that one on
+   * purpose: `/api/me`'s catch sends ANY failure to the login screen (documented
+   * above, and correct there — a bare "Checking…" forever is the silent-hang bug
+   * this codebase has fixed three times), and a failed key probe is not evidence
+   * that a session has lapsed. Sharing the catch would sign a tester out because
+   * one unrelated request 500'd.
+   *
+   * A FAILED PROBE IS ITS OWN STATE, never "no key". `loadStoredKey` throws on any
+   * non-2xx, and `unknown` is what this app knows afterwards: guessing "absent"
+   * pushes a needless form at a user who has a key, and guessing "stored" lets
+   * them press a $1.74 button that refuses. What it must never do is leave
+   * `storedKey` null, which would hold the gate below on "Checking your session…"
+   * forever.
+   *
+   * Read once per mount rather than re-read on `startedGeneration` like `/api/me`:
+   * a key does not change because a generation ended, and the two paths that DO
+   * change it (`KeySettings`'s save and remove) report the new state back directly.
+   */
+  useEffect(() => {
+    if (!hostedShellWithoutProject) return;
+    void loadStoredKey()
+      .then(setStoredKey)
+      .catch((error: unknown) => {
+        if (error instanceof SessionExpiredError) {
+          setSessionExpired(true);
+          return;
+        }
+        console.error("[key] /api/key failed", error);
+        setStoredKey({ kind: "unknown" });
+      });
+  }, []);
 
   /**
    * TASK 4 — the write half of reload survival. ONE write path, driven by the
@@ -1620,7 +1678,12 @@ export default function App() {
   // replaces task 2's placeholder. Reaching a project no longer means reading
   // a UUID out of `user-cli list-projects` and pasting it into the URL.
   if (hostedShellWithoutProject) {
-    if (account === null) {
+    // Both probes, not just the session: the picker's Generate button is refused
+    // 400 with no key stored, so rendering it before the key state is known would
+    // put a tester in front of the one button whose precondition this app has not
+    // finished checking. Neither probe can leave this null forever — `/api/me`
+    // sets `sessionExpired` on any failure, and `/api/key` sets `unknown`.
+    if (account === null || storedKey === null) {
       return (
         <div className="editor-root">
           <div className="account-gate" data-testid="account-gate">
@@ -1674,10 +1737,62 @@ export default function App() {
         </div>
       );
     }
+    // BYOK FORM — SHOWN BY ITSELF WHEN NO KEY IS STORED, which is the whole point
+    // of reading `/api/key` before rendering anything here. `PUT /api/key` has
+    // existed since slice 3 and nothing had ever called it from a browser: the
+    // README told a tester to run two curl commands, and skipping that step used
+    // to surface as a `failed` job eleven minutes after pressing Generate.
+    //
+    // Placed AFTER the progress branch above deliberately: a run in flight proves
+    // a key was stored when it started, and interrupting a paid ~11-minute run
+    // with a settings screen would hide the one screen that matters.
+    if (keyScreen === "open" || (keyScreen === "auto" && storedKey.kind === "absent")) {
+      return (
+        <div className="editor-root">
+          <KeySettings
+            stored={storedKey}
+            // Already in hand from the `/api/me` call the session gate makes — no
+            // second request, and the same function the picker's budget line uses,
+            // so a floor cannot read as an exact figure on one screen and not the
+            // other.
+            spend={{
+              spendCapUsd: account.spendCapUsd,
+              spentUsd24h: account.spentUsd24h,
+              unpricedEvents: account.unpricedEvents,
+            }}
+            // The component holds no copy of the state: one source of truth here,
+            // updated from what the server actually confirmed.
+            //
+            // `setKeyScreen("open")` IS PART OF THE SAVE, found live rather than by
+            // any test. Without it the branch condition above stops holding the
+            // instant `storedKey` becomes `stored`, so a first-time saver — who
+            // arrived here through "auto" — was thrown to the picker in the same
+            // tick and never saw the fingerprint they had just stored. Worse, the
+            // two entry paths then behaved differently: a REPLACE (reached with
+            // `keyScreen === "open"`) stayed and showed it. The fingerprint is the
+            // only thing a user can check their key against, so the save now
+            // always lands on the screen that shows it, and leaving is a click.
+            onSaved={(next) => {
+              setStoredKey(next);
+              setKeyScreen("open");
+            }}
+            onSessionExpired={() => setSessionExpired(true)}
+            // "dismissed", not "auto": with no key stored, "auto" would put this
+            // screen straight back up and the button would read as broken.
+            onClose={() => setKeyScreen("dismissed")}
+          />
+        </div>
+      );
+    }
     return (
       <div className="editor-root">
         <ProjectPicker
           accountEmail={account.email}
+          // One honest line for all three key states — never a provider for a key
+          // that does not exist (`GET /api/key` answers `provider: null` with no
+          // key precisely so this cannot claim a choice the user never made).
+          keyStatus={describeKeyStatus(storedKey)}
+          onOpenKeySettings={() => setKeyScreen("open")}
           // TASK 4. The remaining budget, beside the button that spends it.
           // Already in hand from the `/api/me` call the session gate makes —
           // no second request, and no new endpoint.
@@ -1691,6 +1806,25 @@ export default function App() {
           // The single "the session is not usable" flag, reused rather than
           // duplicated — `showLogin` above turns it into the login screen.
           onSessionExpired={() => setSessionExpired(true)}
+          // FIX ROUND B, R-6. Reached only after the server has actually revoked
+          // the session (`submitLogout` throws otherwise), so nothing here
+          // reports a sign-out that did not happen.
+          //
+          // The persisted run is dropped FIRST and deliberately: `localStorage`
+          // survives a reload, and this button exists for shared machines — the
+          // next person must not land on the previous account's "Generating your
+          // site" screen. (It would clear itself on the 404 that poll gets, since
+          // `GET /api/jobs/:id` is owner-checked, but only after showing it.)
+          //
+          // Then a reload, not a state change, for exactly the reason
+          // `onAuthenticated` reloads: every session-dependent load in this
+          // component runs once on mount, and re-deriving them from the now-absent
+          // cookie in one step is what puts the login screen up with no stale
+          // account email, project list or key state behind it.
+          onSignedOut={() => {
+            forgetPersistedRun(localRunStorage());
+            window.location.reload();
+          }}
         />
       </div>
     );

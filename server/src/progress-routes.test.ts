@@ -73,7 +73,7 @@ function harness() {
       userId: alice.id, projectId: project.id, kind: "generate",
       requestJson: JSON.stringify({ brief: "a bakery" }), now: Date.now(),
     });
-    recordJobRun(db, job.id, { runId, codeVersion: "test-code-version" });
+    recordJobRun(db, job.id, { runId, codeVersion: "test-code-version", provider: null });
     return job.id;
   }
 

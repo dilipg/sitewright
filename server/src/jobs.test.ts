@@ -553,29 +553,49 @@ describe("finishJob", () => {
 });
 
 describe("recordJobRun", () => {
-  it("stamps run_id and code_version, leaving every other field untouched", () => {
+  it("stamps run_id, code_version and provider, leaving every other field untouched", () => {
     const job = seed({ kind: "regen", now: 1_000 });
     claimNextJob(db, 1_500);
 
-    recordJobRun(db, job.id, { runId: "web-abc123", codeVersion: "deadbeef" });
+    recordJobRun(db, job.id, { runId: "web-abc123", codeVersion: "deadbeef", provider: "anthropic" });
 
     const found = findJobById(db, job.id);
     expect(found?.runId).toBe("web-abc123");
     expect(found?.codeVersion).toBe("deadbeef");
-    // Untouched: recordJobRun's whole contract is "just these two columns."
+    // I7: the provider is stamped by this same call, and by ONLY this call —
+    // a job that never reaches here keeps null, which is what the resume
+    // guard's own carve-out reads as "nothing ran".
+    expect(found?.provider).toBe("anthropic");
+    // Untouched: recordJobRun's whole contract is "just these three columns."
     expect(found?.status).toBe("running");
     expect(found?.startedAt).toBe(1_500);
     expect(found?.requestJson).toBe("{}");
   });
 
+  it("leaves provider null for a job that makes no model call, without needing a separate function", () => {
+    // The `export` case, which `job-worker.ts` passes explicitly: a
+    // deterministic build calls no model, so recording a family for it would be
+    // untrue AND would refuse its own resume after an unrelated key change.
+    const job = seed({ kind: "export", now: 1_000 });
+    recordJobRun(db, job.id, { runId: "web-abc123", codeVersion: "deadbeef", provider: null });
+    const found = findJobById(db, job.id);
+    // Recorded as having run (run id + code version present) while carrying no
+    // provider — the two facts are independent, which is the whole point.
+    expect(found?.runId).toBe("web-abc123");
+    expect(found?.provider).toBe(null);
+  });
+
   it("overwrites an already-set run_id with the new value (a resumed job's runId round-trips unchanged in practice, but the function itself does not special-case 'already set')", () => {
     const job = seed({ kind: "regen", now: 1_000, runId: "web-original" });
-    recordJobRun(db, job.id, { runId: "web-original", codeVersion: "sha-1" });
+    recordJobRun(db, job.id, { runId: "web-original", codeVersion: "sha-1", provider: "anthropic" });
     expect(findJobById(db, job.id)?.runId).toBe("web-original");
 
-    recordJobRun(db, job.id, { runId: "web-different", codeVersion: "sha-2" });
+    recordJobRun(db, job.id, { runId: "web-different", codeVersion: "sha-2", provider: "gemini" });
     expect(findJobById(db, job.id)?.runId).toBe("web-different");
     expect(findJobById(db, job.id)?.codeVersion).toBe("sha-2");
+    // The provider is overwritten too, not left at its first value: this
+    // records what the LATEST execution used.
+    expect(findJobById(db, job.id)?.provider).toBe("gemini");
   });
 
   /**
@@ -586,16 +606,19 @@ describe("recordJobRun", () => {
    */
   it("throws (a programmer error, not a user-facing failure) and writes NOTHING when runId has an unsafe shape", () => {
     const job = seed({ kind: "regen", now: 1_000 });
-    expect(() => recordJobRun(db, job.id, { runId: "../../etc/passwd", codeVersion: "sha-1" }))
+    expect(() => recordJobRun(db, job.id, { runId: "../../etc/passwd", codeVersion: "sha-1", provider: "anthropic" }))
       .toThrow(/unsafe shape/);
     const found = findJobById(db, job.id);
     expect(found?.runId).toBe(null);
     expect(found?.codeVersion).toBe(null);
+    // The whole row, including the I7 column: the guard runs before the UPDATE,
+    // so an unsafe runId writes nothing at all rather than a partial stamp.
+    expect(found?.provider).toBe(null);
   });
 
   it("accepts every shape a real run_id actually takes today: a fresh web-<uuid> directory name", () => {
     const job = seed({ kind: "regen", now: 1_000 });
-    expect(() => recordJobRun(db, job.id, { runId: `web-${randomUUID()}`, codeVersion: "sha-1" }))
+    expect(() => recordJobRun(db, job.id, { runId: `web-${randomUUID()}`, codeVersion: "sha-1", provider: "anthropic" }))
       .not.toThrow();
   });
 });

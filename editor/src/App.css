@@ -1220,6 +1220,25 @@ body {
   gap: 12px;
 }
 
+/* FIX ROUND B, R-5. `<ProgressRow>` renders this class and nothing styled it —
+   the head and the track stacked correctly anyway, by block flow, which is why
+   it went unnoticed.
+   Declared rather than left implicit, and `min-width: 0` with it: a flex item's
+   default `min-width: auto` is its own content's minimum, and this row's head is
+   a `space-between` pair of strings the SERVER words ("Plan, design system, app
+   shell" against "12 of 11 sections, 1 failed" — the 12-of-11 case is measured,
+   not hypothetical), so the row's minimum is not a quantity this file can eyeball.
+   Zero stops that minimum widening the row inside the 560px `.generation-progress`
+   caps the panel at. No spacing of its own, deliberately: the 12px BETWEEN rows
+   belongs to `.progress-rows`'s `gap` and the 6px inside one to
+   `.progress-row-head`'s `margin-bottom`, and duplicating either here would
+   double it. */
+.progress-row {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
 .progress-row-head {
   display: flex;
   justify-content: space-between;
@@ -1381,12 +1400,6 @@ body {
   flex: 1;
   gap: 6px;
   font-size: 14px;
-}
-
-.account-gate-hint {
-  margin: 0;
-  color: #9a9aa8;
-  font-size: 12px;
 }
 
 .pad-band {

@@ -1189,7 +1189,7 @@ describe("JobWorker: resumed job safety checks (task-7-review findings 3 and 5)"
     const originalFailedJob = createJob(db, {
       userId: user.id, projectId: project.id, kind: "regen", requestJson: "{}", now: NOW - 1,
     });
-    recordJobRun(db, originalFailedJob.id, { runId: "web-x", codeVersion: "OLD-sha-before-a-deploy" });
+    recordJobRun(db, originalFailedJob.id, { runId: "web-x", codeVersion: "OLD-sha-before-a-deploy", provider: null });
     finishJob(db, originalFailedJob.id, { status: "failed", error: "boom", now: NOW - 1 });
 
     const job = createJob(db, {
@@ -1219,7 +1219,7 @@ describe("JobWorker: resumed job safety checks (task-7-review findings 3 and 5)"
     const originalFailedJob = createJob(db, {
       userId: user.id, projectId: genProject.id, kind: "generate", requestJson, now: NOW - 1,
     });
-    recordJobRun(db, originalFailedJob.id, { runId: "run-gen-guard", codeVersion: "OLD-sha" });
+    recordJobRun(db, originalFailedJob.id, { runId: "run-gen-guard", codeVersion: "OLD-sha", provider: null });
     finishJob(db, originalFailedJob.id, { status: "failed", error: "boom", now: NOW - 1 });
 
     const job = createJob(db, {
@@ -1245,7 +1245,7 @@ describe("JobWorker: resumed job safety checks (task-7-review findings 3 and 5)"
     const originalFailedJob = createJob(db, {
       userId: user.id, projectId: project.id, kind: "regen", requestJson: "{}", now: NOW - 1,
     });
-    recordJobRun(db, originalFailedJob.id, { runId: "web-x", codeVersion: "sha-1" });
+    recordJobRun(db, originalFailedJob.id, { runId: "web-x", codeVersion: "sha-1", provider: null });
     finishJob(db, originalFailedJob.id, { status: "failed", error: "boom", now: NOW - 1 });
 
     const job = createJob(db, {
@@ -1268,6 +1268,88 @@ describe("JobWorker: resumed job safety checks (task-7-review findings 3 and 5)"
       expect(ran).toBe(true);
       expect(pool.acquire).toHaveBeenCalled();
       expect(findJobById(db, job.id)?.status).toBe("succeeded");
+    } finally {
+      await upstream.close();
+    }
+  });
+
+  /**
+   * FIX ROUND B, I7 — the claim-time half of the provider guard, for exactly the
+   * reason finding 3 gives for the code-version re-check above.
+   *
+   * `job-routes.ts` checks the provider at ENQUEUE. A resumed job can then sit
+   * `queued` for minutes (bound of 2 concurrent per user; a `generate` run
+   * measures ~286s) while its owner replaces their key on the settings screen —
+   * the enqueue check has already passed and nothing re-runs it, so the same
+   * half-Anthropic/half-Gemini outcome arrives through a slower door.
+   */
+  it("fails a resumed job at claim time, without touching the pool, when the account's provider changed while it sat queued", async () => {
+    // The job ran under Anthropic...
+    setApiKey(db, MASTER_KEY, user.id, "sk-ant-a-real-looking-key-value", "anthropic");
+    const originalFailedJob = createJob(db, {
+      userId: user.id, projectId: project.id, kind: "regen", requestJson: "{}", now: NOW - 1,
+    });
+    recordJobRun(db, originalFailedJob.id, { runId: "web-x", codeVersion: "sha-1", provider: "anthropic" });
+    finishJob(db, originalFailedJob.id, { status: "failed", error: "boom", now: NOW - 1 });
+
+    // ...the resume was enqueued (passing the endpoint's own check)...
+    const job = createJob(db, {
+      userId: user.id, projectId: project.id, kind: "regen", requestJson: "{}", now: NOW,
+      runId: "web-x", resumedFromJobId: originalFailedJob.id,
+    });
+    // ...and only THEN did the key change, while the job was still queued.
+    setApiKey(db, MASTER_KEY, user.id, "AQ.a-real-looking-gemini-key-value", "gemini");
+
+    const pool = fakePool();
+    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, projectsRoot: PROJECTS_ROOT, now: () => NOW, codeVersion: "sha-1" });
+
+    const ran = await worker.runOnce();
+
+    expect(ran).toBe(true);
+    // Refused BEFORE anything is spawned: no child, so no money.
+    expect(pool.acquire).not.toHaveBeenCalled();
+    const finished = findJobById(db, job.id);
+    expect(finished?.status).toBe("failed");
+    // The same wording the 409 uses, both providers named — asserted in full
+    // rather than by substring, since a message that lost the provider the job
+    // came FROM would still contain "gemini".
+    expect(finished?.error).toBe(
+      "this job ran with a anthropic key and this account now uses gemini; a resume continues "
+      + "the same run, which cannot switch model providers partway — start a fresh job instead",
+    );
+    // Never ran, so recordJobRun never touched this job's own stamp.
+    expect(finished?.provider).toBe(null);
+  });
+
+  it("runs normally when the provider is unchanged — the claim-time check does not refuse a safe resume", async () => {
+    setApiKey(db, MASTER_KEY, user.id, "sk-ant-a-real-looking-key-value", "anthropic");
+    const originalFailedJob = createJob(db, {
+      userId: user.id, projectId: project.id, kind: "regen", requestJson: "{}", now: NOW - 1,
+    });
+    recordJobRun(db, originalFailedJob.id, { runId: "web-x", codeVersion: "sha-1", provider: "anthropic" });
+    finishJob(db, originalFailedJob.id, { status: "failed", error: "boom", now: NOW - 1 });
+
+    const job = createJob(db, {
+      userId: user.id, projectId: project.id, kind: "regen", requestJson: "{}", now: NOW,
+      runId: "web-x", resumedFromJobId: originalFailedJob.id,
+    });
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ passed: true }));
+    });
+    const pool = fakePool({
+      acquire: vi.fn(async (): Promise<PreviewProcess> => ({
+        projectId: project.id, port: upstream.port, base: "/", inFlight: 0, lastUsedAt: Date.now(),
+      })),
+    });
+    const worker = new JobWorker({ db, pool, masterKey: MASTER_KEY, projectsRoot: PROJECTS_ROOT, now: () => NOW, codeVersion: "sha-1" });
+
+    try {
+      expect(await worker.runOnce()).toBe(true);
+      expect(findJobById(db, job.id)?.status).toBe("succeeded");
+      // And the run stamped the provider it actually used, which is what makes
+      // a LATER resume of this job checkable at all.
+      expect(findJobById(db, job.id)?.provider).toBe("anthropic");
     } finally {
       await upstream.close();
     }

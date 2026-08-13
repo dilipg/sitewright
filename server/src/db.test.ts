@@ -179,12 +179,50 @@ setTimeout(() => {
       // perturbing it back to a bare, unconditional ALTER TABLE (no
       // PRAGMA table_info check first) makes THIS test fail on the second
       // open with "duplicate column name: run_id", exactly the crash a real
-      // server restart would hit.
+      // server restart would hit. Covers I7's `job.provider` too, since it
+      // rides the same helper — any later column added the same way is
+      // protected by this test without it having to name them.
       const path = tempDbPath();
       openDatabase(path).close();
       expect(() => openDatabase(path).close()).not.toThrow();
     },
   );
+
+  it("adds provider to the job table, NULLABLE and with NO default (fix round B, I7)", () => {
+    const db = openDatabase(tempDbPath());
+    const provider = (db.prepare("PRAGMA table_info(job)").all() as Array<{
+      name: string; notnull: number; dflt_value: string | null;
+    }>).find((c) => c.name === "provider");
+    expect(provider).toBeDefined();
+    // Both pinned, because both are the decision rather than an oversight: NULL
+    // is the truthful value for a row that predates the column (and for every
+    // job that makes no model call), and a DEFAULT would claim a provider for
+    // work that never used one — which the resume guard would then read as a
+    // real mismatch and refuse.
+    expect(provider?.notnull).toBe(0);
+    expect(provider?.dflt_value).toBe(null);
+    db.close();
+  });
+
+  it("refuses an unrecognised job provider at the database, so api-keys.ts's union is structural here too (I7)", () => {
+    const db = openDatabase(tempDbPath());
+    db.prepare("INSERT INTO user (id, email, password_hash, created_at) VALUES (?, ?, ?, ?)")
+      .run("u1", "a@example.com", "h", 1);
+    db.prepare(
+      "INSERT INTO job (id, user_id, project_id, kind, status, request_json, created_at) VALUES (?, ?, NULL, ?, ?, ?, ?)",
+    ).run("j1", "u1", "regen", "queued", "{}", 1);
+
+    // The two real members and NULL are all writable...
+    for (const value of ["anthropic", "gemini", null]) {
+      expect(() => db.prepare("UPDATE job SET provider = ? WHERE id = ?").run(value, "j1")).not.toThrow();
+    }
+    // ...and nothing else is, by any caller, including one that bypasses
+    // recordJobRun. This is what keeps `providersIncompatible`'s fail-closed
+    // branch a guard against a hand-edited file rather than an ordinary path.
+    expect(() => db.prepare("UPDATE job SET provider = ? WHERE id = ?").run("openai", "j1"))
+      .toThrow(/CHECK constraint failed/);
+    db.close();
+  });
 
   it("adds provider to the api_key table, defaulting to anthropic (BYOK task 1)", () => {
     const db = openDatabase(tempDbPath());

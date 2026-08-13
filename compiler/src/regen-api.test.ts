@@ -948,8 +948,12 @@ describe("snapshotRoute: a second CONCURRENT regeneration may not replace the pe
     await waitForSlot(root);
 
     // 2. tab 2 reverts `home` — refused, loudly, at the endpoint.
+    //    409 since fix round B's C-1 (it was 500): the refusal is a conflict
+    //    with the client's own stale state, not the server breaking. The status
+    //    mapping has its own block below; this asserts the sequence still ends
+    //    in a refusal at all.
     const revert = await call("POST", "/__regen-revert", { section: "home" });
-    expect(revert.status).toBe(500);
+    expect(revert.status).toBe(409);
     expect(revert.body).toContain("is still running");
     expect(existsSync(join(root, ".regen-backup", "page", "home-only.tsx"))).toBe(true);
 
@@ -967,4 +971,140 @@ describe("snapshotRoute: a second CONCURRENT regeneration may not replace the pe
     expect(afterwards.status).toBe(200);
     expect(existsSync(join(root, ".regen-backup"))).toBe(false);
   }, 30_000);
+});
+
+/**
+ * FIX ROUND B, C-1 — the STATUS a refused revert answers with.
+ *
+ * `restoreSnapshot` grew four refusals across the F13 fix and the whole-branch
+ * review, and every one of them arrived at the client as **500**: the handler's
+ * `catch` mapped anything thrown to a server error. So "this snapshot belongs to
+ * another route", "a regeneration is still running", "the snapshot is
+ * incomplete" and "there is nothing to revert" all told the user the server had
+ * broken — untrue, and unactionable, when the real fixes are wait, or reload, or
+ * accept that the undo window has closed.
+ *
+ * Driven through the REAL middleware, because the status is the middleware's
+ * decision: the exported `restoreSnapshot` tests above prove what it throws, and
+ * could not catch a handler that mapped the throw wrongly.
+ *
+ * The last case is the one that keeps this honest: a genuine failure inside the
+ * copy still answers 500. "Every error is a 409" would pass all four tests above
+ * it and would be a worse bug than the one being fixed, since it would tell a
+ * user to retry something no retry can fix.
+ */
+describe("POST /__regen-revert: a refusal is 409, a genuine failure is still 500 (C-1)", () => {
+  const dirs: string[] = [];
+  const held: SnapshotClaim[] = [];
+  afterEach(() => {
+    for (const claim of held) claim.release();
+    held.length = 0;
+    for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
+    dirs.length = 0;
+  });
+
+  function twoRouteProject(): string {
+    const dir = mkdtempSync(join(tmpdir(), "regen-c1status-"));
+    dirs.push(dir);
+    for (const route of ["home", "about"]) {
+      mkdirSync(join(dir, "src", "pages", route), { recursive: true });
+      writeFileSync(join(dir, "src", "pages", route, `${route}-only.tsx`), `// ${route}\n`, "utf8");
+    }
+    writeFileSync(join(dir, "manifest.json"), JSON.stringify({ nodes: {} }), "utf8");
+    return dir;
+  }
+
+  /** A snapshot whose regeneration has FINISHED — the only state in which a revert is offered. */
+  function finishedSnapshot(root: string, route: string): void {
+    snapshotRoute(root, route).release();
+  }
+
+  it("409s when there is nothing to revert", async () => {
+    // A reload, a second tab, or a revert already taken: the client's state is
+    // stale, which is precisely what 409 means.
+    const { call } = mountRegenApi(twoRouteProject());
+    const result = await call("POST", "/__regen-revert", { section: "home" });
+    expect(result.status).toBe(409);
+    expect(result.body).toContain("no regeneration to revert");
+  });
+
+  it("409s when the pending snapshot belongs to a DIFFERENT route, and says which", async () => {
+    // The item's own case (F13's cross-route data-loss guard). The message
+    // reaches the user through the body, so it is asserted here too.
+    const root = twoRouteProject();
+    finishedSnapshot(root, "home");
+    const { call } = mountRegenApi(root);
+
+    const result = await call("POST", "/__regen-revert", { section: "about" });
+
+    expect(result.status).toBe(409);
+    // Parsed, not substring-matched on the raw body: the message quotes the
+    // route names, and JSON encoding escapes those quotes — a raw `toContain`
+    // silently never matches.
+    expect((JSON.parse(result.body) as { error: string }).error).toBe(
+      'the pending regeneration snapshot belongs to route "home", not "about"; nothing was changed',
+    );
+    // ...and nothing was changed, which is what the message claims.
+    expect(existsSync(join(root, "src", "pages", "about", "about-only.tsx"))).toBe(true);
+  });
+
+  it("409s while a regeneration of that route is still running", async () => {
+    const root = twoRouteProject();
+    const claim = snapshotRoute(root, "home");
+    held.push(claim);
+    const { call } = mountRegenApi(root);
+
+    const result = await call("POST", "/__regen-revert", { section: "home" });
+
+    expect(result.status).toBe(409);
+    expect(result.body).toContain("is still running");
+  });
+
+  it("409s when the pending snapshot is incomplete", async () => {
+    const root = twoRouteProject();
+    finishedSnapshot(root, "home");
+    // Half a snapshot: the manifest copy is gone, so there is nothing coherent
+    // to restore — and the guard must refuse BEFORE deleting the live route.
+    rmSync(join(root, ".regen-backup", "manifest.json"), { force: true });
+    const { call } = mountRegenApi(root);
+
+    const result = await call("POST", "/__regen-revert", { section: "home" });
+
+    expect(result.status).toBe(409);
+    expect(result.body).toContain("incomplete");
+    expect(existsSync(join(root, "src", "pages", "home", "home-only.tsx"))).toBe(true);
+  });
+
+  it("still answers 500 when the restore itself genuinely FAILS — not every error is a conflict", async () => {
+    // THE discriminating case. Every guard passes, and then the copy blows up
+    // for a reason that really is the server's problem (here a manifest path
+    // that is a directory, standing in for an EACCES or a full disk). A blanket
+    // 409 would pass every test above and tell the user to retry something no
+    // retry can fix.
+    const root = twoRouteProject();
+    finishedSnapshot(root, "home");
+    rmSync(join(root, "manifest.json"), { force: true });
+    mkdirSync(join(root, "manifest.json"));
+    const { call } = mountRegenApi(root);
+
+    const result = await call("POST", "/__regen-revert", { section: "home" });
+
+    expect(result.status).toBe(500);
+    // And it is the copy that failed, not a guard that was reworded.
+    expect(result.body).toContain("Cannot overwrite directory");
+  });
+
+  it("still answers 200 on the revert the refusals exist to protect", async () => {
+    // The mapping must not have turned a WORKING revert into a refusal: the
+    // guards are only worth anything if the legitimate path still runs.
+    const root = twoRouteProject();
+    finishedSnapshot(root, "home");
+    rmSync(join(root, "src", "pages", "home"), { recursive: true, force: true });
+    const { call } = mountRegenApi(root);
+
+    const result = await call("POST", "/__regen-revert", { section: "home" });
+
+    expect(result.status).toBe(200);
+    expect(existsSync(join(root, "src", "pages", "home", "home-only.tsx"))).toBe(true);
+  });
 });

@@ -31,6 +31,7 @@
  */
 import { useEffect, useState } from "react";
 import { generateUrl, projectsUrl } from "../lib/backend";
+import { submitLogout } from "../lib/logout";
 import { SessionExpiredError } from "../lib/session-fetch";
 import { describeSpend, type SpendSummary } from "../lib/spend";
 
@@ -83,6 +84,18 @@ export interface ProjectPickerProps {
    *  already has a key can get back to it: with a key stored, the screen no
    *  longer appears by itself. */
   readonly onOpenKeySettings?: () => void;
+  /**
+   * FIX ROUND B, R-6. Called only AFTER `POST /api/logout` has actually
+   * succeeded — never optimistically, so this screen cannot report a sign-out
+   * the server did not perform.
+   *
+   * Optional for the same structural reason `onOpenKeySettings` is: absent means
+   * the caller has no session to end, and the button is not rendered at all.
+   * That is what keeps sign-out HOSTED-ONLY without this component having to know
+   * what mode it is in — local mode never mounts this screen, and a caller that
+   * did would have no session cookie to revoke.
+   */
+  readonly onSignedOut?: () => void;
 }
 
 /**
@@ -318,12 +331,17 @@ export default function ProjectPicker({
   spend,
   keyStatus,
   onOpenKeySettings,
+  onSignedOut,
 }: ProjectPickerProps) {
   const [rows, setRows] = useState<ProjectRow[] | null>(null);
   const [loadError, setLoadError] = useState<string | undefined>(undefined);
   const [brief, setBrief] = useState("");
   const [starting, setStarting] = useState(false);
   const [startError, setStartError] = useState<string | undefined>(undefined);
+  // R-6. Separate from `starting`/`startError`: a failed sign-out must not blank
+  // the message from a failed generation, and vice versa.
+  const [signingOut, setSigningOut] = useState(false);
+  const [signOutError, setSignOutError] = useState<string | undefined>(undefined);
   // The SAME function the key screen renders its own spend line from, so neither
   // surface can present a floor as an exact figure — see `lib/spend.ts` for the
   // accepted risk that makes this the mitigation rather than a nicety.
@@ -375,13 +393,59 @@ export default function ProjectPicker({
     }
   }
 
+  /**
+   * R-6. `onSignedOut` runs ONLY after the server confirms the revocation —
+   * `submitLogout` throws on anything else, and the failure is shown here rather
+   * than swallowed. Showing the login screen for a sign-out that did not happen
+   * would leave the next person at this machine one reload away from the previous
+   * user's session, which is the exact opposite of what the button is for.
+   *
+   * No `setSigningOut(false)` on success, deliberately, matching `onGenerate`'s
+   * own reasoning: the caller replaces this screen in the same tick, and
+   * re-enabling the button first would offer a second POST against a session that
+   * no longer exists.
+   */
+  async function onSignOut() {
+    if (signingOut) return;
+    setSignOutError(undefined);
+    setSigningOut(true);
+    try {
+      await submitLogout();
+      onSignedOut?.();
+    } catch (error) {
+      setSignOutError(error instanceof Error ? error.message : String(error));
+      setSigningOut(false);
+    }
+  }
+
   return (
     <div className="project-picker" data-testid="project-picker">
       <header className="picker-header">
         <h1>Website Generator</h1>
         {accountEmail !== undefined && (
           <p className="picker-account" data-testid="picker-account">
-            Signed in as <strong>{accountEmail}</strong>
+            Signed in as <strong>{accountEmail}</strong>{" "}
+            {/* R-6. Beside the account line rather than anywhere else, because
+                that line is the thing this button answers: a tester who reads
+                whose account is about to be billed needs the way to end it in
+                the same breath. Rendered only when the caller supplied
+                `onSignedOut`, which is what keeps it out of local mode. */}
+            {onSignedOut !== undefined && (
+              <button
+                type="button"
+                className="picker-key-button"
+                data-testid="picker-sign-out"
+                onClick={() => void onSignOut()}
+                disabled={signingOut}
+              >
+                {signingOut ? "Signing out…" : "Sign out"}
+              </button>
+            )}
+          </p>
+        )}
+        {signOutError !== undefined && (
+          <p className="picker-error" data-testid="picker-sign-out-error" role="alert">
+            {signOutError}
           </p>
         )}
         {/* BYOK FORM. Which key is stored, and the way back to the screen that

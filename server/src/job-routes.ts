@@ -85,6 +85,7 @@ import { mkdirSync, rmSync } from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
 import { getApiKeyFingerprint } from "./api-keys.ts";
 import { codeVersionsIncompatible, resolveCodeVersion } from "./code-version.ts";
+import { currentProviderFor, describeProviderMismatch, providersIncompatible } from "./job-provider.ts";
 import {
   BILLABLE_JOB_KINDS, countActiveBillableJobsForUser, createBillableJobIfUnderBound, createJob,
   createNonBillableAsyncJobIfUnderBound, ENQUEUE_BOUND_REFUSED, findJobById, hasActiveResumeFor,
@@ -419,6 +420,36 @@ export function jobRoutes(deps: { db: DatabaseSync; projectsRoot: string; codeVe
         // case regardless of the server's own current value.
         if (codeVersionsIncompatible(original.codeVersion, codeVersion)) {
           sendJson(res, 409, CODE_VERSION_MISMATCH);
+          return;
+        }
+        // FIX ROUND B, I7 — the same rule for the other thing a replayed
+        // `run_id` cannot survive a change of: the MODEL PROVIDER. Nothing here
+        // pins one, so `buildAgentEnv` resolves whichever key is stored at claim
+        // time; replace an Anthropic key with a Gemini one between a failed job
+        // and its resume and the same run continues under a different family,
+        // with every completed checkpoint still cached from the old one.
+        //
+        // 409 and NOT 402/400: the account is fine and the request is
+        // well-formed — it conflicts with the state of the job being resumed,
+        // exactly as CODE_VERSION_MISMATCH above does. The message names BOTH
+        // providers (describeProviderMismatch), because "cannot be resumed"
+        // alone gives a user no way to connect it to the key they just swapped.
+        //
+        // `providersIncompatible` is the ONE comparison (job-provider.ts), never
+        // a bare `!==` here: a null recorded provider means nothing ran under
+        // one — including every `export` job and every row predating the column —
+        // and must NOT refuse, the identical carve-out the code-version guard
+        // above makes.
+        // Resolved ONCE and reused for both the decision and the message: two
+        // reads could, in principle, straddle a key change and produce a refusal
+        // naming a provider that is no longer current.
+        const accountProvider = currentProviderFor(db, ctx.user.id);
+        if (providersIncompatible(original.provider, accountProvider)) {
+          // Non-null by the guard just above (`providersIncompatible` returns
+          // false for a null `recorded`), asserted rather than re-tested so this
+          // branch cannot disagree with the guard about when it is reachable.
+          const recordedProvider = original.provider!;
+          sendJson(res, 409, { error: describeProviderMismatch(recordedProvider, accountProvider) });
           return;
         }
 

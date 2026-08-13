@@ -1806,6 +1806,25 @@ export default function App() {
           // The single "the session is not usable" flag, reused rather than
           // duplicated — `showLogin` above turns it into the login screen.
           onSessionExpired={() => setSessionExpired(true)}
+          // FIX ROUND B, R-6. Reached only after the server has actually revoked
+          // the session (`submitLogout` throws otherwise), so nothing here
+          // reports a sign-out that did not happen.
+          //
+          // The persisted run is dropped FIRST and deliberately: `localStorage`
+          // survives a reload, and this button exists for shared machines — the
+          // next person must not land on the previous account's "Generating your
+          // site" screen. (It would clear itself on the 404 that poll gets, since
+          // `GET /api/jobs/:id` is owner-checked, but only after showing it.)
+          //
+          // Then a reload, not a state change, for exactly the reason
+          // `onAuthenticated` reloads: every session-dependent load in this
+          // component runs once on mount, and re-deriving them from the now-absent
+          // cookie in one step is what puts the login screen up with no stale
+          // account email, project list or key state behind it.
+          onSignedOut={() => {
+            forgetPersistedRun(localRunStorage());
+            window.location.reload();
+          }}
         />
       </div>
     );

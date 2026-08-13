@@ -192,5 +192,36 @@ export function openDatabase(path: string): DatabaseSync {
   ensureColumn(db, "job", "run_id", "run_id TEXT");
   ensureColumn(db, "job", "code_version", "code_version TEXT");
   ensureColumn(db, "job", "resumed_from_job_id", "resumed_from_job_id TEXT REFERENCES job(id) ON DELETE SET NULL");
+  // FIX ROUND B, I7 — which model provider a job actually ran under, so a
+  // resume cannot continue one `run_id` under a DIFFERENT model family.
+  //
+  // The exact sibling of `code_version` above, and it exists for the identical
+  // reason: Kitaru keys its checkpoint cache on function code plus args, so a
+  // resume that reuses a `run_id` after the provider changed re-executes the
+  // failed checkpoint against a new family while every completed one stays
+  // cached from the old — a half-Anthropic, half-Gemini site. See
+  // `job-provider.ts` for the ONE comparison and `job-routes.ts` for the 409.
+  //
+  // NULLABLE WITH NO DEFAULT, unlike `api_key.provider` above, and that is the
+  // correct value for every existing row rather than an omission: a `DEFAULT`
+  // here would claim a provider for jobs that predate this column, and the
+  // truthful answer for those is "not recorded". They are not left unguarded by
+  // it — `code_version` is stamped by the same call, so a job that ran before
+  // this column existed necessarily ran under different code and the
+  // code-version guard already refuses its resume. NULL is also what a
+  // brand-new job row carries until `recordJobRun` stamps it, for the same
+  // reason `code_version` is: this records what ACTUALLY ran.
+  //
+  // The CHECK mirrors `api_key.provider`'s, member for member (api-keys.ts's
+  // `API_KEY_PROVIDERS` is the union both spell out), with `IS NULL` added
+  // because this column is nullable. Widening the union therefore needs a
+  // further migration in BOTH places — the intended cost, failing loudly at the
+  // write rather than quietly at a resume.
+  ensureColumn(
+    db,
+    "job",
+    "provider",
+    "provider TEXT CHECK (provider IS NULL OR provider IN ('anthropic', 'gemini'))",
+  );
   return db;
 }

@@ -166,6 +166,22 @@ export function meUrl(): string {
 }
 
 /**
+ * FIX ROUND B, R-6. `POST /api/logout` has existed since slice 2 and nothing in
+ * `editor/src` called it, so a session could be started from the UI but never
+ * ended from it — on the shared machine the "Signed in as …" line exists to
+ * guard against, the only exit was the operator CLI disabling the whole account.
+ *
+ * Session-only in `server/src/project-registry.ts`, so no `?project=`, for the
+ * same reason `loginUrl`/`meUrl` take none: the session cookie identifies the
+ * session being ended, and there is no session id anywhere in the path — which
+ * is what makes it structurally impossible to point this at somebody else's.
+ * Interpolates nothing, so it is not a `..` site.
+ */
+export function logoutUrl(): string {
+  return "/api/logout";
+}
+
+/**
  * BYOK FORM. All three methods (`GET`, `PUT`, `DELETE`) address ONE resource, so
  * there is one function rather than three — the method is the verb, the URL is
  * the noun.

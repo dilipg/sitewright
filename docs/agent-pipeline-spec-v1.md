@@ -179,6 +179,14 @@ SaaS set: `integration-grid`, `comparison-table`, `changelog-list`, `docs-toc-pa
 
 Twenty archetypes total. Each ships with its template, a props-shape hint, and one canonical example. Growing this catalog is the main ongoing content work of the product; treat archetype quality as a first-class backlog.
 
+> **CORRECTION, 2026-08-13 (fix round B, D-2).** The count above is **stale, not violated**, and is corrected here rather than rewritten, per the convention the 2026-08-10 F13 retraction set.
+>
+> `len(ARCHETYPE_CATALOG)` (`orchestrator/src/orchestrator/catalog.py`) is **27**, measured, not estimated. The nineteen named above are all present and unchanged; the count of "twenty" includes `custom` (4.4), which the code's own comment calls "the twentieth". What the three sets above do not name is an **app set** of eight, added after this section was written: `app-shell`, `element-palette`, `builder-canvas`, `properties-inspector`, `form-renderer`, `data-toolbar`, `data-grid`, `detail-drawer` — the *screens* of a product rather than pages about one, each still a presentational section with typed props and handler seams (contract 5.x).
+>
+> This is growth of exactly the kind this paragraph's own last sentence calls for, so no requirement here is broken — but two derived statements elsewhere read as wrong now that the total moved, and are left in place for the same reason: [build-plan-v1.md](build-plan-v1.md) section 5's "6 of 20" and section 6's "remaining 14 archetypes" described the milestone cuts as planned, and both milestones shipped against a catalog of 20.
+>
+> **Section 4.3 is stale in the same way:** the code has a **fifth** page archetype, `app-screen` (`app-shell` first, 2–5 sections, no hero and no cta-band), which exists so a planner can lay out a screen *inside* a product instead of returning a landing page about it. It adds no prompt blocks of its own, so 4.3's own definition of a page archetype holds unchanged.
+
 ### 4.3 Page archetypes
 
 `landing`, `marketing-page`, `storefront`, `saas-product`. A page archetype is just a Planner-side prior: preferred section sequences and count ranges (landing: 4 to 7 sections, hero first, cta-band last). It adds no prompt blocks of its own.

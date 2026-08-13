@@ -386,6 +386,47 @@ describe("ProjectPicker.tsx: the component cannot render a directory", () => {
     expect(pickerSource).not.toMatch(/toFixed\(2\)/);
   });
 
+  it("offers a SIGN-OUT beside the account line, wired to the real logout request (R-6)", async () => {
+    // FIX ROUND B, R-6. `POST /api/logout` existed since slice 2 with no caller,
+    // so a session could be started from the UI and never ended from it.
+    //
+    // A SOURCE assertion, and worth naming as such: this workspace has no React
+    // testing library, so the only way to bind the BUTTON to the request is to
+    // read the markup. `lib/logout.test.ts` covers what the request does; this
+    // covers that the screen actually makes it. Deleting either the button or its
+    // `onClick` fails here — which a unit test of `submitLogout` alone cannot do.
+    expect(pickerSource).toContain('data-testid="picker-sign-out"');
+    expect(pickerSource).toContain("submitLogout()");
+    expect(pickerSource).toContain("onSignOut()");
+    // Beside the account line specifically — the thing it answers. Asserted by
+    // position, since a sign-out button parked anywhere else (next to Generate,
+    // say) is a different, worse screen.
+    const account = pickerSource.indexOf('data-testid="picker-account"');
+    expect(account).toBeGreaterThan(-1);
+    expect(pickerSource.indexOf('data-testid="picker-sign-out"')).toBeGreaterThan(account);
+    expect(pickerSource.indexOf('data-testid="picker-sign-out"')).toBeLessThan(
+      pickerSource.indexOf("new-site-form"),
+    );
+    // And the callback fires only AFTER the request resolves: an `onSignedOut()`
+    // before the `await` would show the login screen for a sign-out that never
+    // happened.
+    expect(pickerSource.indexOf("await submitLogout()")).toBeLessThan(
+      pickerSource.indexOf("onSignedOut?.()"),
+    );
+    // The failure is SHOWN, not swallowed — otherwise a 500 looks identical to a
+    // successful sign-out from the user's side.
+    expect(pickerSource).toContain('data-testid="picker-sign-out-error"');
+  });
+
+  it("renders no sign-out button for a caller that has no session to end (local mode)", async () => {
+    // Structural, not conventional: the button is inside an
+    // `onSignedOut !== undefined` guard, the same pattern `onOpenKeySettings`
+    // already uses, so a caller with no session cannot render one. Local mode
+    // never mounts this screen at all (App.tsx's `hostedShellWithoutProject`),
+    // and this is the second lock on the same door.
+    expect(pickerSource).toContain("onSignedOut !== undefined &&");
+  });
+
   it("offers a way to the API-key screen, so a stored key can be replaced without one appearing by itself", async () => {
     // With a key stored the screen no longer shows itself, so this is the only
     // route back to it — and the status beside it is honest in all three states

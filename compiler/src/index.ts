@@ -9,6 +9,13 @@ export { deriveTokens } from "./derive-tokens";
 export type { DeriveTokensResult, TailwindTheme } from "./derive-tokens";
 
 export { ExportError, exportProject } from "./exporter";
+// Re-exported so callers outside `compiler/` stop hand-rolling it. The
+// whole-branch review found a NINTH copy of the `rmdirSync`-on-a-symlink defect
+// in `editor/e2e/prepare-project.ts`, outside the reach of the Python-only
+// portability guard: `rmdirSync` removes a Windows junction but is `ENOTDIR` on
+// a POSIX symlink, so a contributor on Linux or macOS could not run the e2e
+// setup twice. This helper already branches on `lstatSync` and is tested.
+export { removeDirectoryLink, linkDirectory } from "./exporter";
 export type { ExportOptions, ExportResult, OverrideEntry } from "./exporter";
 
 export { PROPERTY_UTILITIES, STYLE_PROPERTIES, isSupportedStyleProperty } from "./style-properties";

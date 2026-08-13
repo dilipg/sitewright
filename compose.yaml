@@ -36,6 +36,29 @@ x-webgen-volumes: &webgen-volumes
   # and a cross-process write read back correctly.
   - .:/app
 
+  # SECRETS THE BIND MOUNT WOULD OTHERWISE HAND TO MODEL-GENERATED CODE.
+  #
+  # `serve.ts:109` deletes `WEBGEN_MASTER_KEY` from `process.env` the moment it
+  # is read, precisely because `compiler/`'s spawn sites pass no `env` and would
+  # inherit it into a generated project's own `vite.config.ts` — which is
+  # model-authored from a free-text brief and then EXECUTED by Vite. The mount
+  # above defeats that entirely: the same value sits at `/app/.env.docker` where
+  # any generated file can simply read it. Found by the whole-branch review.
+  #
+  # `orchestrator/.env` is worse and the review did not name it: it holds the
+  # OPERATOR's real ANTHROPIC_API_KEY and GEMINI_API_KEY. Shadowing it also
+  # closes the fall-through that has produced the "operator pays" bug twice —
+  # python-dotenv's `override=False` means an absent injected key silently
+  # reaches for this file, so under Docker a user's run could bill the operator.
+  # Nothing in the container needs it: `agent-env.ts` injects the user's own key
+  # from the database, and compose reads `.env.docker` HOST-side for `env_file`,
+  # never from inside the container.
+  #
+  # `/dev/null` rather than a tmpfs or an anonymous volume because both of those
+  # mount a DIRECTORY, and these two paths are files.
+  - /dev/null:/app/.env.docker:ro
+  - /dev/null:/app/orchestrator/.env:ro
+
   # ANONYMOUS VOLUMES OVER EVERY node_modules — the Windows/macOS trap the bind
   # mount above would otherwise walk straight into. The host tree holds
   # win32/darwin native binaries (@node-rs/argon2, esbuild, rolldown,
@@ -87,6 +110,17 @@ services:
       # exhaustion it was. Each worker is a whole Python process that shells out
       # to `tsc`, so the binding constraint is memory, not CPU. Raise it if you
       # give Docker more RAM; the run gets slower, never wrong.
+      #
+      # THIS BOUND IS PER RUN, NOT PER CONTAINER, and the whole-branch review was
+      # right to name it: `MAX_ACTIVE_JOBS_PER_USER` is 2, so one tester running
+      # two generations at once reaches 2 x 2 = 4 concurrent page workers —
+      # exactly the count measured to OOM here. It is documented rather than
+      # lowered to 1 because that would serialise fan-out for the ordinary
+      # single-generation case to protect against a case the tester has to opt
+      # into deliberately (two briefs, ~$3-5, and the progress screen now
+      # recovers a running job on reload specifically so a second is not started
+      # by accident). If you intend to run two at once, give Docker ~8 GB or set
+      # this to 1.
       WEBGEN_FANOUT_MAX_WORKERS: "2"
       # Optional. Set it to your account's address to have existing directories
       # in `generated/` adopted on boot so they appear in the picker. It cannot

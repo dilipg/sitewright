@@ -108,12 +108,16 @@ COPY . .
 # the one committed.
 RUN uv sync --directory orchestrator --frozen
 
-# `sed` before `chmod`, and both deliberately: this repo has no `*.sh eol=lf`
-# rule in .gitattributes and was developed with core.autocrlf=true, so a
-# Windows clone checks the script out with CRLF endings and `#!/bin/sh\r` fails
-# as "no such file or directory". Normalising here fixes it for every clone
-# regardless of the tester's git config, which an .gitattributes line alone
-# would not do for an already-cloned tree.
+# Normalises the copy baked INTO the image, for a run without the bind mount.
+#
+# It does NOT protect the normal `docker compose up`, and the whole-branch review
+# caught that: `compose.yaml` bind-mounts the repo at `/app`, which shadows this
+# file with the HOST checkout, so what actually gets exec'd is whatever the
+# tester's git produced. `.gitattributes` now carries `*.sh text eol=lf` (the
+# real fix, applied at checkout on every platform) and the ENTRYPOINT below
+# invokes the script through `sh`, so neither the line endings nor the exec bit
+# of the mounted copy can stop the container starting. This line stays for the
+# no-mount case and because it costs one cached layer.
 RUN sed -i 's/\r$//' /app/docker/entrypoint.sh && chmod +x /app/docker/entrypoint.sh
 
 # 4000 server, 5173 editor dev server. Preview children are spawned INSIDE this
@@ -121,4 +125,9 @@ RUN sed -i 's/\r$//' /app/docker/entrypoint.sh && chmod +x /app/docker/entrypoin
 # reverse proxy at /preview/<projectId>/*, so they need no port of their own.
 EXPOSE 4000 5173
 
-ENTRYPOINT ["/app/docker/entrypoint.sh"]
+# Invoked through `sh`, not as an executable, so the EXEC BIT of the
+# bind-mounted host copy is irrelevant. A checkout whose index mode is 100644 —
+# the default for a file added on Windows — would otherwise fail with
+# "permission denied" on a POSIX host, from a fresh clone, with the image's own
+# `chmod` shadowed by the mount.
+ENTRYPOINT ["/bin/sh", "/app/docker/entrypoint.sh"]

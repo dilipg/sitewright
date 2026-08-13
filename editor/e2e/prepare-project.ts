@@ -5,16 +5,22 @@
  * Runs as the first step of the preview webServer command (Playwright
  * launches webServers before globalSetup, so setup lives in the command).
  */
-import { cpSync, existsSync, rmdirSync, rmSync, symlinkSync } from "node:fs";
+import { cpSync, existsSync, rmSync, symlinkSync } from "node:fs";
 import { join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+// `removeDirectoryLink` rather than a local `rmdirSync`: this was the NINTH copy
+// of the same defect (whole-branch review). `rmdirSync` removes a Windows
+// junction but throws `ENOTDIR` on a POSIX symlink, so on Linux or macOS the
+// SECOND run of the e2e setup failed here — outside the reach of the Python-only
+// portability guard. That helper branches on `lstatSync` and is tested.
+import { removeDirectoryLink } from "@website-generator/compiler";
 
 const fixtureDir = fileURLToPath(new URL("../../fixtures/acme-landing", import.meta.url));
 const projectDir = fileURLToPath(new URL("../../generated/editor-e2e-project", import.meta.url));
 
 const linkedModules = join(projectDir, "node_modules");
 if (existsSync(linkedModules)) {
-  rmdirSync(linkedModules); // junction: removes the link, never the fixture's tree
+  removeDirectoryLink(linkedModules); // removes the LINK, never the fixture's tree
 }
 if (existsSync(projectDir)) {
   rmSync(projectDir, { recursive: true, force: true });

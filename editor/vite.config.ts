@@ -25,6 +25,26 @@ const HOSTED_SERVER_URL = process.env.WEBGEN_HOSTED_SERVER_URL ?? "http://localh
 export default defineConfig({
   plugins: [react()],
   server: {
+    // The same `fs.deny` hardening `compiler/src/preview.ts` already carries,
+    // for the same reason and now with a sharper one: this dev server serves
+    // `/@fs/...` on an UNAUTHENTICATED port, and Docker made it the everyday way
+    // to reach the product. `searchForWorkspaceRoot` walks up to the repo root,
+    // so `server/data/identity.db` — argon2 hashes, live session ids, encrypted
+    // API keys — sat inside the served root, as did `.env.docker`'s master key
+    // and `orchestrator/.env`'s provider keys. The whole-branch review found the
+    // gap; the preview server was hardened long ago and this file never was.
+    //
+    // Vite takes an EXPLICIT `deny` as-is rather than merging it with its own
+    // defaults, so those defaults (env files, certs, .npmrc, .git) are repeated
+    // verbatim here rather than silently dropped. `*.db` and its WAL sidecars
+    // are NOT in Vite's defaults and are the whole point of this addition.
+    fs: {
+      deny: [
+        ".env", ".env.*", "*.{crt,pem,key,p12,pfx,cer,der}",
+        ".npmrc", ".yarnrc.yml", "**/.git/**",
+        "**/*.db", "**/*.db-{wal,shm}",
+      ],
+    },
     proxy: {
       "/api": { target: HOSTED_SERVER_URL, changeOrigin: true },
       // A plain "/__" string key matches by PREFIX (`doesProxyContextMatchUrl`,

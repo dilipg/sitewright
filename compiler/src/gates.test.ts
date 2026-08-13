@@ -31,10 +31,23 @@ describe("runGates: each broken variant fails exactly its gate", () => {
   it("gate 1: unresolvable import", () => {
     const report = runGates(broken("gate1-unresolved-import"));
     expect(failedGates(report)).toEqual([1]);
-    const failure = failuresOf(report, 1)[0]!;
-    expect(failure.reason).toBe("unresolved-import");
-    expect(failure.message).toContain("./format");
-    expect(failure.file).toContain("Hero.tsx");
+
+    // Found by the whole-branch review: this used to read `failuresOf(...)[0]`
+    // and assert `Hero.tsx` on it, which made the test RED ON LINUX while CI
+    // runs `ubuntu-latest`. Gate 1 runs the project's own `tsc --noEmit`, and
+    // tsc's diagnostic ORDER is not a guarantee — on Linux `src/main.tsx` comes
+    // first. The property under test is "gate 1 catches the unresolved import in
+    // Hero.tsx", never "it is reported first", so the assertion should not have
+    // depended on position. Selecting the failure by file makes it true on both
+    // platforms without branching on one.
+    const failures = failuresOf(report, 1);
+    const failure = failures.find((f) => f.file?.includes("Hero.tsx") === true);
+    expect(
+      failure,
+      `no gate-1 failure named Hero.tsx; got ${failures.map((f) => f.file ?? "(no file)").join(", ")}`,
+    ).toBeDefined();
+    expect(failure!.reason).toBe("unresolved-import");
+    expect(failure!.message).toContain("./format");
   });
 
   it("gate 2: dangling href", () => {

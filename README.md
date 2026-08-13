@@ -402,8 +402,13 @@ model money again, roughly in proportion to the number of sections on that page.
 figure is a floor.** `orchestrator/src/orchestrator/pricing.py` has published
 rates for the Anthropic models this pipeline uses and **none for Gemini**, so a
 Gemini call records its token counts with **no cost** (`NULL`, deliberately, not
-`0.0`). Your 24-hour total is then a **floor**, not a total, and the cap can only
-ever be a floor too: it will stop you eventually, but it cannot stop you at $25.
+`0.0`). Your 24-hour total is then a **floor**, not a total — and on a
+**Gemini-only account the cap never stops you at all.** SQL `SUM` skips `NULL`,
+so if every call in the window was unpriced the total stays `0` and
+`checkSpendCap` keeps answering "allowed" at any real spend, forever. On a mixed
+account it stops you only on the Anthropic portion. An earlier draft of this
+section said the cap "will stop you eventually"; that was wrong, and the
+whole-branch review caught it.
 Wherever spend is shown, the wording changes to say you have spent *at least*
 that much whenever any call in the window was unpriced. This is an accepted
 trade — both providers shipped, with the gap surfaced rather than hidden — and it
@@ -754,11 +759,22 @@ Two things will stop this from being green if you are not expecting them:
   runnable there. The unit suites are, and do pass:
 
 ```bash
-docker compose exec server npm test -w server
-docker compose exec server npm test -w compiler
-docker compose exec server npm test -w editor
-docker compose exec server uv run --directory /app/orchestrator pytest
+docker compose exec --workdir /app server npm test -w server
+docker compose exec --workdir /app server npm test -w compiler
+docker compose exec --workdir /app server npm test -w editor
+docker compose exec --workdir /app server uv run --directory /app/orchestrator pytest
 ```
+
+> **`--workdir /app` is required**, and the whole-branch review caught its
+> absence. The service's `working_dir` is `/app/server` — deliberately, so the
+> `scripts/user.ts` commands above are short — but `npm test -w <name>` must run
+> from the **workspace root**, and from `/app/server` it fails with
+> `No workspaces found`.
+>
+> **The two Playwright suites cannot run in the container at all**: the image
+> installs no browsers, on purpose — they are a test-only dependency and would
+> add hundreds of megabytes to an image whose job is to run the product. Run
+> `npm run check` on the host for those, with the stack **down** (see below).
 
 One `compiler` test is also known to fail on Linux only — a `tsc` diagnostic
 ordering difference against an over-specific assertion, recorded in

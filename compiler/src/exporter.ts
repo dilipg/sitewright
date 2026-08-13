@@ -1248,6 +1248,16 @@ function runVerificationBuild(projectRoot: string, outDir: string): void {
       shell: true,
       encoding: "utf8",
       timeout: 240_000,
+      // NODE_ENV is forced, not inherited. Contract 7.4 calls this a PRODUCTION
+      // build, and vite only treats it as one when NODE_ENV is unset or
+      // "production" (`if (!isNodeEnvSet)` in vite@8.1.5). The Docker image sets
+      // `NODE_ENV=development` for its dev servers, and this spawn passed no
+      // `env` — so every export inside the container silently produced a DEV
+      // bundle while reporting a successful production verification. Found by
+      // the whole-branch review. Fixed here rather than in the Dockerfile
+      // because the guarantee belongs to the exporter on every host, not to one
+      // deployment's environment.
+      env: { ...process.env, NODE_ENV: "production" },
     });
     if (result.status !== 0) {
       throw new ExportError(

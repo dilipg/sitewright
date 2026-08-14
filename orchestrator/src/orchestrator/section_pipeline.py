@@ -30,6 +30,7 @@ from orchestrator.fixture_context import (
     fixture_tokens,
 )
 from orchestrator.model_call import call_model_structured_impl
+from orchestrator.placeholder_image import repair_image_sources
 from orchestrator.placeholder_shield import shield, unshield
 from orchestrator.prompts import load_template, render_template
 from orchestrator.runlog import append_run_event, default_run_log_path
@@ -245,6 +246,33 @@ def ensure_route_page_dirs(project_dir: str, routes: list[dict]) -> None:
             )
 
 
+def write_files_repairing_images(project_dir: str, files: dict[str, str]) -> list[str]:
+    """The single funnel every byte of a model-authored section file passes
+    through, so the G5 image repair cannot be forgotten by a third write path.
+
+    A reserved-domain image URL (`images.yourbrand.example/...`) is rewritten to
+    the local placeholder data URI — see placeholder_image for why a repair
+    rather than a retry. The rewrite is announced on stdout, which the run report
+    captures per node: a silent repair would hide a prompt that has stopped
+    working, and this exact defect already shipped twice unnoticed.
+    """
+    written = []
+    for rel_path, content in files.items():
+        repaired, replaced = repair_image_sources(content)
+        if replaced:
+            print(
+                f"warning: repaired {len(replaced)} unloadable image URL(s) in "
+                f"{rel_path} (first: {replaced[0]}) — a reserved domain can never "
+                "resolve; wrote the placeholder data URI instead",
+                flush=True,
+            )
+        target = Path(project_dir) / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(repaired, encoding="utf-8", newline="\n")
+        written.append(rel_path)
+    return sorted(written)
+
+
 def write_section_files(
     project_dir: str, *, route_slug: str, component: str, files: dict[str, str]
 ) -> list[str]:
@@ -256,13 +284,7 @@ def write_section_files(
     for stale in (page / "sections" / f"{component}.tsx", page / "mock" / f"{component}.data.ts"):
         stale.unlink(missing_ok=True)
 
-    written = []
-    for rel_path, content in files.items():
-        target = Path(project_dir) / rel_path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8", newline="\n")
-        written.append(rel_path)
-    return sorted(written)
+    return write_files_repairing_images(project_dir, files)
 
 
 # How a page arranges its sections. A marketing page stacks them down the
@@ -579,12 +601,7 @@ def write_section_output(project_dir: str, model_result: dict, attempt: int, rou
         if (page / sub).exists():
             shutil.rmtree(page / sub)
 
-    written = []
-    for rel_path, content in files_of(model_result).items():
-        target = Path(project_dir) / rel_path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8", newline="\n")
-        written.append(rel_path)
+    written = write_files_repairing_images(project_dir, files_of(model_result))
 
     meta = data["sectionMeta"]
     index_source = build_index_source(

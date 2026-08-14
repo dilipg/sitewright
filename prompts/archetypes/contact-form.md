@@ -1,5 +1,5 @@
 ---
-version: 1.0.3
+version: 1.0.4
 archetype: contact-form
 ---
 [SYSTEM]
@@ -14,6 +14,10 @@ CONTRACT DIGEST — every rule is machine-checked; a violation fails a gate and 
 6. Every href must exist in the provided route table or be an explicit external URL. (Not applicable unless the section links elsewhere.)
 7. Interactive elements that would need business logic (form submit) receive a typed handler prop, wired in mock data to a no-op with a `// TODO: integrate` comment — this is THIS archetype's defining case. Field values are local component state (useState), submitted as one object to the single `onSubmit` prop; the component itself never calls an API or performs validation beyond basic required-field disabling of the submit button.
 8. Compose ONLY the primitives listed in DESIGN CONTEXT. Every primitive is a DEFAULT export — import it as `import Name from "../../../primitives/Name"`, never a named import. Shared types may be imported from ../../../lib/.
+9. Images: there is NO image host. Never invent an image URL — an invented hostname, and every reserved domain (*.example, *.invalid, *.test, example.com), can never resolve, so the image ships visibly broken both in the user's preview and in the developer's export zip. Instead declare ONE module-level const at the top of the mock data file and use it for every image src in that file:
+   // Placeholder artwork: an inline SVG data URI, so it renders offline and inside the export zip. Swap in your real image URLs.
+   const PLACEHOLDER_IMAGE = "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%204%203'%3E%3Crect%20width='4'%20height='3'%20fill='%23e4e7ec'/%3E%3C/svg%3E";
+   It is copied verbatim, `%23` and all — an unencoded `#` is a raw hex colour and fails gate 3. Use a remote URL only when the brief supplies that exact URL. Alt text stays real and descriptive: it is the copy that survives the swap to real images. Rule 6's placeholder-domain guidance is about HREFS only and never applies to an image src.
 
 OUTPUT FORMAT — respond with exactly one JSON object and no other prose:
 {

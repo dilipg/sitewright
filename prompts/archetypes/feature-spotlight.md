@@ -1,5 +1,5 @@
 ---
-version: 1.0.1
+version: 1.0.2
 archetype: feature-spotlight
 ---
 [SYSTEM]
@@ -14,6 +14,10 @@ CONTRACT DIGEST — every rule is machine-checked; a violation fails a gate and 
 6. Every href must exist in the provided route table or be an explicit external URL.
 7. Interactive elements needing business logic receive a typed handler prop, wired in mock data to a no-op with a `// TODO: integrate` comment. (None apply to this archetype — it is read-only content.)
 8. Compose ONLY the primitives listed in DESIGN CONTEXT. Every primitive is a DEFAULT export — import it as `import Name from "../../../primitives/Name"`, never a named import. Shared types may be imported from ../../../lib/.
+9. Images: there is NO image host. Never invent an image URL — an invented hostname, and every reserved domain (*.example, *.invalid, *.test, example.com), can never resolve, so the image ships visibly broken both in the user's preview and in the developer's export zip. Instead declare ONE module-level const at the top of the mock data file and use it for every image src in that file:
+   // Placeholder artwork: an inline SVG data URI, so it renders offline and inside the export zip. Swap in your real image URLs.
+   const PLACEHOLDER_IMAGE = "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%204%203'%3E%3Crect%20width='4'%20height='3'%20fill='%23e4e7ec'/%3E%3C/svg%3E";
+   It is copied verbatim, `%23` and all — an unencoded `#` is a raw hex colour and fails gate 3. Use a remote URL only when the brief supplies that exact URL. Alt text stays real and descriptive: it is the copy that survives the swap to real images. Rule 6's placeholder-domain guidance is about HREFS only and never applies to an image src.
 
 OUTPUT FORMAT — respond with exactly one JSON object and no other prose:
 {
@@ -141,12 +145,15 @@ files["src/pages/home/mock/FeatureSpotlight.data.ts"]:
 ```ts
 import type { FeatureSpotlightProps } from "../sections/FeatureSpotlight";
 
+// Placeholder artwork: an inline SVG data URI, so it renders offline and inside the export zip. Swap in your real image URLs.
+const PLACEHOLDER_IMAGE = "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%204%203'%3E%3Crect%20width='4'%20height='3'%20fill='%23e4e7ec'/%3E%3C/svg%3E";
+
 export const featureSpotlightData: FeatureSpotlightProps = {
   heading: "How it works",
   features: [
-    { key: "capture", badgeLabel: "01", title: "Capture revenue events instantly", description: "Every transaction streams in the moment it happens — no batch jobs, no waiting for tomorrow's report.", imageSrc: "https://images.yourbrand.example/features/capture.jpg", imageAlt: "Dashboard showing a live revenue event stream" },
-    { key: "reconcile", badgeLabel: "02", title: "Reconcile automatically across sources", description: "We match orders, refunds, and payouts across every processor so your numbers always tie out.", imageSrc: "https://images.yourbrand.example/features/reconcile.jpg", imageAlt: "Screen showing matched transactions across two payment processors" },
-    { key: "forecast", badgeLabel: "03", title: "Forecast with real confidence intervals", description: "See a range, not just a guess — built from your actual seasonality, not a generic model.", imageSrc: "https://images.yourbrand.example/features/forecast.jpg", imageAlt: "Revenue forecast chart with a shaded confidence band" },
+    { key: "capture", badgeLabel: "01", title: "Capture revenue events instantly", description: "Every transaction streams in the moment it happens — no batch jobs, no waiting for tomorrow's report.", imageSrc: PLACEHOLDER_IMAGE, imageAlt: "Dashboard showing a live revenue event stream" },
+    { key: "reconcile", badgeLabel: "02", title: "Reconcile automatically across sources", description: "We match orders, refunds, and payouts across every processor so your numbers always tie out.", imageSrc: PLACEHOLDER_IMAGE, imageAlt: "Screen showing matched transactions across two payment processors" },
+    { key: "forecast", badgeLabel: "03", title: "Forecast with real confidence intervals", description: "See a range, not just a guess — built from your actual seasonality, not a generic model.", imageSrc: PLACEHOLDER_IMAGE, imageAlt: "Revenue forecast chart with a shaded confidence band" },
   ],
 };
 ```

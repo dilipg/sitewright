@@ -1,5 +1,5 @@
 ---
-version: 1.0.3
+version: 1.0.4
 archetype: product-detail
 ---
 [SYSTEM]
@@ -14,6 +14,10 @@ CONTRACT DIGEST — every rule is machine-checked; a violation fails a gate and 
 6. Every href must exist in the provided route table or be an explicit external URL.
 7. Interactive elements needing business logic (add to cart) receive a typed handler prop, wired in mock data to a no-op with a `// TODO: integrate` comment — this archetype's defining case. Quantity stepping and thumbnail selection are pure client-side UI state (useState), not business logic, and stay inside the component; only the final "add to cart" action crosses the props boundary.
 8. Compose ONLY the primitives listed in DESIGN CONTEXT. Every primitive is a DEFAULT export — import it as `import Name from "../../../primitives/Name"`, never a named import. Shared types may be imported from ../../../lib/.
+9. Images: there is NO image host. Never invent an image URL — an invented hostname, and every reserved domain (*.example, *.invalid, *.test, example.com), can never resolve, so the image ships visibly broken both in the user's preview and in the developer's export zip. Instead declare ONE module-level const at the top of the mock data file and use it for every image src in that file:
+   // Placeholder artwork: an inline SVG data URI, so it renders offline and inside the export zip. Swap in your real image URLs.
+   const PLACEHOLDER_IMAGE = "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%204%203'%3E%3Crect%20width='4'%20height='3'%20fill='%23e4e7ec'/%3E%3C/svg%3E";
+   It is copied verbatim, `%23` and all — an unencoded `#` is a raw hex colour and fails gate 3. Use a remote URL only when the brief supplies that exact URL. Alt text stays real and descriptive: it is the copy that survives the swap to real images. Rule 6's placeholder-domain guidance is about HREFS only and never applies to an image src.
 
 OUTPUT FORMAT — respond with exactly one JSON object and no other prose:
 {
@@ -181,14 +185,17 @@ files["src/pages/product/mock/ProductDetail.data.ts"]:
 ```ts
 import type { ProductDetailProps } from "../sections/ProductDetail";
 
+// Placeholder artwork: an inline SVG data URI, so it renders offline and inside the export zip. Swap in your real image URLs.
+const PLACEHOLDER_IMAGE = "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%204%203'%3E%3Crect%20width='4'%20height='3'%20fill='%23e4e7ec'/%3E%3C/svg%3E";
+
 export const productDetailData: ProductDetailProps = {
   productName: "Amber Dusk Candle",
   price: 28,
   description: "A warm amber and sandalwood blend, hand-poured in small batches into a reusable matte jar. 45-hour burn time.",
   images: [
-    { key: "front", src: "https://images.yourbrand.example/products/amber-dusk-front.jpg", alt: "Amber Dusk candle, front view" },
-    { key: "lit", src: "https://images.yourbrand.example/products/amber-dusk-lit.jpg", alt: "Amber Dusk candle lit in a dark room" },
-    { key: "packaging", src: "https://images.yourbrand.example/products/amber-dusk-box.jpg", alt: "Amber Dusk candle in its gift box" },
+    { key: "front", src: PLACEHOLDER_IMAGE, alt: "Amber Dusk candle, front view" },
+    { key: "lit", src: PLACEHOLDER_IMAGE, alt: "Amber Dusk candle lit in a dark room" },
+    { key: "packaging", src: PLACEHOLDER_IMAGE, alt: "Amber Dusk candle in its gift box" },
   ],
   quantityDecrementLabel: "−",
   quantityIncrementLabel: "+",

@@ -102,26 +102,17 @@ services:
       # watchdog < grace) derives from this one number. Kept equal to
       # stop_grace_period below so the two cannot drift.
       WEBGEN_SHUTDOWN_GRACE_MS: "30000"
-      # Fan-out spawns one page worker per route, and unset means "all at once"
-      # — which is fine on a developer machine and fatal here. Measured in this
-      # image (3.8 GB VM, 4 routes): two of the four workers were killed with
-      # EMPTY stdout AND stderr, surfacing only as `manifest CLI produced no
-      # result`, which reads like a compiler bug rather than the memory
-      # exhaustion it was. Each worker is a whole Python process that shells out
-      # to `tsc`, so the binding constraint is memory, not CPU. Raise it if you
-      # give Docker more RAM; the run gets slower, never wrong.
+      # NOT SET, deliberately. `fanout.py` now defaults to SERIAL (1 worker),
+      # and this file used to set 2 to avoid an OOM. That setting turned out to
+      # cause something worse: measured here, two workers 424 ms apart raced
+      # Kitaru's SQLite metadata store (journal_mode=delete, busy_timeout=5000),
+      # a `commit_section_manifest` was lost, and the run shipped a section's
+      # .tsx with no manifest entry — gate 4 rejects that forever, so the site
+      # looked finished in the canvas and could never be exported.
+      # Raise WEBGEN_FANOUT_MAX_WORKERS here only if you accept that race
+      # (docs/pending.md K1 tracks making the store WAL, which would let
+      # parallelism return safely).
       #
-      # THIS BOUND IS PER RUN, NOT PER CONTAINER, and the whole-branch review was
-      # right to name it: `MAX_ACTIVE_JOBS_PER_USER` is 2, so one tester running
-      # two generations at once reaches 2 x 2 = 4 concurrent page workers —
-      # exactly the count measured to OOM here. It is documented rather than
-      # lowered to 1 because that would serialise fan-out for the ordinary
-      # single-generation case to protect against a case the tester has to opt
-      # into deliberately (two briefs, ~$3-5, and the progress screen now
-      # recovers a running job on reload specifically so a second is not started
-      # by accident). If you intend to run two at once, give Docker ~8 GB or set
-      # this to 1.
-      WEBGEN_FANOUT_MAX_WORKERS: "2"
       # Optional. Set it to your account's address to have existing directories
       # in `generated/` adopted on boot so they appear in the picker. It cannot
       # create a user: an address matching no account is a logged skip.

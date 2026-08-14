@@ -42,13 +42,31 @@ def spawn_worker(run_id: str, route_slug: str) -> subprocess.Popen:
 
 
 def max_parallel_workers() -> int:
-    """How many page workers may run at once.
+    """How many page workers may run at once. **Defaults to 1 — serial.**
 
-    Unset means "all of them", which is what fan-out has always done — so an
-    existing invocation behaves identically and none of the measured wall-clock
-    profile changes. A container sets it low because the binding constraint
-    there is MEMORY, not CPU: each worker is a whole Python process that shells
-    out to `tsc`.
+    THE DEFAULT CHANGED, and it changed because parallel fan-out CORRUPTS A RUN.
+    Measured in a dogfood run: two workers started 424 ms apart, and Kitaru's own
+    metadata store is SQLite at `journal_mode=delete` (a rollback journal, so
+    writers block one another) with `busy_timeout=5000` — verified directly on
+    `~/AppData/Roaming/kitaru/local_stores/default_zen_store/zenml.db`. The
+    earlier worker completed `generate_section` and `write_section_only`, then
+    **never got a `commit_section_manifest` row at all**: a SQLAlchemy
+    `OperationalError` whose own failure-record write hit the same lock.
+
+    The result is the worst shape available here — `ContactHero.tsx` on disk with
+    no `manifest.json` entry, which is exactly what gate 4 rejects. The site
+    LOOKS finished in the canvas and **can never be exported**, and no retry of
+    the export can fix it because the loss already happened.
+
+    So this is correctness over speed, deliberately: serial fan-out makes the
+    fan-out phase roughly N× longer for N routes (it was 325 s of a 545 s
+    2-route run), and `docs/reports/m7-wall-clock.md`'s parallel figures no
+    longer describe the default. A slower run is visible and survivable; a
+    silently unexportable project is neither.
+
+    Raising this is allowed and is how the old behaviour comes back — but it
+    reopens the race until Kitaru's store is WAL, which is the recorded
+    follow-up (`docs/pending.md`, K1).
 
     Refuses a bad value rather than clamping, the same call `loadMasterKey` and
     `shutdown-budget.ts` already make: a silently-ignored limit produces a
@@ -57,7 +75,7 @@ def max_parallel_workers() -> int:
     """
     raw = os.environ.get("WEBGEN_FANOUT_MAX_WORKERS", "").strip()
     if raw == "":
-        return 1_000_000
+        return 1
     try:
         value = int(raw)
     except ValueError as exc:

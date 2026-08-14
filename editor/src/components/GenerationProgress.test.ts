@@ -3,8 +3,11 @@ import {
   ACTIVE_RUN_STORAGE_KEY,
   completionFraction,
   describeElapsed,
+  describeKnownFailure,
+  describeProgressSilence,
   describeSections,
   describeTerminal,
+  failedStageOf,
   forgetPersistedRun,
   formatDuration,
   JobGoneError,
@@ -13,10 +16,17 @@ import {
   persistRun,
   pollUntilTerminal,
   PollLostContactError,
+  PROGRESS_COUNTS_CAVEAT,
   PROGRESS_POLL_INTERVAL_MS,
+  PROGRESS_SILENCE_THRESHOLD_MS,
+  progressSignature,
   readDegradedSections,
+  recogniseKnownFailure,
   restorePersistedRun,
   resumeJob,
+  splitFailureMessage,
+  STALE_STACK_HEADING,
+  SUBMIT_AGAIN_LABEL,
   TERMINAL_HEADINGS,
 } from "./GenerationProgress";
 import { SessionExpiredError } from "../lib/session-fetch";
@@ -759,6 +769,218 @@ describe("resumeJob: a failed job can be retried from where it stopped", () => {
 });
 
 /* ------------------------------------------------------------------ *
+ * DOGFOOD G6 — the expected, free, self-healing first-run failure
+ * ------------------------------------------------------------------ */
+
+/**
+ * The real message shape, not an imitation: `kitaru/flow.py`'s own refusal text
+ * (`_fail_closed_on_stale_active_stack`), wrapped in the report that
+ * `server/src/orchestrator-failure.ts` renders and the raw tails it appends —
+ * `uv` noise included, because that noise is what the tester's eye actually
+ * landed on.
+ */
+function staleStackError(stage = "plan"): string {
+  return [
+    "orchestrator exited with code 1",
+    "",
+    `failed stage: ${stage}`,
+    "detail: Kitaru refused to run this flow because the saved active stack appears stale and resolved to fallback stack `default` implicitly.",
+    "  Configured active stack from repo-local config: 9f2c1a30-0000-4000-8000-000000000001",
+    "  Resolved active stack: default (2b7e5d10-0000-4000-8000-000000000002)",
+    "",
+    "--- raw stdout: last 800 of 22114 chars (21314 dropped) ---",
+    "Uninstalled 1 package in 3ms",
+    "Bytecode compiled 6239 files in 889ms",
+    "",
+    "--- raw stderr: 41 chars ---",
+    "Bytecode compiled 6239 files in 450ms",
+  ].join("\n");
+}
+
+describe("recogniseKnownFailure: the documented first-run failure is not a crash", () => {
+  it("recognises Kitaru's stale-stack refusal in the real message", () => {
+    const known = recogniseKnownFailure(staleStackError());
+    expect(known?.kind).toBe("kitaru-stale-stack");
+    expect(known?.stage).toBe("plan");
+  });
+
+  it("returns null for every other failure, so the ordinary failed screen is untouched", () => {
+    // The discriminating direction. A classifier that matched broadly would
+    // reassure a tester that a REAL failure was expected and free.
+    expect(recogniseKnownFailure(undefined)).toBeNull();
+    expect(recogniseKnownFailure("orchestrator exited with code 1\n\nfailed stage: fanout")).toBeNull();
+    expect(
+      recogniseKnownFailure(
+        "failed stage: design\ndetail: sqlalchemy.exc.OperationalError: database is locked",
+      ),
+    ).toBeNull();
+  });
+
+  it("says it is expected, names the remedy, and does not read as a crash", () => {
+    const message = `${STALE_STACK_HEADING} ${describeKnownFailure(recogniseKnownFailure(staleStackError())!)}`;
+    expect(message).toMatch(/expected/i);
+    expect(message).toMatch(/submitting the same brief again/i);
+    // Not a crash, and not the user's fault: both were what the raw dump implied.
+    expect(message).not.toMatch(/crash/i);
+    expect(message).toMatch(/not a fault in your brief or your key/i);
+  });
+
+  it("STATES THAT IT COST $0.00, which the screen never mentioned", () => {
+    const known = recogniseKnownFailure(staleStackError("plan"))!;
+    expect(known.spentNothing).toBe(true);
+    expect(describeKnownFailure(known)).toContain("$0.00");
+  });
+
+  it("never claims $0.00 for a stale-stack refusal reported at a LATER stage", () => {
+    // The money assertion in the direction that can lie. Failing at `design`
+    // means intake, the planner and the design system had already run and been
+    // billed; claiming nothing was spent would be worse than saying nothing.
+    const known = recogniseKnownFailure(staleStackError("design"))!;
+    expect(known.spentNothing).toBe(false);
+    expect(describeKnownFailure(known)).not.toContain("$0.00");
+    expect(describeKnownFailure(known)).toMatch(/were billed/i);
+  });
+
+  it("never claims $0.00 when the failed stage cannot be read at all", () => {
+    // An older server, or a message whose report did not parse: the marker is
+    // there, the stage is not, and "this app cannot tell" is the honest answer.
+    const withoutReport = "Kitaru refused to run this flow because the saved active stack appears stale.";
+    const known = recogniseKnownFailure(withoutReport)!;
+    expect(known.stage).toBeUndefined();
+    expect(known.spentNothing).toBe(false);
+    expect(describeKnownFailure(known)).not.toContain("$0.00");
+    expect(describeKnownFailure(known)).toMatch(/cannot tell/i);
+  });
+
+  it("makes the documented remedy the PRIMARY action, not Resume", () => {
+    expect(recogniseKnownFailure(staleStackError())?.primaryLabel).toBe(SUBMIT_AGAIN_LABEL);
+    expect(SUBMIT_AGAIN_LABEL).toBe("Submit the brief again");
+    // And the label must not be the resume wording, which is the button it
+    // replaces as primary.
+    expect(SUBMIT_AGAIN_LABEL).not.toMatch(/resume/i);
+  });
+});
+
+describe("failedStageOf", () => {
+  it("reads the stage off wave 1's own `failed stage:` line", () => {
+    expect(failedStageOf(staleStackError("fanout"))).toBe("fanout");
+  });
+
+  it("is undefined when there is no report — never a guess", () => {
+    expect(failedStageOf("orchestrator exited with code 1\n\n--- raw stderr: 3 chars ---\nboom")).toBeUndefined();
+    expect(failedStageOf(undefined)).toBeUndefined();
+  });
+
+  it("ignores a `failed stage:` that appears mid-line inside a quoted raw tail", () => {
+    // The raw tails are byte-exact copies of stdout, which CONTAINS the report
+    // — so an unanchored match would read the stage out of the evidence half
+    // and could pick a different one.
+    expect(failedStageOf('--- raw stdout ---\n  "detail": "failed stage: export"')).toBeUndefined();
+  });
+});
+
+describe("splitFailureMessage", () => {
+  it("keeps the explanation above and the raw tails below", () => {
+    const { summary, raw } = splitFailureMessage(staleStackError());
+    expect(summary).toContain("failed stage: plan");
+    expect(summary).not.toContain("Bytecode compiled");
+    expect(raw).toContain("--- raw stdout:");
+    expect(raw).toContain("Bytecode compiled 6239 files in 450ms");
+  });
+
+  it("hands back a message with no tails whole, so an older server's error still renders", () => {
+    const { summary, raw } = splitFailureMessage("something went wrong");
+    expect(summary).toBe("something went wrong");
+    expect(raw).toBeUndefined();
+  });
+
+  it("never produces an empty summary over a collapsed disclosure", () => {
+    // A message that is nothing but tails would otherwise render a screen with
+    // no visible text at all.
+    const onlyTails = "\n--- raw stderr: 5 chars ---\nboom!";
+    const { summary, raw } = splitFailureMessage(onlyTails);
+    expect(summary).toBe(onlyTails);
+    expect(raw).toBeUndefined();
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * DOGFOOD G2 — stop implying forward progress this screen cannot see
+ * ------------------------------------------------------------------ */
+
+describe("PROGRESS_COUNTS_CAVEAT: what the numbers are", () => {
+  it("says the counts record FINISHED work and only go up", () => {
+    expect(PROGRESS_COUNTS_CAVEAT).toMatch(/only ever go up/i);
+    expect(PROGRESS_COUNTS_CAVEAT).toMatch(/work that finished/i);
+  });
+
+  it("admits the screen cannot see a section that will never arrive", () => {
+    // The dogfood run: a worker died at T+6:54 and the screen showed
+    // "7 of 9 sections generated" for another 4.5 minutes. "7 of 9" reads as
+    // "nearly there".
+    expect(PROGRESS_COUNTS_CAVEAT).toMatch(/no longer arrive is not reported/i);
+    expect(PROGRESS_COUNTS_CAVEAT).toMatch(/cannot tell those apart/i);
+  });
+});
+
+describe("describeProgressSilence: an observation, never a diagnosis", () => {
+  it("says nothing at all while the gap is unremarkable", () => {
+    expect(describeProgressSilence(0)).toBeNull();
+    expect(describeProgressSilence(60_000)).toBeNull();
+    expect(describeProgressSilence(PROGRESS_SILENCE_THRESHOLD_MS - 1)).toBeNull();
+    expect(describeProgressSilence(Number.NaN)).toBeNull();
+  });
+
+  it("names the silence, with the clock, once it passes the threshold", () => {
+    const line = describeProgressSilence(PROGRESS_SILENCE_THRESHOLD_MS)!;
+    expect(line).toContain("3m 0s");
+    expect(line).toMatch(/Nothing new has been reported/);
+  });
+
+  it("does not claim the run has failed, because this page cannot know that", () => {
+    // There is no worker-death event in the run log to read (three failure
+    // paths `continue` before the only code that logs one), so inventing the
+    // conclusion here would be the fabricated signal this fix refuses to add.
+    const line = describeProgressSilence(5 * 60_000)!;
+    expect(line).not.toMatch(/\bfailed\b/i);
+    expect(line).not.toMatch(/\bdead\b|\bdied\b/i);
+    // It names the innocent explanation with the measured figure that makes it
+    // plausible, and admits the ambiguity.
+    expect(line).toMatch(/retried step can legitimately take that long/i);
+    expect(line).toMatch(/cannot tell that apart/i);
+    // And it repeats the one fact that is certain either way.
+    expect(line).toMatch(/spending either way/i);
+  });
+
+  it("is quiet for the longest legitimate gap this pipeline is known to produce", () => {
+    // Measured: the design system's two attempts were 136s + 141s, and the step
+    // counter moved between them. A threshold below that would fire on healthy
+    // runs and teach a tester to ignore the line.
+    expect(PROGRESS_SILENCE_THRESHOLD_MS).toBeGreaterThan(141_000);
+    expect(describeProgressSilence(141_000)).toBeNull();
+  });
+});
+
+describe("progressSignature: what counts as 'something changed'", () => {
+  const base = { stage: "generating sections", stagesDone: 5, stagesTotal: 5, sectionsGenerated: 7, sectionsTotal: 9 };
+
+  it("is stable across two identical reads, which is what a silent interval IS", () => {
+    expect(progressSignature(base)).toBe(progressSignature({ ...base }));
+  });
+
+  it("changes for every field, so a stage rename or a step tick counts as progress", () => {
+    expect(progressSignature({ ...base, stage: "exporting" })).not.toBe(progressSignature(base));
+    expect(progressSignature({ ...base, stagesDone: 4 })).not.toBe(progressSignature(base));
+    expect(progressSignature({ ...base, stagesTotal: 6 })).not.toBe(progressSignature(base));
+    expect(progressSignature({ ...base, sectionsGenerated: 8 })).not.toBe(progressSignature(base));
+    expect(progressSignature({ ...base, sectionsTotal: 11 })).not.toBe(progressSignature(base));
+    // `null` is a real value here (nobody knows the denominator until
+    // `plan.complete`), and it must not collide with a numeric total.
+    expect(progressSignature({ ...base, sectionsTotal: null })).not.toBe(progressSignature(base));
+  });
+});
+
+/* ------------------------------------------------------------------ *
  * The component's own wiring — source text, for the reason App.test.ts gives
  * ------------------------------------------------------------------ */
 
@@ -787,6 +1009,43 @@ describe("GenerationProgress.tsx: the wiring a library test structurally cannot 
     expect(running.length).toBeGreaterThan(0);
     expect(running).not.toContain("onDone(");
     expect(running).not.toContain("onAbandon(");
+  });
+
+  it("carries the counts caveat and the silence line on the RUNNING screen (G2)", () => {
+    const running = progressSource.slice(
+      progressSource.indexOf('data-testid="generation-running"'),
+      progressSource.indexOf('data-testid="generation-terminal"'),
+    );
+    expect(running).toContain("PROGRESS_COUNTS_CAVEAT");
+    expect(running).toContain('data-testid="progress-silence"');
+    // The pre-existing property this must not break: no way back to the
+    // Generate button while a paid run is going.
+    expect(running).not.toContain("onAbandon(");
+  });
+
+  it("stamps the silence clock from a CHANGED progress read, not from every read (G2)", () => {
+    // The defect this guards: re-stamping on every poll would make the silence
+    // line unreachable, which is indistinguishable from not having built it.
+    expect(progressSource).toContain("progressSignature(next)");
+    expect(progressSource).toContain("progressSignatureRef.current !== signature");
+  });
+
+  it("makes the submit-again action PRIMARY for a recognised failure, and demotes Resume (G6)", () => {
+    // The finding: the primary button was "Resume from where it stopped" while
+    // the documented fix is to submit the brief again.
+    expect(progressSource).toContain("known.primaryLabel");
+    expect(progressSource).toContain('className={known === null ? "progress-primary" : "progress-secondary"}');
+    // And Resume is still there for every other failure, where it IS right.
+    expect(progressSource).toContain('data-testid="resume-button"');
+  });
+
+  it("shows the failure's summary, with the raw stream tails behind a disclosure (G6)", () => {
+    expect(progressSource).toContain("splitFailureMessage(outcome.error)");
+    expect(progressSource).toContain("{failureText.summary}");
+    expect(progressSource).toContain('data-testid="generation-error-raw"');
+    // The absence half: printing the whole message again would reinstate the
+    // wall of red whose visible end was `Bytecode compiled 6239 files in 889ms`.
+    expect(progressSource).not.toContain("{outcome.error}");
   });
 
   it("states plainly that there is no cancellation", () => {

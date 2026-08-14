@@ -328,3 +328,63 @@ describe("App.tsx: every read goes through the session-aware layer (finding B)",
     expect(body).toContain("SessionExpiredError");
   });
 });
+
+/* ------------------------------------------------------------------ *
+ * DOGFOOD G4 / G8 — the editing surface, and the way out of it
+ * ------------------------------------------------------------------ */
+
+describe("App.tsx: the canvas says how to edit, and how to leave (dogfood G4, G8)", () => {
+  it("names the double-click gesture on hover, from the hovered node's own channels", () => {
+    // G4, the discovery affordance that needs no reading: it appears under the
+    // cursor, on the element, while the user is already pointing at it. Derived
+    // from the node's `editable` list so it can never advertise text editing on
+    // a node that has none.
+    expect(appSource).toContain("hoverHintFor(");
+    expect(appSource).toContain('data-testid="hover-hint"');
+    expect(appSource).toContain("manifest?.nodes[hoverId]?.editable");
+  });
+
+  it("no longer says only 'click to select' when nothing is selected", () => {
+    // The absence half, and the reason this is asserted in App rather than in
+    // the affordances module: the old sentence was a literal in this file, and
+    // a screen can perfectly well render both.
+    expect(appSource).toContain("EMPTY_SELECTION_HINT");
+    expect(appSource).not.toContain("Click an element in the preview to select it.<");
+    expect(appSource).not.toContain(">Click an element in the preview to select it.");
+  });
+
+  it("offers a way out of the canvas, in hosted mode only", () => {
+    // G8: there was none. The toolbar held Home, the width and mode toggles,
+    // Undo/Redo, Export and "Saved"; "Website Generator" beside them is a
+    // <span>. Getting back to the project list meant editing the URL.
+    const header = appSource.slice(
+      appSource.indexOf('<header className="editor-header">'),
+      appSource.indexOf("</header>"),
+    );
+    expect(header.length).toBeGreaterThan(0);
+    expect(header).toContain('data-testid="canvas-exit"');
+    // Hosted-gated: local mode has no project list to return to, and local mode
+    // must stay byte-identical.
+    expect(header).toContain("{hostedMode && (");
+    expect(header).toContain("editorUrlWithoutProject(window.location.href)");
+  });
+
+  it("titles the tab per screen, and does nothing at all in local mode", () => {
+    // G8: the tab read "Editor" on every screen, so two tabs of this app were
+    // indistinguishable. The local-mode guard is what keeps `index.html`'s own
+    // <title> untouched for the milestone-7 Playwright suite.
+    const start = appSource.indexOf("document.title = ");
+    expect(start, "App.tsx no longer sets a document title").toBeGreaterThan(-1);
+    const effect = appSource.slice(start - 400, start + 120);
+    expect(effect).toContain("if (!hostedMode) return;");
+    expect(appSource).toContain("documentTitleFor(screen, backend.projectId)");
+  });
+
+  it("derives one screen name per early return, so no screen inherits another's title", () => {
+    // Perturbation target: dropping a branch here silently gives that screen the
+    // canvas's title.
+    for (const screen of ["login", "unopenable", "checking", "generating", "key", "picker", "plan", "canvas"]) {
+      expect(appSource, `no screen name "${screen}"`).toContain(`"${screen}"`);
+    }
+  });
+});

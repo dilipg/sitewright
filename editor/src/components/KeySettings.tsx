@@ -166,6 +166,23 @@ export const GEMINI_SPEND_WARNING =
   "rates here, so their calls are recorded with no cost and your daily budget does not bound them. " +
   "An Anthropic key is priced exactly.";
 
+/**
+ * DOGFOOD G8: saving a key neither confirmed nor advanced. The Stored key panel
+ * silently swapped to `Anthropic · ••••aQAA`, there was no acknowledgement that
+ * anything had happened, and the only forward control was a small "Your sites"
+ * button in the bottom-left corner of the viewport — about 500px from the centred
+ * content column, reading like a debug affordance.
+ *
+ * So: a confirmation that names what the key will now be used for, and a PRIMARY
+ * button beside it. Exported so both are asserted exactly rather than by
+ * substring — the wording is the whole of what this fix does.
+ */
+export const KEY_SAVED_CONFIRMATION =
+  "Saved. Every generation, regeneration and prompt-edit on this account will now use this key.";
+
+/** The forward action, named for where it goes rather than for what it dismisses. */
+export const KEY_CONTINUE_LABEL = "Continue to your sites";
+
 /** Stated wherever a submit could have failed, because the field is cleared on
  *  every attempt — the key must not sit in this app's state waiting to be
  *  retried, so a rejected key has to be pasted again. */
@@ -428,6 +445,12 @@ export default function KeySettings({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | undefined>(undefined);
   const [replacing, setReplacing] = useState(false);
+  // G8. True only between a successful save and the next thing the user does.
+  // Local to this screen rather than derived from `stored`: "a key is stored" and
+  // "you just stored it" are different facts, and the confirmation belongs to the
+  // second one — a user who arrives here with a key already saved must not be
+  // told they just saved it.
+  const [justSaved, setJustSaved] = useState(false);
 
   const storedLabel = describeStoredKey(stored);
   // The form is the whole screen unless a key is already stored and the user has
@@ -444,6 +467,7 @@ export default function KeySettings({
       const saved = await submitKey(keyDraft, provider);
       onSaved({ kind: "stored", fingerprint: saved.fingerprint, provider: saved.provider });
       setReplacing(false);
+      setJustSaved(true);
     } catch (caught) {
       if (caught instanceof SessionExpiredError) {
         onSessionExpired();
@@ -470,6 +494,9 @@ export default function KeySettings({
       await removeStoredKey();
       onSaved({ kind: "absent" });
       setReplacing(false);
+      // A removal must clear the save confirmation: leaving it up would tell a
+      // user their key is in use one line above the panel saying it is gone.
+      setJustSaved(false);
     } catch (caught) {
       if (caught instanceof SessionExpiredError) {
         onSessionExpired();
@@ -495,6 +522,15 @@ export default function KeySettings({
 
       <section className="picker-panel" aria-labelledby="key-stored-heading">
         <h2 id="key-stored-heading">Stored key</h2>
+        {/* G8 — the acknowledgement, above the fingerprint it is about. `role
+            ="status"` so it is announced rather than only drawn: a silent swap
+            of one line of monospace was the entire feedback for saving a
+            credential. */}
+        {justSaved && (
+          <p className="key-saved" data-testid="key-saved" role="status">
+            {KEY_SAVED_CONFIRMATION}
+          </p>
+        )}
         {storedLabel !== undefined ? (
           <p className="key-stored" data-testid="key-stored">
             {storedLabel}
@@ -516,12 +552,32 @@ export default function KeySettings({
 
         {storedLabel !== undefined && (
           <div className="key-actions">
+            {/* G8 — THE FORWARD CONTROL, beside the key it confirms rather than
+                stranded at the bottom of the page. Only after a save: a user who
+                came here to change a key already knows the way out, and a
+                primary button on every visit would compete with Replace and
+                Remove for no reason. */}
+            {justSaved && (
+              <button
+                type="button"
+                className="picker-generate"
+                data-testid="key-continue"
+                onClick={onClose}
+              >
+                {KEY_CONTINUE_LABEL}
+              </button>
+            )}
             <button
               type="button"
               className="progress-secondary"
               data-testid="key-replace"
               disabled={busy}
-              onClick={() => setReplacing(true)}
+              onClick={() => {
+                setReplacing(true);
+                // Replacing is a new attempt: the previous save's confirmation
+                // must not sit above a form for a different key.
+                setJustSaved(false);
+              }}
             >
               Replace
             </button>
@@ -620,9 +676,16 @@ export default function KeySettings({
         </p>
       </section>
 
-      <button type="button" className="progress-secondary" data-testid="key-close" onClick={onClose}>
-        Your sites
-      </button>
+      {/* G8 — wrapped so it lines up with the content column. `.key-settings` is
+          a centred column of `max-width: 560px` panels, and a bare
+          `align-self: flex-start` child lands at the far left of the VIEWPORT
+          instead: measured at x=24 in a 1600px window, ~500px from the text it
+          belongs to, which is why it read as a debug affordance. */}
+      <div className="key-footer">
+        <button type="button" className="progress-secondary" data-testid="key-close" onClick={onClose}>
+          Your sites
+        </button>
+      </div>
     </div>
   );
 }

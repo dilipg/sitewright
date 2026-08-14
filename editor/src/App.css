@@ -32,6 +32,21 @@ body {
   color: #9a9aa8;
 }
 
+/* DOGFOOD G8 — the way out of the canvas, beside the product name where a user
+   looks for "home". A button rather than an anchor because it is a deliberate
+   full page load (`editorUrlWithoutProject`), and styled as a link rather than
+   as a toolbar button so it does not read as another editing control. */
+.canvas-exit {
+  background: none;
+  border: none;
+  color: #9ab4ff;
+  font-family: inherit;
+  font-size: 13px;
+  padding: 2px 4px;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
 .breadcrumb {
   display: flex;
   align-items: center;
@@ -137,12 +152,40 @@ body {
   border: 1px solid #4f8ef7;
 }
 
-.hover-label {
+/* The label, and (DOGFOOD G4) the edit hint beside it, as one row above the
+   hovered node. A flex row rather than two independently positioned chips: the
+   hint has to sit NEXT TO the label whatever the label says, and anchoring it to
+   the outline's right edge instead would push it outside `.overlay` (which is
+   `overflow: hidden`) on any node as wide as a section — invisible exactly where
+   text nodes usually are. */
+.hover-chips {
   position: absolute;
   top: -22px;
   left: 0;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.hover-label {
   background: #4f8ef7;
   color: white;
+  font-size: 11px;
+  line-height: 1;
+  padding: 4px 6px;
+  border-radius: 3px;
+  white-space: nowrap;
+}
+
+/* DOGFOOD G4 — "double-click to edit text", on the element, under the cursor.
+   Its own element rather than appended to the label, both because
+   `editor.spec.ts` asserts that label's text is EXACTLY "CTA Primary" and
+   because the two say different things: one is what this node is, the other is
+   what you can do to it. Inherits `.overlay`'s `pointer-events: none`, so it can
+   never intercept the double-click it advertises. */
+.hover-hint {
+  background: #1f3b6e;
+  color: #d6e4ff;
   font-size: 11px;
   line-height: 1;
   padding: 4px 6px;
@@ -331,8 +374,58 @@ body {
   font-size: 12px;
 }
 
+/* DOGFOOD G4 — the channel pills were read as four buttons (and one of them,
+   `text`, as a broken one, since the panel has no text field). A status pill is
+   now visibly flatter than any control here: no fill, a hairline border, and an
+   explicit `cursor: default` so it does not even flicker into looking clickable.
+   The GESTURE beside it is what actually fixes the discoverability; this stops
+   the pill from asking to be pressed. */
+.badge-status {
+  background: none;
+  border: 1px solid #4a4a56;
+  color: #c8c8d4;
+  cursor: default;
+  margin: 0;
+}
+
+.channel-list {
+  list-style: none;
+  margin: 0 0 4px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.channel-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.channel-gesture {
+  font-size: 11px;
+  line-height: 1.4;
+  color: #9a9aa8;
+}
+
+/* DOGFOOD G4 — the selection-time hint. Blue-tinted and at the very top of the
+   panel: the failure it fixes was a tester scrolling this panel top to bottom
+   and concluding the text channel did not exist. */
+.inspector-callout {
+  margin: 0 0 12px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid #34558f;
+  background: #1b2740;
+  color: #d6e4ff;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 .inspector-empty {
   color: #9a9aa8;
+  line-height: 1.5;
 }
 
 .header-actions {
@@ -1147,6 +1240,27 @@ body {
   line-height: 1.5;
 }
 
+/* DOGFOOD G8 — the save confirmation. Green, and above the fingerprint it is
+   about: saving a credential used to produce no acknowledgement at all, only a
+   silent swap of one monospaced line. */
+.key-saved {
+  margin: 0 0 10px;
+  color: #8fdcae;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+/* DOGFOOD G8 — keeps the bottom "Your sites" control inside the content column.
+   `.key-settings` centres children that set their own `max-width`; this button
+   sets none, and `align-self: flex-start` therefore put it at the left edge of
+   the VIEWPORT, ~500px from the text it belongs to. */
+.key-footer {
+  width: 100%;
+  max-width: 560px;
+  display: flex;
+  gap: 10px;
+}
+
 /* The accepted risk, stated where the provider is chosen. Amber rather than
    muted: on a Gemini key the spend figure is a FLOOR and the daily budget does
    not bound it, which a tester needs to read rather than skim. */
@@ -1356,6 +1470,21 @@ body {
   font-size: 13px;
 }
 
+/* DOGFOOD G6 — the raw stdout/stderr tails, one click away rather than in the
+   reader's face. Wave 1 built the failure message so its first lines say what
+   broke and the raw bytes sit below; rendering both as one wall of red is why a
+   tester's takeaway from a failed run was `Bytecode compiled 6239 files in
+   889ms`. Nothing is dropped: the disclosure names what it holds. */
+.progress-raw > summary {
+  color: #9a9aa8;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.progress-raw > pre {
+  margin-top: 8px;
+}
+
 .progress-primary {
   align-self: flex-start;
   background: #4f8ef7;
@@ -1553,6 +1682,29 @@ body {
   font-size: 13px;
   color: #ffb4a0;
   white-space: pre-wrap;
+}
+
+/* DOGFOOD G3 — "generated, but not exportable": a state with no retry, because
+   no action in this editor can change the answer. Amber rather than the panel's
+   red, on the same reasoning `.progress-degraded` already uses here: this is not
+   an error the user made or can fix, it is a fact about the site they were
+   handed, and red invites them to hunt for their own mistake. */
+.export-blocked {
+  margin: 4px 0 12px;
+  padding: 14px 16px;
+  border-radius: 10px;
+  border: 1px solid #6b5a2a;
+  background: #241f14;
+  color: #e8ddc4;
+  font-size: 13px;
+  line-height: 1.6;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.export-blocked p {
+  margin: 0;
 }
 
 .export-gate-report {

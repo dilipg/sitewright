@@ -5,6 +5,8 @@ import {
   describeStoredKey,
   EMPTY_KEY_MESSAGE,
   GEMINI_SPEND_WARNING,
+  KEY_CONTINUE_LABEL,
+  KEY_SAVED_CONFIRMATION,
   loadStoredKey,
   NO_KEY_STATUS,
   removeStoredKey,
@@ -422,5 +424,56 @@ describe("KeySettings.tsx: the key never lingers, and nothing else is shown", ()
     // The form's initial radio position is not a claim about what is stored; the
     // status line is, and it names no provider (asserted above).
     expect(DEFAULT_API_KEY_PROVIDER).toBe("anthropic");
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * DOGFOOD G8 — saving a key neither confirmed nor advanced
+ * ------------------------------------------------------------------ */
+
+describe("saving a key confirms, and offers the way forward (dogfood G8)", () => {
+  it("acknowledges the save in as many words, naming what the key is now used for", () => {
+    // The finding: the Stored key panel silently swapped to `Anthropic ·
+    // ••••aQAA` and that was the entire feedback for storing a credential.
+    expect(KEY_SAVED_CONFIRMATION).toBe(
+      "Saved. Every generation, regeneration and prompt-edit on this account will now use this key.",
+    );
+  });
+
+  it("names the forward action by where it goes", () => {
+    expect(KEY_CONTINUE_LABEL).toBe("Continue to your sites");
+  });
+
+  it("renders the confirmation and a PRIMARY continue button, only after a save", () => {
+    expect(keySettingsSource).toContain("{KEY_SAVED_CONFIRMATION}");
+    expect(keySettingsSource).toContain("{KEY_CONTINUE_LABEL}");
+    // `picker-generate` is this app's primary-button class; `progress-secondary`
+    // is what the stranded bottom control uses. Getting this the wrong way round
+    // is the finding, not a style preference.
+    const continueAt = keySettingsSource.indexOf('data-testid="key-continue"');
+    expect(continueAt).toBeGreaterThan(-1);
+    expect(keySettingsSource.slice(continueAt - 120, continueAt)).toContain('className="picker-generate"');
+    // Guarded on `justSaved`, so a user who merely came to change a key is not
+    // told they just saved one.
+    expect(keySettingsSource).toContain("{justSaved && (");
+  });
+
+  it("clears the confirmation on a removal and on a replace, so it cannot outlive its truth", () => {
+    // A confirmation left standing above "No API key stored" would be the same
+    // class of lie as the autosave "Saved" this codebase already had to fix.
+    expect(keySettingsSource).toContain("setJustSaved(false)");
+    const removeAt = keySettingsSource.indexOf("async function onRemove()");
+    expect(removeAt).toBeGreaterThan(-1);
+    expect(keySettingsSource.slice(removeAt, removeAt + 700)).toContain("setJustSaved(false)");
+    const replaceAt = keySettingsSource.indexOf('data-testid="key-replace"');
+    expect(keySettingsSource.slice(replaceAt, replaceAt + 400)).toContain("setJustSaved(false)");
+  });
+
+  it("keeps the bottom 'Your sites' control inside the content column", () => {
+    // Measured at x=24 in a 1600px window — about 500px from the centred text it
+    // belongs to, which is why it read as a debug affordance.
+    expect(keySettingsSource).toContain('className="key-footer"');
+    const footerAt = keySettingsSource.indexOf('className="key-footer"');
+    expect(keySettingsSource.slice(footerAt, footerAt + 300)).toContain('data-testid="key-close"');
   });
 });

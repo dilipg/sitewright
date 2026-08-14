@@ -1,5 +1,11 @@
 import { useState } from "react";
 import type { ManifestNode } from "@website-generator/compiler/src/manifest.ts";
+import {
+  CHANNEL_LIST_NOTE,
+  describeChannelGesture,
+  SPACING_CHANNEL_NOTE,
+  TEXT_EDIT_HINT,
+} from "../lib/edit-affordances";
 import { PRIMITIVE_VARIANTS } from "../lib/inventory";
 import { humanizeSegment } from "../lib/labels";
 import type { TokensJson } from "../lib/tokens";
@@ -36,6 +42,7 @@ export default function Inspector({
 }: InspectorProps) {
   const styleEditable = node.editable.includes("style");
   const visibilityEditable = node.editable.includes("visibility");
+  const textEditable = node.editable.includes("text");
   const variants = PRIMITIVE_VARIANTS[node.element];
 
   return (
@@ -46,14 +53,39 @@ export default function Inspector({
         <dt>Element</dt>
         <dd>{node.element}</dd>
       </dl>
-      <h3 className="inspector-subheading">Editable channels</h3>
-      <div>
+
+      {/* DOGFOOD G4 — first thing in the panel, above the channel list and
+          every control, because the failure it fixes was a tester scrolling
+          this panel top to bottom, finding no text field, and concluding the
+          text channel did not exist. The gesture is the whole message; see
+          `lib/edit-affordances.ts` for why a text INPUT here would be a
+          data-losing lie rather than a nicety. */}
+      {textEditable && (
+        <p className="inspector-callout" data-testid="text-edit-hint">
+          {TEXT_EDIT_HINT}
+        </p>
+      )}
+
+      <h3 className="inspector-subheading">What you can edit here</h3>
+      {/* The pills are a STATUS, and they were read as four broken buttons.
+          Each one now carries the gesture that reaches it, so the list answers
+          "how?" instead of raising it — and `channel-badge`'s own text is still
+          exactly the channel name, which is what `editor.spec.ts` asserts. */}
+      <ul className="channel-list" data-testid="channel-list">
         {node.editable.map((channel) => (
-          <span key={channel} data-testid="channel-badge" className="badge">
-            {channel}
-          </span>
+          <li key={channel} className="channel-row">
+            <span data-testid="channel-badge" className="badge badge-status">
+              {channel}
+            </span>
+            <span className="channel-gesture" data-testid={`channel-gesture-${channel}`}>
+              {describeChannelGesture(channel)}
+            </span>
+          </li>
         ))}
-      </div>
+      </ul>
+      <p className="inspector-note" data-testid="channel-list-note">
+        {CHANNEL_LIST_NOTE}
+      </p>
 
       {node.element === "Image" && (
         <section className="control-section">
@@ -154,6 +186,13 @@ export default function Inspector({
 
           <section className="control-section">
             <h3 className="inspector-subheading">Spacing</h3>
+            {/* DOGFOOD G8: a Margin Top edit made here persists as `channel:
+                "style"` while this panel also advertises a `layout` channel,
+                which reads as the override file contradicting the UI. Both are
+                right; only the UI was silent about which is which. */}
+            <p className="inspector-note" data-testid="spacing-channel-note">
+              {SPACING_CHANNEL_NOTE}
+            </p>
             <StepperRow label="Padding" property="padding" groupPath={["space"]} tokens={tokens} tokenPaths={tokenPaths} styleValue={styleValue} onCommit={onCommit} />
             <StepperRow label="Margin Top" property="marginTop" groupPath={["space"]} tokens={tokens} tokenPaths={tokenPaths} styleValue={styleValue} onCommit={onCommit} />
             <StepperRow label="Margin Bottom" property="marginBottom" groupPath={["space"]} tokens={tokens} tokenPaths={tokenPaths} styleValue={styleValue} onCommit={onCommit} />

@@ -133,6 +133,151 @@ export function describeTerminal(status: TerminalJobStatus): string {
 }
 
 /* ------------------------------------------------------------------ *
+ * DOGFOOD G6 — the expected, free, self-healing first-run failure
+ * ------------------------------------------------------------------ */
+
+/**
+ * The marker Kitaru's own refusal always carries
+ * (`kitaru/flow.py`'s `_fail_closed_on_stale_active_stack`).
+ *
+ * WHY THIS SCREEN RECOGNISES ONE FAILURE BY TEXT AT ALL. A freshly created
+ * container's FIRST generation always fails at about 13 seconds having spent
+ * **$0.00**: `orchestrator/.kitaru/` is gitignored host state carried in by the
+ * bind mount, so a stack id written on the host reaches a container whose own
+ * Kitaru database was created fresh and does not have it. Kitaru refuses rather
+ * than silently running on a different stack, rewrites the config through the
+ * mount, and the next submission works. The README documents this as expected;
+ * the screen said none of it. What a tester met instead was "The generation
+ * failed" over ~30 lines of raw subprocess output (Kitaru's stale-stack
+ * reasoning plus `uv` noise like `Bytecode compiled 6239 files in 889ms`), with
+ * no statement that nothing was charged, and with **"Resume from where it
+ * stopped" as the primary button** while the documented fix is to submit the
+ * brief again.
+ *
+ * Matched on the refusal's own sentence rather than on an exit code or a stage
+ * name, because that sentence is the only thing that identifies THIS failure
+ * (the stage is `plan`, which every early failure shares, and the exit code is
+ * 1, which every failure shares). Kitaru is a dependency, so the string can
+ * change under us — the failure mode of a miss is today's behaviour, i.e. the
+ * ordinary failed screen, which is why this is safe to key on text.
+ */
+export const STALE_STACK_MARKER = "active stack appears stale";
+
+/**
+ * The FIRST stage `acceptance.py` can fail in (`generate_site` runs
+ * plan -> approve -> design -> shell -> fanout -> export, and its `StageError`
+ * names the stage). Failing here means nothing downstream ran.
+ */
+export const FIRST_PIPELINE_STAGE = "plan";
+
+/**
+ * The stage named by `server/src/orchestrator-failure.ts`'s rendered report
+ * (`failed stage: <stage>` is line 2 of a failed generate's `error`), or
+ * `undefined` when there is no report to read — a container OOM kill, a missing
+ * interpreter, or an older server.
+ *
+ * Anchored to the start of a line so a stage name quoted inside a raw stream
+ * tail further down the same message cannot be mistaken for the verdict.
+ */
+export function failedStageOf(error: string | undefined): string | undefined {
+  if (error === undefined) return undefined;
+  return /^failed stage: *(\S+)/m.exec(error)?.[1];
+}
+
+/**
+ * A failure this screen can explain instead of merely printing.
+ *
+ * `spentNothing` is the field that must never be wrong: it is a claim about the
+ * user's money. It is true only when the refusal is provably before the first
+ * model call — the marker present AND the failed stage being the first one. A
+ * stale-stack refusal reported at any later stage means the stages before it had
+ * already run and were billed, and a refusal with no readable stage means this
+ * app does not know, so neither may claim $0.00.
+ */
+export interface KnownFailure {
+  readonly kind: "kitaru-stale-stack";
+  readonly stage: string | undefined;
+  readonly spentNothing: boolean;
+  readonly heading: string;
+  /** The label for the PRIMARY action, which for this failure is not Resume. */
+  readonly primaryLabel: string;
+}
+
+/** No word from the crash family, deliberately: this outcome is documented,
+ *  expected, free and self-healing, and reading as a crash is the whole defect. */
+export const STALE_STACK_HEADING = "This first run stopped — expected in a fresh container";
+
+/** The primary action, in the words of the README's own remedy ("Submit the
+ *  brief again and it works"). */
+export const SUBMIT_AGAIN_LABEL = "Submit the brief again";
+
+export function recogniseKnownFailure(error: string | undefined): KnownFailure | null {
+  if (error === undefined || !error.includes(STALE_STACK_MARKER)) return null;
+  const stage = failedStageOf(error);
+  return {
+    kind: "kitaru-stale-stack",
+    stage,
+    spentNothing: stage === FIRST_PIPELINE_STAGE,
+    heading: STALE_STACK_HEADING,
+    primaryLabel: SUBMIT_AGAIN_LABEL,
+  };
+}
+
+/**
+ * The body for a recognised failure: what happened, what it cost, and what to do
+ * — in that order, because the cost is the fact the tester most needs and the
+ * one the screen never mentioned.
+ *
+ * The money sentence has three forms and no default. Verified: the dogfood run's
+ * first generation recorded **zero** `usage_event` rows and the CLI reported
+ * `$0.00 spent`, which is what licenses the $0.00 claim for a `plan`-stage
+ * refusal — and what forbids it anywhere else.
+ */
+export function describeKnownFailure(failure: KnownFailure): string {
+  const what =
+    "Kitaru refused to start the pipeline because its saved active stack was stale. This is the known first-run failure in a freshly created container, not a fault in your brief or your key: Kitaru has already rewritten its own config, and submitting the same brief again gets past it.";
+  if (failure.spentNothing) {
+    return `${what} It stopped before any model was called, so this attempt cost $0.00 — no calls were billed to your key and your daily budget is untouched.`;
+  }
+  if (failure.stage === undefined) {
+    return `${what} This page cannot tell from the message how far the run got, so check the budget line on your sites page before submitting again.`;
+  }
+  return `${what} It stopped at the ${failure.stage} stage rather than at the start, so the stages before it did run and were billed — check the budget line on your sites page before submitting again.`;
+}
+
+/** Where `server/src/orchestrator-failure.ts` stops explaining and starts
+ *  quoting: every raw stream tail it appends is introduced by this. */
+const RAW_TAIL_MARKER = "\n--- raw ";
+
+/**
+ * Splits a failed generate's `error` into the part that says what broke and the
+ * raw stream tails below it.
+ *
+ * Wave 1 built that message specifically so "a reader who stops after three
+ * lines has the stage; a reader who needs bytes has them below" — but the screen
+ * rendered the whole thing as one wall of red, so the reader stopped at
+ * `Bytecode compiled 6239 files in 889ms`. The summary is shown; the tails go
+ * behind a disclosure that says what it holds. Nothing is discarded, and a
+ * message with no marker at all (an older server, a non-generate failure) comes
+ * back whole with `raw: undefined`, which renders exactly as it does today.
+ */
+export function splitFailureMessage(error: string): { summary: string; raw: string | undefined } {
+  const at = error.indexOf(RAW_TAIL_MARKER);
+  if (at === -1) return { summary: error, raw: undefined };
+  const summary = error.slice(0, at).trim();
+  const raw = error.slice(at + 1);
+  // A message that is nothing BUT tails (no exit-code header, no report) must
+  // not render an empty summary over a collapsed disclosure — that is a screen
+  // with nothing on it.
+  return summary === "" ? { summary: error, raw: undefined } : { summary, raw };
+}
+
+/** What the disclosure that hides the raw tails is labelled. Names both what is
+ *  inside and that it is the evidence half, so it is not read as "more of the
+ *  same". */
+export const RAW_OUTPUT_SUMMARY_LABEL = "Show the raw output from the run (stdout and stderr tails)";
+
+/* ------------------------------------------------------------------ *
  * A run must survive a reload
  * ------------------------------------------------------------------ */
 
@@ -406,6 +551,67 @@ export function completionFraction(done: number, total: number | null): number |
   if (total === null || !Number.isFinite(total) || total <= 0) return null;
   if (!Number.isFinite(done) || done <= 0) return 0;
   return Math.min(1, done / total);
+}
+
+/* ------------------------------------------------------------------ *
+ * DOGFOOD G2 — stop implying forward progress this screen cannot see
+ * ------------------------------------------------------------------ */
+
+/**
+ * WHAT THIS FIX DOES NOT DO, stated first because it is the honest half.
+ *
+ * One dogfood run's `contact` page worker died at T+6:54 and the screen counted
+ * happily up to "5 of 5 steps / 7 of 9 sections generated" for another 4.5
+ * minutes, until the parent process exited at T+11:14. "7 of 9" reads as "nearly
+ * there", not "one of two workers is gone".
+ *
+ * **There is no worker-death signal to render.** The run log has no such event:
+ * three failure paths `continue` before the only code that would log one, and
+ * that is `orchestrator/`/`server/` territory rather than this file's. So
+ * nothing here invents one. What this screen CAN do is stop implying a
+ * progression it cannot observe — say plainly what the counts are (finished
+ * work, monotonic, read from a log) and say when they last moved.
+ */
+export const PROGRESS_COUNTS_CAVEAT =
+  "These counts come from the run log and only ever go up: they record work that finished. A section that can no longer arrive is not reported at all, so a figure that stays still may mean a slow step or a stopped one — this page cannot tell those apart.";
+
+/**
+ * How long the numbers may stand still before the screen says so.
+ *
+ * Three minutes, chosen against measured behaviour rather than picked: a section
+ * lands about every 27 s (`docs/reports/m7-wall-clock.md`), and the longest
+ * legitimate silence measured is a retried design-system stage — 136 s + 141 s
+ * on one real run, during which the step counter did move once. Below three
+ * minutes this would fire on healthy runs; above it, it stops being news.
+ */
+export const PROGRESS_SILENCE_THRESHOLD_MS = 3 * 60 * 1000;
+
+/**
+ * A fingerprint of everything the progress endpoint reports, so "nothing has
+ * changed" means the numbers AND the stage name, not just the section count.
+ * Two consecutive reads with the same signature are a silent interval.
+ */
+export function progressSignature(progress: ProgressView): string {
+  return [
+    progress.stage,
+    progress.stagesDone,
+    progress.stagesTotal,
+    progress.sectionsGenerated,
+    progress.sectionsTotal ?? "?",
+  ].join("|");
+}
+
+/**
+ * The silence line, or `null` while the gap is unremarkable.
+ *
+ * DELIBERATELY NOT A DIAGNOSIS. It names the observation, names the innocent
+ * explanation with the measured figure that makes it plausible, and admits the
+ * screen cannot separate the two — because it cannot. Reading this as "your run
+ * has died" would be exactly the fabricated signal this fix refuses to add.
+ */
+export function describeProgressSilence(msSinceChange: number): string | null {
+  if (!Number.isFinite(msSinceChange) || msSinceChange < PROGRESS_SILENCE_THRESHOLD_MS) return null;
+  return `Nothing new has been reported for ${formatDuration(msSinceChange)}. A retried step can legitimately take that long — the design system took 4m 37s across two attempts on one measured run — and this page cannot tell that apart from a step that has stopped. The run is spending either way.`;
 }
 
 /* ------------------------------------------------------------------ *
@@ -717,6 +923,12 @@ export default function GenerationProgress({
   const [phase, setPhase] = useState<Phase>({ kind: "polling" });
   const [progress, setProgress] = useState<ProgressView | null>(null);
   const [elapsedMs, setElapsedMs] = useState(0);
+  // G2. How long the reported numbers have stood still. Driven by the same 1s
+  // ticker as `elapsedMs` and measured from the last read whose SIGNATURE
+  // differed, not from the last read that arrived — a poll that returns the
+  // identical report is not progress, and treating it as one is what let a
+  // screen with a dead worker behind it look busy for 4.5 minutes.
+  const [silenceMs, setSilenceMs] = useState(0);
   const [trouble, setTrouble] = useState(0);
   const [resuming, setResuming] = useState(false);
   const [resumeError, setResumeError] = useState<string | undefined>(undefined);
@@ -730,6 +942,12 @@ export default function GenerationProgress({
   // number after it wrong for the rest of the run.
   const baselineRef = useRef(Date.now());
   const baselineKnownRef = useRef(false);
+  /** G2. When the reported progress last actually changed, and what it said then.
+   *  `null` until the first progress read arrives: before that there is nothing
+   *  to be silent ABOUT, and starting the clock at mount would accuse a run of
+   *  stalling while it was still starting up. */
+  const progressChangedAtRef = useRef<number | null>(null);
+  const progressSignatureRef = useRef<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -754,7 +972,18 @@ export default function GenerationProgress({
         }
       },
       onProgress: (next) => {
-        if (!cancelled) setProgress(next);
+        if (cancelled) return;
+        // Compared here rather than inside the state updater on purpose: an
+        // updater can be invoked more than once for one update (React's own
+        // strict-mode double-invocation), and a side effect in there would
+        // re-stamp the clock on a re-render and hide every silence.
+        const signature = progressSignature(next);
+        if (progressSignatureRef.current !== signature) {
+          progressSignatureRef.current = signature;
+          progressChangedAtRef.current = Date.now();
+          setSilenceMs(0);
+        }
+        setProgress(next);
       },
       onConnectionTrouble: (consecutive) => {
         if (!cancelled) setTrouble(consecutive);
@@ -793,7 +1022,11 @@ export default function GenerationProgress({
 
   useEffect(() => {
     if (phase.kind === "terminal") return;
-    const tick = () => setElapsedMs(Date.now() - baselineRef.current);
+    const tick = () => {
+      setElapsedMs(Date.now() - baselineRef.current);
+      const changedAt = progressChangedAtRef.current;
+      setSilenceMs(changedAt === null ? 0 : Date.now() - changedAt);
+    };
     tick();
     const timer = setInterval(tick, 1000);
     return () => clearInterval(timer);
@@ -825,6 +1058,7 @@ export default function GenerationProgress({
     progress?.sectionsGenerated ?? 0,
     progress?.sectionsTotal ?? null,
   );
+  const silence = describeProgressSilence(silenceMs);
 
   if (phase.kind !== "terminal") {
     return (
@@ -854,9 +1088,27 @@ export default function GenerationProgress({
           />
         </div>
 
+        {/* G2 — under the bars, because the bars are what implied the
+            progression. Always shown, not only when something looks wrong: it
+            is a statement about what these numbers ARE, and it is as true at
+            "1 of 9" as at "7 of 9". */}
+        <p className="progress-footnote" data-testid="progress-counts-caveat">
+          {PROGRESS_COUNTS_CAVEAT}
+        </p>
+
         <p className="progress-elapsed" data-testid="progress-elapsed">
           {describeElapsed(elapsedMs)}
         </p>
+
+        {/* G2 — the observation, once the numbers have genuinely stood still
+            for longer than any measured healthy gap. Not a diagnosis: there is
+            no worker-death event in the run log to read, so this says what it
+            saw and admits what it cannot distinguish. */}
+        {silence !== null && (
+          <p className="progress-trouble-line" data-testid="progress-silence" role="status">
+            {silence}
+          </p>
+        )}
 
         {phase.kind === "lost-contact" ? (
           <div className="progress-trouble" data-testid="progress-lost-contact" role="alert">
@@ -906,12 +1158,19 @@ export default function GenerationProgress({
 
   const { outcome } = phase;
   const degraded = outcome.status === "succeeded" ? readDegradedSections(outcome.result) : { kind: "unknown" as const };
+  // G6. A failure this screen can EXPLAIN rather than merely print. `null` for
+  // every other failure, which keeps the ordinary failed screen exactly as it
+  // is — including its Resume primary, which is the right primary there.
+  const known = outcome.status === "failed" ? recogniseKnownFailure(outcome.error) : null;
+  const failureText = outcome.error === undefined ? undefined : splitFailureMessage(outcome.error);
 
   return (
     <div className="generation-progress" data-testid="generation-terminal" data-status={outcome.status}>
-      <h1 className="progress-heading">{TERMINAL_HEADINGS[outcome.status]}</h1>
+      <h1 className="progress-heading">
+        {known === null ? TERMINAL_HEADINGS[outcome.status] : known.heading}
+      </h1>
       <p className="progress-body" data-testid="terminal-message">
-        {describeTerminal(outcome.status)}
+        {known === null ? describeTerminal(outcome.status) : describeKnownFailure(known)}
       </p>
       <p className="progress-elapsed">{formatDuration(elapsedMs)} elapsed.</p>
 
@@ -954,19 +1213,49 @@ export default function GenerationProgress({
 
       {outcome.status === "failed" && (
         <>
-          {outcome.error !== undefined && (
+          {/* G6. The message wave 1 built has its answer in the first lines and
+              its evidence in the stream tails below; rendering both as one wall
+              of red is why a tester's takeaway was `Bytecode compiled 6239
+              files in 889ms`. The answer stays visible, the bytes stay one
+              click away, and nothing is dropped. */}
+          {failureText !== undefined && (
             <pre className="progress-error" data-testid="generation-error">
-              {outcome.error}
+              {failureText.summary}
             </pre>
+          )}
+          {failureText?.raw !== undefined && (
+            <details className="progress-raw" data-testid="generation-error-raw">
+              <summary>{RAW_OUTPUT_SUMMARY_LABEL}</summary>
+              <pre className="progress-error">{failureText.raw}</pre>
+            </details>
           )}
           {resumeError !== undefined && (
             <p className="progress-error-line" data-testid="resume-error" role="alert">
               {resumeError}
             </p>
           )}
+          {/* G6, THE SECOND HALF: the right primary action.
+              For the recognised first-run refusal the documented fix is to
+              submit the brief again, and Resume was the big blue button while
+              that lived behind a smaller secondary. So for THAT failure the
+              submit-again action is primary and Resume is demoted — not
+              removed, because a resume of a run that never started is harmless
+              and a tester may prefer it. For every other failure Resume stays
+              primary, which is correct: it does not pay for completed steps
+              twice. */}
+          {known !== null && (
+            <button
+              type="button"
+              className="progress-primary"
+              data-testid="submit-again"
+              onClick={() => onAbandon()}
+            >
+              {known.primaryLabel}
+            </button>
+          )}
           <button
             type="button"
-            className="progress-primary"
+            className={known === null ? "progress-primary" : "progress-secondary"}
             data-testid="resume-button"
             onClick={() => void onResume()}
             disabled={resuming}
@@ -979,6 +1268,12 @@ export default function GenerationProgress({
             since the run, because a cached step would then silently skip work; start a fresh brief
             in that case.
           </p>
+          {known !== null && (
+            <p className="progress-footnote" data-testid="submit-again-footnote">
+              “{known.primaryLabel}” takes you back to your sites, where the brief box is. The brief
+              itself is not kept anywhere, so paste it in again.
+            </p>
+          )}
         </>
       )}
 

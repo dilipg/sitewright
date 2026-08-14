@@ -1,0 +1,41 @@
+{
+  "note": "MACHINE-GENERATED from real `job.error` rows in server/data/identity.db (which is gitignored, so this\nfile is the only checked-in copy). Each `stdout`/`stderr` pair is the EXACT text a real failed\ngeneration produced, recovered by splitting the stored message on the labels the old formatter wrote.\n\nREAD THIS BEFORE TRUSTING `stdout`: it is only the LAST 1500 CHARACTERS of that run's real stdout,\nbecause .slice(-1500) is all the old code preserved. The earlier bytes are gone forever, and that\nloss IS dogfood finding G1. So `fanout`'s report head was destroyed (its `{` never made it into the\nrow) while `design`'s and `plan`'s happened to fit inside the window and survived intact.\n\nStored as JSON, not as .txt, on purpose: core.autocrlf=true on the machine this was captured on, so a\nplain text fixture's line endings would depend on which OS cloned the repo. Inside a JSON string a\nnewline is an escaped \n, so these bytes survive any EOL translation of the file itself.",
+  "records": [
+    {
+      "jobId": "b83ab999-80d7-4b9c-bfb6-159fac42ebb1",
+      "runId": "web-f502b18b-d4ea-461d-8a13-198ca1e0b773",
+      "stage": "fanout",
+      "why": "the dogfood run this fixture exists for: 11m12s, $1.2767, a lost commit_section_manifest. Its stderr was one line.",
+      "storedErrorChars": 1592,
+      "elapsedSeconds": 673,
+      "spendUsd": 1.276724,
+      "usageEventRows": 13,
+      "stdout": "10:46:40.723128', None, 'failed', \\\\\\\"Validates + commits proposals through the manifest service CLI \\\\u2014\\\\\\\\n    manifest.json changes only through the service (contract 5.4), lock-\\\\\\\\n    seria ... (302 characters truncated) ...  would go stale the instant a concurrent worker commits in between,\\\\\\\\n    and rolling back to a stale snapshot would erase that worker's commit.\\\\\\\\n    \\\\\\\", 'efbb715c3e61e8b0565cd4bf58843d6f', None, '@checkpoint\\\\\\\\ndef commit_section_manifest(\\\\\\\\n    project_dir: str,\\\\\\\\n    model_result: dict,\\\\\\\\n    attempt: int,\\\\\\\\n    regen_section: str = \\\\\\\"\\\\\\\",\\\\\\\\n    owner ... (1633 characters truncated) ... issues\\\\\\\": payload[\\\\\\\"issues\\\\\\\"],\\\\\\\\n        \\\\\\\"tombstoned\\\\\\\": payload.get(\\\\\\\"tombstoned\\\\\\\", []),\\\\\\\\n        \\\\\\\"previous_manifest\\\\\\\": payload[\\\\\\\"previousManifest\\\\\\\"],\\\\\\\\n    }\\\\\\\\n', None, 1, 0, '{\\\\\\\"traceback\\\\\\\":\\\\\\\"File \\\\\\\\\\\\\\\\\\\\\\\"/opt/venv/lib/python3.12/site-packages/zenml/orchestrators/step_launcher.py\\\\\\\\\\\\\\\\\\\\\\\", line 211, in launch\\\\\\\\\\\\\\\\n  request_factory.populat ... (3819 characters truncated) ... d = ?]\\\\\\\\\\\\\\\\n[parameters: (\\\\\\\\'df31a5ce2d324eec9128eb289626f2a0\\\\\\\\',)]\\\\\\\\\\\\\\\\n(Background on this error at: https://sqlalche.me/e/20/e3q8)\\\\\\\",\\\\\\\"user_code_line\\\\\\\":null}', None, None, '3eee78ce0b414297b9f2bddf02dd7e7c', 'a88d4048d71f4cc0a1e9a52e792c6493', 'f73caf78ecfd4e8ba65a73a6fb38ddce', 'df31a5ce2d324eec9128eb289626f2a0', None, None)]\\\\n(Background on this error at: https://sqlalche.me/e/20/e3q8)\\\\n\\\"}}}\"\n}\n",
+      "stderr": "Bytecode compiled 6239 files in 450ms\n"
+    },
+    {
+      "jobId": "f014632a-d277-46d9-98cc-e47d2b1914b9",
+      "runId": "web-9a0928d3-9e8c-4dc4-99a8-35be7128797b",
+      "stage": "design",
+      "why": "a real design-stage failure whose COMPLETE failed_stage report survived inside the old 1500-char window.",
+      "storedErrorChars": 1592,
+      "elapsedSeconds": 482,
+      "spendUsd": 1.009017,
+      "usageEventRows": 6,
+      "stdout": "rate_primitives` started.\nKitaru: HTTP Request: POST https://api.anthropic.com/v1/messages \"HTTP/1.1 200 OK\"\nKitaru: Checkpoint `generate_primitives` finished in 1m52s.\nKitaru: Checkpoint `write_primitives` started.\nKitaru: Checkpoint `write_primitives` finished in 7.730s.\nKitaru: Checkpoint `generate_primitives_2` started.\nKitaru: HTTP Request: POST https://api.anthropic.com/v1/messages \"HTTP/1.1 200 OK\"\nKitaru: Checkpoint `generate_primitives_2` finished in 2m15s.\nKitaru: Checkpoint `write_primitives_2` started.\nKitaru: Checkpoint `write_primitives_2` finished in 3.355s.\nKitaru: Checkpoint `generate_primitives_3` started.\nKitaru: HTTP Request: POST https://api.anthropic.com/v1/messages \"HTTP/1.1 200 OK\"\nKitaru: Checkpoint `generate_primitives_3` finished in 2m20s.\nKitaru: Checkpoint `write_primitives_3` started.\nKitaru: Checkpoint `write_primitives_3` finished in 3.069s.\nKitaru: Flow `design_system_flow` completed successfully.\nKitaru: Execution finished in 7m20s.\n{\n  \"failed_stage\": \"design\",\n  \"detail\": \"- typecheck: src/primitives/Icon.tsx(164,7): error TS2322: Type '{ \\\"data-node-id\\\": string | undefined; \\\"aria-label\\\": string | undefined; role: string | undefined; tabIndex: number | undefined; draggable: boolean | undefined; onClick: MouseEventHandler<Element> | undefined; ... 12 more ...; children: (Element | ReactNode)[]; }' is not assignable to type 'SVGProps<SVGSVGElement>'.\\n- typecheck:   Property 'draggable' does not exist on type 'SVGProps<SVGSVGElement>'.\"\n}\n",
+      "stderr": "Bytecode compiled 6239 files in 511ms\n"
+    },
+    {
+      "jobId": "58102023-2ef3-4ad9-814d-5b7c9a3a8813",
+      "runId": "web-20a9f3f2-2c87-4f96-91a0-d3e0a370f532",
+      "stage": "plan",
+      "why": "a real plan-stage failure with a multi-line detail.",
+      "storedErrorChars": 1364,
+      "elapsedSeconds": 13,
+      "spendUsd": null,
+      "usageEventRows": 0,
+      "stdout": "Kitaru: Creating database tables\nKitaru: Creating default project 'default' ...\nKitaru: Creating default stack...\nKitaru: The current repo active project is no longer available.\nKitaru: Setting the repo active project to 'default'.\nKitaru: The current repo active stack is no longer available. Resetting the active stack to default.\nKitaru: Setting the global active project to 'default'.\nKitaru: Setting the global active stack to default.\nKitaru: Reloading configuration file /app/orchestrator/.kitaru/config.yaml\n{\n  \"failed_stage\": \"plan\",\n  \"detail\": \"Kitaru refused to run this flow because the saved active stack appears stale and resolved to fallback stack `default` implicitly.\\nConfigured active stack from repo-local config (/app/orchestrator/.kitaru/config.yaml): 8ed31748-ca32-4226-9f48-0d19a9c2252b\\nResolved active stack: default (c2127b52-c00b-4c92-ba20-36535865dfa4)\\nChoose a stack explicitly before running this workflow. For example: pass `stack=...`, set `KITARU_STACK=...`, configure `[tool.kitaru].stack`, or run `kitaru stack use <stack>` once the saved active stack is correct again.\"\n}\n",
+      "stderr": "   Building orchestrator @ file:///app/orchestrator\n      Built orchestrator @ file:///app/orchestrator\nUninstalled 1 package in 3ms\nInstalled 1 package in 4ms\nBytecode compiled 6239 files in 809ms\n"
+    }
+  ]
+}

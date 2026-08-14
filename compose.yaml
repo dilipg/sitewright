@@ -59,24 +59,75 @@ x-webgen-volumes: &webgen-volumes
   - /dev/null:/app/.env.docker:ro
   - /dev/null:/app/orchestrator/.env:ro
 
-  # ANONYMOUS VOLUMES OVER EVERY node_modules — the Windows/macOS trap the bind
+  # NAMED VOLUMES OVER EVERY node_modules — the Windows/macOS trap the bind
   # mount above would otherwise walk straight into. The host tree holds
   # win32/darwin native binaries (@node-rs/argon2, esbuild, rolldown,
   # lightningcss); mounting it over the image's linux-x64 install replaces every
-  # one of them with a binary this container cannot load. An anonymous volume is
-  # initialised from the IMAGE's directory contents, so each of these keeps the
-  # tree `npm ci` built during the build.
+  # one of them with a binary this container cannot load. A volume is
+  # initialised from the IMAGE's directory contents when it is EMPTY, so each of
+  # these keeps the tree `npm ci` built during the build.
   #
-  # Consequence worth knowing: compose REUSES anonymous volumes when it recreates
-  # a container, so after changing a dependency the refresh is
+  # NAMED, NOT ANONYMOUS, and that one word was worth ~50 minutes of a tester's
+  # evening. Measured on this machine, image already built, `up -d` wall clock:
+  #
+  #                        anonymous          named
+  #   first `up`           61.1s              13.4s
+  #   every `up` after     27.1s              12.2–12.9s (5 cycles)
+  #   volumes per `up`     10 (5 per svc)     5, created once and reused
+  #   bytes copied         478 MB every up    239 MB, once
+  #   orphans per cycle    +10                0
+  #
+  # (13.4s is with the volumes already filled; from zero volumes it is 22.2s,
+  # and that one includes `--wait` blocking until BOTH services report healthy,
+  # which the anonymous numbers above do not.)
+  #
+  # Anonymous volumes are per-container and are NEVER reused across a
+  # `down`/`up`: each `up` created five fresh ones per service and copied
+  # node_modules into every one of them, and a plain `docker compose down`
+  # (which does not take `-v`) left all ten behind as dangling volumes nothing
+  # could name again. A dogfood run accumulated 92 of them, 3.39 GB. Worse, the
+  # copy happens during the phase compose prints as `Container … Creating` and
+  # then says nothing more about, and the SECOND container's five were measured
+  # at 48.1s and 12.8s against 5.8s for the first container's (why the second set
+  # costs so much more was not established — writeback contention is the guess,
+  # and sharing removes it rather than explaining it). Compose prints one line
+  # and then goes quiet for that whole time, which is indistinguishable from a
+  # hang, and was reported as one.
+  #
+  # Named volumes fix all three: they survive a plain `down` so the copy is paid
+  # ONCE, they carry compose's own project labels so `down -v` removes exactly
+  # these five and `docker volume ls --filter
+  # label=com.docker.compose.project=websitegenerator` can enumerate them (an
+  # anonymous volume carries only `com.docker.volume.anonymous=`, so there is no
+  # way to target this project's — the only command that reaches them is
+  # `docker volume prune`, which takes every OTHER project's anonymous volumes
+  # with it), and nothing accumulates.
+  #
+  # SHARED between the two services on purpose. Both run the SAME image and need
+  # the identical linux-x64 tree, and they already share every other file in
+  # /app through the bind mount above — the per-container isolation anonymous
+  # volumes gave was incidental, never a designed property. Sharing halves both
+  # the first-start copy and the disk. Only the editor writes into any of these
+  # (Vite's dep cache at editor/node_modules/.vite) and only the editor runs
+  # that Vite; the preview children the SERVER spawns run Vite against
+  # generated/<runId>, in the bind mount.
+  #
+  # Consequence worth knowing, unchanged: a volume is initialised from the image
+  # only while it is empty, so after changing a dependency the refresh is
   # `docker compose down -v && docker compose up --build` — safe here precisely
   # because `generated/` and the database are bind mounts, not volumes, so `-v`
   # cannot touch them.
-  - /app/node_modules
-  - /app/compiler/node_modules
-  - /app/editor/node_modules
-  - /app/server/node_modules
-  - /app/fixtures/acme-landing/node_modules
+  #
+  # compiler/node_modules and editor/node_modules are EMPTY in the image (0
+  # entries; npm workspaces hoists everything to the root) and are still mounted
+  # deliberately: the job is to shadow whatever the HOST has at that path, and a
+  # host install can legitimately place a win32 native binary there when a
+  # version conflict defeats hoisting. An empty volume costs nothing.
+  - root_node_modules:/app/node_modules
+  - compiler_node_modules:/app/compiler/node_modules
+  - editor_node_modules:/app/editor/node_modules
+  - server_node_modules:/app/server/node_modules
+  - fixture_node_modules:/app/fixtures/acme-landing/node_modules
   # orchestrator's venv needs no entry here: the Dockerfile sets
   # UV_PROJECT_ENVIRONMENT=/opt/venv, outside /app entirely, so the host's
   # Windows `.venv` is never consulted.
@@ -157,3 +208,32 @@ services:
     depends_on:
       server:
         condition: service_healthy
+    healthcheck:
+      # Nothing depends on this one, so it gates nothing. It exists so that
+      # "is it up yet?" has an answer a tester can read — `docker compose ps`
+      # shows `healthy` on both rows, and `docker compose up --wait` returns
+      # only when the editor is genuinely serving rather than merely started.
+      # Vite answers `/` with the index HTML; a 200 means the dev server has
+      # finished booting, which is several seconds after `Started`.
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:5173/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+# Declared so they are NAMED (see the volume list above): compose creates them as
+# `websitegenerator_<name>`, labels them with this project, reuses them across a
+# plain `down`/`up`, and removes exactly these five — and nothing else on the
+# machine — on `docker compose down -v`.
+volumes:
+  root_node_modules:
+  compiler_node_modules:
+  editor_node_modules:
+  server_node_modules:
+  fixture_node_modules:

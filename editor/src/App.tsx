@@ -51,6 +51,9 @@ import {
   hostedMode,
   meUrl,
 } from "./lib/backend";
+import type { EditorScreen } from "./lib/doc-title";
+import { documentTitleFor } from "./lib/doc-title";
+import { EMPTY_SELECTION_HINT, hoverHintFor } from "./lib/edit-affordances";
 import { applyEditOperations, interpretEditResult, validateEditOperations } from "./lib/edit-ops";
 import type { EditPromptResponse } from "./lib/edit-ops";
 import { expandStyleValue } from "./lib/inventory";
@@ -1592,6 +1595,9 @@ export default function App() {
     return { ...boxes[0]!, rect: { x: left, y: top, width: right - left, height: bottom - top } };
   })();
   const hoverGeom = hoverId !== undefined && hoverId !== selectedId ? geometry[hoverId] : undefined;
+  /** DOGFOOD G4: named on hover, from the hovered node's own declared channels,
+   *  so it can never advertise text editing on a node that has none. */
+  const hoverHint = hoverHintFor(hoverId === undefined ? undefined : manifest?.nodes[hoverId]?.editable);
   const selectedStyle =
     selectedId !== undefined
       ? ((map[selectedId]?.style as Record<string, string> | undefined) ?? {})
@@ -1620,6 +1626,44 @@ export default function App() {
    * work that silently cannot land.
    */
   const showLogin = hostedMode && sessionExpired;
+
+  /**
+   * DOGFOOD G8 — WHICH SCREEN IS ON SCREEN, derived once and used only for the
+   * tab title.
+   *
+   * It mirrors the early-return chain below in the same order, and that
+   * duplication is deliberate rather than lazy: the returns cannot be reordered
+   * into a single expression (each renders a different tree), and a title
+   * computed inside them would have to be a hook after a conditional return,
+   * which React forbids. Keeping the two in the same order in the same file is
+   * the honest version of that constraint — a new screen added below without a
+   * name here inherits `canvas`'s title, which is why every name exists.
+   */
+  const screen: EditorScreen = showLogin
+    ? "login"
+    : hostedMode && bootstrapError !== null
+      ? "unopenable"
+      : hostedShellWithoutProject
+        ? account === null || storedKey === null
+          ? "checking"
+          : startedGeneration !== null
+            ? "generating"
+            : keyScreen === "open" || (keyScreen === "auto" && storedKey.kind === "absent")
+              ? "key"
+              : "picker"
+        : pendingPlan !== null
+          ? "plan"
+          : "canvas";
+
+  useEffect(() => {
+    // LOCAL MODE IS UNTOUCHED, and this guard is the whole of that guarantee:
+    // `index.html` ships `<title>Editor</title>`, and the milestone-7 Playwright
+    // suite runs against the local preview server. A title set there would be a
+    // behaviour change in the one mode that may not have one.
+    if (!hostedMode) return;
+    document.title = documentTitleFor(screen, backend.projectId);
+  }, [screen]);
+
   if (showLogin) {
     return (
       <div className="editor-root">
@@ -1847,6 +1891,30 @@ export default function App() {
     <div className="editor-root">
       <header className="editor-header">
         <span className="editor-title">Website Generator</span>
+        {/* DOGFOOD G8 — THE WAY OUT OF THE CANVAS. There was none: the toolbar
+            held Home, the width and mode toggles, Undo/Redo, Export and
+            "Saved", and "Website Generator" beside it is a `<span>`, not a
+            button — so returning to the project list meant hand-editing the
+            URL. Same navigation the bootstrap-error screen already offers
+            (`editorUrlWithoutProject`), which is a full page load rather than a
+            state change for the reason `openProject` documents: `backend` is a
+            module-scope singleton resolved once at import time, so dropping
+            `?project=` without reloading would leave every URL in the app
+            still pointed at the project just left.
+
+            Hosted mode only, like every other screen that assumes a session:
+            in local mode there is no project list to return to, and local mode
+            must stay byte-identical. */}
+        {hostedMode && (
+          <button
+            type="button"
+            data-testid="canvas-exit"
+            className="canvas-exit"
+            onClick={() => window.location.assign(editorUrlWithoutProject(window.location.href))}
+          >
+            Your sites
+          </button>
+        )}
         <nav data-testid="breadcrumb" className="breadcrumb" aria-label="Selection breadcrumb">
           {crumbs.map((crumb, index) => {
             const isLast = index === crumbs.length - 1;
@@ -2029,9 +2097,31 @@ export default function App() {
                           height: hoverGeom.rect.height,
                         }}
                       >
-                        <span data-testid="hover-label" className="hover-label">
-                          {humanizeSegment(hoverId.split(".").pop()!)}
-                        </span>
+                        <div className="hover-chips">
+                          <span data-testid="hover-label" className="hover-label">
+                            {humanizeSegment(hoverId.split(".").pop()!)}
+                          </span>
+                          {/* DOGFOOD G4 — the discovery affordance that needs no
+                              reading and no scrolling: it appears under the
+                              cursor, on the element itself, exactly when the
+                              user is already pointing at it. A cursor change
+                              would be the obvious alternative and is not
+                              available from here — the cursor over page content
+                              is the preview frame's own, set by the shim inside
+                              a cross-origin document, and `compiler/src/shim/`
+                              is out of scope.
+
+                              Its own element, never appended to `hover-label`:
+                              `editor.spec.ts` asserts that label's text is
+                              EXACTLY "CTA Primary". Inside `.overlay`, which is
+                              `pointer-events: none`, so it can never be the
+                              thing a click lands on. */}
+                          {hoverHint !== undefined && (
+                            <span data-testid="hover-hint" className="hover-hint">
+                              {hoverHint}
+                            </span>
+                          )}
+                        </div>
                       </div>
                     )}
                     {regenGeom !== undefined && regen.phase === "running" && routeOf(regen.section) === route.slug && (
@@ -2250,7 +2340,13 @@ export default function App() {
               }
             />
           ) : (
-            <p className="inspector-empty">Click an element in the preview to select it.</p>
+            /* DOGFOOD G4: this line was the ONLY thing the whole app ever said
+               about how to edit anything, and it named the one gesture that is
+               not an edit. It keeps "click to select" and adds the gesture the
+               tester could not find. */
+            <p className="inspector-empty" data-testid="inspector-empty">
+              {EMPTY_SELECTION_HINT}
+            </p>
           )}
         </aside>
       </div>
@@ -2268,6 +2364,12 @@ export default function App() {
           downloadUrl={backend.apiUrl("/__export-download")}
           onClose={() => setExportOutcome(null)}
           onRetry={() => void runExport()}
+          // DOGFOOD G3. Which routes this canvas actually has, so a
+          // gate-4-blocked export can tell "regenerate the contact page" (which
+          // the user can do) from "contact is not on this canvas at all" (which
+          // they cannot) — the dogfood run's own case, where the lost section
+          // took its whole route out of the manifest and out of the tab strip.
+          canvasRoutes={routes.map((route) => route.slug)}
         />
       )}
 

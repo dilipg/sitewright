@@ -244,6 +244,52 @@ def test_fanout_fails_when_gates_fail_even_though_every_worker_exited_clean(
     assert result["passed"] is False
 
 
+def test_a_successful_workers_repair_warning_escapes_its_subprocess(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """I1: the deterministic-repair warning was written to a stream nothing read.
+
+    A page worker is a subprocess. Its stdout was tailed into
+    `workers[slug]["stdout_tail"]` — one occurrence in the whole repo, its own
+    assignment — while `main()` strips `workers` before printing and
+    `acceptance.py` keeps only FAILED workers' `stderr_tail`. So the author's
+    declared "only signal that the prompt has stopped working" reached no log, no
+    run report, no `job.error` and no UI on exactly the run where it matters: a
+    SUCCESSFUL one, which is why this worker exits 0.
+
+    Two things must hold: the warning is re-emitted by the PARENT (whose stdout
+    the job result carries), and it appears OUTSIDE `workers` in the result, since
+    anything nested there is stripped before printing.
+    """
+    from orchestrator import fanout
+    from orchestrator.section_pipeline import REPAIR_WARNING_PREFIX
+
+    warning = f"{REPAIR_WARNING_PREFIX} 1 unloadable image URL(s) in src/pages/home/mock/Hero.data.ts"
+    project = _fanout_project(tmp_path, ["home"])
+    monkeypatch.setattr(fanout, "GENERATED_DIR", tmp_path)
+    monkeypatch.setattr(fanout, "ensure_route_page_dirs", lambda *a, **k: None)
+    monkeypatch.setattr(
+        fanout,
+        "_run_compiler_cli",
+        lambda *a, **k: _FakeCompletedProcess(json.dumps({"passed": True, "gates": []})),
+    )
+    # the warning sits at the START of a stream long enough that the 1500-char
+    # tail cannot contain it — the truncation is half the finding
+    noise = "kitaru: checkpoint cached\n" * 200
+    monkeypatch.setattr(
+        fanout,
+        "spawn_worker",
+        lambda run_id, slug: _FakeProc(0, stdout=f"{warning}\n{noise}"),
+    )
+
+    result = fanout.run_fanout(project.name)
+
+    assert warning not in result["workers"]["home"]["stdout_tail"], "premise: the tail loses it"
+    assert result["repair_warnings"] == [f"home: {warning}"]
+    assert "repair_warnings" in {k: v for k, v in result.items() if k != "workers"}
+    assert warning in capsys.readouterr().out
+
+
 def test_the_fanout_write_log_and_ownership_files_are_cleaned_up(tmp_path: Path, monkeypatch) -> None:
     """These two files exist only to hand the gates CLI the real write log;
     leaving them behind would put generator scratch files into the export."""

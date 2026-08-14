@@ -195,6 +195,12 @@ def generate_site(brief: str, run_id: str | None = None) -> dict:
         # was the point of it, which is how a run gets called green while a
         # data grid is missing. Planned-minus-built, named.
         "degraded_sections": degraded_sections(project_dir),
+        # Every deterministic repair a page worker applied, lifted out of the
+        # subprocess it happened in. Reported on SUCCESS on purpose: a repair
+        # means the model stopped producing the shape the prompt asks for, and a
+        # failed run is loud already, so success is the only run where this is
+        # the sole evidence (see fanout.repair_warnings).
+        "repair_warnings": fanout_result.get("repair_warnings", []),
         "timings_s": {k: round(v, 2) for k, v in timings.items()},
         "cost": cost_for_run(run_id),
     }

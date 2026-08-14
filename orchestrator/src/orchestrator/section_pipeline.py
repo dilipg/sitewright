@@ -30,6 +30,7 @@ from orchestrator.fixture_context import (
     fixture_tokens,
 )
 from orchestrator.model_call import call_model_structured_impl
+from orchestrator.placeholder_image import inline_hoisted_string_consts, repair_image_sources
 from orchestrator.placeholder_shield import shield, unshield
 from orchestrator.prompts import load_template, render_template
 from orchestrator.runlog import append_run_event, default_run_log_path
@@ -245,6 +246,71 @@ def ensure_route_page_dirs(project_dir: str, routes: list[dict]) -> None:
             )
 
 
+#: Every deterministic-repair line the write funnel emits starts with this, and
+#: `fanout.py` scans a page worker's stdout for it. A page worker is a SUBPROCESS,
+#: so a print inside it reaches no log, no run report and no UI on a successful
+#: run — its stdout is stored as a 1500-character tail nothing reads. The prefix
+#: is the contract between the two sides; both import this constant so a reworded
+#: message cannot silence the signal.
+REPAIR_WARNING_PREFIX = "warning: repaired"
+
+
+def write_files_repairing_images(project_dir: str, files: dict[str, str]) -> list[str]:
+    """The single funnel every byte of a model-authored section file passes
+    through, so the deterministic repairs cannot be forgotten by a third write
+    path. Two run here, both with the same character: the model was told the
+    correct shape, and this makes the wrong shape unshippable rather than
+    trusting prose. Every repair is announced with REPAIR_WARNING_PREFIX — a
+    silent repair would hide a prompt that has stopped working, and this exact
+    defect already shipped twice unnoticed.
+
+    1. A reserved-domain image URL (`images.yourbrand.example/...`) is rewritten
+       to the local placeholder data URI — see placeholder_image for why a repair
+       rather than a retry.
+    2. In a MOCK DATA file only, a hoisted string const is inlined back to a
+       literal at each of its references. Contract 7.1's text channel rewrites
+       the mock data LITERAL feeding a node, and the exporter refuses anything
+       that is not a `StringLiteral` — so a shared const (the natural thing to do
+       with a long repeated data URI, and what digest rule 9 itself taught until
+       the whole-branch review caught it) makes one image edit fail the user's
+       whole export permanently. Scoped to mock data because that is the only
+       file the text channel rewrites; a component file is left untouched.
+    """
+    written = []
+    for rel_path, content in files.items():
+        repaired, replaced = repair_image_sources(content)
+        if replaced:
+            print(
+                f"{REPAIR_WARNING_PREFIX} {len(replaced)} unloadable image URL(s) in "
+                f"{rel_path} (first: {replaced[0]}) — a reserved domain can never "
+                "resolve; wrote the placeholder data URI instead",
+                flush=True,
+            )
+        if is_mock_data_file(rel_path):
+            repaired, inlined = inline_hoisted_string_consts(repaired)
+            if inlined:
+                print(
+                    f"{REPAIR_WARNING_PREFIX} {len(inlined)} hoisted string const(s) in "
+                    f"{rel_path} ({', '.join(inlined)}) — contract 7.1 rewrites the mock "
+                    "data literal, so an identifier would fail every text/image edit's "
+                    "export; inlined the literal at each reference instead",
+                    flush=True,
+                )
+        target = Path(project_dir) / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(repaired, encoding="utf-8", newline="\n")
+        written.append(rel_path)
+    return sorted(written)
+
+
+def is_mock_data_file(rel_path: str) -> bool:
+    """`src/pages/<slug>/mock/<Section>.data.ts` — the one file the exporter's
+    text channel rewrites (contract 7.1). Both separators, because a model-
+    authored `files` key has arrived with backslashes."""
+    normalised = rel_path.replace("\\", "/")
+    return "/mock/" in normalised and normalised.endswith(".data.ts")
+
+
 def write_section_files(
     project_dir: str, *, route_slug: str, component: str, files: dict[str, str]
 ) -> list[str]:
@@ -256,13 +322,7 @@ def write_section_files(
     for stale in (page / "sections" / f"{component}.tsx", page / "mock" / f"{component}.data.ts"):
         stale.unlink(missing_ok=True)
 
-    written = []
-    for rel_path, content in files.items():
-        target = Path(project_dir) / rel_path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8", newline="\n")
-        written.append(rel_path)
-    return sorted(written)
+    return write_files_repairing_images(project_dir, files)
 
 
 # How a page arranges its sections. A marketing page stacks them down the
@@ -579,12 +639,7 @@ def write_section_output(project_dir: str, model_result: dict, attempt: int, rou
         if (page / sub).exists():
             shutil.rmtree(page / sub)
 
-    written = []
-    for rel_path, content in files_of(model_result).items():
-        target = Path(project_dir) / rel_path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8", newline="\n")
-        written.append(rel_path)
+    written = write_files_repairing_images(project_dir, files_of(model_result))
 
     meta = data["sectionMeta"]
     index_source = build_index_source(

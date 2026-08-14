@@ -560,6 +560,107 @@ describe("exportProject: image replace (PRD 3.5, milestone 7.7)", () => {
   });
 });
 
+/**
+ * THE TEST THIS SUITE WAS MISSING, and the reason a contract-level regression got
+ * all the way to a pre-merge review with every gate and all 1,000-odd tests green.
+ *
+ * Contract 7.1 defines the text channel as rewriting the mock data LITERAL, and
+ * both implementations resolve the leaf via `.asKind(SyntaxKind.StringLiteral)`.
+ * A generation prompt was then changed to hoist every image's data URI into one
+ * `const PLACEHOLDER_IMAGE = "…"` per mock file and reference it — an
+ * `Identifier`, not a `StringLiteral` — which turned image replace (PRD 3.5,
+ * feature 7.7: the text channel with key `src`) into a permanent export failure
+ * on every generated storefront.
+ *
+ * Nothing caught it because THE ONLY PROJECT THIS SUITE EVER EXPORTS IS
+ * `fixtures/acme-landing`, whose mock fields are all literals — so the export
+ * path had never once seen an identifier. That is the same fixture-vs-generated-
+ * shape gap that produced 5.4's list-item override bug and 5.5's `generic-section`
+ * contract violations. These two cases close it by exporting a project shaped the
+ * way generation shapes them, on BOTH override paths.
+ *
+ * They pin a refusal, deliberately. The fix belongs on the generator side (the
+ * prompt now forbids hoisting, and `placeholder_image.inline_hoisted_string_consts`
+ * inlines it back if the model does it anyway); teaching the exporter to resolve
+ * identifiers was rejected, because one const feeds many items and the
+ * deterministic spine is what guarantees preview = handover. If that decision is
+ * ever revisited, these are the tests to change on purpose.
+ */
+describe("exportProject: a mock field bound to an identifier (contract 7.1)", () => {
+  /** The exact shape the generator briefly taught: one hoisted const, referenced. */
+  function hoistMockField(projectDir: string): void {
+    const mockPath = join(projectDir, "src", "pages", "about", "mock", "AboutIntro.data.ts");
+    const original = readFileSync(mockPath, "utf8");
+    writeFileSync(
+      mockPath,
+      original.replace(
+        'portraitSrc: "https://images.acme.example/team/founders.jpg",',
+        "portraitSrc: PLACEHOLDER_IMAGE,",
+      ).replace(
+        "export const aboutIntroData",
+        'const PLACEHOLDER_IMAGE = "data:image/svg+xml,%3Csvg%20/%3E";\n\nexport const aboutIntroData',
+      ),
+    );
+  }
+
+  it("refuses the keyed image-replace override instead of silently shipping the old image", () => {
+    const source = fixtureCopyWithOverrides([]);
+    hoistMockField(source);
+    // premise: without this the file is a literal and the case is vacuous
+    expect(readOut(source, "src/pages/about/mock/AboutIntro.data.ts")).toContain(
+      "portraitSrc: PLACEHOLDER_IMAGE,",
+    );
+
+    writeFileSync(
+      join(source, "overrides", "about.overrides.json"),
+      JSON.stringify({
+        version: 1,
+        route: "/about",
+        overrides: [
+          {
+            nodeId: "about.intro.portrait",
+            channel: "text",
+            key: "src",
+            value: "https://cdn.example.com/new-portrait.jpg",
+          },
+        ],
+      }),
+    );
+    const outDir = join(tempDir("export-hoisted-"), "export");
+    expect(() => exportProject(source, { outDir, skipBuild: true })).toThrow(
+      /"portraitSrc" for node "about\.intro\.portrait" is not a string literal/,
+    );
+    // and nothing half-written is left behind for a retry to trip over
+    expect(existsSync(outDir)).toBe(false);
+  });
+
+  it("refuses a plain copy edit on a hoisted field too — the defect is not image-specific", () => {
+    const source = fixtureCopyWithOverrides([]);
+    const mockPath = join(source, "src", "pages", "about", "mock", "AboutIntro.data.ts");
+    writeFileSync(
+      mockPath,
+      readFileSync(mockPath, "utf8")
+        .replace(/heading: ".*",/, "heading: SHARED_HEADING,")
+        .replace(
+          "export const aboutIntroData",
+          'const SHARED_HEADING = "Built by analysts, for analysts";\n\nexport const aboutIntroData',
+        ),
+    );
+    writeFileSync(
+      join(source, "overrides", "about.overrides.json"),
+      JSON.stringify({
+        version: 1,
+        route: "/about",
+        overrides: [{ nodeId: "about.intro.heading", channel: "text", value: "A new heading" }],
+      }),
+    );
+    const outDir = join(tempDir("export-hoisted-text-"), "export");
+    expect(() => exportProject(source, { outDir, skipBuild: true })).toThrow(
+      /is not a string literal/,
+    );
+  });
+});
+
 describe("exportProject: orphan page directories", () => {
   it("drops a page directory with no route pointing at it", { timeout: 60_000 }, () => {
     // The Design System Agent writes a dev-only primitive gallery to

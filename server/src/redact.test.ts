@@ -89,4 +89,32 @@ describe("redactSecrets, every provider whose key can reach a child", () => {
     expect(redactSecrets("AQ. Next question")).toBe("AQ. Next question");
     expect(redactSecrets("AIza")).toBe("AIza");
   });
+
+  /**
+   * Dogfood finding G1. The `AQ.` entry is the only pattern here anchored on a
+   * word boundary, and an ESCAPE SEQUENCE destroys one: a key at the start of a
+   * line, inside a string whose newline was escaped by whatever printed it,
+   * presents a `n` immediately before `AQ.` — no boundary, no match, key
+   * published. Not hypothetical text: the real artefact behind G1
+   * (server/src/fixtures/real-generate-failures.json) is a Python `repr` whose
+   * every newline arrived exactly like this, and it went into `job.error`.
+   */
+  it("masks a key hidden behind an ESCAPED newline, where the word boundary a real newline would give is missing", () => {
+    const escaped = `FOO=1\\n${GEMINI_AUTH_KEY}`;
+    // The precondition, asserted rather than assumed: there really is no word
+    // boundary here, so the first alternative genuinely cannot match.
+    expect(/\bAQ\./.test(escaped)).toBe(false);
+    const output = redactSecrets(escaped);
+    expect(output).not.toContain(GEMINI_AUTH_KEY);
+    expect(output).toContain("AQ.[redacted]");
+    // The escape itself survives — redaction replaces the key, never the text
+    // around it.
+    expect(output).toContain("FOO=1\\n");
+  });
+
+  it("masks a key behind an escaped tab or carriage return too, not just \\n", () => {
+    for (const escape of ["\\t", "\\r"]) {
+      expect(redactSecrets(`x${escape}${GEMINI_AUTH_KEY}`)).not.toContain(GEMINI_AUTH_KEY);
+    }
+  });
 });

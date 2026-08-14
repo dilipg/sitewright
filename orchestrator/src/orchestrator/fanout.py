@@ -22,7 +22,36 @@ import time
 from pathlib import Path
 
 from orchestrator import portable
-from orchestrator.section_pipeline import GENERATED_DIR, REPO_ROOT, _run_compiler_cli, ensure_route_page_dirs
+from orchestrator.section_pipeline import (
+    GENERATED_DIR,
+    REPAIR_WARNING_PREFIX,
+    REPO_ROOT,
+    _run_compiler_cli,
+    ensure_route_page_dirs,
+)
+
+
+def repair_warnings(stdout: str) -> list[str]:
+    """The deterministic-repair lines in a page worker's stdout.
+
+    Scanned from the FULL stream, not from `stdout_tail`: the tail is the last
+    1500 characters of a stream dense with Kitaru checkpoint chatter, and a
+    warning printed early in a long page is simply not in it. That truncation is
+    the same one that destroyed the signal a failed generation's report needed.
+
+    This exists because a page worker is a SUBPROCESS. Its stdout was captured,
+    tailed into `workers[slug]["stdout_tail"]`, and then read by nothing at all:
+    `main()` strips `workers` before printing, and `acceptance.py` keeps only
+    FAILED workers' `stderr_tail`. So on a successful generation — the only run
+    where the repair matters, because a failed one is loud anyway — the warning
+    reached no log, no run report, no `job.error` and no UI. Re-emitting it in the
+    PARENT is what fixes that: the parent's stdout is what the job result carries.
+    """
+    return [
+        line.strip()
+        for line in stdout.splitlines()
+        if line.strip().startswith(REPAIR_WARNING_PREFIX)
+    ]
 
 
 def spawn_worker(run_id: str, route_slug: str) -> subprocess.Popen:
@@ -130,14 +159,18 @@ def run_fanout(run_id: str) -> dict:
             procs[slug] = spawn_worker(run_id, slug)
         for slug, proc in procs.items():
             stdout, stderr = proc.communicate()
+            warnings = repair_warnings(stdout)
             workers[slug] = {
                 "returncode": proc.returncode,
                 "started_at": round(started_at[slug], 3),
                 "duration_s": round(time.monotonic() - started_at[slug], 2),
                 "stdout_tail": stdout[-1500:],
                 "stderr_tail": stderr[-1500:],
+                "repair_warnings": warnings,
             }
             print(f"=== {slug}: exit={proc.returncode} duration={workers[slug]['duration_s']}s", flush=True)
+            for warning in warnings:
+                print(f"=== {slug}: {warning}", flush=True)
 
     written_files = {f"page:{slug}": collect_written_files(project_dir, slug) for slug in route_slugs}
     written_files["shell"] = sorted(
@@ -178,6 +211,14 @@ def run_fanout(run_id: str) -> dict:
         "run_id": run_id,
         "routes": route_slugs,
         "workers": workers,
+        # OUTSIDE `workers` deliberately: main() prints the result with `workers`
+        # stripped, and acceptance.py reads only failed workers' stderr. A signal
+        # nested inside `workers` is a signal nothing reads (see repair_warnings).
+        "repair_warnings": [
+            f"{slug}: {warning}"
+            for slug, worker in workers.items()
+            for warning in worker["repair_warnings"]
+        ],
         "gate_report": gate_report,
         "passed": all_ok,
     }

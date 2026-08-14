@@ -1,5 +1,5 @@
 ---
-version: 1.0.5
+version: 1.0.7
 archetype: cart-drawer
 ---
 [SYSTEM]
@@ -14,6 +14,11 @@ CONTRACT DIGEST — every rule is machine-checked; a violation fails a gate and 
 6. Every href must exist in the provided route table or be an explicit external URL.
 7. Interactive elements needing business logic (remove item, checkout) receive typed handler props, wired in mock data to no-ops with `// TODO: integrate` comments — this archetype's defining case. Quantity display is read-only content here (no stepper) — cart quantity editing is out of scope for this generated section; a developer wires that in later per HANDOVER.md.
 8. Compose ONLY the primitives listed in DESIGN CONTEXT. Every primitive is a DEFAULT export — import it as `import Name from "../../../primitives/Name"`, never a named import. Shared types may be imported from ../../../lib/.
+9. Images: there is NO image host. Never invent an image URL — an invented hostname, and every reserved domain (*.example, *.invalid, *.test, example.com), can never resolve, so the image ships visibly broken both in the user's preview and in the developer's export zip. Instead write this exact inline SVG data URI as the value of EVERY image field in the mock data file — in full, once per field — under one comment line at the top of that file:
+   // Placeholder artwork: an inline SVG data URI, so it renders offline and inside the export zip. Swap in your real image URLs.
+   imageSrc: "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%204%203'%3E%3Crect%20width='4'%20height='3'%20fill='%23e4e7ec'/%3E%3C/svg%3E",
+   NEVER hoist it into a shared const and reference that (`const PLACEHOLDER_IMAGE = "…"` and then `imageSrc: PLACEHOLDER_IMAGE`). The editor's image-replace edit rewrites the mock data STRING LITERAL in place (contract 7.1), and an identifier is not a literal — so one shared const makes the user's whole export fail, permanently, naming a mock field they never saw. Repeating the URI is deliberate: verbose mock data is disposable output, a broken export is not.
+   It is copied verbatim, `%23` and all — an unencoded `#` is a raw hex colour and fails gate 3. Use a remote URL only when the brief supplies that exact URL. Alt text stays real and descriptive: it is the copy that survives the swap to real images. Rule 6's placeholder-domain guidance is about HREFS only and never applies to an image src.
 
 OUTPUT FORMAT — respond with exactly one JSON object and no other prose:
 {
@@ -201,12 +206,13 @@ files["src/pages/shop/mock/CartDrawer.data.ts"]:
 ```ts
 import type { CartDrawerProps } from "../sections/CartDrawer";
 
+// Placeholder artwork: an inline SVG data URI, so it renders offline and inside the export zip. Swap in your real image URLs.
 export const cartDrawerData: CartDrawerProps = {
   heading: "Your cart",
   emptyMessage: "Your cart is empty.",
   items: [
-    { key: "amber-dusk", name: "Amber Dusk Candle", unitPrice: 28, quantity: 1, imageSrc: "https://images.yourbrand.example/products/amber-dusk-thumb.jpg", imageAlt: "Amber Dusk candle" },
-    { key: "cedar-fog", name: "Cedar Fog Candle", unitPrice: 28, quantity: 2, imageSrc: "https://images.yourbrand.example/products/cedar-fog-thumb.jpg", imageAlt: "Cedar Fog candle" },
+    { key: "amber-dusk", name: "Amber Dusk Candle", unitPrice: 28, quantity: 1, imageSrc: "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%204%203'%3E%3Crect%20width='4'%20height='3'%20fill='%23e4e7ec'/%3E%3C/svg%3E", imageAlt: "Amber Dusk candle" },
+    { key: "cedar-fog", name: "Cedar Fog Candle", unitPrice: 28, quantity: 2, imageSrc: "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%204%203'%3E%3Crect%20width='4'%20height='3'%20fill='%23e4e7ec'/%3E%3C/svg%3E", imageAlt: "Cedar Fog candle" },
   ],
   removeLabel: "Remove",
   subtotalLabel: "Subtotal",

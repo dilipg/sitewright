@@ -526,6 +526,21 @@ interface ListItemContext {
   arrayPropName: string;
   /** The field on each item used as its stable key (e.g. "key"). */
   keyPropName: string;
+  /**
+   * The local id variable every child's node id is built from (e.g. "tierId"),
+   * i.e. the name of the `const tierId = `${nodeId}.tier-${tier.key}`` binding.
+   * Used to find WHICH element in the shared `.map()` body carries a given
+   * child id — the only way to learn which mock field feeds it.
+   */
+  itemIdName: string;
+  /**
+   * The `.map((tier) => ...)` callback parameter (e.g. "tier") — the root of
+   * every field reference on the item, and therefore the prefix that gets
+   * stripped to turn a source expression into a path inside the array element.
+   */
+  itemParamName: string;
+  /** The map callback itself: the only place a child of THIS item can be rendered. */
+  mapCallback: Node;
 }
 
 const REGEX_SPECIAL_CHARS = /[.*+?^${}()|[\]\\]/g;
@@ -592,6 +607,12 @@ function resolveListItemContext(project: Project, nodeId: string): ListItemConte
       const arrayPropName = mapped === undefined ? undefined : resolveDataArrayName(mapped);
       if (arrayPropName === undefined) continue;
 
+      const mapCallback =
+        mapCall.getArguments()[0]?.asKind(SyntaxKind.ArrowFunction) ??
+        mapCall.getArguments()[0]?.asKind(SyntaxKind.FunctionExpression);
+      const itemParamName = mapCallback?.getParameters()[0]?.getName();
+      if (mapCallback === undefined || itemParamName === undefined) continue;
+
       const prefixPattern = templateToPrefixPattern(template);
       const match = prefixPattern.exec(nodeId);
       if (match === null) continue;
@@ -605,19 +626,21 @@ function resolveListItemContext(project: Project, nodeId: string): ListItemConte
         childSuffix: remainder === "" ? undefined : remainder.slice(1),
         arrayPropName,
         keyPropName: keyAccess.getName(),
+        itemIdName: declaration.getName(),
+        itemParamName,
+        mapCallback,
       };
     }
   }
   return undefined;
 }
 
-/** Locates the ONE mock-data array element matching a resolved list-item context. */
-function findMockArrayElement(
+/** Locates a section's `<SectionName>Props`-annotated mock data object (contract 4.3's seam). */
+function findMockDataObject(
   project: Project,
   outDir: string,
   node: ManifestNode,
-  context: ListItemContext,
-): { element: ObjectLiteralExpression; mockFile: SourceFile } {
+): { dataObject: ObjectLiteralExpression; mockFile: SourceFile; mockPath: string } {
   const mockPath = join(outDir, dirname(node.file), "..", "mock", `${node.component}.data.ts`);
   const mockFile = project.getSourceFile(mockPath.replace(/\\/g, "/"));
   if (mockFile === undefined) {
@@ -631,6 +654,17 @@ function findMockArrayElement(
   if (dataObject === undefined) {
     throw new ExportError(`No ${node.component}Props mock object found in ${mockPath}.`);
   }
+  return { dataObject, mockFile, mockPath };
+}
+
+/** Locates the ONE mock-data array element matching a resolved list-item context. */
+function findMockArrayElement(
+  project: Project,
+  outDir: string,
+  node: ManifestNode,
+  context: ListItemContext,
+): { element: ObjectLiteralExpression; mockFile: SourceFile } {
+  const { dataObject, mockFile, mockPath } = findMockDataObject(project, outDir, node);
   const array = dataObject
     .getProperty(context.arrayPropName)
     ?.asKind(SyntaxKind.PropertyAssignment)
@@ -731,6 +765,126 @@ function findClassTarget(
   throw new ExportError(`No data-node-id root element found in "${node.file}" for node "${nodeId}".`);
 }
 
+/**
+ * The element inside a list item's `.map()` body that carries `nodeId` for
+ * this child suffix — i.e. `` nodeId={`${tierId}.badge`} ``, the shape contract
+ * 5.2/5.5 mandates. One `.map()` body renders every item, so this is the ONLY
+ * source location that says which mock field feeds this node.
+ *
+ * Matched structurally (head is empty, one span, the span's expression is the
+ * item-id binding, its literal is exactly `.<suffix>`) rather than by comparing
+ * source text, so formatting cannot change the answer.
+ */
+function findListItemChildElement(
+  context: ListItemContext,
+  childSuffix: string,
+): JsxOpeningElement | JsxSelfClosingElement | undefined {
+  for (const attribute of context.mapCallback.getDescendantsOfKind(SyntaxKind.JsxAttribute)) {
+    const name = attribute.getNameNode().getText();
+    if (name !== "nodeId" && name !== "data-node-id") continue;
+    const template = attribute
+      .getInitializer()
+      ?.asKind(SyntaxKind.JsxExpression)
+      ?.getExpression()
+      ?.asKind(SyntaxKind.TemplateExpression);
+    if (template === undefined) continue;
+    if (template.getHead().getLiteralText() !== "") continue;
+    const spans = template.getTemplateSpans();
+    if (spans.length !== 1) continue;
+    if (spans[0]!.getExpression().getText() !== context.itemIdName) continue;
+    if (spans[0]!.getLiteral().getLiteralText() !== `.${childSuffix}`) continue;
+    return (
+      attribute.getFirstAncestorByKind(SyntaxKind.JsxSelfClosingElement) ??
+      attribute.getFirstAncestorByKind(SyntaxKind.JsxOpeningElement)
+    );
+  }
+  return undefined;
+}
+
+/**
+ * The expression feeding a node's content: the mock-data reference bound to the
+ * attribute named by `override.key` (image replace, PRD 3.5), or — with no key,
+ * every ordinary copy edit — the node's single text-bearing child expression.
+ *
+ * Shared by BOTH text paths (literal node and list item) because both answer
+ * the same question, and answering it differently is exactly how the list-item
+ * path came to guess a field name from the node id instead of reading source.
+ */
+function resolveContentExpression(
+  element: JsxOpeningElement | JsxSelfClosingElement,
+  override: OverrideEntry,
+): Node | undefined {
+  if (override.key !== undefined) {
+    const keyed = attributeExpression(element, override.key);
+    if (keyed === undefined) {
+      throw new ExportError(
+        `Node "${override.nodeId}" has no "${override.key}" attribute bound to a prop; ` +
+          `a keyed text override rewrites the mock-data field feeding that attribute (PRD 3.5).`,
+      );
+    }
+    return keyed;
+  }
+
+  const container = element.isKind(SyntaxKind.JsxOpeningElement)
+    ? element.getFirstAncestorByKind(SyntaxKind.JsxElement)
+    : undefined;
+  if (container === undefined) {
+    throw new ExportError(`Node "${override.nodeId}" has no JSX children; text overrides need a text-bearing child.`);
+  }
+  const expressions = container.getJsxChildren().filter((child) => child.isKind(SyntaxKind.JsxExpression));
+  if (expressions.length !== 1) {
+    throw new ExportError(
+      `Node "${override.nodeId}" has ${expressions.length} child expressions; expected exactly one text-bearing prop (contract 7.1).`,
+    );
+  }
+  return expressions[0]!.asKindOrThrow(SyntaxKind.JsxExpression).getExpression();
+}
+
+/**
+ * Walks a mock-data field path from an object literal and rewrites its
+ * string-literal leaf (contract 7.1: the text channel rewrites LITERALS — a
+ * hoisted `const` is refused, never resolved, because one const feeds many
+ * nodes). Shared by both text paths; only the root differs (the section's
+ * whole mock object for a literal node, the ONE array element for a list item).
+ */
+function rewriteMockStringField(root: ObjectLiteralExpression, path: string[], override: OverrideEntry): void {
+  let current = root;
+  for (const segment of path.slice(0, -1)) {
+    const next = findProperty(current, segment)?.getInitializer()?.asKind(SyntaxKind.ObjectLiteralExpression);
+    if (next === undefined) {
+      throw new ExportError(`Mock field path "${path.join(".")}" not found for node "${override.nodeId}".`);
+    }
+    current = next;
+  }
+  const leaf = findProperty(current, path[path.length - 1]!)
+    ?.getInitializer()
+    ?.asKind(SyntaxKind.StringLiteral);
+  if (leaf === undefined) {
+    throw new ExportError(
+      `Mock field "${path.join(".")}" for node "${override.nodeId}" is not a string literal; text overrides rewrite string literals only.`,
+    );
+  }
+  leaf.setLiteralValue(override.value as string);
+}
+
+/**
+ * Text on a list item's child (contract 5.5: "they rewrite the matching content
+ * field directly, the same mechanism 4.3's props/mock-data seam already
+ * provides for section-level text").
+ *
+ * The field is resolved from SOURCE — find the element carrying this child's
+ * node id inside the `.map()` body, read the expression feeding its content,
+ * and strip the map parameter to get the path inside the array element. It is
+ * NOT resolved from the node id's last segment: contract 5.5 keys only the
+ * exporter-written `childClassNames`/`childHidden` maps by the id suffix, and
+ * the shipped templates deliberately name content fields differently from the
+ * suffixes (`.badge` -> `badgeLabel`, `.image` -> `imageSrc`,
+ * `.photo` -> `photoSrc`, `.cta` -> `ctaLabel`). Reading the suffix as a field
+ * name made an ordinary copy edit or image replace on a card apply in preview
+ * and then fail the export permanently — preview ≠ handover, the one
+ * unforgivable failure. Candidate-name guessing is not an option either: this
+ * is the deterministic spine, and a plausible-but-wrong rewrite ships silently.
+ */
 function applyListItemTextOverride(
   project: Project,
   outDir: string,
@@ -744,18 +898,25 @@ function applyListItemTextOverride(
       `Text override on "${override.nodeId}" targets a list item's own root; text overrides need a child field to rewrite.`,
     );
   }
-  const { element, mockFile } = findMockArrayElement(project, outDir, node, context);
-  const leaf = element
-    .getProperty(context.childSuffix)
-    ?.asKind(SyntaxKind.PropertyAssignment)
-    ?.getInitializer()
-    ?.asKind(SyntaxKind.StringLiteral);
-  if (leaf === undefined) {
+  const element = findListItemChildElement(context, context.childSuffix);
+  if (element === undefined) {
     throw new ExportError(
-      `Mock field "${context.childSuffix}" for node "${override.nodeId}" is not a string literal; text overrides rewrite string literals only.`,
+      `No element inside the "${context.arrayPropName}" map carries node id "${override.nodeId}"; ` +
+        "a list item's child must set nodeId={`${itemId}.<suffix>`} (contract 5.2).",
     );
   }
-  leaf.setLiteralValue(override.value as string);
+
+  const inner = resolveContentExpression(element, override);
+  const path = expressionToPath(inner?.getText() ?? "");
+  if (path === undefined || path.length < 2 || path[0] !== context.itemParamName) {
+    throw new ExportError(
+      `Cannot map node "${override.nodeId}" to a mock-data field: "${inner?.getText()}" is not a plain ` +
+        `"${context.itemParamName}.<field>" reference on the mapped item (contract 5.5).`,
+    );
+  }
+
+  const { element: arrayElement, mockFile } = findMockArrayElement(project, outDir, node, context);
+  rewriteMockStringField(arrayElement, path.slice(1), override);
   changed.add(mockFile);
 }
 
@@ -893,36 +1054,7 @@ function applyTextOverride(
     throw new ExportError(`No element carries data-node-id "${override.nodeId}"; cannot apply text override.`);
   }
 
-  const keyedExpression =
-    override.key === undefined ? undefined : attributeExpression(attached, override.key);
-  if (override.key !== undefined && keyedExpression === undefined) {
-    throw new ExportError(
-      `Node "${override.nodeId}" has no "${override.key}" attribute bound to a prop; ` +
-        `a keyed text override rewrites the mock-data field feeding that attribute (PRD 3.5).`,
-    );
-  }
-
-  let inner: import("ts-morph").Node | undefined;
-  if (keyedExpression !== undefined) {
-    inner = keyedExpression;
-  } else {
-    const container = attached.isKind(SyntaxKind.JsxOpeningElement)
-      ? attached.getFirstAncestorByKind(SyntaxKind.JsxElement)
-      : undefined;
-    if (container === undefined) {
-      throw new ExportError(`Node "${override.nodeId}" has no JSX children; text overrides need a text-bearing child.`);
-    }
-
-    const expressions = container
-      .getJsxChildren()
-      .filter((child) => child.isKind(SyntaxKind.JsxExpression));
-    if (expressions.length !== 1) {
-      throw new ExportError(
-        `Node "${override.nodeId}" has ${expressions.length} child expressions; expected exactly one text-bearing prop (contract 7.1).`,
-      );
-    }
-    inner = expressions[0]!.asKindOrThrow(SyntaxKind.JsxExpression).getExpression();
-  }
+  const inner = resolveContentExpression(attached, override);
   const propPath = expressionToPath(inner?.getText() ?? "");
   if (propPath === undefined) {
     throw new ExportError(
@@ -930,44 +1062,8 @@ function applyTextOverride(
     );
   }
 
-  const mockPath = join(outDir, dirname(node.file), "..", "mock", `${node.component}.data.ts`);
-  const mockFile = project.getSourceFile(mockPath.replace(/\\/g, "/"));
-  if (mockFile === undefined) {
-    throw new ExportError(`Mock data file for "${node.component}" not found at ${mockPath}.`);
-  }
-
-  const dataObject = mockFile
-    .getVariableDeclarations()
-    .find((declaration) => declaration.getTypeNode()?.getText() === `${node.component}Props`)
-    ?.getInitializer()
-    ?.asKind(SyntaxKind.ObjectLiteralExpression);
-  if (dataObject === undefined) {
-    throw new ExportError(`No ${node.component}Props mock object found in ${mockPath}.`);
-  }
-
-  let current = dataObject;
-  for (const segment of propPath.slice(0, -1)) {
-    const next = current
-      .getProperty(segment)
-      ?.asKind(SyntaxKind.PropertyAssignment)
-      ?.getInitializer()
-      ?.asKind(SyntaxKind.ObjectLiteralExpression);
-    if (next === undefined) {
-      throw new ExportError(`Mock field path "${propPath.join(".")}" not found for node "${override.nodeId}".`);
-    }
-    current = next;
-  }
-  const leaf = current
-    .getProperty(propPath[propPath.length - 1]!)
-    ?.asKind(SyntaxKind.PropertyAssignment)
-    ?.getInitializer()
-    ?.asKind(SyntaxKind.StringLiteral);
-  if (leaf === undefined) {
-    throw new ExportError(
-      `Mock field "${propPath.join(".")}" for node "${override.nodeId}" is not a string literal; text overrides rewrite string literals only.`,
-    );
-  }
-  leaf.setLiteralValue(override.value as string);
+  const { dataObject, mockFile } = findMockDataObject(project, outDir, node);
+  rewriteMockStringField(dataObject, propPath, override);
   changed.add(mockFile);
 }
 

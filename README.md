@@ -40,8 +40,8 @@ suites — it has just moved [further down](#run-it-from-source-contributors-and
 | | |
 |---|---|
 | **Docker Desktop** | That is the whole list. No Node, no Python, no uv on the host — the image carries Node 24, a uv-managed CPython 3.12, and `uv` itself. |
-| **RAM for Docker** | **4 GB or more.** Measured on a 3.8 GiB VM: the server container peaks around 825 MiB during a generation, with page fan-out capped at 2 workers (see [`WEBGEN_FANOUT_MAX_WORKERS`](#docker-notes-worth-knowing-before-they-surprise-you)). Below 4 GB, workers get killed with no output. |
-| **Disk** | ~1.6 GB for the image, plus ~1 GB of `node_modules` volumes (installed once per service, by design). |
+| **RAM for Docker** | **4 GB or more.** Measured on a 3.8 GiB VM: the server container peaks around 825 MiB during a generation, when page fan-out was running 2 workers. Fan-out now defaults to **serial**, one worker, which is strictly less memory (see [`WEBGEN_FANOUT_MAX_WORKERS`](#docker-notes-worth-knowing-before-they-surprise-you)). Below 4 GB, workers get killed with no output. |
+| **Disk** | ~1.6 GB for the image, plus **~240 MB** of `node_modules` volumes — five named volumes, filled once and shared by both services. Docker's own free space is what matters, not your C: drive; this machine's VM reported 925 GB free. |
 | **An API key** | Anthropic (`sk-ant-…`, <https://console.anthropic.com/>) or Google Gemini (`AIza…`, <https://aistudio.google.com/app/apikey>). It needs credit on it: **a generation costs $1.45–$2.58** depending on how many pages the plan comes back with. |
 
 Every command below is written for **bash / zsh** (macOS, Linux, or Git Bash on
@@ -105,9 +105,52 @@ accident.
 docker compose up
 ```
 
-The first run builds the image — about 4 minutes and 1.62 GB here. After that it
-is seconds, and because the repo is bind-mounted at `/app`, a `git pull` takes
-effect with no rebuild.
+That stays attached and streams both services' logs, which is what you want the
+first time — the progress below is all visible. If you would rather have one
+yes/no answer than a log stream, `docker compose up --wait` returns only when
+**both** services report healthy and exits non-zero if either fails to get
+there; it implies `-d`, so it hands you back your prompt instead of streaming.
+
+### What a first start looks like, and how to tell it from a hang
+
+The first start is slow, and most of the slowness is silent. Knowing which
+silence is normal is the difference between waiting two minutes and giving up
+after fifty. Measured on this machine (Docker Desktop 4.49.0, Windows 11, NVMe):
+
+| Phase | What compose prints | First run | Every run after |
+|---|---|---|---|
+| Build the image | live `#22 [stage-1 13/16] RUN uv sync …` progress, continuously | **118 s** | skipped entirely |
+| Create the five `node_modules` volumes | `Volume websitegenerator_root_node_modules Created`, ×5 | ~1 s | skipped (reused) |
+| Fill them from the image | `Container … Creating`, then **nothing at all** until it is done | 3–9 s | 0 s |
+| Start both, wait for health | `Created` → `Healthy`, one line each | 8–12 s | 8–12 s |
+| **Total** | | **~2.3 min** | **12–13 s** |
+
+Those are measured ranges across six starts, not estimates — wall clock from `up`
+to both services healthy. The build figure is a separate `--no-cache` build with
+the `node:24-bookworm-slim` and `uv` base images already pulled; a genuinely
+first-ever run adds their download (~410 MB) to it. The 1.62 GB image size is
+unchanged.
+
+So the honest summary is: **the first start is a ~2 minute build with a live
+progress bar, followed by ~20 seconds of mostly-silent container setup. Every
+start after that is 12–13 seconds.** If you are past the build and it has been
+silent at `Container … Creating` for more than about two minutes, something is
+wrong — that phase measured 3–9 seconds here, and 0 on every start after the
+first.
+
+To check whether a quiet stack is working or stuck, from a second terminal:
+
+```bash
+docker compose ps                 # per-service: starting / healthy / exited
+docker compose logs -f            # both services, live
+docker stats --no-stream          # CPU and block-I/O moving means work is happening
+```
+
+A dependency failure is loud and fast, not a hang. If the server cannot boot —
+by far the most likely cause being a missing master key — you get the
+entrypoint's full explanation, then `dependency failed to start: container
+websitegenerator-server-1 exited (1)`, and `up` exits non-zero. Measured at 4.8 s
+from `up` to that message.
 
 Two services come up from one image: the **server** on port 4000 and the
 **editor**'s Vite dev server on port 5173. Both are published on `127.0.0.1`
@@ -272,18 +315,55 @@ path, and **not destroyed by `docker compose down -v`.** That was verified by
 removing and recreating the containers twice, including with `-v`: the account
 survived, and the stored key still decrypted through the production decrypt path.
 
-The only volumes are anonymous ones over each `node_modules`, which exist to stop
-your host's Windows/macOS native binaries from shadowing the image's Linux ones.
-They are cheap to throw away — and must be, after a dependency change:
+The only volumes are five **named** ones over each `node_modules`, which exist to
+stop your host's Windows/macOS native binaries from shadowing the image's Linux
+ones. You can always see exactly which volumes belong to this project:
+
+```bash
+docker volume ls --filter label=com.docker.compose.project=websitegenerator
+```
+
+`docker compose down` keeps them, which is why every start after the first skips
+the fill phase entirely and takes ~13 s rather than ~22. After a **dependency
+change** you want them gone, so the image's fresh install can repopulate them:
 
 ```bash
 docker compose down -v && docker compose up --build
 ```
 
-`-v` is safe here *because* the data is bind-mounted. It discards only the
-`node_modules` volumes, which compose otherwise reuses even when it recreates a
-container — which is exactly how a stale dependency tree produces a confusing
+`-v` is safe here *because* the data is bind-mounted. It discards exactly those
+five volumes, by name, and nothing else on your machine — compose prints each one
+as it goes. A volume is only refilled from the image while it is empty, so
+without the `-v` a stale dependency tree survives and produces a confusing
 "module not found" a month later.
+
+> **These volumes used to be anonymous, and that was a bug worth understanding if
+> you started this stack before.** An anonymous volume is per-container and is
+> never reused across a `down`/`up`: each `up` created **ten** fresh ones (five
+> per service) and copied `node_modules` into every one of them, and a plain
+> `docker compose down` — which does not take `-v` — left all ten behind as
+> dangling volumes that nothing could name again. Measured: 10 new orphans and
+> ~478 MB per cycle, and one dogfood run accumulated **92 orphaned volumes,
+> 3.39 GB**. It also made `up` take 27–61 s instead of 13 s, most of it silent at
+> `Container … Creating`, which is what got reported as a hang.
+>
+> If you were running the old stack, note that switching to this one strands one
+> final set of ten: compose recreates the containers because the config changed,
+> and the anonymous volumes their predecessors held are detached rather than
+> deleted. Running `docker compose down -v` **before** you pull avoids that.
+>
+> Orphans you already have are stranded for good: `docker compose down -v` cannot
+> reach a volume that is already detached, and an anonymous volume carries no
+> project label, so there is nothing to filter on. Look at what you have first:
+>
+> ```bash
+> docker volume ls --filter dangling=true
+> ```
+>
+> On Docker 23.0 and later, `docker volume prune` (**without** `-a`) removes only
+> *anonymous* unused volumes, so it will not touch any named volume — yours or
+> another project's. It **will** remove other projects' anonymous volumes, so
+> read that list before you run it, and never use `-a`.
 
 ## The `docker compose exec` commands you will want
 
@@ -302,15 +382,19 @@ docker compose logs -f server
 
 - **Never paste `docker compose config` output anywhere.** It prints
   `WEBGEN_MASTER_KEY` in plaintext.
-- **`WEBGEN_FANOUT_MAX_WORKERS` is set to 2 in `compose.yaml`, and it is load-bearing.**
-  Page fan-out spawns one worker per route, and unset means *all of them at once*
-  — fine on a developer machine, fatal in a small VM. Measured in this image with
-  4 routes and no cap: two of the four workers were killed with **empty stdout
-  and empty stderr**, surfacing only as `manifest CLI produced no result`, which
-  reads like a compiler bug rather than the memory exhaustion it was. Each worker
-  is a whole Python process that shells out to `tsc`, so the binding constraint
-  is memory, not CPU. Raise it if you give Docker more RAM; the run gets slower,
-  never wrong.
+- **`WEBGEN_FANOUT_MAX_WORKERS` is deliberately *not* set in `compose.yaml`.**
+  Unset now means **serial** — one page worker at a time — because parallel
+  fan-out raced Kitaru's SQLite metadata store and lost a manifest commit, which
+  ships a section's `.tsx` with no manifest entry: the site looks finished in the
+  canvas and can never be exported. `compose.yaml` used to set this to `2` to
+  avoid an out-of-memory kill, and that setting caused the worse failure. Serial
+  is slower and visible; the alternative was silent and unfixable. Raising it
+  reopens that race, and separately reopens the memory problem it was originally
+  set for: measured in this image with 4 routes and no cap, two of the four
+  workers were killed with **empty stdout and empty stderr**, surfacing only as
+  `manifest CLI produced no result`, which reads like a compiler bug rather than
+  the memory exhaustion it was. Each worker is a whole Python process that shells
+  out to `tsc`, so the binding constraint is memory, not CPU.
 - **The container runs as root**, which is what avoids bind-mount ownership
   problems on Windows. Acceptable for a single-user local tool; not a model for a
   deployment.

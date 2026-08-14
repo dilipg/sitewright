@@ -149,6 +149,7 @@ import {
   BILLABLE_JOB_KINDS, claimNextJob, finishJob, findJobById, isSafeRunId, recordJobRun, requeueJob,
   type Job, type JobKind,
 } from "./jobs.ts";
+import { describeOrchestratorFailure } from "./orchestrator-failure.ts";
 import { findProjectById } from "./projects.ts";
 import { forwardToPreview } from "./preview-forward.ts";
 import { type PreviewPool } from "./preview-pool.ts";
@@ -1267,31 +1268,30 @@ export class JobWorker {
       // Nothing to delete.
     }
 
-    const safeStdout = redactSecrets(spawned.stdout);
-    const safeStderr = redactSecrets(spawned.stderr);
     if (spawned.code !== 0) {
-      // BOTH streams, always, and stdout FIRST.
+      // BOTH streams, always, stdout FIRST, and — since dogfood finding G1 —
+      // the STRUCTURED REPORT ahead of either of them.
       //
-      // This used to be `stderr.trim() !== "" ? stderr : stdout`, which made
-      // every failure undiagnosable in practice: `uv run` writes its own chatter
-      // to stderr (e.g. `Bytecode compiled ...` on a first run in a fresh
-      // container), so stderr is essentially never empty — while
-      // `acceptance.py` prints its structured `{"failed_stage": ...}` report to
-      // STDOUT. The preference therefore reported noise and discarded the one
-      // thing that says what broke. Measured during task 3b: a generation failed
-      // after 11s inside Docker and the reason was unrecoverable, which cost a
-      // whole diagnostic cycle and, indirectly, a wasted run.
+      // This was once `stderr.trim() !== "" ? stderr : stdout`, which made every
+      // failure undiagnosable: `uv run` writes its own chatter to stderr (e.g.
+      // `Bytecode compiled ...` on a first run in a fresh container), so stderr
+      // is essentially never empty — while `acceptance.py` prints its
+      // `{"failed_stage": ...}` report to STDOUT. Reporting both streams fixed
+      // that half and is kept.
       //
-      // stdout first because it carries the report; both labelled so a reader
-      // can tell which stream said what; and the budget split so a chatty
-      // stderr cannot crowd out the report.
-      const parts: string[] = [];
-      if (safeStdout.trim() !== "") parts.push(`stdout: ${safeStdout.slice(-1500)}`);
-      if (safeStderr.trim() !== "") parts.push(`stderr: ${safeStderr.slice(-1500)}`);
-      const tail = parts.length > 0 ? parts.join("\n---\n") : "(no output on either stream)";
-      return { kind: "failed", error: `orchestrator exited with code ${String(spawned.code)}: ${tail}` };
+      // What it did NOT fix, and what `describeOrchestratorFailure` is for: the
+      // payload. A `.slice(-1500)` window into a nested-escaped Python `repr`
+      // lands in the middle of noise, and on the real 11m14s / $1.28 failure it
+      // opened AFTER the report's own `{` — so the row held the report's tail
+      // with nothing to say it was one. Every reason this module used to state
+      // inline now lives in that module's comment, next to the code that
+      // enforces it.
+      return {
+        kind: "failed",
+        error: describeOrchestratorFailure({ code: spawned.code, stdout: spawned.stdout, stderr: spawned.stderr }),
+      };
     }
-    return { kind: "succeeded", resultJson: JSON.stringify({ stdout: safeStdout.slice(-4000) }) };
+    return { kind: "succeeded", resultJson: JSON.stringify({ stdout: redactSecrets(spawned.stdout).slice(-4000) }) };
   }
 
   /**

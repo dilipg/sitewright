@@ -1152,11 +1152,20 @@ describe("JobWorker: generate", () => {
     expect(finished?.status).toBe("failed");
     // The point of the fix: the reason a user can act on must be present.
     expect(finished?.error).toContain("primitives exhausted retries");
-    expect(finished?.error).toContain("failed_stage");
+    // DOGFOOD FINDING G1 raised the bar here, and these two assertions are the
+    // difference. It is no longer enough that the report is somewhere in the
+    // message: `describeOrchestratorFailure` must EXTRACT it, so the stage is
+    // named on its own line above both raw tails rather than left inside a
+    // 1500-character window that could open anywhere. See
+    // orchestrator-failure.test.ts for the real-artefact coverage; this asserts
+    // only that the worker routes a nonzero exit through it at all.
+    expect(finished?.error).toContain("failed stage: design");
+    expect(finished?.error?.indexOf("failed stage:")).toBeLessThan(finished!.error!.indexOf("--- raw stdout"));
     // And the noise is kept alongside it rather than swapped for it, labelled so
     // a reader can tell which stream said what.
-    expect(finished?.error).toContain("stdout:");
-    expect(finished?.error).toContain("stderr:");
+    expect(finished?.error).toContain("--- raw stdout");
+    expect(finished?.error).toContain("--- raw stderr");
+    expect(finished?.error).toContain("Bytecode compiled 1234 files");
   });
 
   it("fails cleanly (never throws out of runOnce) when the request payload has no brief", async () => {

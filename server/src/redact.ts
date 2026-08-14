@@ -50,7 +50,19 @@ const KEY_PATTERNS: ReadonlyArray<{ pattern: RegExp; replacement: string }> = [
   { pattern: /AIza[A-Za-z0-9_-]{10,}/g, replacement: "AIza[redacted]" },
   // Google AI Studio "auth" key: `AQ.` + an unknown-length body that may itself
   // contain dots.
-  { pattern: /\bAQ\.[A-Za-z0-9._-]{16,}/g, replacement: "AQ.[redacted]" },
+  //
+  // THE SECOND ALTERNATIVE IS NOT DECORATION, and it is the only pattern here
+  // that needs one. This is the only entry anchored on a word boundary (see the
+  // `FAQ.` case in redact.test.ts), and a word boundary is exactly what an
+  // ESCAPE SEQUENCE can destroy: text that reads `…\nAQ.<key>` — a key at the
+  // start of a line, inside a string whose newline was escaped by whatever
+  // printed it, which is precisely the shape dogfood finding G1's real artefact
+  // is full of — presents `n` immediately before `AQ.`, so there is no boundary
+  // and the key went UNREDACTED into a log and into `job.error`. The lookbehind
+  // matches the same key when the preceding whitespace is an escape sequence
+  // rather than real whitespace. `FAQ.` is untouched either way: `F` is neither
+  // a boundary nor an escape.
+  { pattern: /(?:\b|(?<=\\[nrt0]))AQ\.[A-Za-z0-9._-]{16,}/g, replacement: "AQ.[redacted]" },
 ];
 
 export function redactSecrets(text: string): string {

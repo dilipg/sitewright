@@ -301,6 +301,202 @@ describe("exportProject: list-item overrides", () => {
   });
 });
 
+/**
+ * THE CASE THE LIST-ITEM SUITE ABOVE COULD NOT CATCH, and the reason a
+ * preview ≠ handover defect shipped.
+ *
+ * There is exactly one list-item TEXT test above, and it targets
+ * `home.pricing.tier-starter.name` — the single shape in the whole project
+ * where a node id's last segment happens to EQUAL the mock field it feeds
+ * (`.name` -> `name`). The exporter resolved the field to rewrite FROM THAT
+ * SUFFIX, so it passed for the one tested shape and failed for every other
+ * shape the shipped archetype templates actually use:
+ *
+ *   `.badge` -> `badgeLabel`   (pricing-tiers, product-card-grid)
+ *   `.cta`   -> `ctaLabel`     (pricing-tiers, and the fixture below)
+ *   `.image` -> `imageSrc`     (cart-drawer, product-card-grid)
+ *   `.photo` -> `photoSrc`     (team-grid)
+ *
+ * So an ordinary double-click copy edit on a card's badge — and an image
+ * replace on a card's image (PRD 3.5: the TEXT channel with `key: "src"`) —
+ * applied in the preview and then made the export fail PERMANENTLY with
+ * `Mock field "badge" ... is not a string literal`. Naming a field the user
+ * never saw, on an edit they watched succeed.
+ *
+ * The field must be resolved from SOURCE — which mock field feeds this node's
+ * text child, or feeds the attribute named by `override.key` — exactly as the
+ * literal-node path (`applyTextOverride`) has always resolved it. Never from
+ * the id, and never by guessing candidate field names: a wrong-but-plausible
+ * rewrite ships silently into handover, which is worse than a loud refusal.
+ */
+describe("exportProject: a list item whose mock field is not named after its id suffix", () => {
+  it("plain copy edit on `.badge` rewrites `badgeLabel`, leaving the JSX seam intact", { timeout: 60_000 }, () => {
+    const source = fixtureCopyWithOverrides([
+      { nodeId: "home.pricing.tier-growth.badge", channel: "text", value: "Best value" },
+    ]);
+    // premise: the suffix and the field genuinely differ, or the case is vacuous
+    expect(readOut(source, "src/pages/home/sections/Pricing.tsx")).toContain("{tier.badgeLabel}");
+
+    const outDir = join(tempDir("export-suffix-badge-"), "export");
+    exportProject(source, { outDir, skipBuild: true });
+
+    const mock = readOut(outDir, "src/pages/home/mock/Pricing.data.ts");
+    expect(mock).toContain('badgeLabel: "Best value"');
+    expect(mock).not.toContain("Most popular");
+    // no field literally named after the suffix was invented
+    expect(mock).not.toContain("badge:");
+    // sibling tiers untouched, and the props seam preserved
+    expect(mock).toContain('"Starter"');
+    expect(readOut(outDir, "src/pages/home/sections/Pricing.tsx")).toContain("{tier.badgeLabel}");
+  });
+
+  it("`key` picks between two differently-named fields on the SAME node (`.cta`: ctaLabel vs ctaHref)", { timeout: 60_000 }, () => {
+    const source = fixtureCopyWithOverrides([
+      { nodeId: "home.pricing.tier-starter.cta", channel: "text", value: "Try it free" },
+      { nodeId: "home.pricing.tier-growth.cta", channel: "text", key: "href", value: "/about" },
+    ]);
+    const outDir = join(tempDir("export-suffix-cta-"), "export");
+    exportProject(source, { outDir, skipBuild: true });
+
+    const mock = readOut(outDir, "src/pages/home/mock/Pricing.data.ts");
+    // the unkeyed edit hit the text child's field...
+    expect(mock).toMatch(/key:\s*"starter"[\s\S]*?ctaLabel:\s*"Try it free"/);
+    expect(mock).not.toContain('"Start free"');
+    // ...and the keyed one hit the attribute's field on the OTHER item only
+    expect(mock).toMatch(/key:\s*"growth"[\s\S]*?ctaHref:\s*"\/about"/);
+    expect(mock).toMatch(/key:\s*"starter"[\s\S]*?ctaHref:\s*"\/"/);
+    expect(mock).toMatch(/key:\s*"growth"[\s\S]*?ctaLabel:\s*"Start trial"/);
+  });
+
+  it("image replace (key `src`) on a list item's image rewrites `avatarSrc`", { timeout: 60_000 }, () => {
+    const source = fixtureCopyWithOverrides([
+      {
+        nodeId: "home.testimonials.testimonial-elena.avatar",
+        channel: "text",
+        key: "src",
+        value: "https://cdn.example.com/new-avatar.jpg",
+      },
+    ]);
+    addListItemAvatar(source);
+
+    const outDir = join(tempDir("export-suffix-avatar-"), "export");
+    exportProject(source, { outDir, skipBuild: true });
+
+    const mock = readOut(outDir, "src/pages/home/mock/Testimonials.data.ts");
+    expect(mock).toContain('avatarSrc: "https://cdn.example.com/new-avatar.jpg"');
+    // the targeted item only, and its alt sibling untouched
+    expect(mock).toMatch(/key:\s*"elena"[\s\S]*?avatarSrc:\s*"https:\/\/cdn\.example\.com\/new-avatar\.jpg"/);
+    expect(mock).toContain("avatars/priya.jpg");
+    expect(mock).toContain("avatars/marcus.jpg");
+    expect(mock).toMatch(/key:\s*"elena"[\s\S]*?avatarAlt:\s*"Portrait of elena"/);
+    // the swap landed in data, never in JSX (contract 7.1's props seam)
+    expect(readOut(outDir, "src/pages/home/sections/Testimonials.tsx")).toContain("src={testimonial.avatarSrc}");
+  });
+
+  it("still refuses when no mock field feeds the node, rather than guessing one", { timeout: 60_000 }, () => {
+    // `formatMoney(item.price)`-style wrappers, a hoisted const, a typo'd key:
+    // all must fail loudly. Here the named attribute exists on no element.
+    const source = fixtureCopyWithOverrides([
+      { nodeId: "home.pricing.tier-growth.badge", channel: "text", key: "src", value: "x" },
+    ]);
+    const outDir = join(tempDir("export-suffix-refuse-"), "export");
+    expect(() => exportProject(source, { outDir, skipBuild: true })).toThrow(/no "src" attribute/);
+    expect(existsSync(outDir)).toBe(false);
+  });
+
+  it("refuses a node inside the map that renders a SECTION-level prop, not the item's own field", { timeout: 60_000 }, () => {
+    // The reason resolution is anchored to the map parameter and not merely
+    // "the field the expression names". Here a per-item node renders the
+    // section's shared `description` prop. Both the suffix (`description`) and
+    // the bare expression (`description`) collide with a field the tier DOES
+    // have — so a resolver that trusted either would rewrite `tier.description`,
+    // a field this component no longer renders: the preview shows the shared
+    // section text edited, the export writes to a dead per-item field, and
+    // nothing anywhere reports a problem. A silent wrong rewrite is worse than
+    // a refusal, because it ships into handover.
+    const source = fixtureCopyWithOverrides([
+      { nodeId: "home.pricing.tier-growth.description", channel: "text", value: "Rewritten" },
+    ]);
+    const sectionPath = join(source, "src", "pages", "home", "sections", "Pricing.tsx");
+    const rewired = readFileSync(sectionPath, "utf8").replace("{tier.description}", "{description}");
+    // premise: the fixture still renders the item's own field there
+    expect(rewired, "fixture's Pricing no longer renders {tier.description}").not.toContain("{tier.description}");
+    writeFileSync(sectionPath, rewired);
+
+    const outDir = join(tempDir("export-suffix-shared-"), "export");
+    expect(() => exportProject(source, { outDir, skipBuild: true })).toThrow(
+      /is not a plain "tier\.<field>" reference on the mapped item/,
+    );
+    expect(existsSync(outDir)).toBe(false);
+  });
+});
+
+/**
+ * Adds the list-item IMAGE shape the fixture has no instance of but four
+ * shipped templates do (`cart-drawer`/`product-card-grid`: `.image` ->
+ * `imageSrc`; `team-grid`: `.photo` -> `photoSrc`): a mapped item's child
+ * whose id suffix differs from the mock field feeding its `src`.
+ *
+ * Mutating the COPY, not `fixtures/acme-landing` itself — the fixture is the
+ * invariant suite's subject and its rendered pixels are load-bearing there
+ * (see the reorder case in decisions.md's 2026-08-02 rows). Same technique the
+ * "DERIVED list" case above uses for the same reason.
+ */
+function addListItemAvatar(projectDir: string): void {
+  const sectionPath = join(projectDir, "src", "pages", "home", "sections", "Testimonials.tsx");
+  const section = readFileSync(sectionPath, "utf8")
+    .replace(
+      'import Heading from "../../../primitives/Heading";',
+      'import Heading from "../../../primitives/Heading";\nimport Image from "../../../primitives/Image";',
+    )
+    .replace("  quote: string;", "  avatarSrc: string;\n  avatarAlt: string;\n  quote: string;")
+    .replace(
+      "                {testimonial.childHidden?.quote !== true && (",
+      "                {testimonial.childHidden?.avatar !== true && (\n" +
+        "                  <Image\n" +
+        "                    nodeId={`${testimonialId}.avatar`}\n" +
+        "                    src={testimonial.avatarSrc}\n" +
+        "                    alt={testimonial.avatarAlt}\n" +
+        "                    className={testimonial.childClassNames?.avatar}\n" +
+        "                  />\n" +
+        "                )}\n" +
+        "                {testimonial.childHidden?.quote !== true && (",
+    );
+  // premise: every replacement landed, or the case would test nothing
+  expect(section, "fixture's Testimonials no longer has the shape this case mutates").toContain(
+    "src={testimonial.avatarSrc}",
+  );
+  expect(section).toContain("avatarSrc: string;");
+  expect(section).toContain('import Image from "../../../primitives/Image";');
+  writeFileSync(sectionPath, section);
+
+  const dataPath = join(projectDir, "src", "pages", "home", "mock", "Testimonials.data.ts");
+  const data = readFileSync(dataPath, "utf8").replace(
+    /key: "(\w+)",/g,
+    (_match, key: string) =>
+      `key: "${key}",\n      avatarSrc: "https://images.acme.example/avatars/${key}.jpg",\n` +
+      `      avatarAlt: "Portrait of ${key}",`,
+  );
+  expect(data.match(/avatarSrc:/g)).toHaveLength(3);
+  writeFileSync(dataPath, data);
+
+  // gate 4 / validateOverrides: a list item's id must still be a registered,
+  // active manifest node, pattern-attached like its siblings.
+  const manifestPath = join(projectDir, "manifest.json");
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as Manifest;
+  for (const key of ["priya", "marcus", "elena"]) {
+    manifest.nodes[`home.testimonials.testimonial-${key}.avatar`] = {
+      route: "/",
+      file: "src/pages/home/sections/Testimonials.tsx",
+      component: "Testimonials",
+      element: "Image",
+      editable: ["text", "style", "layout", "visibility"],
+      status: "active",
+    };
+  }
+  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+}
+
 describe("exportProject: failure behavior", () => {
   it("a gate-failing project aborts with a report and leaves no output directory", { timeout: 60_000 }, () => {
     const outDir = join(tempDir("export-out-"), "export");

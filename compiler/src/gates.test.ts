@@ -1,10 +1,32 @@
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import type { GateReport } from "./gates";
 import { runGates } from "./gates";
+
+/**
+ * Skips ONLY the fixture's own top-level `dist/`, never a `dist` anywhere else.
+ *
+ * This was `!src.includes("dist")` — a substring match against the whole
+ * absolute path — and that also stripped `node_modules/react-router-dom/dist/`,
+ * i.e. the package's type declarations. The copied project then failed `tsc` on
+ * `src/main.tsx` (a missing module) BEFORE reaching the defect these tests
+ * deliberately introduce, so `failures[0]` was the wrong file and the assertion
+ * broke.
+ *
+ * It passed on the machine this was written on for an accidental reason worth
+ * recording: a `node_modules` exists in an ANCESTOR of `%TEMP%` there, so Node's
+ * resolver found the types anyway. Inside the shipped Docker image — and on
+ * `ubuntu-latest`, which is what `.github/workflows/ci.yml` runs `npm run check`
+ * on — there is no such ancestor, `npm run check` exits 1, and CI is red while
+ * the host stays green. Measured, not inferred.
+ */
+function skipFixtureDist(src: string): boolean {
+  return relative(cleanFixture, src).split(sep)[0] !== "dist";
+}
+
 
 const fixturesDir = fileURLToPath(new URL("../../fixtures/", import.meta.url));
 const cleanFixture = `${fixturesDir}acme-landing`;
@@ -643,7 +665,7 @@ describe("runGates: gate 1 typecheck (contract section 8's \"build passes\")", (
     const dir = mkdtempSync(join(tmpdir(), "gate1-typecheck-"));
     // Borrow the fixture wholesale (it has node_modules + tsconfig), then
     // introduce the exact defect seen live: a field used but never declared.
-    cpSync(cleanFixture, dir, { recursive: true, filter: (src) => !src.includes("dist") });
+    cpSync(cleanFixture, dir, { recursive: true, filter: skipFixtureDist });
     const heroPath = join(dir, "src", "pages", "home", "sections", "Hero.tsx");
     writeFileSync(
       heroPath,
@@ -690,7 +712,7 @@ describe("runGates: gate 1 typecheck (contract section 8's \"build passes\")", (
       // typechecking is whole-program, but a worker must only answer for its
       // own route (the same containment gate 4 already applies).
       const dir = mkdtempSync(join(tmpdir(), "gate1-scoped-typecheck-"));
-      cpSync(cleanFixture, dir, { recursive: true, filter: (src) => !src.includes("dist") });
+      cpSync(cleanFixture, dir, { recursive: true, filter: skipFixtureDist });
       const aboutPath = join(dir, "src", "pages", "about", "sections", "AboutIntro.tsx");
       writeFileSync(
         aboutPath,

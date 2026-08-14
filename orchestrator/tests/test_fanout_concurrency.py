@@ -19,8 +19,11 @@ inherit by accident.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
+from orchestrator.config import ORCHESTRATOR_ROOT
 from orchestrator.fanout import max_parallel_workers
 
 
@@ -57,3 +60,47 @@ class TestExplicitOptIn:
         monkeypatch.setenv("WEBGEN_FANOUT_MAX_WORKERS", bad)
         with pytest.raises(ValueError):
             max_parallel_workers()
+
+
+class TestTheReadmeAgreesWithTheCode:
+    """The README described BOTH defaults at once, in the two halves two
+    different people last touched: the Docker half said unset means serial (true),
+    while the from-source half said "unset means one worker per route at once …
+    and is the setting the wall-clock figures were measured under" (false on both
+    counts once the default flipped). A contributor reading the from-source path
+    got the wrong model of the default and an untrue provenance for the timings.
+
+    No test could have caught that, because nothing in the suite reads the README.
+    This does. It is intentionally narrow — a claim about the UNSET default, whose
+    truth `max_parallel_workers()` decides — rather than a prose linter.
+    """
+
+    README = ORCHESTRATOR_ROOT.parent / "README.md"
+
+    def test_the_readme_exists_where_this_looks_for_it(self) -> None:
+        # premise guard: a moved README would make everything below vacuous
+        assert self.README.is_file()
+
+    def test_no_half_of_the_readme_claims_unset_means_parallel(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("WEBGEN_FANOUT_MAX_WORKERS", raising=False)
+        assert max_parallel_workers() == 1, "premise: the default really is serial"
+
+        text = self.README.read_text(encoding="utf-8")
+        for claim in ("one worker per route at once", "fan-out is **uncapped**"):
+            assert claim not in text, (
+                f"README still claims {claim!r}, but WEBGEN_FANOUT_MAX_WORKERS unset "
+                f"means {max_parallel_workers()} worker(s)."
+            )
+
+    def test_every_mention_of_the_variable_sits_near_the_word_serial(self) -> None:
+        """Each place the variable is named must carry the default it actually
+        has. Checked per mention, because the defect was one mention out of three
+        being stale, not the file lacking the word."""
+        text = self.README.read_text(encoding="utf-8")
+        mentions = [m.start() for m in re.finditer(r"WEBGEN_FANOUT_MAX_WORKERS", text)]
+        assert len(mentions) >= 3, mentions  # RAM row, Docker note, from-source step
+        for start in mentions:
+            window = text[max(0, start - 600) : start + 600]
+            assert "serial" in window, text[max(0, start - 200) : start + 200]

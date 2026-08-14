@@ -22,9 +22,16 @@ import kitaru
 from kitaru import checkpoint, flow
 
 from orchestrator.model_call import call_model_structured_impl
+from orchestrator.placeholder_image import repair_image_sources
 from orchestrator.portable import link_directory, run_project_typecheck
 from orchestrator.runlog import append_run_event, default_run_log_path
-from orchestrator.section_pipeline import COMPILER_DIR, MAX_ATTEMPTS, _run_compiler_cli, materialize
+from orchestrator.section_pipeline import (
+    COMPILER_DIR,
+    MAX_ATTEMPTS,
+    REPAIR_WARNING_PREFIX,
+    _run_compiler_cli,
+    materialize,
+)
 
 EXPECTED_SHELL_FILES = {"src/shell/AppShell.tsx", "src/shell/Nav.tsx", "src/shell/Footer.tsx"}
 
@@ -52,6 +59,7 @@ Rules (machine-checked):
 - Internal links use react-router's `Link` (`import {{ Link }} from "react-router-dom"`, `to={{route.path}}`), NEVER a raw <a href>. The app is a client-side-routed SPA; a raw anchor triggers a full document reload, which throws away all React state (fatal for anything holding fetched data, e.g. a cart).
 - SKIP parameterized routes in nav: a path containing ":" (e.g. "/product/:id") is a template, not a destination, and linking to it ships a dead link to the literal URL. Filter them out (`routes.filter((route) => !route.path.includes(":"))`).
 - Style ONLY with Tailwind utilities over the token CSS variables in DESIGN CONTEXT. NEVER raw hex, NEVER raw px.
+- IMAGES (a logo above all): there is NO image host. Never invent an image URL — an invented hostname, and every reserved domain (*.example, *.invalid, *.test, example.com), can never resolve, so the image ships visibly broken on EVERY page of the site and in the developer's export zip, and no gate can see it. Prefer wordmark TEXT for the brand. If you do render an image, its src is this exact inline SVG data URI, written out in full: "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%204%203'%3E%3Crect%20width='4'%20height='3'%20fill='%23e4e7ec'/%3E%3C/svg%3E" — copied verbatim, `%23` and all, because an unencoded `#` is a raw hex colour and fails a gate.
 - Compose ONLY the primitives listed in DESIGN CONTEXT, imported from ../primitives/<Name>.
 - Shell elements carry no data-node-id/nodeId — the shell is not canvas-editable in v1.
 - AppShell accepts `{{ children }}: {{ children: ReactNode }}` and renders Nav, then <main>{{children}}</main>, then Footer.
@@ -221,7 +229,23 @@ def write_shell(
     shell_dir.mkdir(parents=True)
     (shell_dir / "routes.ts").write_text(routes_ts, encoding="utf-8", newline="\n")
     for rel_path, content in shell_result["files"].items():
-        (project / rel_path).write_text(content, encoding="utf-8", newline="\n")
+        # The shell was OUTSIDE both halves of the image fix: rule 9 reaches the
+        # 28 SECTION archetypes and the repair funnel reaches the two section
+        # write paths, and the shell is neither. A logo rendered as an `Image` —
+        # the shell's most natural use of one — would therefore ship broken on
+        # EVERY page of every generated site, with no gate able to see it (gate 2
+        # collects `href` only, gate 3 matches hex/px only). Same repair, same
+        # announcement; this write runs in the parent process, so the print
+        # already reaches the stream the job result carries.
+        repaired, replaced = repair_image_sources(content)
+        if replaced:
+            print(
+                f"{REPAIR_WARNING_PREFIX} {len(replaced)} unloadable image URL(s) in "
+                f"{rel_path} (first: {replaced[0]}) — a reserved domain can never "
+                "resolve; wrote the placeholder data URI instead",
+                flush=True,
+            )
+        (project / rel_path).write_text(repaired, encoding="utf-8", newline="\n")
 
     if brand_name:
         brand_scaffold(project_dir, brand_name)

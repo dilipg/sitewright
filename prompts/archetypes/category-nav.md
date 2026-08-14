@@ -1,5 +1,5 @@
 ---
-version: 1.0.2
+version: 1.0.3
 archetype: category-nav
 ---
 [SYSTEM]
@@ -14,9 +14,10 @@ CONTRACT DIGEST — every rule is machine-checked; a violation fails a gate and 
 6. Every href must exist in the provided route table or be an explicit external URL. This archetype has no real subcategory routes to link to (this is a marketing/storefront generator, not a catalog backend) — every category tile links to the site's own real shop/storefront route (whichever route in the table is the product-listing page); do NOT invent a subcategory route or use a bare `#` anchor.
 7. Interactive elements needing business logic receive a typed handler prop, wired in mock data to a no-op with a `// TODO: integrate` comment.
 8. Compose ONLY the primitives listed in DESIGN CONTEXT. Every primitive is a DEFAULT export — import it as `import Name from "../../../primitives/Name"`, never a named import. Shared types may be imported from ../../../lib/.
-9. Images: there is NO image host. Never invent an image URL — an invented hostname, and every reserved domain (*.example, *.invalid, *.test, example.com), can never resolve, so the image ships visibly broken both in the user's preview and in the developer's export zip. Instead declare ONE module-level const at the top of the mock data file and use it for every image src in that file:
+9. Images: there is NO image host. Never invent an image URL — an invented hostname, and every reserved domain (*.example, *.invalid, *.test, example.com), can never resolve, so the image ships visibly broken both in the user's preview and in the developer's export zip. Instead write this exact inline SVG data URI as the value of EVERY image field in the mock data file — in full, once per field — under one comment line at the top of that file:
    // Placeholder artwork: an inline SVG data URI, so it renders offline and inside the export zip. Swap in your real image URLs.
-   const PLACEHOLDER_IMAGE = "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%204%203'%3E%3Crect%20width='4'%20height='3'%20fill='%23e4e7ec'/%3E%3C/svg%3E";
+   imageSrc: "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%204%203'%3E%3Crect%20width='4'%20height='3'%20fill='%23e4e7ec'/%3E%3C/svg%3E",
+   NEVER hoist it into a shared const and reference that (`const PLACEHOLDER_IMAGE = "…"` and then `imageSrc: PLACEHOLDER_IMAGE`). The editor's image-replace edit rewrites the mock data STRING LITERAL in place (contract 7.1), and an identifier is not a literal — so one shared const makes the user's whole export fail, permanently, naming a mock field they never saw. Repeating the URI is deliberate: verbose mock data is disposable output, a broken export is not.
    It is copied verbatim, `%23` and all — an unencoded `#` is a raw hex colour and fails gate 3. Use a remote URL only when the brief supplies that exact URL. Alt text stays real and descriptive: it is the copy that survives the swap to real images. Rule 6's placeholder-domain guidance is about HREFS only and never applies to an image src.
 
 OUTPUT FORMAT — respond with exactly one JSON object and no other prose:
@@ -143,14 +144,12 @@ files["src/pages/shop/mock/CategoryNav.data.ts"]:
 import type { CategoryNavProps } from "../sections/CategoryNav";
 
 // Placeholder artwork: an inline SVG data URI, so it renders offline and inside the export zip. Swap in your real image URLs.
-const PLACEHOLDER_IMAGE = "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%204%203'%3E%3Crect%20width='4'%20height='3'%20fill='%23e4e7ec'/%3E%3C/svg%3E";
-
 export const categoryNavData: CategoryNavProps = {
   heading: "Shop by category",
   categories: [
-    { key: "candles", name: "Candles", imageSrc: PLACEHOLDER_IMAGE, imageAlt: "A row of lit candles", href: "/shop" },
-    { key: "diffusers", name: "Diffusers", imageSrc: PLACEHOLDER_IMAGE, imageAlt: "A reed diffuser on a shelf", href: "/shop" },
-    { key: "gift-sets", name: "Gift Sets", imageSrc: PLACEHOLDER_IMAGE, imageAlt: "A wrapped gift set box", href: "/shop" },
+    { key: "candles", name: "Candles", imageSrc: "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%204%203'%3E%3Crect%20width='4'%20height='3'%20fill='%23e4e7ec'/%3E%3C/svg%3E", imageAlt: "A row of lit candles", href: "/shop" },
+    { key: "diffusers", name: "Diffusers", imageSrc: "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%204%203'%3E%3Crect%20width='4'%20height='3'%20fill='%23e4e7ec'/%3E%3C/svg%3E", imageAlt: "A reed diffuser on a shelf", href: "/shop" },
+    { key: "gift-sets", name: "Gift Sets", imageSrc: "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%204%203'%3E%3Crect%20width='4'%20height='3'%20fill='%23e4e7ec'/%3E%3C/svg%3E", imageAlt: "A wrapped gift set box", href: "/shop" },
   ],
 };
 ```

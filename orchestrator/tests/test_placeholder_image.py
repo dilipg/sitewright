@@ -23,6 +23,7 @@ actually produced; they cannot prove a model obeys prose.
 
 from __future__ import annotations
 
+import json
 import re
 import xml.etree.ElementTree as ElementTree
 from pathlib import Path
@@ -33,10 +34,11 @@ import pytest
 from orchestrator.design_pipeline import PRIMITIVE_SPECS
 from orchestrator.page_pipeline import DEDICATED_TEMPLATES
 from orchestrator.placeholder_image import (
+    HOISTED_CONST_NAME,
     PLACEHOLDER_COMMENT,
-    PLACEHOLDER_CONST_NAME,
     PLACEHOLDER_IMAGE_DATA_URI,
     find_unloadable_image_urls,
+    inline_hoisted_string_consts,
     is_unloadable_image_url,
     is_unresolvable_host,
     repair_image_sources,
@@ -44,6 +46,7 @@ from orchestrator.placeholder_image import (
 from orchestrator.placeholder_shield import shield, unshield
 from orchestrator.prompts import PROMPTS_DIR, load_template, render_template
 from orchestrator.section_pipeline import (
+    is_mock_data_file,
     write_files_repairing_images,
     write_section_files,
     write_section_output,
@@ -101,13 +104,43 @@ def test_the_image_rule_reaches_the_rendered_system_prompt(archetype: str) -> No
     }
     rendered = render_template(load_template(archetype), context)
 
-    # the literal the model is to copy, and the name it binds it to
+    # the literal the model is to copy, shown AS a field's quoted value
     assert PLACEHOLDER_IMAGE_DATA_URI in rendered.system, archetype
-    assert PLACEHOLDER_CONST_NAME in rendered.system, archetype
-    # and WHY, naming the failure. An unexplained "use this constant" reads as
+    assert f'imageSrc: "{PLACEHOLDER_IMAGE_DATA_URI}"' in rendered.system, archetype
+    # and WHY, naming the failure. An unexplained "use this literal" reads as
     # style advice and gets ignored; the `<UNKNOWN>` fix needed the same.
     assert "never resolve" in rendered.system.lower(), archetype
     assert "*.example" in rendered.system, archetype
+
+
+@pytest.mark.parametrize("archetype", ALL_ARCHETYPES)
+def test_every_archetype_forbids_hoisting_the_uri_into_a_shared_const(archetype: str) -> None:
+    """C1, the whole-branch review's Critical, pinned at the prompt.
+
+    The first version of this rule told every page agent to declare one
+    `const PLACEHOLDER_IMAGE = "..."` per mock data file and reference it. That
+    makes the image field an `Identifier`, and contract 7.1's text channel — which
+    image replace (PRD 3.5 / feature 7.7) IS, with key `src` — rewrites a
+    `StringLiteral` or refuses. So one shared const turned a single image edit
+    into a permanent whole-export failure.
+
+    The const name must still APPEAR (naming the anti-pattern is what makes the
+    prohibition legible), but only inside a prohibition — so this asserts both:
+    the name is present, and it is never presented as a declaration to copy.
+    """
+    context = fixture_render_context() | {
+        "section_slug": archetype,
+        "section_brief": f"Test brief for {archetype}.",
+    }
+    system = render_template(load_template(archetype), context).system
+
+    assert HOISTED_CONST_NAME in system, archetype
+    assert f"NEVER hoist it into a shared const" in system, archetype
+    # the exact declaration the old rule taught must not be teachable any more
+    assert f'const {HOISTED_CONST_NAME} = "{PLACEHOLDER_IMAGE_DATA_URI}"' not in system, archetype
+    # and the reason is stated, not just the ban
+    assert "STRING LITERAL" in system, archetype
+    assert "7.1" in system, archetype
 
 
 @pytest.mark.parametrize("archetype", ALL_ARCHETYPES)
@@ -119,24 +152,49 @@ def test_no_archetype_teaches_an_image_url_that_cannot_load(archetype: str) -> N
     found = find_unloadable_image_urls(source)
     assert found == [], (
         f"{archetype}.md teaches image URLs that can never resolve: {sorted(set(found))}. "
-        f"Use the {PLACEHOLDER_CONST_NAME} constant instead."
+        "Inline the placeholder data URI at each image field instead."
     )
 
 
-@pytest.mark.parametrize(
-    "archetype", ["cart-drawer", "category-nav", "feature-spotlight",
-                  "product-card-grid", "product-detail", "team-grid"]
-)
-def test_the_image_archetypes_show_the_const_pattern_in_their_mock_data(archetype: str) -> None:
-    """The six archetypes whose canonical example has images must demonstrate
-    the whole pattern — declaration plus use — or a model has the rule without
-    an example of applying it."""
+IMAGE_ARCHETYPES = ["cart-drawer", "category-nav", "feature-spotlight",
+                    "product-card-grid", "product-detail", "team-grid"]
+
+
+@pytest.mark.parametrize("archetype", IMAGE_ARCHETYPES)
+def test_the_image_archetypes_inline_the_uri_at_every_image_field(archetype: str) -> None:
+    """C1 again, this time at the worked example — which outweighs a prose rule.
+
+    Every image field in the canonical mock data must carry the URI as its own
+    quoted string, and the example must contain no hoisted declaration at all.
+    Before the fix this file asserted the OPPOSITE ("used unquoted as an
+    identifier, not re-inlined as a string per item"), which is how a
+    contract-violating shape got pinned as intended.
+    """
     source = (PROMPTS_DIR / f"{archetype}.md").read_text(encoding="utf-8")
     example = source[source.index("[ARCHETYPE]") :]
-    assert f'const {PLACEHOLDER_CONST_NAME} = "{PLACEHOLDER_IMAGE_DATA_URI}";' in example
+
+    assert f'const {HOISTED_CONST_NAME} =' not in example
+    assert f": {HOISTED_CONST_NAME}," not in example
+    # every image field is its own literal, and there is more than one of them
+    # (each of these six archetypes maps over a list) — so the duplication the
+    # contract requires is actually demonstrated, not merely described
+    assert example.count(f'"{PLACEHOLDER_IMAGE_DATA_URI}"') >= 2
+    # the one-line handover story survives the change
     assert PLACEHOLDER_COMMENT in example
-    # used unquoted as an identifier, not re-inlined as a string per item
-    assert f": {PLACEHOLDER_CONST_NAME}," in example
+
+
+@pytest.mark.parametrize("archetype", IMAGE_ARCHETYPES)
+def test_the_worked_examples_bind_the_uri_to_an_image_key(archetype: str) -> None:
+    """Not just "the URI is in the file" — it has to be the VALUE of a field
+    whose name is an image field, which is what the exporter walks to."""
+    source = (PROMPTS_DIR / f"{archetype}.md").read_text(encoding="utf-8")
+    example = source[source.index("[ARCHETYPE]") :]
+    bound_keys = re.findall(rf'(\w+): "{re.escape(PLACEHOLDER_IMAGE_DATA_URI)}"', example)
+    assert bound_keys, archetype
+    assert all(re.search(r"src|image|photo|logo|avatar", key, re.IGNORECASE) for key in bound_keys), (
+        archetype,
+        bound_keys,
+    )
 
 
 def test_the_docs_toc_placeholder_links_are_deliberately_left_alone() -> None:
@@ -370,3 +428,198 @@ def test_a_clean_section_is_written_byte_for_byte(tmp_path: Path, capsys) -> Non
         encoding="utf-8"
     ) == clean
     assert capsys.readouterr().out == ""
+
+
+# --------------------------------------------------------------------------
+# C1's second backstop: a hoisted string const, inlined back to a literal
+#
+# The prompt half of the C1 fix cannot be tested by running it. This half can,
+# and it is what makes the forbidden shape unshippable even when the model
+# hoists anyway — which is the likely disobedience, because sharing a long
+# repeated literal is what a competent programmer does everywhere else.
+# --------------------------------------------------------------------------
+
+
+HOISTED_MOCK = (
+    "import type { TeamGridProps } from \"../sections/TeamGrid\";\n"
+    "\n"
+    f'const {HOISTED_CONST_NAME} = "{PLACEHOLDER_IMAGE_DATA_URI}";\n'
+    "\n"
+    "export const teamGridData: TeamGridProps = {\n"
+    "  members: [\n"
+    f'    {{ key: "a", photoSrc: {HOISTED_CONST_NAME}, photoAlt: "A" }},\n'
+    f'    {{ key: "b", photoSrc: {HOISTED_CONST_NAME}, photoAlt: "B" }},\n'
+    "  ],\n"
+    "};\n"
+)
+
+
+class TestInlineHoistedStringConsts:
+    def test_it_replaces_every_reference_with_the_literal(self) -> None:
+        inlined_source, names = inline_hoisted_string_consts(HOISTED_MOCK)
+        assert names == [HOISTED_CONST_NAME]
+        # what the exporter needs: a quoted literal at each field, twice
+        assert inlined_source.count(f'photoSrc: "{PLACEHOLDER_IMAGE_DATA_URI}"') == 2
+        # and no identifier reference survives anywhere
+        assert HOISTED_CONST_NAME not in inlined_source
+
+    def test_it_removes_the_declaration_it_inlined(self) -> None:
+        inlined_source, _ = inline_hoisted_string_consts(HOISTED_MOCK)
+        assert f"const {HOISTED_CONST_NAME}" not in inlined_source
+        # the rest of the file is otherwise intact
+        assert "import type { TeamGridProps }" in inlined_source
+        assert "export const teamGridData: TeamGridProps = {" in inlined_source
+
+    def test_it_is_inert_on_a_file_that_already_uses_literals(self) -> None:
+        clean = HOISTED_MOCK.replace(
+            f'const {HOISTED_CONST_NAME} = "{PLACEHOLDER_IMAGE_DATA_URI}";\n', ""
+        ).replace(HOISTED_CONST_NAME, f'"{PLACEHOLDER_IMAGE_DATA_URI}"')
+        assert inline_hoisted_string_consts(clean) == (clean, [])
+
+    def test_it_is_idempotent(self) -> None:
+        once, _ = inline_hoisted_string_consts(HOISTED_MOCK)
+        twice, names = inline_hoisted_string_consts(once)
+        assert twice == once
+        assert names == []
+
+    def test_it_generalises_past_images(self) -> None:
+        """The defect class is wider than images: a shared copy const breaks a
+        TEXT edit on those nodes identically, because contract 7.1 rewrites the
+        literal either way. The general rule is simpler than the special case."""
+        source = 'const CTA = "Get started";\nexport const d = { label: CTA };\n'
+        inlined_source, names = inline_hoisted_string_consts(source)
+        assert names == ["CTA"]
+        assert inlined_source == 'export const d = { label: "Get started" };\n'
+
+    def test_it_leaves_an_exported_const_alone(self) -> None:
+        """Removing an `export`ed declaration could break the section file's own
+        import beside it — so an exported const is not eligible, and the field
+        stays as it was rather than being made subtly wrong."""
+        source = 'export const SHARED = "x";\nexport const d = { label: SHARED };\n'
+        assert inline_hoisted_string_consts(source) == (source, [])
+
+    def test_it_leaves_a_const_declared_inside_a_function_alone(self) -> None:
+        """Anchored at column 0: a local binding is not a module const, and
+        inlining one would be a rewrite of logic rather than of data."""
+        source = 'function f() {\n  const local = "x";\n  return local;\n}\n'
+        assert inline_hoisted_string_consts(source) == (source, [])
+
+    def test_it_does_not_rewrite_the_name_inside_a_string_or_comment(self) -> None:
+        """The identifier substitution walks TypeScript atoms, consuming comments
+        and strings first — so a mention of the const's name in prose is prose."""
+        source = (
+            'const LOGO = "x";\n'
+            "// LOGO is the brand mark\n"
+            'export const d = { note: "set LOGO later", src: LOGO };\n'
+        )
+        inlined_source, names = inline_hoisted_string_consts(source)
+        assert names == ["LOGO"]
+        assert "// LOGO is the brand mark" in inlined_source
+        assert '"set LOGO later"' in inlined_source
+        assert 'src: "x"' in inlined_source
+
+    def test_an_unreferenced_const_is_left_where_the_model_put_it(self) -> None:
+        """This exists to make a REFERENCE compilable, not to tidy code."""
+        source = 'const UNUSED = "x";\nexport const d = { label: "y" };\n'
+        assert inline_hoisted_string_consts(source) == (source, [])
+
+
+def test_the_write_funnel_inlines_a_hoisted_const_in_mock_data(tmp_path: Path, capsys) -> None:
+    """The backstop is WIRED, not merely correct — the same thing that had to be
+    pinned for the image repair and for the brand-name guard."""
+    write_files_repairing_images(
+        str(tmp_path), {"src/pages/about/mock/TeamGrid.data.ts": HOISTED_MOCK}
+    )
+    written = (tmp_path / "src" / "pages" / "about" / "mock" / "TeamGrid.data.ts").read_text(
+        encoding="utf-8"
+    )
+    assert HOISTED_CONST_NAME not in written
+    assert written.count(f'photoSrc: "{PLACEHOLDER_IMAGE_DATA_URI}"') == 2
+    # announced, with the const named, for the same reason the image repair is
+    out = capsys.readouterr().out
+    assert HOISTED_CONST_NAME in out
+    assert "7.1" in out
+
+
+def test_the_write_funnel_leaves_a_component_file_alone(tmp_path: Path) -> None:
+    """Scoped to mock data on purpose: that is the only file contract 7.1's text
+    channel rewrites. A component's module const is ordinary code, and inlining
+    it would be an unasked-for rewrite of the file a developer reads."""
+    component = f'const CLASSES = "flex";\nexport default function S() {{ return CLASSES; }}\n'
+    write_files_repairing_images(
+        str(tmp_path), {"src/pages/about/sections/TeamGrid.tsx": component}
+    )
+    assert (tmp_path / "src" / "pages" / "about" / "sections" / "TeamGrid.tsx").read_text(
+        encoding="utf-8"
+    ) == component
+
+
+@pytest.mark.parametrize(
+    "rel_path,expected",
+    [
+        ("src/pages/home/mock/Hero.data.ts", True),
+        ("src\\pages\\home\\mock\\Hero.data.ts", True),  # a model-authored key has arrived this way
+        ("src/pages/home/sections/Hero.tsx", False),
+        ("src/pages/home/mock/Hero.ts", False),
+    ],
+)
+def test_which_files_the_inlining_applies_to(rel_path: str, expected: bool) -> None:
+    assert is_mock_data_file(rel_path) is expected
+
+
+# --------------------------------------------------------------------------
+# I3: the SHELL was outside both halves of the fix
+#
+# The rule reached 28 SECTION archetypes and the repair reached the two SECTION
+# write paths. `src/shell/` is neither — and a logo is the shell's most natural
+# use of an image, so a broken one ships on EVERY page of every generated site,
+# invisible to every gate (gate 2 collects `href` only; gate 3 matches hex/px).
+# --------------------------------------------------------------------------
+
+
+def test_the_shell_agent_is_told_the_image_rule() -> None:
+    from orchestrator.shell_pipeline import SHELL_SYSTEM
+
+    system = SHELL_SYSTEM.format(brand_name="Acme")
+    assert PLACEHOLDER_IMAGE_DATA_URI in system
+    assert "never resolve" in system.lower()
+    assert "*.example" in system
+
+
+def test_the_shell_write_path_repairs_an_unloadable_logo(tmp_path: Path, capsys) -> None:
+    """The deterministic half for the shell. `write_shell` runs in the parent
+    process, so the warning already lands on the stream the job result carries."""
+    from orchestrator import shell_pipeline
+
+    project = tmp_path / "run-shell"
+    (project / "src" / "shell").mkdir(parents=True)
+    nav = f'export default function Nav() {{ return <img src="{DOGFOOD_URL}" />; }}\n'
+
+    # everything after the write is a subprocess (tsc, the gates CLI) and is not
+    # what this test is about
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr(shell_pipeline, "ensure_node_modules", lambda *a, **k: None)
+        monkey.setattr(
+            shell_pipeline,
+            "run_project_typecheck",
+            lambda *a, **k: type("P", (), {"returncode": 0, "stdout": ""})(),
+        )
+        monkey.setattr(
+            shell_pipeline,
+            "_run_compiler_cli",
+            lambda *a, **k: type("P", (), {"stdout": json.dumps({"passed": True, "gates": []})})(),
+        )
+        shell_pipeline.write_shell.__wrapped__(
+            str(project),
+            "export const routes = [];\n",
+            {"files": {"src/shell/Nav.tsx": nav}},
+            1,
+        )
+    finally:
+        monkey.undo()
+
+    written = (project / "src" / "shell" / "Nav.tsx").read_text(encoding="utf-8")
+    assert DOGFOOD_URL not in written
+    assert PLACEHOLDER_IMAGE_DATA_URI in written
+    assert "Nav.tsx" in capsys.readouterr().out

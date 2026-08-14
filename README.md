@@ -289,10 +289,11 @@ a landing page for a neighbourhood bakery, with a menu and an order form
 ```
 
 **Before you press "Generate site", read the next section.** That button spends
-$1.45–$2.58 of your own money, takes about nine to eleven minutes, and there is
-no way to take it back. Naming the number of pages you want in the brief itself
-("exactly two pages: a home page and a contact page") is the one lever you have
-over both figures.
+$1.45–$2.58 of your own money, takes at least nine to eleven minutes (the
+measured range, taken before fan-out went serial — see ["What to
+expect"](#what-to-expect)), and there is no way to take it back. Naming the number
+of pages you want in the brief itself ("exactly two pages: a home page and a
+contact page") is the one lever you have over both figures.
 
 Once it starts you get a progress screen: the current stage, how many sections
 are done, and an elapsed clock. When it finishes, open the project and you are on
@@ -426,14 +427,27 @@ docker compose logs -f server
 
 Everything in this section applies to both paths.
 
-**A generation costs $1.45–$2.58 and takes about nine to eleven minutes.** Both
-figures are measured from real runs on real keys, not estimated: **$1.4516689
-across 18 billed calls in 9m 09s** for a 2-route site, and **$2.5774346 across 29
-calls** for a 4-route one. Cost scales with the number of pages the planner
-returns and with how many sections need a retry — one run spent a third of its
-bill on three attempts at the design system alone. The app's own warning says
-"about $1.74 and about 11 minutes", which is the middle of that range; treat the
-range as the truth. **It is your key and your money.**
+**A generation costs $1.45–$2.58, and the measured times were nine to eleven
+minutes — but expect longer now, and read the next paragraph before you use those
+timings for anything.** Both figures are measured from real runs on real keys, not
+estimated: **$1.4516689 across 18 billed calls in 9m 09s** for a 2-route site, and
+**$2.5774346 across 29 calls** for a 4-route one. Cost scales with the number of
+pages the planner returns and with how many sections need a retry — one run spent
+a third of its bill on three attempts at the design system alone. The app's own
+warning says "about $1.74 and about 11 minutes", which is the middle of that
+range; treat the **cost** range as the truth. **It is your key and your money.**
+
+**The wall-clock figures were measured with page fan-out running two workers in
+parallel, and fan-out now defaults to serial** — so they are a floor, not a
+prediction, and the more pages the plan returns the further off they are. The
+generation phase is roughly N× longer for N routes than it was under parallel
+fan-out (in one 2-route run, fan-out was 325 s of 545 s). This is deliberate,
+and the reason is in [the Docker
+note](#docker-notes-worth-knowing-before-they-surprise-you): parallel fan-out
+raced Kitaru's SQLite metadata store and lost a manifest commit, which ships a
+site that looks finished and can never be exported. **Cost is unaffected** —
+serial changes when calls happen, not how many. No re-measurement has been run
+since the default changed; that is a known gap rather than a rounded-up number.
 
 **Your first generation in a freshly created container will probably fail in
 about 13 seconds, having spent $0.00. Submit the brief again and it works.** This
@@ -754,10 +768,13 @@ the database can be committed by accident.
 ## 9. Generate your first site
 
 Same as [Docker step 6](#6-generate-your-first-site), and the same warnings in
-["What to expect"](#what-to-expect) apply. Note that fan-out is **uncapped** from
-source (`WEBGEN_FANOUT_MAX_WORKERS` unset means one worker per route at once),
-which is faster on a developer machine and is the setting the wall-clock figures
-were measured under.
+["What to expect"](#what-to-expect) apply. Fan-out behaves **identically from
+source and in Docker**: `WEBGEN_FANOUT_MAX_WORKERS` unset means **serial**, one
+page worker at a time, on both paths — see [the Docker
+note](#docker-notes-worth-knowing-before-they-surprise-you) for why, since the
+reason is about Kitaru's metadata store rather than about containers. Setting it
+to a number greater than 1 is how the old parallel behaviour comes back, on
+either path, and it reopens that race.
 
 ## Restarting later
 
@@ -883,7 +900,8 @@ worth making.
 Four packages, one repo:
 
 - **`orchestrator/`** (Python 3.12, uv) — the agent pipeline: intake, planner,
-  design system, shell, and a parallel page fan-out that generates each section.
+  design system, shell, and a page fan-out that generates each section (serial by
+  default; see [`WEBGEN_FANOUT_MAX_WORKERS`](#docker-notes-worth-knowing-before-they-surprise-you)).
 - **`compiler/`** (TypeScript) — the deterministic spine: the manifest service,
   the token deriver, seven validation gates, the exporter, and the preview
   bridge.

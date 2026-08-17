@@ -34,6 +34,7 @@ from orchestrator.placeholder_image import inline_hoisted_string_consts, repair_
 from orchestrator.placeholder_shield import shield, unshield
 from orchestrator.prompts import load_template, render_template
 from orchestrator.runlog import append_run_event, default_run_log_path
+from orchestrator.safe_path import safe_project_path, unsafe_model_paths
 
 REPO_ROOT = ORCHESTRATOR_ROOT.parent
 COMPILER_DIR = REPO_ROOT / "compiler"
@@ -209,7 +210,11 @@ def prepare_workspace_dir(project_dir: str, routes: list[dict] | None = None) ->
         plan_dir = target / "plan"
         plan_dir.mkdir(parents=True, exist_ok=True)
         for name, content in preserved_plan.items():
-            (plan_dir / name).write_text(content, encoding="utf-8")
+            # These names came from `plan_dir.iterdir()`, so they are bare
+            # basenames by construction — but they go through the same funnel
+            # as everything else, because "this one is fine" is the reasoning
+            # that produced the other nine traversal defects.
+            safe_project_path(plan_dir, name).write_text(content, encoding="utf-8")
     return str(target)
 
 
@@ -276,6 +281,16 @@ def write_files_repairing_images(project_dir: str, files: dict[str, str]) -> lis
        whole export permanently. Scoped to mock data because that is the only
        file the text channel rewrites; a component file is left untouched.
     """
+    # Every key is a KEY OF THE MODEL'S OWN output, so it is untrusted:
+    # `Path(root) / '../../evil.ts'` traverses and `Path(root) / '/etc/passwd'`
+    # discards the root entirely, after which the `mkdir(parents=True)` below
+    # CREATES the chain it names (task M4). Resolved for the WHOLE mapping
+    # first, before a single byte is written: refusing partway through would
+    # leave the section half-written on disk. `validate_file_paths` normally
+    # refuses one earlier still and drives a retry; this raise is what makes
+    # the write safe without depending on every caller remembering.
+    targets = {rel_path: safe_project_path(project_dir, rel_path) for rel_path in files}
+
     written = []
     for rel_path, content in files.items():
         repaired, replaced = repair_image_sources(content)
@@ -296,7 +311,7 @@ def write_files_repairing_images(project_dir: str, files: dict[str, str]) -> lis
                     "export; inlined the literal at each reference instead",
                     flush=True,
                 )
-        target = Path(project_dir) / rel_path
+        target = targets[rel_path]
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(repaired, encoding="utf-8", newline="\n")
         written.append(rel_path)
@@ -441,6 +456,23 @@ def validate_root_proposal(section_id: str, manifest_proposals: list[dict]) -> s
         f'root node id "{section_id}". Every section must register its own root '
         "element, not just its children (contract 5.2/5.4)."
     )
+
+
+def validate_file_paths(files: dict[str, str]) -> str:
+    """Every key of the model's `files` mapping must stay inside the project.
+
+    The section pipeline is the ONLY one of the three write paths with no
+    fixed expected-file set to check against — a section's filenames follow
+    its component name, so they are genuinely free-form — which is why the
+    design and shell agents' stray-file checks already refuse an escaping path
+    for free and this one needs its own. Returns a failure-report line so a bad
+    path costs one retry rather than the whole run; `safe_project_path` refuses
+    it again at the write regardless (task M4).
+    """
+    issues = unsafe_model_paths(files)
+    if not issues:
+        return ""
+    return "\n".join(f"- content: {issue}" for issue in issues)
 
 
 def validate_section_meta(model_result: dict) -> str:
@@ -917,6 +949,11 @@ def generate_section_flow(
         root_failure = validate_root_proposal(section_id, proposals_of(materialize(generated)))
         if root_failure:
             failure_report = root_failure
+            continue
+
+        path_failure = validate_file_paths(files_of(materialize(generated)))
+        if path_failure:
+            failure_report = path_failure
             continue
 
         if assemble_index:

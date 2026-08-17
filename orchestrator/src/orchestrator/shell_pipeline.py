@@ -25,6 +25,7 @@ from orchestrator.model_call import call_model_structured_impl
 from orchestrator.placeholder_image import repair_image_sources
 from orchestrator.portable import link_directory, run_project_typecheck
 from orchestrator.runlog import append_run_event, default_run_log_path
+from orchestrator.safe_path import safe_project_path, unsafe_model_paths
 from orchestrator.section_pipeline import (
     COMPILER_DIR,
     MAX_ATTEMPTS,
@@ -223,6 +224,14 @@ def write_shell(
     project_dir: str, routes_ts: str, shell_result: dict, attempt: int, brand_name: str = ""
 ) -> dict:
     project = Path(project_dir)
+    # Before the rmtree below, for the same reason as write_primitives: an
+    # escaping model-authored key is a retryable output defect, and raising
+    # from the write loop would already have deleted the whole shell — the one
+    # directory every page on the site imports from. Task M4.
+    path_issues = unsafe_model_paths(shell_result.get("files", {}))
+    if path_issues:
+        return {"ok": False, "issues": path_issues}
+
     shell_dir = project / "src" / "shell"
     if shell_dir.exists():
         shutil.rmtree(shell_dir)
@@ -245,7 +254,10 @@ def write_shell(
                 "resolve; wrote the placeholder data URI instead",
                 flush=True,
             )
-        (project / rel_path).write_text(repaired, encoding="utf-8", newline="\n")
+        # Model-authored key; see safe_path.py (task M4). `validate_shell_output`
+        # already refuses a stray path before this checkpoint runs — this is the
+        # backstop that does not depend on the caller having done so.
+        safe_project_path(project, rel_path).write_text(repaired, encoding="utf-8", newline="\n")
 
     if brand_name:
         brand_scaffold(project_dir, brand_name)

@@ -19,6 +19,7 @@ from orchestrator.design_context import build_design_context
 from orchestrator.model_call import call_model_structured_impl
 from orchestrator.portable import link_directory, run_project_typecheck
 from orchestrator.runlog import append_run_event, default_run_log_path
+from orchestrator.safe_path import safe_project_path, unsafe_model_paths
 from orchestrator.section_pipeline import (
     COMPILER_DIR,
     GENERATED_DIR,
@@ -476,12 +477,26 @@ def write_primitives(project_dir: str, primitives_result: dict, attempt: int) ->
     """Full-replaces src/primitives/, writes the inventory + gallery page,
     then validates: tsc --noEmit + gates. Returns the failure report."""
     project = Path(project_dir)
+    # Before the rmtree below, not after: a model-authored key that escapes the
+    # project is a RETRYABLE output defect (`validate_primitive_output`'s fixed
+    # expected-file set normally catches it first), and raising from the write
+    # loop would already have deleted every primitive the previous attempt
+    # produced. Task M4.
+    path_issues = unsafe_model_paths(primitives_result.get("files", {}))
+    if path_issues:
+        return {"ok": False, "issues": path_issues}
+
     primitives_dir = project / "src" / "primitives"
     if primitives_dir.exists():
         shutil.rmtree(primitives_dir)
     primitives_dir.mkdir(parents=True)
     for rel_path, content in primitives_result["files"].items():
-        (project / rel_path).write_text(content, encoding="utf-8", newline="\n")
+        # A model-authored key: `Path(root) / '/etc/passwd'` discards the root
+        # outright (task M4). `validate_primitive_output`'s fixed expected-file
+        # set already refuses one before this checkpoint runs, so this is the
+        # structural backstop for any future caller that skips that check —
+        # including a Kitaru replay invoked directly.
+        safe_project_path(project, rel_path).write_text(content, encoding="utf-8", newline="\n")
 
     (project / "design-inventory.json").write_text(
         json.dumps({"primitives": primitives_result["inventory"]}, indent=2) + "\n",

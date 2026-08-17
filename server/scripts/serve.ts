@@ -14,6 +14,7 @@ import { adoptExistingProjects } from "../src/adopt.ts";
 import { resolveCodeVersion } from "../src/code-version.ts";
 import { buildRoutes } from "../src/compose.ts";
 import { openDatabase } from "../src/db.ts";
+import { seedDevAdmin } from "../src/dev-admin.ts";
 import { JobWorker } from "../src/job-worker.ts";
 import { markRunningJobsInterrupted } from "../src/jobs.ts";
 import { loadMasterKey, MASTER_KEY_ENV_VAR } from "../src/master-key.ts";
@@ -294,8 +295,25 @@ server.on("error", (error) => {
 // imported for a unit test (see compose.test.ts's comment on exactly why).
 server.on("upgrade", createPreviewUpgradeListener({ db, pool }));
 
-server.listen(port, () => {
-  console.log(`server listening on http://localhost:${port} (db: ${dbPath})`);
+// An EXPLICIT host, where this used to pass none. `listen(port)` with no host
+// binds every interface, which put a session cookie carrying no Secure flag
+// (INSECURE_COOKIES=1 is the documented local setting) on the tester's LAN.
+// `compose.yaml` already said why that is wrong — "127.0.0.1, not 0.0.0.0: this
+// is a single-user local tool" — but it enforced it with a `127.0.0.1:` port
+// mapping, so the from-source path never got the protection Docker did.
+// `--host` remains available for anyone who genuinely wants to expose it, and
+// choosing it also refuses the seeded default account below.
+const host = requireValueIfPresent("host") ?? "127.0.0.1";
+
+// BEFORE `listen`, not inside its callback: once the socket is open a request
+// can arrive, and a login racing the seed would answer the deliberately uniform
+// `invalid email or password` for a credential the console is about to print.
+// Awaited at module scope, so a boot that cannot seed fails loudly here rather
+// than serving with an empty user table it claims to have populated.
+await seedDevAdmin(db, { host });
+
+server.listen(port, host, () => {
+  console.log(`server listening on http://${host}:${port} (db: ${dbPath})`);
   if (!secureCookies) console.log("INSECURE_COOKIES=1 — Secure flag omitted; local development only");
 
   // Registered only once the server is genuinely up, and deliberately NOT at

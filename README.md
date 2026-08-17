@@ -649,10 +649,44 @@ server; a different one makes every stored API key undecryptable. It must be
 canonical padded base64, not hex — see [the Docker note](#1-generate-a-master-key--once-and-never-again),
 which explains why the length error reads like the wrong thing.
 
-## 4. Create your account
+## 4. Your account: `admin` / `admin`
 
-There is no sign-up page. Accounts exist **only** through the operator CLI —
-that is deliberate and structural, not a missing feature.
+**You do not need to create one.** On its first boot against an empty database,
+the server creates a local account and prints it:
+
+```
+  created the default local account — sign in with admin / admin
+```
+
+Sign in with **`admin`** as the email and **`admin`** as the password. (It is not
+an email address, and does not need to be — the address check lives in the
+operator CLI, not in login.)
+
+This is a **known password**, so it is deliberately fenced in three ways, and
+each one is a real refusal you can trigger:
+
+| Condition | What happens |
+| --- | --- |
+| The database already has **any** user | Skipped. It cannot resurrect an account you deleted, overwrite one you made, or undo a password you changed. |
+| You start with `--host` set to anything but loopback | **Refused**, with a line telling you to use the CLI instead. A known credential must not be reachable from your network. |
+| `WEBGEN_NO_DEV_ADMIN=1` | Skipped entirely. Use this and the CLI below if you want no default account at all. |
+
+Change it whenever you like:
+
+```bash
+node server/scripts/user.ts reset-password --email admin --db "$WEBGEN_DB"
+```
+
+> **If you are re-using a database from an earlier run, there is no default
+> account** — the seed only fires on an empty user table, so an existing
+> database means an existing account. Either sign in with that one, or point
+> `--db` at a new path.
+
+### Additional accounts
+
+There is still no sign-up page, and no HTTP route can create a user — that is
+deliberate and structural, not a missing feature. Extra accounts come only from
+the operator CLI:
 
 ```bash
 node server/scripts/user.ts create --email you@example.com --db "$WEBGEN_DB"
@@ -676,11 +710,11 @@ node server/scripts/user.ts reset-password --email you@example.com --db "$WEBGEN
 
 ## 5. Set a spend cap
 
-New accounts get a **$10** cap per rolling 24 hours. Set it to whatever you are
-actually willing to spend:
+Every account — the default `admin` included — gets a **$10** cap per rolling 24
+hours. Set it to whatever you are actually willing to spend:
 
 ```bash
-node server/scripts/user.ts set-cap --email you@example.com --usd 25 --db "$WEBGEN_DB"
+node server/scripts/user.ts set-cap --email admin --usd 25 --db "$WEBGEN_DB"
 ```
 
 > **The flag is `--usd`, not `--cap`.** Using `--cap` produces
@@ -690,7 +724,7 @@ node server/scripts/user.ts set-cap --email you@example.com --usd 25 --db "$WEBG
 Check it any time with:
 
 ```bash
-node server/scripts/user.ts usage --email you@example.com --db "$WEBGEN_DB"
+node server/scripts/user.ts usage --email admin --db "$WEBGEN_DB"
 ```
 
 ## 6. Start the server
@@ -700,20 +734,41 @@ In the **same shell** (it needs `WEBGEN_MASTER_KEY`):
 ```bash
 INSECURE_COOKIES=1 npm run serve -w server -- \
   --db "$WEBGEN_DB" \
-  --projects-root "$WEBGEN_REPO/generated"
+  --projects-root "$WEBGEN_REPO/generated" \
+  --bootstrap-email admin
 ```
+
+> **`--bootstrap-email` is what gives already-generated sites an owner.** Any
+> site directory already sitting in `generated/` is adopted by the account you
+> name, once, on boot. Leave it off and those directories stay ownerless, which
+> looks exactly like an empty project list. It never *creates* an account: an
+> address that matches no user is a warning and a skip.
 
 Leave this running. You should see roughly:
 
 ```
 shutdown budget: grace 10000ms (…) — default; set WEBGEN_SHUTDOWN_GRACE_MS to match your supervisor
 code version: <a git sha>
-server listening on http://localhost:4000 (db: …/server/data/identity.db)
+
+  created the default local account — sign in with admin / admin
+  This is a KNOWN password and exists only because this server is bound to 127.0.0.1. …
+
+project adoption: 0 adopted, 0 already known (owner: admin)
+server listening on http://127.0.0.1:4000 (db: …/server/data/identity.db)
 INSECURE_COOKIES=1 — Secure flag omitted; local development only
 ```
 
-Three things about this command:
+The account line appears only on the **first** boot against a given database.
+The adoption count is however many site directories were already in
+`generated/` — `0 adopted` on a fresh clone, and that is correct, not a failure.
 
+Four things about this command:
+
+- **It binds `127.0.0.1` only, so nothing on your network can reach it.** That is
+  the default and you should keep it. `--host 0.0.0.0` exposes the server to
+  everyone on your Wi-Fi, over plain HTTP, with a session cookie that has no
+  `Secure` flag — and it also refuses to create the default `admin` account, for
+  exactly that reason.
 - **`INSECURE_COOKIES=1` drops the `Secure` flag from the session cookie**,
   which is what you want when everything is plain HTTP. Strictly speaking you
   can leave it off and still log in: browsers and `curl` both treat `localhost`
@@ -808,7 +863,11 @@ node server/scripts/user.ts list-projects --db "$WEBGEN_DB"
 
 ## PowerShell equivalents
 
-Only the variable syntax differs.
+Only the variable syntax differs — but it differs in a way that **fails silently
+if you copy a bash line verbatim**. `VAR=value command` is bash-only: PowerShell
+has no inline environment-variable prefix, so `WEBGEN_MASTER_KEY=… node …` is a
+parse error rather than a command with a variable set. Set the variable on its
+own line first.
 
 ```powershell
 $env:WEBGEN_REPO = $PWD.Path
@@ -816,8 +875,10 @@ $env:WEBGEN_DB   = "$($env:WEBGEN_REPO)\server\data\identity.db"
 $env:WEBGEN_MASTER_KEY = node -e "console.log(require('node:crypto').randomBytes(32).toString('base64'))"
 $env:INSECURE_COOKIES = "1"
 
-npm run serve -w server -- --db "$env:WEBGEN_DB" --projects-root "$($env:WEBGEN_REPO)\generated"
+npm run serve -w server -- --db "$env:WEBGEN_DB" --projects-root "$($env:WEBGEN_REPO)\generated" --bootstrap-email admin
 ```
+
+Then sign in as **`admin` / `admin`** — see [step 4](#4-your-account-admin--admin).
 
 If you script anything with `curl`, **write `curl.exe`, not `curl`**. In
 PowerShell 7 `curl` already resolves to the real `curl.exe` that ships with

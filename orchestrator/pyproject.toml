@@ -22,3 +22,28 @@ dev = ["pytest>=8"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+# Pins the Kitaru stack EXPLICITLY, and the reason is a real failure: a run
+# died at the `plan` stage with "Kitaru refused to run this flow because the
+# saved active stack appears stale and resolved to fallback stack `default`
+# implicitly."
+#
+# Nothing in this repo ever named a stack, so every flow inherited Kitaru's
+# SAVED ACTIVE STACK -- machine-local mutable state in `.kitaru/config.yaml`
+# (gitignored), holding a UUID. When that UUID stops resolving, Kitaru fails
+# closed rather than silently running on a different stack, which is the right
+# call on its part: a silent switch would run the flow against the wrong
+# metadata store and cache.
+#
+# This line is what makes that unreachable. Kitaru's precedence is
+# zenml_active_stack < project_config < environment < runtime < decorator <
+# invocation, and its guard's first statement is
+# `if resolved_execution.stack_source != "zenml_active_stack": return` -- so any
+# explicit source, this one included, skips the refusal by construction.
+#
+# A NAME, never a UUID. `stack` is typed `str | None` and resolves by name, so
+# `default` means the same thing on every machine; a UUID is per-install and
+# committing one would break every other clone -- the exact failure this is
+# fixing, inverted.
+[tool.kitaru]
+stack = "default"

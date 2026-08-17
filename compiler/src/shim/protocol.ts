@@ -77,7 +77,51 @@ export interface NodeHitMessage {
   text?: string;
 }
 
-export type ShimToParentMessage = FrameReadyMessage | NodesGeometryMessage | NodeHitMessage;
+/**
+ * A wheel gesture that happened INSIDE a preview frame, forwarded so the canvas
+ * can pan or zoom from it.
+ *
+ * REPORTED BY A TESTER: "when mouse pointer is hovering over any part of the
+ * page inside the canvas scroll doesn't work." Exactly right, and it is
+ * structural rather than a missed case — the editor's pan/zoom lives in a
+ * `wheel` handler on the stage element, and a wheel over an iframe is delivered
+ * to the IFRAME's document, which never bubbles into the parent. So the canvas
+ * was inert over the very thing that fills it, and worked only over the
+ * background gaps between frames.
+ *
+ * `clientX`/`clientY` are in the FRAME's own viewport coordinates, which is all
+ * the shim can know. The parent converts them using the iframe element's
+ * position and the current zoom — the same 1:1 mapping `NodeGeometry.rect`
+ * already relies on.
+ *
+ * NO PROTOCOL VERSION BUMP, deliberately. The version exists so the editor can
+ * refuse to attach to an OLDER shim missing behaviour it depends on (PRD risk
+ * 4). This direction is purely additive: an editor that does not know this
+ * message ignores it, and a shim that does not send it simply leaves the canvas
+ * as it is today. Both halves are also served from `compiler/` — the shim at
+ * `/@website-generator/bridge-shim.js`, never copied into a project — so they
+ * ship together and cannot disagree in practice. Bumping would manufacture a
+ * `version-mismatch` warning for a cached shim while changing nothing real.
+ */
+export interface FrameWheelMessage {
+  type: "frame:wheel";
+  protocolVersion: number;
+  deltaX: number;
+  deltaY: number;
+  /** Frame-viewport coordinates of the pointer. */
+  clientX: number;
+  clientY: number;
+  /** Zoom-intent modifiers, forwarded so the parent applies ONE rule for both
+   *  a wheel over the background and a wheel over a frame. */
+  ctrlKey: boolean;
+  metaKey: boolean;
+}
+
+export type ShimToParentMessage =
+  | FrameReadyMessage
+  | NodesGeometryMessage
+  | NodeHitMessage
+  | FrameWheelMessage;
 
 /* ---------- parent -> shim ---------- */
 

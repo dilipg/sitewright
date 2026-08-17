@@ -42,6 +42,8 @@ import {
   routesFromManifest,
   splitOverridesByRoute,
   zoomAt,
+  MAX_ZOOM,
+  MIN_ZOOM,
 } from "./lib/canvas";
 import {
   backend,
@@ -98,6 +100,14 @@ type ShimStatus = "connecting" | "ready" | "version-mismatch";
  * slots is the realistic upper bound this has to clear.
  */
 const PREVIEW_READY_GRACE_MS = 20_000;
+
+/**
+ * One button press or keyboard step of zoom. `zoomAt` clamps to
+ * `MIN_ZOOM`/`MAX_ZOOM` (0.1–2), so 0.1 gives a predictable ~10 presses across
+ * the range — coarse enough to cross it without a dozen clicks, fine enough to
+ * land on a readable size.
+ */
+const ZOOM_STEP = 0.1;
 type SaveStatus = "Loading…" | "Saving…" | "Saved";
 
 /** Canned planner brief for the walking skeleton's single hero section
@@ -363,6 +373,7 @@ export default function App() {
   const stageRef = useRef<HTMLDivElement | null>(null);
   const hydratedRef = useRef(false);
   const widthEditableRef = useRef(true);
+  const viewportRef = useRef<Viewport>({ x: 40, y: 40, zoom: 1 });
   // Real wall-clock baselines for the elapsed-time displays below (task-4
   // review): a tick that just adds 1000ms to the last displayed value drifts
   // under background-tab throttling, where the browser can clamp
@@ -388,6 +399,11 @@ export default function App() {
   const skipNextSaveRef = useRef(false);
   historyRef.current = history;
   widthEditableRef.current = isEditableWidth(previewWidth);
+  // Read by the `frame:wheel` handler, which lives in a mount-once effect and
+  // would otherwise close over the viewport as it was at mount — zoom 1 forever,
+  // so a forwarded wheel would map its cursor to the wrong point at any other
+  // zoom. Same assign-during-render idiom as the two refs above.
+  viewportRef.current = viewport;
 
   const map = history !== null ? currentSnapshot(history) : {};
   const routes = useMemo<RouteInfo[]>(() => (manifest === null ? [] : routesFromManifest(manifest)), [manifest]);
@@ -641,6 +657,36 @@ export default function App() {
           }));
           break;
         }
+        case "frame:wheel": {
+          // A wheel inside a frame, forwarded by the shim because it never
+          // bubbles out of the iframe (see FrameWheelMessage). Handled through
+          // the SAME `applyWheel` the stage's own handler calls, so panning and
+          // zooming cannot drift apart depending on what the cursor happened to
+          // be over — which is exactly the inconsistency this bug was.
+          const slug = slugForSource(event.source);
+          if (slug === undefined) break;
+          const frame = iframeRefs.current[slug];
+          const stage = stageRef.current;
+          if (!frame || !stage) break;
+
+          // Frame-viewport coords -> stage-element coords. The frame lives
+          // inside `.canvas-surface`, which is `scale(zoom)`d, so a point at
+          // frame-internal `clientX` renders `clientX * zoom` from the frame's
+          // left edge on screen. Both rects are read from the live DOM rather
+          // than derived from `frameOffsetX`, so this stays correct regardless
+          // of how frames are laid out.
+          const frameRect = frame.getBoundingClientRect();
+          const stageRect = stage.getBoundingClientRect();
+          const zoom = viewportRef.current.zoom;
+          applyWheel({
+            deltaX: data.deltaX,
+            deltaY: data.deltaY,
+            zoomIntent: data.ctrlKey || data.metaKey,
+            cursorX: frameRect.left - stageRect.left + data.clientX * zoom,
+            cursorY: frameRect.top - stageRect.top + data.clientY * zoom,
+          });
+          break;
+        }
         case "node:hit": {
           // Read-only at narrow widths (PRD 7 P1): selecting would offer edits
           // that cannot be expressed per-breakpoint, so nothing is selectable.
@@ -687,10 +733,31 @@ export default function App() {
       if (redoKey) {
         event.preventDefault();
         setHistory((h) => (h === null ? h : redo(h)));
-      } else if (undoKey) {
+        return;
+      }
+      if (undoKey) {
         event.preventDefault();
         setHistory((h) => (h === null ? h : undo(h)));
+        return;
       }
+
+      // ZOOM THE CANVAS, NOT THE BROWSER. `Ctrl/Cmd` with `+`, `-` or `0` is
+      // the browser's own page-zoom gesture, and letting it through scales the
+      // editor chrome along with the preview — which is never what someone
+      // inspecting a design at 150% wants. `preventDefault` is what makes these
+      // canvas actions rather than page actions.
+      //
+      // Both key spellings on purpose: `+` needs Shift on most layouts, so the
+      // event arrives as either "+" or "=" depending on the keyboard, and
+      // "NumpadAdd" as neither.
+      if (!(event.ctrlKey || event.metaKey)) return;
+      const zoomIn = event.key === "+" || event.key === "=";
+      const zoomOut = event.key === "-" || event.key === "_";
+      const zoomReset = event.key === "0";
+      if (!zoomIn && !zoomOut && !zoomReset) return;
+      event.preventDefault();
+      if (zoomReset) resetZoom();
+      else zoomByStep(zoomIn ? ZOOM_STEP : -ZOOM_STEP);
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
@@ -1225,14 +1292,66 @@ export default function App() {
 
   /** Two-finger trackpad scroll / mouse wheel pans; Ctrl/Cmd+wheel (pinch on
    * most trackpads reports this way) zooms toward the cursor. */
-  function onStageWheel(event: React.WheelEvent<HTMLDivElement>) {
-    if (event.ctrlKey || event.metaKey) {
-      event.preventDefault();
-      const rect = event.currentTarget.getBoundingClientRect();
-      setViewport((v) => zoomAt(v, event.clientX - rect.left, event.clientY - rect.top, -event.deltaY * ZOOM_WHEEL_SENSITIVITY));
+  /**
+   * The ONE rule for every wheel gesture, wherever the cursor is.
+   *
+   * Extracted from `onStageWheel` when the shim began forwarding wheels from
+   * inside frames (`frame:wheel`): two copies would let panning over the
+   * background and panning over a frame drift apart, and "the canvas behaves
+   * differently depending on what you happen to be hovering" is precisely the
+   * bug being fixed. `cursorX`/`cursorY` are stage-element coordinates — the
+   * convention `zoomAt` expects.
+   */
+  function applyWheel(gesture: {
+    deltaX: number;
+    deltaY: number;
+    zoomIntent: boolean;
+    cursorX: number;
+    cursorY: number;
+  }) {
+    if (gesture.zoomIntent) {
+      setViewport((v) =>
+        zoomAt(v, gesture.cursorX, gesture.cursorY, -gesture.deltaY * ZOOM_WHEEL_SENSITIVITY),
+      );
     } else {
-      setViewport((v) => ({ ...v, x: v.x - event.deltaX, y: v.y - event.deltaY }));
+      setViewport((v) => ({ ...v, x: v.x - gesture.deltaX, y: v.y - gesture.deltaY }));
     }
+  }
+
+  /**
+   * Zoom about the CENTRE OF THE STAGE, for the gestures that carry no cursor:
+   * the toolbar buttons and the keyboard shortcuts. A wheel gesture zooms about
+   * the pointer instead (`applyWheel`), which is the right anchor there and the
+   * wrong one here — a button press has no pointer position to speak of, and
+   * anchoring to a stale one would make the canvas lurch.
+   */
+  function zoomByStep(delta: number) {
+    const stage = stageRef.current;
+    if (!stage) return;
+    const rect = stage.getBoundingClientRect();
+    setViewport((v) => zoomAt(v, rect.width / 2, rect.height / 2, delta));
+  }
+
+  /** Back to 1:1 AND back to the origin. Zoom alone would leave the user at
+   *  100% somewhere off in the canvas with no content in view, which is a worse
+   *  place to be than where they started. */
+  function resetZoom() {
+    setViewport({ x: 40, y: 40, zoom: 1 });
+  }
+
+  function onStageWheel(event: React.WheelEvent<HTMLDivElement>) {
+    const rect = event.currentTarget.getBoundingClientRect();
+    // Only the zoom path calls preventDefault, exactly as before: a ctrl+wheel
+    // is the browser's own page-zoom gesture and must not reach it, while a
+    // plain wheel over the stage has no default worth blocking.
+    if (event.ctrlKey || event.metaKey) event.preventDefault();
+    applyWheel({
+      deltaX: event.deltaX,
+      deltaY: event.deltaY,
+      zoomIntent: event.ctrlKey || event.metaKey,
+      cursorX: event.clientX - rect.left,
+      cursorY: event.clientY - rect.top,
+    });
   }
 
   /** Drag-to-pan from empty canvas background only — a click that starts on
@@ -2108,6 +2227,43 @@ export default function App() {
               onClick={() => setPreviewMode("interact")}
             >
               Interact
+            </button>
+          </div>
+          {/*
+            ZOOM CONTROLS. Until now zoom existed only as ctrl+wheel, which is
+            undiscoverable — nothing on screen said the canvas zoomed at all,
+            and no control set it back. The readout doubles as the reset button
+            because "100%" is both the status and the thing you want to click
+            when you are lost.
+          */}
+          <div className="zoom-controls" role="group" aria-label="Canvas zoom">
+            <button
+              type="button"
+              data-testid="zoom-out"
+              aria-label="Zoom out"
+              title="Zoom out (Ctrl -)"
+              disabled={viewport.zoom <= MIN_ZOOM}
+              onClick={() => zoomByStep(-ZOOM_STEP)}
+            >
+              −
+            </button>
+            <button
+              type="button"
+              data-testid="zoom-reset"
+              title="Reset to 100% (Ctrl 0)"
+              onClick={resetZoom}
+            >
+              {Math.round(viewport.zoom * 100)}%
+            </button>
+            <button
+              type="button"
+              data-testid="zoom-in"
+              aria-label="Zoom in"
+              title="Zoom in (Ctrl +)"
+              disabled={viewport.zoom >= MAX_ZOOM}
+              onClick={() => zoomByStep(ZOOM_STEP)}
+            >
+              +
             </button>
           </div>
           <button

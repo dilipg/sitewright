@@ -287,6 +287,44 @@ document.addEventListener(
   true,
 );
 
+/**
+ * Hands the canvas its pan/zoom gestures back. See `FrameWheelMessage` for why
+ * the parent cannot see these itself: a wheel over an iframe is delivered to the
+ * iframe's document and never bubbles out, so the canvas was inert over every
+ * frame and worked only over the background between them.
+ *
+ * EDIT MODE ONLY, and `interact` is the reason this is a mode check rather than
+ * an unconditional forward: in interact mode the user is deliberately driving
+ * the page — following a link, opening a menu, scrolling a pane the design
+ * actually scrolls — and stealing the wheel there would break the one mode whose
+ * whole purpose is that the page behaves like a real page.
+ *
+ * `passive: false` is REQUIRED, not stylistic: wheel listeners are passive by
+ * default in every current browser, and `preventDefault()` from a passive
+ * listener is ignored with a console warning. Without it the frame would scroll
+ * its own document AND pan the canvas — two responses to one gesture.
+ */
+document.addEventListener(
+  "wheel",
+  (event) => {
+    if (mode !== "edit") return;
+    event.preventDefault();
+    post({
+      type: "frame:wheel",
+      protocolVersion: PROTOCOL_VERSION,
+      deltaX: event.deltaX,
+      deltaY: event.deltaY,
+      clientX: event.clientX,
+      clientY: event.clientY,
+      // `ctrlKey` is what a trackpad pinch arrives as, so this is the ordinary
+      // zoom path and not an edge case.
+      ctrlKey: event.ctrlKey,
+      metaKey: event.metaKey,
+    });
+  },
+  { capture: true, passive: false },
+);
+
 document.addEventListener(
   "submit",
   (event) => {

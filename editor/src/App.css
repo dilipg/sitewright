@@ -1995,3 +1995,43 @@ body {
   font-size: 12px;
   color: #9a9aa8;
 }
+
+/* Zoom controls: one segmented group, so they read as a single canvas control
+   rather than three unrelated toolbar buttons. The readout is fixed-width
+   (`min-width` + centred) because a percentage that changes digit count would
+   otherwise shift both buttons under the cursor mid-click. */
+.zoom-controls {
+  display: flex;
+  align-items: center;
+  border: 1px solid #3a3a46;
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.zoom-controls button {
+  background: #2e2e38;
+  border: none;
+  color: #d8d8e2;
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1;
+  padding: 5px 9px;
+  cursor: pointer;
+}
+
+.zoom-controls button[data-testid="zoom-reset"] {
+  min-width: 48px;
+  text-align: center;
+  border-left: 1px solid #3a3a46;
+  border-right: 1px solid #3a3a46;
+  font-variant-numeric: tabular-nums;
+}
+
+.zoom-controls button:hover:not(:disabled) {
+  background: #3a3a46;
+}
+
+.zoom-controls button:disabled {
+  color: #61616e;
+  cursor: default;
+}

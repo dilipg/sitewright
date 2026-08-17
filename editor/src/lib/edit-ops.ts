@@ -187,7 +187,27 @@ export function validateEditOperations(
     }
     const channel = CHANNEL_OF[op.op];
     if (!node.editable.includes(channel)) {
-      errors.push(`"${nodeId}" cannot be edited through ${channel}`);
+      // The refusal stands — PRD 3.6 requirement 4 is that a node is editable
+      // only through a channel its MANIFEST declares, and weakening that here
+      // would let the prompt box author overrides the exporter never agreed to
+      // compile. What changes is that one common case stops being a dead end.
+      //
+      // REPORTED BY A TESTER: an Image whose entry declared only style and
+      // visibility, so "change this image" was refused with nothing to do next
+      // — while the Inspector's own Image field replaces it happily, because
+      // that control gates on `node.element === "Image"` rather than on
+      // `editable`. Two rules for one channel, and the user met the stricter
+      // one. The templates now require `text` on every Image node (PRD 3.5:
+      // image replace IS the text channel, key `src`), but a site generated
+      // BEFORE that carries the old manifest and cannot be fixed by editing it
+      // — generated output is regenerated, never hand-patched — so the message
+      // has to name the way through that works today.
+      const imageHint =
+        node.element === "Image" && channel === "text"
+          ? ` — this site was generated before Image nodes declared the text channel, so replace it` +
+            ` with the Image field in the inspector instead (select it and paste a URL)`
+          : "";
+      errors.push(`"${nodeId}" cannot be edited through ${channel}${imageHint}`);
       continue;
     }
     // The property namespace is the EXPORTER's (single source of truth in

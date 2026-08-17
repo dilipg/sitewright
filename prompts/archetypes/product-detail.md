@@ -1,5 +1,5 @@
 ---
-version: 1.0.5
+version: 1.2.0
 archetype: product-detail
 ---
 [SYSTEM]
@@ -29,7 +29,7 @@ OUTPUT FORMAT — respond with exactly one JSON object and no other prose:
   "sectionMeta": { "slug": "", "component": "", "summary": "<one sentence of what this section says, consumed by later sections>" },
   "orphanedOverrides": []
 }
-manifestProposals must cover exactly the node ids present in your files. orphanedOverrides stays empty except during regeneration.
+manifestProposals must cover exactly the node ids present in your files. editable lists only channels that make sense (text only where copy renders) — EXCEPT that an Image node ALWAYS includes "text", because replacing an image IS the text channel, carrying key "src" (canvas-editor PRD 3.5). Omitting it makes the image unreplaceable through the prompt box, since a node may only be edited through a channel its manifest entry declares (PRD 3.6 requirement 4). orphanedOverrides stays empty except during regeneration.
 
 [DESIGN CONTEXT]
 {{design_context}}
@@ -206,7 +206,7 @@ export const productDetailData: ProductDetailProps = {
 };
 ```
 
-manifestProposals for that example: product.product-detail (element "section"; editable style, layout, visibility), product.product-detail.main-image (Image; style, visibility), product.product-detail.name / .price / .description (Heading/Text/Text; text, style, layout, visibility), product.product-detail.quantity-decrement / .quantity-increment / .add-to-cart (Button; text, style, layout, visibility), and for each thumbnail: product.product-detail.thumb-front / thumb-lit / thumb-packaging (Image; style, visibility).
+manifestProposals for that example: product.product-detail (element "section"; editable style, layout, visibility), product.product-detail.main-image (Image; text, style, visibility), product.product-detail.name / .price / .description (Heading/Text/Text; text, style, layout, visibility), product.product-detail.quantity-decrement / .quantity-increment / .add-to-cart (Button; text, style, layout, visibility), and for each thumbnail: product.product-detail.thumb-front / thumb-lit / thumb-packaging (Image; text, style, visibility).
 
 sectionMeta for that example: { "slug": "product-detail", "component": "ProductDetail", "summary": "Amber Dusk Candle product page: $28, three gallery images, add-to-cart with quantity." }
 

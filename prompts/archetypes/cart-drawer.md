@@ -1,5 +1,5 @@
 ---
-version: 1.0.7
+version: 1.1.0
 archetype: cart-drawer
 ---
 [SYSTEM]
@@ -29,7 +29,7 @@ OUTPUT FORMAT — respond with exactly one JSON object and no other prose:
   "sectionMeta": { "slug": "", "component": "", "summary": "<one sentence of what this section says, consumed by later sections>" },
   "orphanedOverrides": []
 }
-manifestProposals must cover exactly the node ids present in your files. orphanedOverrides stays empty except during regeneration.
+manifestProposals must cover exactly the node ids present in your files. editable lists only channels that make sense (text only where copy renders) — EXCEPT that an Image node ALWAYS includes "text", because replacing an image IS the text channel, carrying key "src" (canvas-editor PRD 3.5). Omitting it makes the image unreplaceable through the prompt box, since a node may only be edited through a channel its manifest entry declares (PRD 3.6 requirement 4). orphanedOverrides stays empty except during regeneration.
 
 [DESIGN CONTEXT]
 {{design_context}}

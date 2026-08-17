@@ -142,7 +142,26 @@ export default function LoginScreen({ onAuthenticated }: LoginScreenProps) {
         <input
           id="login-email"
           data-testid="login-email"
-          type="email"
+          // `text`, NOT `email`, and this is load-bearing rather than sloppy.
+          // The server's login treats this value as an OPAQUE IDENTIFIER: it
+          // looks the string up verbatim, and `looksLikeEmail` is enforced only
+          // in `server/src/user-cli.ts` — never in `createUser` and never in
+          // `findUserByEmail`. So accounts whose name is not an email address
+          // legitimately exist, and the local default account seeded by
+          // `server/src/dev-admin.ts` is exactly one: it is literally `admin`.
+          //
+          // With `type="email"` the browser's own constraint validation refuses
+          // to submit ("Please include an '@' in the email address"), so the
+          // credential the SERVER CONSOLE just told the user to type could not
+          // be typed here at all — a dead end with no server round trip, which
+          // is why no API-level test could have caught it.
+          //
+          // A form must not impose a stricter rule than the system it submits
+          // to. `inputMode` keeps the email keyboard on a phone and
+          // `autoComplete="username"` keeps password managers working, so the
+          // affordances survive without the false rejection.
+          type="text"
+          inputMode="email"
           autoComplete="username"
           value={email}
           onChange={(event) => setEmail(event.target.value)}

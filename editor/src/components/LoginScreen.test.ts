@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { submitLogin } from "./LoginScreen";
+// Vite's own `?raw` suffix, typed by `vite/client` — the precedent
+// `App.test.ts` and `ExportPanel.test.ts` already set for reading a component's
+// own source in this workspace. NOT `node:fs`: `editor/tsconfig.json` declares
+// only `["ES2022", "DOM", "DOM.Iterable"]` with no `node` types, so a
+// `node:fs` import typechecks nowhere here — and it fails in `tsc --noEmit`
+// while `vitest run` (esbuild, which strips types without checking them)
+// passes, so the local test run looked green and only the gate caught it.
+import loginScreenSource from "./LoginScreen.tsx?raw";
 import { SessionExpiredError } from "../lib/session-fetch";
 
 /**
@@ -116,5 +124,57 @@ describe("submitLogin: the failure message", () => {
     const error = await submitLogin("a@b.c", "wrong", { fetchImpl }).catch((caught: unknown) => caught);
     expect(error).toBeInstanceOf(Error);
     expect(error).not.toBeInstanceOf(SessionExpiredError);
+  });
+});
+
+/**
+ * A SOURCE-LEVEL guard, and the only kind available here: this workspace mounts
+ * no components (see the header — no React testing library, and "no new runtime
+ * dependencies"), so the rendered attribute cannot be inspected. It is read off
+ * the source instead, in the same idiom as this repo's other source guards
+ * (`orchestrator/tests/test_portability_guard.py`, the README-agreement tests).
+ *
+ * The bug this pins was found by a human typing into the form, and NO test at
+ * this file's usual level could have found it — every assertion above calls
+ * `submitLogin` directly, so all of them passed while the form was impossible
+ * to submit. The browser rejected the value before any request existed.
+ */
+describe("the email field accepts a non-email identifier", () => {
+  // COMMENTS ARE STRIPPED FIRST, and skipping that step is not a hypothetical
+  // tidiness concern — it was a live false positive here. The attribute's own
+  // explanation necessarily contains the string `type="email"` (it exists to say
+  // why that value is wrong), so a naive scan of the raw file failed on
+  // correct code and would have gone on failing no matter how the input was
+  // written. A source-level guard has to look at code, or it is asserting on
+  // prose.
+  const source = loginScreenSource
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/^\s*\/\/.*$/gm, "");
+
+  it("does not use type=email, which would refuse the default `admin` account", () => {
+    // `server/src/dev-admin.ts` seeds an account literally named `admin`, and
+    // the server's login accepts it: `looksLikeEmail` is enforced only in
+    // `user-cli.ts`, never in `createUser` or `findUserByEmail`. With
+    // type=email the browser's constraint validation blocks submit entirely
+    // ("Please include an '@' in the email address"), so the credential the
+    // server console prints on first boot could not be entered.
+    expect(source).not.toMatch(/type="email"/);
+  });
+
+  it("keeps the email keyboard and password-manager affordances", () => {
+    // The reason type=email was chosen in the first place. Dropping it must not
+    // cost a phone keyboard or autofill, or the next person will "fix" this
+    // back to type=email and reintroduce the block.
+    expect(source).toMatch(/inputMode="email"/);
+    expect(source).toMatch(/autoComplete="username"/);
+  });
+
+  it("imposes no other client-side constraint the server would not", () => {
+    // `pattern` and `required` would each re-create the same class of dead end:
+    // a value the server accepts that the form refuses to send. The server
+    // answers a blank credential with the same uniform failure as a wrong one,
+    // so there is nothing here for the browser to usefully pre-empt.
+    expect(source).not.toMatch(/\bpattern=/);
+    expect(source).not.toMatch(/\brequired\b/);
   });
 });

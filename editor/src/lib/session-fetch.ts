@@ -49,8 +49,22 @@ export class SessionExpiredError extends Error {
  * against the local, unauthenticated preview server, which has no session
  * and never answers 401.
  */
-export async function sessionAwareFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
-  const response = await fetch(input, init);
+export async function sessionAwareFetch(
+  input: RequestInfo | URL,
+  init?: RequestInit,
+  // OPTIONAL third parameter, added for `project-status.ts`, whose whole purpose
+  // is to distinguish an expired session from a failed generation and which
+  // therefore has to be tested against a 401 without a live server. Optional and
+  // last, so every existing call site is byte-identical in behaviour.
+  //
+  // Wrapped rather than aliased when defaulting: a bare `fetchImpl = fetch`
+  // followed by `fetchImpl(...)` invokes the global with the wrong receiver and
+  // throws "Illegal invocation" in a browser -- the same trap `submitLogin`
+  // documents.
+  fetchImpl?: typeof fetch,
+): Promise<Response> {
+  const doFetch = fetchImpl ?? ((target: RequestInfo | URL, options?: RequestInit) => fetch(target, options));
+  const response = await doFetch(input, init);
   if (response.status === 401) throw new SessionExpiredError();
   return response;
 }

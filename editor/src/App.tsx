@@ -59,6 +59,8 @@ import type { EditPromptResponse } from "./lib/edit-ops";
 import { expandStyleValue } from "./lib/inventory";
 import { enqueueAndPoll, formatElapsedSeconds } from "./lib/jobs";
 import { breadcrumbFor, humanizeSegment, parentNodeId } from "./lib/labels";
+import type { ProjectOpenFailure } from "./lib/project-status";
+import { explainUnopenableProject } from "./lib/project-status";
 import { fetchJson, SessionExpiredError, sessionAwareFetch } from "./lib/session-fetch";
 import type { History, OverridesMap } from "./lib/store";
 import {
@@ -84,6 +86,18 @@ import { nearestSpaceStep, tokenPathSet } from "./lib/tokens";
 import "./App.css";
 
 type ShimStatus = "connecting" | "ready" | "version-mismatch";
+
+/**
+ * How long every route may report no editable nodes before the editor asks the
+ * server whether the generation failed.
+ *
+ * Generous on purpose, and it can afford to be: the wait costs nothing (the
+ * canvas is already rendering) and the answer it eventually shows comes from the
+ * job row, not from the expiry — so a slow preview child cannot be mistaken for
+ * a failed run. A cold `vite` start plus a queue for one of the preview pool's 6
+ * slots is the realistic upper bound this has to clear.
+ */
+const PREVIEW_READY_GRACE_MS = 20_000;
 type SaveStatus = "Loading…" | "Saving…" | "Saved";
 
 /** Canned planner brief for the walking skeleton's single hero section
@@ -297,6 +311,11 @@ export default function App() {
   // console.error-and-sit-on-"Loading…" behaviour byte-identically, and the
   // milestone-7 Playwright suite runs there.
   const [bootstrapError, setBootstrapError] = useState<string | null>(null);
+  // What the SERVER says about the failed bootstrap, once asked (see
+  // `explainUnopenableProject`). `null` means "not asked yet, or the answer
+  // explained nothing" — the panel keeps its generic wording in that case
+  // rather than inventing a cause.
+  const [openFailure, setOpenFailure] = useState<ProjectOpenFailure | null>(null);
   // TASK 3. A generation that has STARTED — both ids, held together, because
   // they name different things: `jobId` is what the progress view polls,
   // `projectId` is what the editor opens once the job succeeds.
@@ -468,6 +487,24 @@ export default function App() {
       // nothing reads this state there.
       console.error("[bootstrap] failed", error);
       setBootstrapError(error instanceof Error ? error.message : String(error));
+
+      // Then ASK the server why, instead of leaving the panel to guess between
+      // "still running" and "failed". A real tester hit a generation that had
+      // failed at gate 1 with an exact diagnosis (unresolved import, named file
+      // and line) sitting in its job row, and saw a raw Vite overlay instead.
+      // Hosted mode only: local mode has no jobs, no session, and must stay
+      // byte-identical.
+      if (!hostedMode) return;
+      void explainUnopenableProject()
+        .then(setOpenFailure)
+        .catch((explainError: unknown) => {
+          // A 401 while explaining is a lapsed session, not a failed
+          // generation. Reporting the latter would be the same lie this whole
+          // path exists to stop, so it takes precedence over the panel above.
+          if (explainError instanceof SessionExpiredError) setSessionExpired(true);
+          // Anything else: keep the generic panel. Failing to fetch an
+          // explanation must never replace the message the user already has.
+        });
     });
   }, []);
 
@@ -694,6 +731,57 @@ export default function App() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [history, frameStatus, frameReadySeq, routes]);
+
+  /* ---------- a preview that never loads: ask the server why ---------- */
+
+  /**
+   * THE CASE A REAL TESTER HIT, and which the bootstrap-error panel cannot
+   * cover. A generation failed at gate 1 with an exact diagnosis in its job row
+   * (`unresolved-import`, `src/pages/home/index.tsx:1`, the specifier named).
+   * But `manifest.json` and `plan` were both written before the failure, so
+   * BOOTSTRAP SUCCEEDED: the editor drew its full chrome — toolbar, "Saved",
+   * "Click an element in the preview" — over an iframe containing nothing but a
+   * `vite-error-overlay`. Measured on that project: bootstrap panel absent, 1
+   * iframe, **0 `[data-node-id]` nodes**, `500` on the page module. An editor
+   * that looks completely healthy and is completely empty.
+   *
+   * THE SIGNAL IS ZERO EDITABLE NODES, NOT `frame:ready` — and getting that
+   * wrong first is worth recording, because `frame:ready` looks like exactly the
+   * right signal and is not. `bridge-shim.js` is injected as its OWN script tag,
+   * so it loads, connects and announces itself perfectly well while `main.tsx`
+   * fails to compile beside it. Measured on the broken project: iframe scripts
+   * `inline, client, bridge-shim.js, main.tsx`, a `vite-error-overlay` present,
+   * and **0** `[data-node-id]` nodes — a ready shim attached to a page that
+   * rendered nothing. A detector keyed on readiness bails out precisely when it
+   * is needed.
+   *
+   * THE TIMEOUT DECIDES ONLY WHEN TO ASK — NEVER WHAT TO SAY. The claim comes
+   * from the job row, and `explainUnopenableProject` answers `unexplained` for
+   * anything it cannot attribute, which renders nothing. So neither a slow
+   * preview child (a cold `vite` start, or a wait for one of the pool's 6 slots)
+   * nor a route that legitimately reports no nodes can produce a false "your
+   * generation failed" — at worst they cost one request that says nothing.
+   */
+  useEffect(() => {
+    if (!hostedMode) return;
+    // Nothing to wait for until bootstrap has produced routes; and if it FAILED
+    // instead, the bootstrap-error panel already owns the explanation.
+    if (routes.length === 0 || bootstrapError !== null) return;
+    if (openFailure !== null) return;
+    const anyNodes = Object.values(geometryByRoute).some(
+      (nodes) => Object.keys(nodes).length > 0,
+    );
+    if (anyNodes) return;
+
+    const timer = setTimeout(() => {
+      void explainUnopenableProject()
+        .then(setOpenFailure)
+        .catch((error: unknown) => {
+          if (error instanceof SessionExpiredError) setSessionExpired(true);
+        });
+    }, PREVIEW_READY_GRACE_MS);
+    return () => clearTimeout(timer);
+  }, [routes, geometryByRoute, bootstrapError, openFailure]);
 
   /* ---------- debounced persistence (one overrides file per route + one history file) ---------- */
 
@@ -1698,12 +1786,58 @@ export default function App() {
     return (
       <div className="editor-root">
         <div className="bootstrap-error" data-testid="bootstrap-error" role="alert">
-          <h1>This site could not be opened</h1>
-          <p>
-            Its files could not be loaded. The usual reason is that its generation is still
-            running — a new site has no files until the run finishes — or that the generation
-            failed. Nothing was changed by opening it.
-          </p>
+          {/*
+            One of four headings, three of them FACTS from the job row rather
+            than the guess this panel used to offer ("the usual reason is …").
+            The states call for opposite actions — wait, versus read the error
+            and regenerate — so collapsing them was the defect.
+          */}
+          <h1>
+            {openFailure?.state === "generating"
+              ? "This site is still being generated"
+              : openFailure?.state === "failed"
+                ? "This site's generation failed"
+                : openFailure?.state === "interrupted"
+                  ? "This site's generation was interrupted"
+                  : "This site could not be opened"}
+          </h1>
+          {openFailure?.state === "generating" ? (
+            <p>
+              A new site has no files until the run finishes, so there is nothing to open yet.
+              Reload this page when it completes. Nothing was changed by opening it.
+            </p>
+          ) : openFailure?.state === "failed" ? (
+            <p>
+              The run stopped before the site was complete, so its files are missing or
+              unusable. The report below is the generator's own — it names the file and the
+              check that failed. Nothing was changed by opening it.
+            </p>
+          ) : openFailure?.state === "interrupted" ? (
+            // Deliberately does NOT say "failed": the server was restarted
+            // mid-run and cannot know whether the work finished. Inventing an
+            // outcome here is what this state exists to prevent.
+            <p>
+              The server restarted while this site was being generated, so how far it got is
+              unknown. Nothing was changed by opening it.
+            </p>
+          ) : (
+            <p>
+              Its files could not be loaded. The usual reason is that its generation is still
+              running — a new site has no files until the run finishes — or that the generation
+              failed. Nothing was changed by opening it.
+            </p>
+          )}
+          {/*
+            The bootstrap error is the SYMPTOM (a fetch that 500'd); the job
+            report is the CAUSE. Both are shown, cause first, because the
+            symptom is what a bug report needs to be reproducible while the
+            cause is what a tester can act on.
+          */}
+          {openFailure?.state === "failed" && openFailure.detail !== "" && (
+            <pre className="bootstrap-error-report" data-testid="bootstrap-error-report">
+              {openFailure.detail}
+            </pre>
+          )}
           <p className="bootstrap-error-detail">{bootstrapError}</p>
           <button
             type="button"
@@ -2021,6 +2155,40 @@ export default function App() {
           </span>
         )}
       </header>
+
+      {/*
+        A BANNER, not a replacement for the canvas. Bootstrap succeeded, so the
+        project is real and its overrides and history are intact — the editor
+        stays usable (Export, "Back to your sites") and this says why the stage
+        is empty. Replacing the whole screen here would throw away a working
+        editor over a preview that failed to compile.
+
+        Only the two states that mean "this will not load on its own" get a
+        banner. `generating` deliberately does not: a run in flight already has
+        its own progress UI, and a second, quieter claim about the same thing is
+        how contradictory statuses appear on one screen.
+      */}
+      {(openFailure?.state === "failed" || openFailure?.state === "interrupted") && (
+        <div className="preview-failure" data-testid="preview-failure" role="alert">
+          <div className="preview-failure-head">
+            <strong>
+              {openFailure.state === "failed"
+                ? "This site's generation failed, so there is nothing to preview"
+                : "This site's generation was interrupted, so the preview may be incomplete"}
+            </strong>
+            <span>
+              {openFailure.state === "failed"
+                ? "The report below is the generator's own. Regenerating the named section is usually the fix."
+                : "The server restarted mid-run, so how far it got is unknown. Nothing was changed by opening it."}
+            </span>
+          </div>
+          {openFailure.state === "failed" && openFailure.detail !== "" && (
+            <pre className="bootstrap-error-report" data-testid="preview-failure-report">
+              {openFailure.detail}
+            </pre>
+          )}
+        </div>
+      )}
 
       <div className="editor-main">
         <div

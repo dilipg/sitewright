@@ -496,6 +496,68 @@ def validate_section_meta(model_result: dict) -> str:
     return ""
 
 
+def validate_mock_data_file(model_result: dict, route_slug: str) -> str:
+    """A section MUST ship the mock data file the page assembler will import.
+
+    THE FAILURE THIS EXISTS FOR, measured on a real ~$1 run: the model returned
+    `files` containing ONLY `src/pages/home/sections/StickyHero.tsx` and no
+    `mock/StickyHero.data.ts`. Every gate passed (`{"passed": true,
+    "failures": []}`), the manifest took all 7 of its node ids, the run reported
+    success, and the site was **unopenable** — Vite: `Failed to resolve import
+    "./mock/StickyHero.data"`.
+
+    WHY NO GATE CAUGHT IT, which is the part worth understanding. Gate 1 really
+    does run the project's own `tsc --noEmit`, and a missing module really is a
+    type error — but NOTHING IMPORTED THE FILE YET. `index.tsx` is written after
+    all sections are done, and a section component takes its data as props, so
+    `StickyHero.tsx` alone typechecks perfectly. The broken import is created
+    later, by the deterministic assembler, out of the section list. A section
+    validated in isolation cannot see a pair that is only half present.
+
+    So the check has to be here: at the moment the model's output is accepted,
+    against the filename the assembler is GOING to import. `build_page_source`
+    emits `import { <component>Data } from "./mock/<component>.data"`
+    unconditionally for every non-failed section, so there is no legitimate case
+    of a section without one.
+
+    EXACT PATH, not "some mock file": a case-mismatched
+    `mock/stickyHero.data.ts` resolves on this Windows dev box and breaks in the
+    Linux container, which is the failure mode `portable.py` exists because of.
+    The export NAME is checked too, because a right-named file exporting the
+    wrong symbol is the same defect with the same blind spot — the assembler
+    imports a specific binding, and nothing else would notice until assembly.
+
+    Returns a failure-report line so this costs ONE RETRY rather than the run,
+    matching `validate_file_paths` and `validate_section_meta` either side.
+    """
+    files = files_of(model_result)
+    component = model_result["data"]["sectionMeta"]["component"]
+    expected = f"src/pages/{route_slug}/mock/{component}.data.ts"
+
+    # Both separators, for the same reason `is_mock_data_file` does it: a
+    # model-authored key has arrived with backslashes.
+    by_normalised = {key.replace("\\", "/"): value for key, value in files.items()}
+    if expected not in by_normalised:
+        supplied = ", ".join(sorted(by_normalised)) or "(no files at all)"
+        return (
+            f'- content: this section is missing its mock data file "{expected}". '
+            f"Every section is TWO files: the component and its mock data. The page "
+            f"is assembled with `import {{ {component[0].lower() + component[1:]}Data }} "
+            f'from "./mock/{component}.data"`, so without that exact file the whole '
+            f"page fails to load — the section component alone still typechecks, which "
+            f"is why no gate reports this. You supplied: {supplied}"
+        )
+
+    data_var = component[0].lower() + component[1:] + "Data"
+    if f"export const {data_var}" not in by_normalised[expected]:
+        return (
+            f'- content: "{expected}" does not export `{data_var}`. The page is '
+            f'assembled with `import {{ {data_var} }} from "./mock/{component}.data"`, '
+            f"so the exported name must be exactly that."
+        )
+    return ""
+
+
 def format_gate_failures(report: dict) -> str:
     lines = []
     for gate in report.get("gates", []):
@@ -954,6 +1016,15 @@ def generate_section_flow(
         path_failure = validate_file_paths(files_of(materialize(generated)))
         if path_failure:
             failure_report = path_failure
+            continue
+
+        # AFTER validate_section_meta above, which is what guarantees
+        # sectionMeta["component"] exists to read here, and BEFORE the write:
+        # a section missing its mock data file must cost a retry, not a
+        # half-written page that no gate can see is broken.
+        mock_failure = validate_mock_data_file(materialize(generated), route_slug)
+        if mock_failure:
+            failure_report = mock_failure
             continue
 
         if assemble_index:

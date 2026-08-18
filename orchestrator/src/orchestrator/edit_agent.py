@@ -147,6 +147,16 @@ Rules, all machine-checked after you answer — a violation means NOTHING is app
 4. Use `styleExact` ONLY when the user asked for a specific literal value
    ("exactly 37px"). It is recorded as an off-scale edit.
 5. `sectionOrder` must list every section on the route, or the export fails.
+6. A `text` op on an Image node MUST set `"key": "src"`. Replacing an image IS
+   the text channel (its source is content, not style), but ONLY with that key —
+   a `text` op with no key means the element's TEXT CONTENT, which does nothing
+   at all to an image in the preview and then fails the export. Measured: this
+   is the mistake actually made on the first such request.
+7. You CANNOT create, generate or find an image. There is no image host and no
+   image generator here. If the user asks for a new or "representative" image
+   without giving a URL, set `clarify` and ask for one — never invent a URL, and
+   never point at a stock-photo or placeholder domain, because an image that
+   cannot resolve ships visibly broken in both the preview and the export zip.
 
 If two nodes are equally plausible targets, set `clarify` and emit no
 operations. Guessing is worse than asking.

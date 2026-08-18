@@ -210,6 +210,39 @@ export function validateEditOperations(
       errors.push(`"${nodeId}" cannot be edited through ${channel}${imageHint}`);
       continue;
     }
+    // A TEXT OP ON AN IMAGE MUST CARRY key "src". Measured on a live edit-agent
+    // call the moment Image nodes became text-editable: the agent returned
+    // `{op:"text", nodeId:"…​.image", value:"https://…"}` with NO key. That is a
+    // different edit — a keyless text override means "this node's text content"
+    // (contract 7.1) — and it fails in the worst available way, silently in
+    // preview and loudly much later:
+    //
+    //   preview  the shim sets `element.textContent`. An `<img>` is a void
+    //            element, so NOTHING VISIBLY CHANGES and the user is told the
+    //            edit applied.
+    //   export   `resolveContentExpression` finds no key, looks for the node's
+    //            single text-bearing JSX child, and a self-closing `<Image />`
+    //            has no children container at all — ExportError.
+    //
+    // So the override persists invisibly and kills the export later: exactly the
+    // preview ≠ handover failure the whole override layer exists to prevent.
+    // Refused HERE, in the same place and for the same reason as the style
+    // property check below — an override the exporter cannot compile must never
+    // be authored, not merely fail at the end.
+    //
+    // "src" specifically, not "any key": that is what PRD 3.5 defines and what
+    // the agent's own tool schema documents ('only "src", for image replace').
+    if (op.op === "text" && node.element === "Image" && op.key !== "src") {
+      errors.push(
+        op.key === undefined
+          ? `"${nodeId}" is an image, so a text edit must replace its "src" — a text edit with` +
+              ` no key sets an element's text content, which does nothing to an image in the` +
+              ` preview and then fails the export`
+          : `"${nodeId}" is an image, so a text edit must use key "src", not "${op.key}"`,
+      );
+      continue;
+    }
+
     // The property namespace is the EXPORTER's (single source of truth in
     // compiler/src/style-properties.json). The shim will happily apply any CSS
     // property in the preview, so without this an unsupported one is invisible

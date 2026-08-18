@@ -325,3 +325,79 @@ describe("applyEditOperations", () => {
     expect(before).toEqual(untouched);
   });
 });
+
+/**
+ * A text op on an Image node must carry key "src".
+ *
+ * FROM A LIVE EDIT-AGENT CALL, made the moment Image nodes became
+ * text-editable: the agent returned `{op:"text", nodeId:"…​.image",
+ * value:"https://…"}` with no key. Both halves of the system then disagree in
+ * the worst possible direction — the shim sets `textContent` on a void `<img>`
+ * (no visible change, edit reported as applied) and the exporter throws, because
+ * a self-closing element has no text-bearing child. An invisible override that
+ * kills the export later is precisely the preview ≠ handover failure the
+ * override layer exists to prevent.
+ */
+describe("a text edit on an image must replace its src", () => {
+  const imageManifest = {
+    nodes: {
+      "home.gallery": { route: "/", file: "f.tsx", component: "G", element: "section", editable: ["style", "visibility"], status: "active" },
+      "home.gallery.photo": { route: "/", file: "f.tsx", component: "G", element: "Image", editable: ["text", "style", "visibility"], status: "active" },
+      "home.gallery.caption": { route: "/", file: "f.tsx", component: "G", element: "Text", editable: ["text", "style"], status: "active" },
+    },
+  } as unknown as Manifest;
+
+  // (ops, manifest, tokenPaths, route) — activeSections are derived inside.
+  const validate = (ops: EditOperation[]) =>
+    validateEditOperations(ops, imageManifest, new Set(["color.brand"]), "home");
+
+  it("refuses a keyless text op on an Image — the exact payload the agent produced", () => {
+    const errors = validate([
+      { op: "text", nodeId: "home.gallery.photo", value: "https://example.com/x.jpg" },
+    ]);
+    expect(errors).toHaveLength(1);
+    // The message must say what to do, not just that it is wrong: this text is
+    // what the user reads when their instruction does not land.
+    expect(errors[0]).toContain("src");
+  });
+
+  it("accepts the same op WITH key src", () => {
+    expect(
+      validate([{ op: "text", nodeId: "home.gallery.photo", key: "src", value: "https://example.com/x.jpg" }]),
+    ).toEqual([]);
+  });
+
+  it("refuses some other key on an Image", () => {
+    // PRD 3.5 defines `src`, and the agent's own tool schema says 'only "src"'.
+    const errors = validate([
+      { op: "text", nodeId: "home.gallery.photo", key: "alt", value: "a mug" },
+    ]);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain("alt");
+  });
+
+  it("leaves ordinary text nodes completely alone", () => {
+    // The rule is keyed to `element === "Image"`, so a keyless text edit on a
+    // Text node — every ordinary copy edit — must be unaffected.
+    expect(validate([{ op: "text", nodeId: "home.gallery.caption", value: "Hand-thrown" }])).toEqual([]);
+  });
+
+  it("still refuses a channel the manifest does not declare, and says so about images", () => {
+    // A site generated before templates required `text` on Image nodes: the
+    // refusal stands (PRD 3.6#4), and the message routes the user to the
+    // inspector control that does work.
+    const legacy = {
+      nodes: {
+        "home.gallery.photo": { route: "/", file: "f.tsx", component: "G", element: "Image", editable: ["style", "visibility"], status: "active" },
+      },
+    } as unknown as Manifest;
+    const errors = validateEditOperations(
+      [{ op: "text", nodeId: "home.gallery.photo", key: "src", value: "https://example.com/x.jpg" }],
+      legacy,
+      new Set(),
+      "home",
+    );
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain("Image field");
+  });
+});

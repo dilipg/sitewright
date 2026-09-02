@@ -44,6 +44,8 @@ The editor gained **hosted mode** behind `?project=<id>`, reached through the Vi
 
 **Known gaps, recorded rather than implied.** Fan-out-subprocess resume is unverified — the Kitaru experiment was single-process, though the real exposure is small because `page_worker.py` skips already-recorded sections from `progress.json` **before** invoking the flow, which is file-based and holds regardless of the cache. Killing a preview child mid-regen orphans the orchestrator **grandchild**, which finishes and writes a usage log nobody ingests. Six concurrent proxied jobs can consume the whole preview pool, so job traffic can 503 a user's live preview. `runOnce()` is deliberately uncapped, so a future production caller would bypass `MAX_CONCURRENT_JOBS`. The hosted server still serves **no HTML, no static assets and no login page** — production serving, a login UI and project selection are the next slice, and `docs/` still describes `--projects-root` as a free choice and the pool cap as bounding every job. Full account: decisions.md's 2026-08-06 through 2026-08-09 rows.
 
+**Three of that paragraph's gaps are now closed, corrected here rather than rewritten** (the convention this repo uses for a stale claim — see Standing rules). *Fan-out-subprocess resume was verified in round 1*, below. *The login UI, project picker and live generation progress shipped* — in the **editor** (`LoginScreen.tsx`, `ProjectPicker.tsx`, `GenerationProgress.tsx`, `KeySettings.tsx`, hosted mode only); the **server** still serves no HTML, and production static serving is deliberately **deferred, not pending** ([docs/pending.md](docs/pending.md) D3: testers run the editor's own Vite dev server, whose proxy already carries `/api`, `/__*` and `/preview` same-origin). *The `--projects-root` and pool-cap doc claims were corrected in place* (pending.md D-1/D-3). What remains open there: H1 (the orphaned grandchild — round 1 gained **no** evidence, since it killed the orchestrator tree directly rather than a preview child), H3, H4, H5, and H6.
+
 **Round 1 (post-slice-5 hardening) is COMPLETE**, specced in [docs/superpowers/specs/2026-08-10-post-slice-5-hardening-design.md](docs/superpowers/specs/2026-08-10-post-slice-5-hardening-design.md) and reported in [m8-live-verification.md](docs/reports/m8-live-verification.md). It ran the three features that had **never touched a live model** and all three work: **7.6 add-section** (a real new section, 184->205 semantic node ids, all seven gates incl. a real `tsc --noEmit`), **7.9 page regeneration** (every section regenerated, and one revert restored the page byte-identically across all 15 tracked files), and **fan-out-subprocess resume**. $3.94 total against a $6 authorisation, 43 `usage_event` rows, 0 unpriced.
 
 **Resume is verified, and the proof is the money, not the log.** A generate job killed at the process-tree level mid-fan-out landed `failed` (NOT `interrupted` -- only a non-zero orchestrator exit is resumable), the resume reused the same `run_id`, re-executed **zero** of the 6 completed section checkpoints, emitted **zero** prelude events, and cost **$0.3621 against the first attempt's $1.1842 (31%)**. Kitaru **0.21.0** does not cache a failed checkpoint's exception. The run log was deliberately not trusted as the primary evidence -- it is written by the code under test -- so cost was the independent check. **The MECHANISM is deliberately NOT claimed**: the proven prelude replay happens in the PARENT process, which was never in doubt, and no `progress.json` survives in a finished project, so whether Kitaru's cache or `page_worker.py`'s file-based skip carries the section-level skip is still open.
@@ -52,9 +54,11 @@ The editor gained **hosted mode** behind `?project=<id>`, reached through the Vi
 
 **Five API facts round 1 corrected, each of which had already caused a wrong assumption.** A project's **id and its on-disk directory are different UUIDs** -- `generated/<project-id>` never exists, the directory is the run id, and `GET /api/jobs/:id` does not expose `run_id`. The success field **differs per endpoint**: `passed` for the four regen/add/edit kinds, **`ok` for `/__export`** (a gate failure is HTTP 200 + `{ok:false}` mapped to a `succeeded` job), and **neither for `generate`** (result is `{stdout}`; a gate failure lands `failed`). `/__regen-revert` takes **`{ section }`**, never `{ route }` -- that module's own header documented it wrong. `WEBGEN_MASTER_KEY` is **base64, not hex**, and a hex key *passes* the canonicality check, failing only on length. And `resolveCodeVersion()` is called **once at boot**, so commits are harmless to a running server while a **restart** refuses every later resume 409.
 
-**A methodological warning worth more than any single finding: four of round 1's errors were in the verification plan itself, and one would have produced a false failure.** Its check was `md5sum <route>/*.tsx` -- which matches only `index.tsx`, since section components live in `<route>/sections/` -- and on a tone-only instruction **no component file changes at all**, because copy lives in `mock/*.data.ts` while the component holds structure. Followed literally, that brief files 7.9 as BROKEN. It survived only because the assertion was re-derived from three independent signals (distinct data files, mtimes in section order, six billing rows with six different token counts). **When a verification says a feature is broken, suspect the verification first.** Recorded open after round 1: H1 (killing a preview child orphans the orchestrator grandchild) gained **no** evidence, because round 1 killed the orchestrator tree directly rather than a preview child; the live archetype catalog has **27** entries where docs still say 20; `manifest.json` key order is unstable across a regen (same keys, same byte count, different hash), which defeats hash-based change detection; and the sequential page-regen loop gets **zero** prompt-cache reuse, so its cost is strictly linear in section count. Full account: decisions.md's 2026-08-10 rows.
+**A methodological warning worth more than any single finding: four of round 1's errors were in the verification plan itself, and one would have produced a false failure.** Its check was `md5sum <route>/*.tsx` -- which matches only `index.tsx`, since section components live in `<route>/sections/` -- and on a tone-only instruction **no component file changes at all**, because copy lives in `mock/*.data.ts` while the component holds structure. Followed literally, that brief files 7.9 as BROKEN. It survived only because the assertion was re-derived from three independent signals (distinct data files, mtimes in section order, six billing rows with six different token counts). **When a verification says a feature is broken, suspect the verification first.** Recorded open after round 1: H1 (killing a preview child orphans the orchestrator grandchild) gained **no** evidence, because round 1 killed the orchestrator tree directly rather than a preview child; the live archetype catalog has **27** entries where docs still say 20 (*closed 2026-08-13 as a dated in-place doc correction, pending.md D-2 — `prompts/archetypes/` holds those 27 plus the `generic-section` fallback, and §4.3 gained a fifth page archetype, `app-screen`*); `manifest.json` key order is unstable across a regen (same keys, same byte count, different hash), which defeats hash-based change detection; and the sequential page-regen loop gets **zero** prompt-cache reuse, so its cost is strictly linear in section count. Full account: decisions.md's 2026-08-10 rows.
 
 **One defect shape this codebase keeps producing, at four different layers: `..`.** An unvalidated proxied `route` joined with `path.join`, which normalises `..`. A `runId` rail whose regex `^[A-Za-z0-9._-]+$` matched `..`, because `.` is in the character class. A project id where a single `encodeURIComponent` pass is insufficient, since WHATWG URL normalization treats `%2e` as a literal dot — `/preview/%2E%2E/x` collapses. And model-generated `route.slug`/`route.path` interpolated raw into URL paths. **Assume the fifth exists.** Any place a client- or model-influenced string reaches a path, a URL, or a spawn argument is where to look.
+
+**It did, and the count is now ten.** The fifth was real: `manifest.ts`'s `propose` validated only `nodeId`, while `component` and `file` are **equally model-authored** (they arrive in an agent's structured output) and were persisted verbatim, then interpolated into `path.join` at six sites including the real exporter — fixed at the proposal boundary, the one place model output becomes persisted state, so all six joins are protected by construction (pending.md H2). **The tenth is OPEN and worth reading before touching the section pipeline**: `section_pipeline.write_files_repairing_images` — its own docstring calls it "the single funnel every byte of a model-authored section file passes through" — does `Path(project_dir) / rel_path` with **no validation of `rel_path`**, which is a key of the model's own `files` object; an *absolute* key discards the project root entirely, and gate 6's `out-of-boundary-write` cannot catch it because `collect_written_files` only scans `src/pages/<slug>/`. Recorded Minor **only** because the deployment model is one local tester attacking themselves; it becomes serious the day a shared host exists (pending.md M4, which also names the guard to copy: `manifest.ts`'s `validateProposalPaths`/`unsafeRelativePath`).
 
 ## Documents and their authority
 
@@ -67,6 +71,11 @@ Read these before writing code. Conflicts resolve top-down:
 5. [docs/build-prompts-v1.md](docs/build-prompts-v1.md) — the step-by-step build playbook (one prompt per session).
 6. [docs/decisions.md](docs/decisions.md) — decision log (created in prompt P2); append a row for any call the docs don't cover.
 
+Two files sit outside that hierarchy because they describe *status*, not spec, and both are newer than most of this file:
+
+- **[docs/pending.md](docs/pending.md) — the living list of open work.** Read it before planning anything: every item is open or explicitly deferred *with the reason*, and its opening section states the premise that sets severity for the whole list (**friends-and-family testers each run the full stack locally, on their own machine, with their own key — there is no shared hosted instance**, which is why D1/D2's cross-tenant items are deferred rather than blocking, and what would un-defer them). Items are referenced by id throughout this file (B*, C*, D*, F*, G*, H*, K1, M*, N1, R*, U1, W1, X*).
+- **[README.md](README.md) — the tester-facing runbook**, Docker-first, followed literally from a clean shell before it was trusted. It is the authority on *how to run the thing*; the commands below are the contributor subset.
+
 ## Ownership map (hard rules — from contract section 2)
 
 Write contention is prevented by construction, not resolved. Each path has exactly one writer:
@@ -77,12 +86,21 @@ Write contention is prevented by construction, not resolved. Each path has exact
 - `overrides/<route-slug>.overrides.json` — **only** the editor. No agent ever writes overrides.
 - `manifest.json` — append-and-update **only** through the deterministic manifest service (never freehand, never by an LLM directly).
 
-Target package layout (per [docs/build-plan-v1.md](docs/build-plan-v1.md) section 0): `orchestrator/` (Python 3.12, uv, pytest — the agent pipeline), `editor/` (Vite + React + TS — the canvas), `compiler/` (TS library, vitest — manifest service, token deriver, validation gates, exporter, bridge-shim protocol; shared by editor and CLI), `prompts/` (versioned archetype templates), `fixtures/` (hand-written ground-truth project), `generated/` (gitignored output workspace). **Plus `server/`, added by slice 2 and NOT in build-plan section 0** (Node 24 — requires ≥22.13 for `node:sqlite`, declared in its `engines`; vitest; no framework) — the hosted composition root and identity store. `server/data/` is gitignored and holds the identity database.
+Target package layout (per [docs/build-plan-v1.md](docs/build-plan-v1.md) section 0): `orchestrator/` (Python 3.12, uv, pytest — the agent pipeline), `editor/` (Vite + React + TS — the canvas), `compiler/` (TS library, vitest — manifest service, token deriver, validation gates, exporter, bridge-shim protocol; shared by editor and CLI), `prompts/` (versioned archetype templates), `fixtures/` (hand-written ground-truth project), `generated/` (gitignored output workspace). **Plus `server/`, added by slice 2 and NOT in build-plan section 0** (Node 24 — requires ≥22.13 for `node:sqlite`, declared in its `engines`; vitest; no framework) — the hosted composition root and identity store. `server/data/` is gitignored and holds the identity database. Also not in section 0: **[Dockerfile](Dockerfile) + [compose.yaml](compose.yaml) + [docker/entrypoint.sh](docker/entrypoint.sh)**, one image carrying Node + Python + `uv` because **the server spawns Python at runtime**; all three files hold long measured comments that are the real documentation for their decisions.
+
+Two facts about this layout bite in practice:
+
+- **The real Node floor is 22.18, not `engines`' ≥22.13.** Every entry point in the repo is a `.ts` file handed straight to `node` (`server/scripts/serve.ts`, `scripts/user.ts`, `compiler/scripts/preview.ts`), and unflagged type stripping only lands in 22.18 — at 22.17 the failure is `ERR_UNKNOWN_FILE_EXTENSION: Unknown file extension ".ts"`, which names neither Node's version nor TypeScript. `≥22.13` is exactly right for what it was written for (`node:sqlite`, `stripTypeScriptTypes`) and is not the whole floor. CI and the image both pin **24**; the Dockerfile header holds the measured version table.
+- **`fixtures/acme-landing` is a standalone npm project, not a workspace**, and its `node_modules` is load-bearing **at runtime, not just for tests**: the orchestrator links it into every generated project, so the preview child and the export verification build have something to resolve against. That link is *absolute*, which is why a project generated in Docker cannot be previewed from source (pending.md X1).
 
 Two ownership rules extend the contract's list for `server/`, and both are structural rather than conventional:
 
 - **No HTTP route may create a user.** Account creation exists *only* in `server/src/user-cli.ts`. This is what makes invite-only a property of the code rather than a feature nobody got around to. (There is no login *page* to keep a sign-up link off: the hosted server serves no HTML at all, only JSON and the preview proxy. When one is built, it carries no sign-up link.) `POST /api/generate` creates a **project**, which is allowed and is slice 5's own work; creating a *user* is not.
 - **Auth lives at the HTTP boundary only.** The orchestrator CLIs, `compiler/scripts/preview.ts`, and `npm run check` must never require a login. Adding a guard to an existing handler is the wrong move; compose a new root instead.
+
+**The login screen now exists** (`editor/src/components/LoginScreen.tsx`, hosted mode only) and carries **no sign-up link and no reset link** — both would be dead ends by design. The rule above is unchanged: it is still the *server* that serves no HTML.
+
+**`server/src/dev-admin.ts` seeds a default `admin` / `admin` account and is NOT a violation of that rule** — read its header before touching it. It runs in the composition root at boot, with the same authority as `user-cli.ts`, and no request can reach it; it fires only on a genuinely **empty** user table (so it cannot resurrect a deleted account or re-seed after an operator `disable`), and the server binds **127.0.0.1** by default, refusing to seed at all under `--host 0.0.0.0`. It is a shipped default credential, defensible only under the local-single-tester deployment model, and **must be deleted rather than adjusted** the moment a shared host exists.
 
 ## Build philosophy (from build-plan section 0 — these govern ordering)
 
@@ -94,9 +112,69 @@ The `fixtures/` project is the permanent test bed for `compiler/` and shim chang
 
 ## Verify commands
 
-One root command runs every package's test suite: **`npm run check`** (npm workspaces for `compiler/` and `editor/`, then `uv run --directory orchestrator pytest`). CI runs exactly this command. Per-package tools: `orchestrator/` → pytest (Python 3.12 via uv); `compiler/` and `editor/` → vitest; editor/shim end-to-end → Playwright (from milestone 2). The **invariant suite** (edit → export → build → screenshot-diff, [docs/canvas-editor-prd-v1.md](docs/canvas-editor-prd-v1.md) section 7.1) is a required CI check and the enforcement mechanism for preview = handover; it runs on every change to the shim, the exporter, or the primitive set.
+One root command runs exactly what CI runs: **`npm run check`** — vitest for `compiler/`, `editor/` and `server/` (each package's own `test` script is `tsc --noEmit && vitest run`), then `uv run --directory orchestrator pytest`, then **both Playwright suites** (`compiler`'s shim spec, `editor`'s e2e including the invariant suite). **There is no eslint or prettier in this repo** — `tsc --noEmit` is the lint, and it already runs inside every `test`.
+
+First-time setup in a fresh clone is **three installs, not one** (see the layout notes above for why the fixture is separate):
+
+```bash
+npm install                             # workspaces: compiler, editor, server
+npm ci --prefix fixtures/acme-landing   # standalone project; load-bearing at runtime
+uv sync --directory orchestrator        # Python 3.12, auto-fetched from .python-version
+npx playwright install chromium         # --with-deps in CI
+```
+
+Narrower runs — reach for these instead of `npm run check` while iterating:
+
+| Goal | Command |
+|---|---|
+| One package | `npm test -w compiler` (or `-w editor`, `-w server`) |
+| One vitest file | `npm exec -w server -- vitest run src/jobs.test.ts` |
+| One vitest case | same, plus `-t "substring of the test name"` |
+| One pytest file or case | `uv run --directory orchestrator pytest tests/test_regen.py -k name` |
+| One Playwright spec | `npm run test:e2e -w editor -- invariant.spec.ts` (`-g "case"` for one case) |
+| Editor e2e against a **real** generated site | `WG_PROJECT_DIR=../generated/web-<uuid> npm run test:e2e -w editor` |
+| The deterministic spine, end to end on the fixture | `npm run spine` (derive tokens → gates → export) |
+| Gates / export / preview on any project | `npm run gates -w compiler -- <dir>` · `npm run export -w compiler -- <dir> <out> --clean` · `npm run preview -w compiler -- <dir> --port 5273` |
+| Orchestrator pipeline stages | `uv run --directory orchestrator python -m orchestrator.<module>` (`acceptance`, `plan`, `design`, `shell`, `fanout`, `regenerate`, `add_section`, `run_report`, `soak`, `stress`) |
+
+The **invariant suite** (edit → export → build → screenshot-diff, [docs/canvas-editor-prd-v1.md](docs/canvas-editor-prd-v1.md) section 7.1) is a required CI check and the enforcement mechanism for preview = handover; it runs on every change to the shim, the exporter, or the primitive set. `orchestrator/tests/conftest.py` makes the Python suite **structurally offline** in two independent layers — a perturbation during development once made a real, billed API call, so do not weaken it.
 
 Validation gates (contract section 8) run after every agent and before every export via `compiler/`'s `runGates` / the `gates <dir>` CLI. Export runs typecheck + gates + a production build and **fails loudly** — a failed export never ships silently degraded code.
+
+## Running the app
+
+Two paths, both documented at length in [README.md](README.md). **Docker is the recommended path for using it; from source is the only path that can run the test suites** (the image ships no browsers).
+
+```bash
+# Docker — one command, two services on one image (server :4000, editor :5173)
+docker compose up
+
+# From source — two terminals, from the repo root
+INSECURE_COOKIES=1 npm run serve -w server -- \
+  --db "$PWD/server/data/identity.db" --projects-root "$PWD/generated" --bootstrap-email admin
+npm run dev:hosted -w editor            # then open http://localhost:5173/
+```
+
+Five things that will otherwise cost you an hour:
+
+- **`dev:hosted`, not `dev`.** Plain `npm run dev -w editor` is **local mode**: it talks to an unauthenticated standalone preview server on port 5273 and shows **no login screen at all**. `dev:hosted` is `vite --mode hosted`, which sets `VITE_WEBGEN_HOSTED=1` and proxies `/api`, `/__*` and `/preview` to the server on 4000 so the browser sees **one origin** (cookies flow, `SameSite=Lax` survives, no CORS). Local mode stays byte-identical and is what the milestone-7 Playwright suite runs against.
+- **`WEBGEN_MASTER_KEY` is generated exactly once, and never again.** Every stored API key is AES-256-GCM ciphertext under it; a different key does not fail at boot, it fails later at decrypt time. Nothing in this repo may generate it as a convenience default — `docker/entrypoint.sh` refuses to start and explains instead, deliberately. It is **base64, not hex** (a hex key passes the canonicality check and fails only on length).
+- **`--projects-root` must resolve to this repo's own `generated/`** or the server refuses to boot, because `GENERATED_DIR` is hardcoded from the orchestrator's package location. `--bootstrap-email` (or `WEBGEN_BOOTSTRAP_EMAIL`) adopts directories already sitting in `generated/`, once, on boot; without it they are ownerless, which looks exactly like an empty project list. It can never *create* an account.
+- **A project's id and its on-disk directory are different UUIDs.** `generated/<project-id>` does not exist — the directory is the *run* id, and `GET /api/jobs/:id` does not expose it. Use `node server/scripts/user.ts list-projects --db …`.
+- **Fan-out defaults to SERIAL, and raising it reopens a measured corruption.** `WEBGEN_FANOUT_MAX_WORKERS` unset means one page worker (`fanout.py`); at 2, two workers 424 ms apart raced Kitaru's SQLite metadata store (`journal_mode=delete`, `busy_timeout=5000`), a `commit_section_manifest` was lost, and the run shipped a `.tsx` with no manifest entry — gate 4 rejects that forever, so the site looks finished in the canvas and can **never** be exported. Making the store WAL is what would let parallelism return (pending.md K1).
+
+Environment variables, all of them:
+
+| Variable | Effect |
+|---|---|
+| `WEBGEN_MASTER_KEY` | **Required** by `server/`; base64, 32 bytes; `serve.ts` deletes it from `process.env` right after reading, because `compiler/`'s spawn sites pass no `env` and would leak it into model-authored build config |
+| `INSECURE_COOKIES=1` | Drops the session cookie's `Secure` flag. Correct on plain HTTP locally; never on a real deployment |
+| `WEBGEN_SHUTDOWN_GRACE_MS` | Declares the supervisor's grace and derives the whole shutdown budget (`proxiedWait < watchdog < grace`); 10s floor, refuses invalid input rather than clamping |
+| `WEBGEN_BOOTSTRAP_EMAIL` | Compose equivalent of `--bootstrap-email` |
+| `WEBGEN_FANOUT_MAX_WORKERS` | Unset ⇒ **1 (serial)**. See the warning above |
+| `WEBGEN_HOSTED_SERVER_URL` | Where the editor's hosted-mode Vite proxy points (default `http://localhost:4000`; Docker sets `http://server:4000`) |
+| `WEBGEN_USAGE_LOG` | Path the orchestrator writes its priced `usage.jsonl` rows to, so one invocation's spend is attributed to one user |
+| `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` + `ORCH_MODEL_PROVIDER` | `orchestrator/.env` for CLI runs. Under the server the user's own key is injected per run; both Docker services shadow `orchestrator/.env` with `/dev/null` precisely so an absent injected key cannot fall through to the operator's (python-dotenv's `override=False` has produced "the operator pays" twice) |
 
 ## Standing rules
 
@@ -105,3 +183,8 @@ Validation gates (contract section 8) run after every agent and before every exp
 - Generated output (`generated/`) is disposable; fixtures and tests are not. Fix a generation-quality problem in the template or the contract enforcement — **never hand-patch generated files.**
 - Any decision the docs don't cover → one row in [docs/decisions.md](docs/decisions.md).
 - Node IDs are semantic (`home.hero.cta-primary`), never positional (`child-3`), and immutable once registered — positional IDs break regeneration.
+- **A wrong claim is corrected beside the original, never rewritten.** This applies to `decisions.md`, `pending.md` and this file. A silently-rewritten record hides that a review caught something, and the log's whole value is that it can be trusted; there are entries here whose retraction is more instructive than the original claim (pending.md's own X2 withdrawal is the model).
+- **`decisions.md` is append-only, and a row is dated to the day the work LANDED** — not to the incident it answers. Back-dating is a small, plausible habit that destroys the property that date order means append order (pending.md M6).
+- **Close a `pending.md` item by moving it to "Recently closed" with its commit, or by recording why it stays open.** Never delete an open row.
+- **Verification plans are suspect too.** When a check says a feature is broken, suspect the check first and re-derive the claim from independent signals — four of round 1's errors were in its own verification plan, and one would have filed a working feature as BROKEN. Prefer evidence the code under test does not write (money, file mtimes, billing rows) over its own run log.
+- **Do not raise a concurrency knob to make something faster** without reading why it was lowered: fan-out's serial default and the preview pool's cap of 6 are both load-bearing (K1, H3).

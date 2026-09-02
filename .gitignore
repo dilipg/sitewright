@@ -27,14 +27,23 @@ playwright-report/
 # the AES-256-GCM key every stored API key is encrypted under. Needs its own
 # line: `.env` matches only that exact name and `*.env` matches only names
 # ENDING in `.env`, so `.env.docker` slipped past both and `git status` offered
-# it for commit. `/.env.*` covers any future sibling (.env.local, …) too.
+# it for commit.
 #
-# ANCHORED with a leading slash, and that matters: an unanchored `.env.*` matches
-# at every level, which would cover `editor/.env.hosted` — a file that is
-# committed on purpose (it is what makes `npm run dev:hosted` hosted mode, and it
-# holds no secret). Being already tracked, it would not actually have been
-# dropped, but the rule would be lying about intent.
-/.env.*
+# UNANCHORED as of 2026-09-02, when the repo was opened to the public. It was
+# `/.env.*` — anchored to the root so it could not cover `editor/.env.hosted`, a
+# file committed on purpose (it is what makes `npm run dev:hosted` hosted mode,
+# and it holds no secret). That kept the rule honest about intent but left a real
+# hole: a contributor's `server/.env.local` or `editor/.env.production` matched
+# NOTHING here and would have been offered for commit, in a repo where env files
+# are exactly where the master key and the provider keys live. The negation below
+# now states the single exception the anchor was standing in for, which is also
+# where a reader asking "why is that one file tracked?" will look.
+.env.*
+# The one deliberately committed env file. Being already tracked, this line does
+# not rescue it — ignore rules never apply to a tracked path — so it exists for
+# the case that actually bites: the file gets deleted and re-added, and the rule
+# above swallows it silently.
+!editor/.env.hosted
 
 # Identity database (argon2 hashes, live session ids, and — from slice 3 —
 # encrypted API keys). Ignore the directory, not just the filename: WAL mode

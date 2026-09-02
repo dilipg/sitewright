@@ -99,9 +99,11 @@ $b = [byte[]]::new(32)
 > too, with a different message. Use the command above and it is right by
 > construction.
 
-`.env.docker` is gitignored (`/.env.*`, anchored so it does not also cover the
-deliberately committed `editor/.env.hosted`), so the key cannot be committed by
-accident.
+`.env.docker` is gitignored, so the key cannot be committed by accident. The rule
+is an unanchored `.env.*` plus an explicit `!editor/.env.hosted` for the one env
+file that *is* committed on purpose. It was anchored (`/.env.*`) until
+2026-09-02: that could not reach `editor/.env.hosted`, but it also could not
+reach a `server/.env.local`, which is the more likely accident.
 
 ## 2. Start the stack
 

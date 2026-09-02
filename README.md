@@ -24,7 +24,7 @@ every structural decision below exists to prevent it.
 Three things you can read here that most generated-code projects don't publish:
 
 - **A decision log with its retractions intact.** [`docs/decisions.md`](docs/decisions.md)
-  is 392 dated rows and counting, append-only. A claim that turned out wrong is corrected
+  is 393 dated rows and counting, append-only. A claim that turned out wrong is corrected
   *beside* the original, never rewritten — because a silently-edited record hides
   that a review caught something. Some retractions are more instructive than the
   original claim.
@@ -37,8 +37,8 @@ Three things you can read here that most generated-code projects don't publish:
   every open item with the reason it's open and the premise that sets its
   severity. Nothing is quietly dropped.
 
-It is also a fairly large case study in agentic development: **301 commits over
-six weeks, 223 of them co-authored by Claude Code, 2,492 tests.** See
+It is also a fairly large case study in agentic development: **302 commits over
+six weeks, 224 of them co-authored by Claude Code, 2,492 tests.** See
 [How it was built](#how-it-was-built).
 
 ---
@@ -121,7 +121,7 @@ The receipts that the loop was doing real work, all countable from git:
 
 | Evidence | Count |
 |---|---|
-| Commits / co-authored by Claude | 301 / 223 |
+| Commits / co-authored by Claude | 302 / 224 |
 | `fix(` commits vs `feat(` commits | **90 vs 85** — it found more than it added |
 | Commits citing a *perturbation* (breaking the implementation to prove a test catches it) | 29 |
 | Commits citing a whole-branch review finding | 28 |

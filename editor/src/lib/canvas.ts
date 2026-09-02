@@ -4,7 +4,7 @@
  * frames in/near the viewport run live).
  */
 
-import type { Manifest } from "@website-generator/compiler/src/manifest.ts";
+import type { Manifest } from "@sitewright/compiler/src/manifest.ts";
 import type { OverridesMap } from "./store";
 
 export interface RouteInfo {

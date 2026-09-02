@@ -18,7 +18,7 @@ import type { Plugin } from "vite";
 export function planApiPlugin(projectRoot: string): Plugin {
   const planDir = join(resolve(projectRoot), "plan");
   return {
-    name: "website-generator:plan-api",
+    name: "sitewright:plan-api",
     apply: "serve",
     configureServer(server) {
       server.middlewares.use((req, res, next) => {

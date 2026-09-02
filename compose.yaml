@@ -18,7 +18,7 @@ x-webgen-image: &webgen-image
     dockerfile: Dockerfile
   # Named so both services resolve the SAME built image and the second build is a
   # pure cache hit rather than a second install of everything.
-  image: website-generator:local
+  image: sitewright:local
 
 x-webgen-volumes: &webgen-volumes
   # The repo itself, so the code running is the code the tester cloned and a

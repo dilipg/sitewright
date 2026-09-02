@@ -355,7 +355,7 @@ describe("App.tsx: the canvas says how to edit, and how to leave (dogfood G4, G8
 
   it("offers a way out of the canvas, in hosted mode only", () => {
     // G8: there was none. The toolbar held Home, the width and mode toggles,
-    // Undo/Redo, Export and "Saved"; "Website Generator" beside them is a
+    // Undo/Redo, Export and "Saved"; "Sitewright" beside them is a
     // <span>. Getting back to the project list meant editing the URL.
     const header = appSource.slice(
       appSource.indexOf('<header className="editor-header">'),

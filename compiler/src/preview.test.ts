@@ -131,7 +131,7 @@ describe("startPreviewServer: preview pool support (dynamic port, base path)", (
       const match = /src="([^"]*bridge-shim\.js)"/.exec(html);
       expect(match).not.toBeNull();
       const src = match![1]!;
-      expect(src).toBe("/@website-generator/bridge-shim.js");
+      expect(src).toBe("/@sitewright/bridge-shim.js");
       const scriptRes = await fetch(`http://127.0.0.1:${port}${src}`);
       expect(scriptRes.status).toBe(200);
     } finally {

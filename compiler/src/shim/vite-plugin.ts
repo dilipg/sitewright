@@ -9,14 +9,14 @@ import { buildSync } from "esbuild";
 import { fileURLToPath } from "node:url";
 import type { Plugin } from "vite";
 
-const SHIM_PATH = "/@website-generator/bridge-shim.js";
+const SHIM_PATH = "/@sitewright/bridge-shim.js";
 const RESOLVED_SHIM_ID = `\0${SHIM_PATH}`;
 
 export function bridgeShimPlugin(): Plugin {
   let bundledShim: string | undefined;
 
   return {
-    name: "website-generator:bridge-shim",
+    name: "sitewright:bridge-shim",
     apply: "serve",
     transformIndexHtml(_html, ctx) {
       // The injected `src` must be BASE-AWARE. Vite's own internally

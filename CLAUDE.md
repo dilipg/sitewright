@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Product summary
 
-An AI website-generator: a user types a one-line brief, an agent pipeline generates a complete multi-page marketing/storefront/SaaS site as typed React source, the user edits it on an infinite canvas (text, style, layout, visibility) and regenerates individual sections without losing edits, then exports a zip of developer-handover-quality code that matches the preview **pixel-for-pixel on every edited node**. The product's one unforgivable failure is preview ≠ handover; the entire architecture (stable node IDs, an override layer, a deterministic exporter) exists to prevent it.
+**Sitewright** — an AI website generator (renamed from `website-generator` on 2026-09-02; the npm scope is `@sitewright/*`). A user types a one-line brief, an agent pipeline generates a complete multi-page marketing/storefront/SaaS site as typed React source, the user edits it on an infinite canvas (text, style, layout, visibility) and regenerates individual sections without losing edits, then exports a zip of developer-handover-quality code that matches the preview **pixel-for-pixel on every edited node**. The product's one unforgivable failure is preview ≠ handover; the entire architecture (stable node IDs, an override layer, a deterministic exporter) exists to prevent it.
 
 ## Current state
 

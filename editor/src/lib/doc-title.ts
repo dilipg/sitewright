@@ -36,7 +36,7 @@ export type EditorScreen =
 
 /** The product name, last in every title so a truncated tab still shows the
  *  distinguishing half. */
-export const APP_TITLE = "Website Generator";
+export const APP_TITLE = "Sitewright";
 
 /** How much of a project id identifies it to a human. Eight hex characters is
  *  what `user-cli list-projects`, the picker's own URLs and every id in this

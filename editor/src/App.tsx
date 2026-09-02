@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { Manifest } from "@website-generator/compiler/src/manifest.ts";
+import type { Manifest } from "@sitewright/compiler/src/manifest.ts";
 import type {
   NodeGeometry,
   ShimOverride,
   ShimToParentMessage,
-} from "@website-generator/compiler/src/shim/protocol.ts";
-import { PROTOCOL_VERSION } from "@website-generator/compiler/src/shim/protocol.ts";
+} from "@sitewright/compiler/src/shim/protocol.ts";
+import { PROTOCOL_VERSION } from "@sitewright/compiler/src/shim/protocol.ts";
 import type { ExportOutcome } from "./components/ExportPanel";
 import ExportPanel from "./components/ExportPanel";
 import Inspector from "./components/Inspector";
@@ -2143,10 +2143,10 @@ export default function App() {
   return (
     <div className="editor-root">
       <header className="editor-header">
-        <span className="editor-title">Website Generator</span>
+        <span className="editor-title">Sitewright</span>
         {/* DOGFOOD G8 — THE WAY OUT OF THE CANVAS. There was none: the toolbar
             held Home, the width and mode toggles, Undo/Redo, Export and
-            "Saved", and "Website Generator" beside it is a `<span>`, not a
+            "Saved", and "Sitewright" beside it is a `<span>`, not a
             button — so returning to the project list meant hand-editing the
             URL. Same navigation the bootstrap-error screen already offers
             (`editorUrlWithoutProject`), which is a full page load rather than a

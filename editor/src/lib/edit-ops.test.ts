@@ -4,9 +4,9 @@
  * changes nothing at all.
  */
 import { describe, expect, it } from "vitest";
-import type { Manifest } from "@website-generator/compiler/src/manifest.ts";
-import type { EditOperation } from "@website-generator/compiler/src/edit-protocol.ts";
-import { STYLE_PROPERTIES } from "@website-generator/compiler/src/style-properties.ts";
+import type { Manifest } from "@sitewright/compiler/src/manifest.ts";
+import type { EditOperation } from "@sitewright/compiler/src/edit-protocol.ts";
+import { STYLE_PROPERTIES } from "@sitewright/compiler/src/style-properties.ts";
 import type { OverridesMap } from "./store";
 import { applyEditOperations, interpretEditResult, validateEditOperations } from "./edit-ops";
 

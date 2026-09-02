@@ -3,6 +3,6 @@ import { COMPILER_PACKAGE } from "./index";
 
 describe("compiler test runner", () => {
   it("runs (P0 placeholder)", () => {
-    expect(COMPILER_PACKAGE).toBe("@website-generator/compiler");
+    expect(COMPILER_PACKAGE).toBe("@sitewright/compiler");
   });
 });

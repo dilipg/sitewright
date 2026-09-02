@@ -99,7 +99,7 @@ export interface NodeHitMessage {
  * 4). This direction is purely additive: an editor that does not know this
  * message ignores it, and a shim that does not send it simply leaves the canvas
  * as it is today. Both halves are also served from `compiler/` — the shim at
- * `/@website-generator/bridge-shim.js`, never copied into a project — so they
+ * `/@sitewright/bridge-shim.js`, never copied into a project — so they
  * ship together and cannot disagree in practice. Bumping would manufacture a
  * `version-mismatch` warning for a cached shim while changing nothing real.
  */

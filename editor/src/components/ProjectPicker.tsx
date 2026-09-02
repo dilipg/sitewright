@@ -421,7 +421,7 @@ export default function ProjectPicker({
   return (
     <div className="project-picker" data-testid="project-picker">
       <header className="picker-header">
-        <h1>Website Generator</h1>
+        <h1>Sitewright</h1>
         {accountEmail !== undefined && (
           <p className="picker-account" data-testid="picker-account">
             Signed in as <strong>{accountEmail}</strong>{" "}

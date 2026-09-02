@@ -137,7 +137,7 @@ export class RevertConflictError extends Error {
 export function regenApiPlugin(projectRoot: string): Plugin {
   const root = resolve(projectRoot);
   return {
-    name: "website-generator:regen-api",
+    name: "sitewright:regen-api",
     apply: "serve",
     configureServer(server) {
       server.middlewares.use((req, res, next) => {

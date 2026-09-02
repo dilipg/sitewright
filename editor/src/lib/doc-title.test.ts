@@ -32,7 +32,7 @@ describe("documentTitleFor", () => {
   });
 
   it("names the run on the screen a tester leaves open for eleven minutes", () => {
-    expect(documentTitleFor("generating")).toBe("Generating your site · Website Generator");
+    expect(documentTitleFor("generating")).toBe("Generating your site · Sitewright");
   });
 
   it("names the project by its id PREFIX on the canvas, which is what the URL shows", () => {
@@ -40,7 +40,7 @@ describe("documentTitleFor", () => {
     // shows is not in hand there; the id is, on the URL. Eight characters is
     // what identifies a project everywhere else in this codebase.
     expect(documentTitleFor("canvas", "532b215c-1962-4996-8411-f4e722fbf6ab")).toBe(
-      "Editing 532b215c · Website Generator",
+      "Editing 532b215c · Sitewright",
     );
   });
 

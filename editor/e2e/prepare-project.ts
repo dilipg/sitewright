@@ -13,7 +13,7 @@ import { fileURLToPath } from "node:url";
 // junction but throws `ENOTDIR` on a POSIX symlink, so on Linux or macOS the
 // SECOND run of the e2e setup failed here — outside the reach of the Python-only
 // portability guard. That helper branches on `lstatSync` and is tested.
-import { removeDirectoryLink } from "@website-generator/compiler";
+import { removeDirectoryLink } from "@sitewright/compiler";
 
 const fixtureDir = fileURLToPath(new URL("../../fixtures/acme-landing", import.meta.url));
 const projectDir = fileURLToPath(new URL("../../generated/editor-e2e-project", import.meta.url));

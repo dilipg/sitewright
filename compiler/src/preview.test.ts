@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -172,7 +172,14 @@ describe("resolveFsAllow", () => {
     symlinkSync(sharedInstall, join(root, "node_modules"), "junction");
     const allow = resolveFsAllow(root);
     expect(allow).toContain(root);
-    expect(allow.some((p) => p.replace(/\\/g, "/") === sharedInstall.replace(/\\/g, "/"))).toBe(true);
+    // `realpathSync` on the EXPECTED side too, because the function under test
+    // returns the REAL resolved location by design. On macOS `tmpdir()` is itself
+    // a symlink (`/var/folders/...` -> `/private/var/folders/...`), so comparing
+    // against the path `mkdtempSync` handed back fails on the `/private` prefix
+    // alone while the function is behaving correctly. Passed on Windows and Linux,
+    // where `tmpdir()` is a real directory -- the same platform asymmetry as the
+    // X1/X2 portability findings.
+    expect(allow.some((p) => p.replace(/\\/g, "/") === realpathSync(sharedInstall).replace(/\\/g, "/"))).toBe(true);
   });
 });
 

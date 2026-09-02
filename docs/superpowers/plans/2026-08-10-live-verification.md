@@ -92,7 +92,7 @@ So `result.passed !== false` is *vacuously true* for an export that failed its g
 - [ ] **Step 1: Confirm a clean starting point**
 
 ```bash
-cd "c:/Users/Dilip/Documents/GitHub/website generator"
+cd /path/to/sitewright   # this repo's root
 git status --porcelain          # expect empty
 node --version                  # expect >= 22.13 (node:sqlite)
 uv --version

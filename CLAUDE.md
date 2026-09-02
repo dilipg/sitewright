@@ -74,7 +74,7 @@ Read these before writing code. Conflicts resolve top-down:
 Two files sit outside that hierarchy because they describe *status*, not spec, and both are newer than most of this file:
 
 - **[docs/pending.md](docs/pending.md) — the living list of open work.** Read it before planning anything: every item is open or explicitly deferred *with the reason*, and its opening section states the premise that sets severity for the whole list (**friends-and-family testers each run the full stack locally, on their own machine, with their own key — there is no shared hosted instance**, which is why D1/D2's cross-tenant items are deferred rather than blocking, and what would un-defer them). Items are referenced by id throughout this file (B*, C*, D*, F*, G*, H*, K1, M*, N1, R*, U1, W1, X*).
-- **[README.md](README.md) — the tester-facing runbook**, Docker-first, followed literally from a clean shell before it was trusted. It is the authority on *how to run the thing*; the commands below are the contributor subset.
+- **[docs/runbook.md](docs/runbook.md) — the tester-facing runbook**, Docker-first, followed literally from a clean shell before it was trusted. It is the authority on *how to run the thing*; the commands below are the contributor subset. **It lived at `README.md` until 2026-09-02**, when the repo was opened to the public and `README.md` became a short front page (why the project exists, the architectural decisions, the structure, and how it was built); the runbook moved with `git mv`, so its history is intact and older records that cite `README.md` for run instructions mean this file.
 
 ## Ownership map (hard rules — from contract section 2)
 
@@ -143,7 +143,7 @@ Validation gates (contract section 8) run after every agent and before every exp
 
 ## Running the app
 
-Two paths, both documented at length in [README.md](README.md). **Docker is the recommended path for using it; from source is the only path that can run the test suites** (the image ships no browsers).
+Two paths, both documented at length in [docs/runbook.md](docs/runbook.md). **Docker is the recommended path for using it; from source is the only path that can run the test suites** (the image ships no browsers).
 
 ```bash
 # Docker — one command, two services on one image (server :4000, editor :5173)

@@ -1,4 +1,8 @@
-# Sitewright
+# Sitewright — runbook
+
+*How to run the thing. For what it is, why it exists and how it is built, see
+[the README](../README.md). This file lived at `README.md` until 2026-09-02 and
+moved with `git mv`, so its history is intact.*
 
 Type a one-line brief. An agent pipeline generates a complete multi-page site as
 typed React source. You edit it on an infinite canvas — text, style, layout,
@@ -510,7 +514,7 @@ whole-branch review caught it.
 Wherever spend is shown, the wording changes to say you have spent *at least*
 that much whenever any call in the window was unpriced. This is an accepted
 trade — both providers shipped, with the gap surfaced rather than hidden — and it
-is tracked in [docs/pending.md](docs/pending.md). **If you want the cap to mean
+is tracked in [docs/pending.md](pending.md). **If you want the cap to mean
 what it says, use an Anthropic key.**
 
 **Accounts are created only by the operator CLI.** There is no sign-up, and no
@@ -940,14 +944,14 @@ docker compose exec --workdir /app server uv run --directory /app/orchestrator p
 
 One `compiler` test is also known to fail on Linux only — a `tsc` diagnostic
 ordering difference against an over-specific assertion, recorded in
-[docs/pending.md](docs/pending.md).
+[docs/pending.md](pending.md).
 
 ---
 
 ## Known rough edges
 
 This is a work in progress and the list of what is unfinished, deferred, or
-known-broken is maintained deliberately in **[docs/pending.md](docs/pending.md)**.
+known-broken is maintained deliberately in **[docs/pending.md](pending.md)**.
 Read it before filing something — several of the surprising behaviours in this
 system are already written down there, with the reason they are still open.
 

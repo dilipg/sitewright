@@ -1,4 +1,4 @@
-# Website Generator
+# Sitewright
 
 Type a one-line brief. An agent pipeline generates a complete multi-page site as
 typed React source. You edit it on an infinite canvas — text, style, layout,
@@ -836,7 +836,7 @@ either path, and it reopens that race.
 Everything except the database and your stored key is disposable. To come back:
 
 ```bash
-cd /path/to/website-generator
+cd /path/to/sitewright
 export WEBGEN_REPO="$PWD"
 export WEBGEN_DB="$WEBGEN_REPO/server/data/identity.db"
 export WEBGEN_MASTER_KEY="<the same key from step 3>"

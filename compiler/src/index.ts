@@ -11,7 +11,7 @@
  * specifier is NOT searched for candidate extensions, so `export { deriveTokens }
  * from "./derive-tokens"` threw `ERR_MODULE_NOT_FOUND` the moment anything
  * outside `compiler/` imported this module: round A pointed
- * `editor/e2e/prepare-project.ts` at `@website-generator/compiler`, and the
+ * `editor/e2e/prepare-project.ts` at `@sitewright/compiler`, and the
  * editor's Playwright `webServer` then failed to start at all.
  *
  * It went unnoticed because nothing here is exercised by Node until then: vitest
@@ -23,7 +23,7 @@
  * elsewhere survive without extensions (they are erased before any resolution
  * happens) and why a value export like the ones below does not.
  */
-export const COMPILER_PACKAGE = "@website-generator/compiler";
+export const COMPILER_PACKAGE = "@sitewright/compiler";
 
 export { deriveTokens } from "./derive-tokens.ts";
 export type { DeriveTokensResult, TailwindTheme } from "./derive-tokens.ts";

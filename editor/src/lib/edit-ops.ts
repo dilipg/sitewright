@@ -6,9 +6,9 @@
  * a token. The requirement is that any of those changes NOTHING — validation is
  * all-or-nothing per prompt, so a compound instruction never half-lands.
  */
-import type { EditableChannel, Manifest } from "@website-generator/compiler/src/manifest.ts";
-import type { EditOperation } from "@website-generator/compiler/src/edit-protocol.ts";
-import { isSupportedStyleProperty } from "@website-generator/compiler/src/style-properties.ts";
+import type { EditableChannel, Manifest } from "@sitewright/compiler/src/manifest.ts";
+import type { EditOperation } from "@sitewright/compiler/src/edit-protocol.ts";
+import { isSupportedStyleProperty } from "@sitewright/compiler/src/style-properties.ts";
 import type { OverridesMap } from "./store";
 import {
   applyLayoutProperty,

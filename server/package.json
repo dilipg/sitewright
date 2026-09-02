@@ -1,5 +1,5 @@
 {
-  "name": "@website-generator/server",
+  "name": "@sitewright/server",
   "private": true,
   "version": "0.0.0",
   "type": "module",

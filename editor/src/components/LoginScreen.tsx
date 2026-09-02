@@ -135,7 +135,7 @@ export default function LoginScreen({ onAuthenticated }: LoginScreenProps) {
   return (
     <div className="login-screen" data-testid="login-screen">
       <form className="login-card" onSubmit={(event) => void onSubmit(event)}>
-        <h1>Website Generator</h1>
+        <h1>Sitewright</h1>
         <p className="login-intro">Sign in to generate and edit sites.</p>
 
         <label htmlFor="login-email">Email</label>

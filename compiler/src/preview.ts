@@ -144,7 +144,7 @@ export function resolveFsAllow(root: string): string[] {
 function enforceFsAllowPlugin(root: string): Plugin {
   const vitePackageRoot = fileURLToPath(new URL(".", import.meta.resolve("vite/package.json")));
   return {
-    name: "website-generator:enforce-fs-allow",
+    name: "sitewright:enforce-fs-allow",
     apply: "serve",
     configResolved(resolvedConfig) {
       resolvedConfig.server.fs.allow = [...resolveFsAllow(root), vitePackageRoot].map((p) => normalizePath(p));
@@ -237,7 +237,7 @@ export async function startPreviewServer(
 /** Exported for direct testing (preview.test.ts) — mirrors regen-api.ts's already-exported `regenApiPlugin`, driven the same way there via a fake Vite `configureServer` server. */
 export function overridesApiPlugin(projectRoot: string): Plugin {
   return {
-    name: "website-generator:overrides-api",
+    name: "sitewright:overrides-api",
     apply: "serve",
     configureServer(server) {
       server.middlewares.use((req, res, next) => {

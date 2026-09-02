@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { Manifest } from "@website-generator/compiler/src/manifest.ts";
+import type { Manifest } from "@sitewright/compiler/src/manifest.ts";
 import {
   clampZoom,
   FRAME_GAP,

@@ -3,7 +3,7 @@
  * the breadcrumb (page › section › element), and Esc's walk-up target.
  */
 
-import type { Manifest } from "@website-generator/compiler/src/manifest.ts";
+import type { Manifest } from "@sitewright/compiler/src/manifest.ts";
 
 const ACRONYMS = new Set(["cta", "faq", "url", "seo", "api"]);
 

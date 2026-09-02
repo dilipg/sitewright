@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { ManifestNode } from "@website-generator/compiler/src/manifest.ts";
+import type { ManifestNode } from "@sitewright/compiler/src/manifest.ts";
 import {
   CHANNEL_LIST_NOTE,
   describeChannelGesture,

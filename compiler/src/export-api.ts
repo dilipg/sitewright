@@ -33,7 +33,7 @@ export function exportApiPlugin(projectRoot: string): Plugin {
   const zipPath = join(dirname(root), `${projectName}-export.zip`);
 
   return {
-    name: "website-generator:export-api",
+    name: "sitewright:export-api",
     apply: "serve",
     configureServer(server) {
       server.middlewares.use((req, res, next) => {

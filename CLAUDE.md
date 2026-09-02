@@ -112,7 +112,7 @@ The `fixtures/` project is the permanent test bed for `compiler/` and shim chang
 
 ## Verify commands
 
-One root command runs exactly what CI runs: **`npm run check`** — vitest for `compiler/`, `editor/` and `server/` (each package's own `test` script is `tsc --noEmit && vitest run`), then `uv run --directory orchestrator pytest`, then **both Playwright suites** (`compiler`'s shim spec, `editor`'s e2e including the invariant suite). **There is no eslint or prettier in this repo** — `tsc --noEmit` is the lint, and it already runs inside every `test`.
+One root command runs the whole suite: **`npm run check`** — which is also what `.github/workflows/ci.yml` invokes, though **CI no longer runs automatically** (`workflow_dispatch` only since 2026-09-02: every automatic run had failed and the cause was never diagnosed — pending.md CI1). Treat a green `npm run check` as the gate, not a badge. — vitest for `compiler/`, `editor/` and `server/` (each package's own `test` script is `tsc --noEmit && vitest run`), then `uv run --directory orchestrator pytest`, then **both Playwright suites** (`compiler`'s shim spec, `editor`'s e2e including the invariant suite). **There is no eslint or prettier in this repo** — `tsc --noEmit` is the lint, and it already runs inside every `test`.
 
 First-time setup in a fresh clone is **three installs, not one** (see the layout notes above for why the fixture is separate):
 
@@ -137,7 +137,7 @@ Narrower runs — reach for these instead of `npm run check` while iterating:
 | Gates / export / preview on any project | `npm run gates -w compiler -- <dir>` · `npm run export -w compiler -- <dir> <out> --clean` · `npm run preview -w compiler -- <dir> --port 5273` |
 | Orchestrator pipeline stages | `uv run --directory orchestrator python -m orchestrator.<module>` (`acceptance`, `plan`, `design`, `shell`, `fanout`, `regenerate`, `add_section`, `run_report`, `soak`, `stress`) |
 
-The **invariant suite** (edit → export → build → screenshot-diff, [docs/canvas-editor-prd-v1.md](docs/canvas-editor-prd-v1.md) section 7.1) is a required CI check and the enforcement mechanism for preview = handover; it runs on every change to the shim, the exporter, or the primitive set. `orchestrator/tests/conftest.py` makes the Python suite **structurally offline** in two independent layers — a perturbation during development once made a real, billed API call, so do not weaken it.
+The **invariant suite** (edit → export → build → screenshot-diff, [docs/canvas-editor-prd-v1.md](docs/canvas-editor-prd-v1.md) section 7.1) is the enforcement mechanism for preview = handover (a *required* check in the sense that it gates a commit — note CI itself is manual-only, CI1); it runs on every change to the shim, the exporter, or the primitive set. `orchestrator/tests/conftest.py` makes the Python suite **structurally offline** in two independent layers — a perturbation during development once made a real, billed API call, so do not weaken it.
 
 Validation gates (contract section 8) run after every agent and before every export via `compiler/`'s `runGates` / the `gates <dir>` CLI. Export runs typecheck + gates + a production build and **fails loudly** — a failed export never ships silently degraded code.
 

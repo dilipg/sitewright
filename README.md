@@ -24,7 +24,7 @@ every structural decision below exists to prevent it.
 Three things you can read here that most generated-code projects don't publish:
 
 - **A decision log with its retractions intact.** [`docs/decisions.md`](docs/decisions.md)
-  is 394 dated rows and counting, append-only. A claim that turned out wrong is corrected
+  is 395 dated rows and counting, append-only. A claim that turned out wrong is corrected
   *beside* the original, never rewritten — because a silently-edited record hides
   that a review caught something. Some retractions are more instructive than the
   original claim.
@@ -37,8 +37,8 @@ Three things you can read here that most generated-code projects don't publish:
   every open item with the reason it's open and the premise that sets its
   severity. Nothing is quietly dropped.
 
-It is also a fairly large case study in agentic development: **303 commits over
-six weeks, 225 of them co-authored by Claude Code, 2,493 tests.** See
+It is also a fairly large case study in agentic development: **304 commits over
+six weeks, 226 of them co-authored by Claude Code, 2,493 tests.** See
 [How it was built](#how-it-was-built).
 
 ---
@@ -121,7 +121,7 @@ The receipts that the loop was doing real work, all countable from git:
 
 | Evidence | Count |
 |---|---|
-| Commits / co-authored by Claude | 303 / 225 |
+| Commits / co-authored by Claude | 304 / 226 |
 | `fix(` commits vs `feat(` commits | **91 vs 85** — it found more than it added |
 | Commits citing a *perturbation* (breaking the implementation to prove a test catches it) | 22 |
 | Commits citing a whole-branch review finding | 28 |
@@ -170,7 +170,7 @@ Contributors run it from source instead, which is the only path that can run the
 test suites (the image ships no browsers):
 
 ```bash
-npm run check    # vitest ×3, pytest, and both Playwright suites — exactly what CI runs
+npm run check    # vitest ×3, pytest, and both Playwright suites — the whole suite
 ```
 
 **→ [`docs/runbook.md`](docs/runbook.md) is the full runbook**: both paths step by
@@ -229,4 +229,12 @@ relying on anything. The deployment model it was designed and tested against is
 are deferred *because* of that premise, and the file says which ones and what
 would un-defer them.
 
-No license is granted yet.
+**MIT licensed** — use it, fork it, ship it, sell it; just keep the copyright
+notice. See [`LICENSE`](LICENSE).
+
+CI is **manual-only** (`workflow_dispatch`). Every automatic run had failed
+without the cause ever being diagnosed, and a permanently red badge that carries
+no information is worse than none — `npm run check` is green locally on every
+commit, so the difference is something about the Linux runner. The triggers are
+commented out in [`.github/workflows/ci.yml`](.github/workflows/ci.yml) with the
+candidates listed, not deleted.

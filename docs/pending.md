@@ -5,7 +5,7 @@ deferred with the reason. When an item closes, move it to "Recently closed"
 with the commit, then prune that section once it is stale. Do not delete an
 open item without recording why.
 
-**Last updated:** 2026-08-14, after the `fix/dogfood-findings` whole-branch review's
+**Last updated:** 2026-09-02, when the repo was opened to the public: **CI1** added (every Actions run has failed, never diagnosed, now `workflow_dispatch`-only). Before that: 2026-08-14, after the `fix/dogfood-findings` whole-branch review's
 fix round closed its Critical (C1) and all three Importants (I1/I2/I3) and recorded
 its seven minors as M1–M7 below. Before that: 2026-08-13, when fix round B closed
 I7, R-6 (picker half), C-1 (revert half), R-5 and D-1/D-2/D-3, and recorded three
@@ -92,6 +92,7 @@ this list said `dev` while the hosted shell needs `dev:hosted`.)
 
 | # | Item | Notes |
 |---|---|---|
+| **CI1** | **Every GitHub Actions run of `.github/workflows/ci.yml` has failed, and no log was ever read.** Automatic triggers were switched off on 2026-09-02 (`workflow_dispatch` only) rather than the failure being diagnosed | Not a broken suite: the same `npm run check` the workflow invokes is green locally on every commit (299 / 437 / 907 / 714 / 13 + 123, Windows). So the delta is the **Linux runner**, and it is genuinely unknown which — the plausible candidates are Playwright's chromium system deps, the standalone `fixtures/acme-landing` install, and a path- or case-sensitivity assumption that only bites on a case-sensitive filesystem. **Closing this means reading one real run's log**, which needs `gh` (not installed on the dev machine) or the web UI. Turned off rather than left red because a permanently failing badge nobody can act on trains everyone to ignore the one signal that is supposed to mean something; the triggers are commented out with the candidates listed, never deleted |
 | **F19** | Which mechanism carries fan-out resume — Kitaru's cache or `page_worker.py`'s `progress.json` skip | Round 1 proved the *outcome* (0 re-execution, 31% cost) but not the cause; no `progress.json` survives a finished project. Needs a run that inspects the filesystem *during* fan-out |
 | **U1** | **`degraded_sections` is a one-shot notice.** The persisted job entry is cleared the instant a terminal status is observed, so a tester who reloads twice after a generation completes never learns a section shipped as a placeholder | Fixing it properly needs a per-project server-side record of the degraded set. Cosmetic for a trial, misleading at scale |
 | **F17** | `manifest.json` key order is unstable across a regen — same keys, same byte count, different hash | Defeats hash-based change detection. Worth checking against 6.2's byte-identical export-zip guarantee |

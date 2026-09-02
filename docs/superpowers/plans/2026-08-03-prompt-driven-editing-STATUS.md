@@ -1,8 +1,8 @@
 # Prompt-driven editing — status and restart guide
 
 **Written:** 2026-08-03. **Updated:** 2026-08-04 — merged, and the live gap closed.
-**Branch:** `feat/prompt-driven-editing` — **merged to `main` as `1d6467a`**, branch deleted.
-**HEAD:** `e50c94d`
+**Branch:** `feat/prompt-driven-editing` — **merged to `main` as `8f17e4a`**, branch deleted.
+**HEAD:** `42d0595`
 **Tree:** clean. `npm run check` green: 170 compiler · 108 editor · 246 orchestrator · 13 + 99 e2e = **636 tests**.
 
 ## State in one line
@@ -72,7 +72,7 @@ structural branch, and threw on every real prompt while the suite stayed green
 against a mock that omitted the keys instead.
 
 The runtime bug was already fixed; what remained was a type that would lead the
-next reader straight back into it. Fixed in `e50c94d`, and the stricter type
+next reader straight back into it. Fixed in `42d0595`, and the stricter type
 immediately earned itself by catching an unguarded `result.operations[0]!` in
 `edit-mock.test.ts`.
 
@@ -122,7 +122,7 @@ reviews had passed. Neither was reachable by a per-task review.
    the structural branch always won and threw on every prompt. Invisible
    because the TypeScript mock *omits* those keys and every test ran in mock
    mode — exactly the mock-diverges-from-real trap the design doc warned
-   about. Hence commit `1968761`'s mock change.
+   about. Hence commit `0f74fcf`'s mock change.
 2. **`runCli` spawned with `shell: true` and unescaped arguments.** A
    multi-word instruction arrived as separate argv entries, argparse exited 2,
    no result line. It was also a **shell-injection surface fed by free-form

@@ -28,7 +28,7 @@ the round.
 | runId | `web-2578801a-9d5a-4461-90eb-4a771fde5648` |
 | project directory | `generated/web-2578801a-9d5a-4461-90eb-4a771fde5648` |
 | export directory | `generated/web-2578801a-9d5a-4461-90eb-4a771fde5648-export` |
-| job `code_version` | `05d53603e7ba1bcfb0f862f9ef058717e43082e9` (the server's boot HEAD) |
+| job `code_version` | `ea0623f0ac43c12c48089e93730e5b248dd17944` (the server's boot HEAD) |
 | enqueued | `2026-08-10T06:41:22Z` (epoch 1786344082) |
 | finished | epoch 1786344759444 |
 

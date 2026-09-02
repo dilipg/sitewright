@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-10
 **Status:** approved in brainstorming; round 1 ready to plan
-**Follows:** `2026-08-06-job-model-design.md` (slice 5, merged as `5272a69`)
+**Follows:** `2026-08-06-job-model-design.md` (slice 5, merged as `9f965b7`)
 
 ## What this document is
 

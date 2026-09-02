@@ -24,7 +24,7 @@ every structural decision below exists to prevent it.
 Three things you can read here that most generated-code projects don't publish:
 
 - **A decision log with its retractions intact.** [`docs/decisions.md`](docs/decisions.md)
-  is 393 dated rows and counting, append-only. A claim that turned out wrong is corrected
+  is 394 dated rows and counting, append-only. A claim that turned out wrong is corrected
   *beside* the original, never rewritten — because a silently-edited record hides
   that a review caught something. Some retractions are more instructive than the
   original claim.
@@ -37,8 +37,8 @@ Three things you can read here that most generated-code projects don't publish:
   every open item with the reason it's open and the premise that sets its
   severity. Nothing is quietly dropped.
 
-It is also a fairly large case study in agentic development: **302 commits over
-six weeks, 224 of them co-authored by Claude Code, 2,492 tests.** See
+It is also a fairly large case study in agentic development: **303 commits over
+six weeks, 225 of them co-authored by Claude Code, 2,493 tests.** See
 [How it was built](#how-it-was-built).
 
 ---
@@ -121,11 +121,11 @@ The receipts that the loop was doing real work, all countable from git:
 
 | Evidence | Count |
 |---|---|
-| Commits / co-authored by Claude | 302 / 224 |
-| `fix(` commits vs `feat(` commits | **90 vs 85** — it found more than it added |
-| Commits citing a *perturbation* (breaking the implementation to prove a test catches it) | 29 |
+| Commits / co-authored by Claude | 303 / 225 |
+| `fix(` commits vs `feat(` commits | **91 vs 85** — it found more than it added |
+| Commits citing a *perturbation* (breaking the implementation to prove a test catches it) | 22 |
 | Commits citing a whole-branch review finding | 28 |
-| Tests (compiler 298 · editor 437 · server 907 · pytest 714 · Playwright 13 + 123) | **2,492** |
+| Tests (compiler 299 · editor 437 · server 907 · pytest 714 · Playwright 13 + 123) | **2,493** |
 
 **Where the human actually intervened:** approving each design spec and plan,
 authorizing spend before live runs, and occasionally ruling on scope — one
@@ -179,6 +179,47 @@ troubleshooting, and what to expect before you press Generate — a generation
 spends real money on your key and cannot be cancelled.
 
 ---
+
+## Using the export
+
+The export is the point of the whole thing, so it is worth knowing what comes out
+of it. In the editor it's the Export button; from a checkout, the CLI does the
+same work:
+
+```bash
+npm run export -w compiler -- <projectDir> <outDir> --clean --zip <handover.zip>
+```
+
+One trap: `npm run -w` sets the working directory to the **workspace**, so both
+paths must be absolute (or relative to `compiler/`). A repo-relative
+`generated/…` fails with `manifest.json not found`.
+
+Export is not a copy step. It compiles every override into the source, typechecks,
+runs all seven gates and then the project's own production build — and it **fails
+loudly** rather than shipping quietly degraded code. What you get, measured on a
+real 5-route generated site (80 files):
+
+| | |
+|---|---|
+| `src/pages/<route>/` | one directory per route — an `index.tsx` container that owns state, `sections/` components, and `mock/*.data.ts` where the copy lives |
+| `src/primitives/` · `src/tokens/` · `src/shell/` | the primitive set, the derived design tokens, and the app shell with its route table |
+| `HANDOVER.md` | written per export: which seams to touch, where async state belongs, what a section deliberately does *not* do (no arithmetic, no loading states), and why some utility classes end in `!` |
+| `design-inventory.json` | every primitive with its full prop signature |
+| `overrides-archive/` | a record of the canvas edits that were applied, with a README — **not** something the site reads |
+
+Then it is an ordinary Vite app:
+
+```bash
+unzip handover.zip -d my-site && cd my-site
+npm install        # 43 packages
+npm run dev        # or `npm run build` — tsc --noEmit && vite build
+```
+
+Two properties worth verifying yourself rather than taking on trust. **Every
+canvas edit is already in the source** — there is no runtime override layer to
+install and no dependency on the editor, which is what makes the zip a real
+handover rather than a preview artifact. And **the archive is deterministic**:
+two exports of the same project produce byte-identical zips.
 
 ## Status and license
 

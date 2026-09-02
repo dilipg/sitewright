@@ -1077,4 +1077,33 @@ describe("the borrowed node_modules directory link", () => {
     expect(existsSync(source), "removal followed the link into the source tree").toBe(true);
     expect(readFileSync(join(source, "some-package", "index.js"), "utf8")).toBe("module.exports = 1;\n");
   });
+
+  /**
+   * A DANGLING source link is the state every generated project is in after the
+   * repository root is renamed, and that a container-built project is in on a
+   * host. `existsSync` follows the link, so it answered `false` — identical to
+   * owning no dependencies — and the old guard therefore skipped linking and
+   * ran `npm run build` anyway. Node then walked UP out of the export and
+   * resolved against whatever `node_modules` sat above it (here, the one in the
+   * user's home directory), so a stale link surfaced as four TypeScript errors
+   * blaming `@types/react-dom` in a project that already declares it.
+   *
+   * Asserted on the MESSAGE, because the whole defect was a true failure
+   * reported as the wrong cause.
+   */
+  it(
+    "refuses when the source link dangles, rather than building against whatever sits up the tree",
+    { timeout: 180_000 },
+    () => {
+      const project = fixtureCopyWithOverrides([]);
+      const borrowed = join(tempDir("borrowed-modules-"), "node_modules");
+      mkdirSync(join(borrowed, "some-package"), { recursive: true });
+      linkDirectory(borrowed, join(project, "node_modules"));
+      rmSync(borrowed, { recursive: true, force: true });
+
+      expect(() => exportProject(project, { outDir: join(tempDir("export-dangling-"), "out") })).toThrow(
+        /directory link whose target no longer exists/,
+      );
+    },
+  );
 });

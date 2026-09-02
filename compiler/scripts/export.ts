@@ -8,6 +8,8 @@
 import { existsSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
 import { ExportError, exportProject } from "../src/exporter.ts";
+import { fixtureNodeModules } from "../src/fixture-path.ts";
+import { ensureNodeModulesLink } from "../src/node-modules-link.ts";
 
 const args = process.argv.slice(2);
 const clean = args.includes("--clean");
@@ -34,8 +36,23 @@ if (clean && existsSync(outDir)) {
   rmSync(outDir, { recursive: true, force: true });
 }
 
+// A generated project borrows the fixture's node_modules through a link holding
+// an ABSOLUTE path, and the verification build cannot run without it. Repaired
+// HERE and not inside the exporter, which must not mutate the project it was
+// handed; `startPreviewServer` already does the same for every hosted call, so
+// this covers the one entry point that was not self-healing. Reported, never
+// thrown — the exporter's own refusal names the consequence better than a
+// best-effort repair can.
+const projectDir = resolve(src);
+const link = ensureNodeModulesLink(projectDir, fixtureNodeModules());
+if (link.action === "repaired") {
+  console.log(`Repaired a stale node_modules link (it pointed at ${link.staleTarget})`);
+} else if (link.action === "unavailable") {
+  console.error(`node_modules could not be linked: ${link.reason}`);
+}
+
 try {
-  const result = exportProject(resolve(src), {
+  const result = exportProject(projectDir, {
     outDir,
     ...(zip === undefined ? {} : { zipPath: resolve(zip) }),
   });

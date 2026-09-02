@@ -1329,14 +1329,65 @@ export function removeDirectoryLink(linkPath: string): void {
   else rmdirSync(linkPath);
 }
 
-/** Runs the output project's own typecheck+build, borrowing source node_modules via a directory link. */
+/**
+ * Says WHICH way a `node_modules` path is unusable, which `existsSync` cannot:
+ * it follows the link, so a dangling link and an absent path both answer
+ * `false`. The two have different remedies — a stale link is repaired from the
+ * fixture, an absent fixture needs `npm install` — so the error text has to
+ * tell them apart or it sends the reader to the wrong one.
+ */
+function describeMissingModules(path: string): string {
+  try {
+    // NOT existsSync: lstat is what sees the link rather than its target.
+    return lstatSync(path).isSymbolicLink()
+      ? "is a directory link whose target no longer exists"
+      : "exists but is not a readable directory";
+  } catch {
+    return "does not exist";
+  }
+}
+
+/**
+ * Runs the output project's own typecheck+build, borrowing source node_modules via a directory link.
+ *
+ * WHY THIS REFUSES RATHER THAN SKIPPING. The guard was
+ * `if (!existsSync(outModules) && existsSync(sourceModules))`, and `existsSync`
+ * FOLLOWS a link — so a generated project whose borrowed link had gone stale
+ * (a container-built project on a host, or ANY project after the repository
+ * root is renamed) reported `false`, indistinguishable from owning no
+ * dependencies at all. The link was then never created, and `npm run build` ran
+ * anyway with nothing to resolve against: Node walked UP out of the export
+ * directory and found whatever `node_modules` happened to sit above it — on
+ * this machine, the one in the user's home directory. The export failed with
+ *
+ *     src/main.tsx(3,28): error TS7016: Could not find a declaration file for
+ *     module 'react-dom/client'. 'C:/Users/<user>/node_modules/react-dom/...'
+ *
+ * which sends the reader after `@types/react-dom` in a project that already
+ * declares it. It is the same `existsSync`-follows-a-link trap that
+ * `node-modules-link.ts` was written for, surviving in a second place. Naming
+ * the real cause is the fix here; REPAIRING the stale link belongs at the entry
+ * points (`scripts/export.ts`, and `startPreviewServer` for every hosted call),
+ * because the exporter must not silently mutate the project it was handed.
+ */
 function runVerificationBuild(projectRoot: string, outDir: string): void {
   const sourceModules = join(projectRoot, "node_modules");
   const outModules = join(outDir, "node_modules");
   let linked = false;
-  if (!existsSync(outModules) && existsSync(sourceModules)) {
-    linkDirectory(sourceModules, outModules);
-    linked = true;
+  if (!existsSync(outModules)) {
+    if (existsSync(sourceModules)) {
+      linkDirectory(sourceModules, outModules);
+      linked = true;
+    } else {
+      throw new ExportError(
+        `Export verification build needs the source project's node_modules, and ` +
+          `${sourceModules} ${describeMissingModules(sourceModules)}. A generated project ` +
+          `borrows the fixture's dependencies through a directory link holding an ABSOLUTE ` +
+          `path, so the link breaks whenever the layout that created it changes. Open the ` +
+          `project in the preview once (it self-heals there), or run \`npm install\` at the ` +
+          `repository root if the fixture's own node_modules is what is missing.`,
+      );
+    }
   }
   try {
     const result = spawnSync("npm run build", {

@@ -10,6 +10,7 @@ deterministic gallery page renders every primitive for eyeball review.
 
 import json
 import shutil
+import os
 from pathlib import Path
 
 import kitaru
@@ -523,11 +524,43 @@ def write_primitives(project_dir: str, primitives_result: dict, attempt: int) ->
 
 
 def ensure_node_modules(project_dir: Path) -> None:
+    """Links the project at the fixture's node_modules, repairing a stale link.
+
+    `Path.exists()` FOLLOWS a link, so a dangling one reports False — exactly
+    like no link at all. This function used to branch on `exists()` alone and
+    then call `link_directory`, which fails on a path that is already there
+    (the Windows branch's link builtin refuses one): a BROKEN link was
+    therefore an exception rather than a repair. That is pending item X1, whose visible form is a container-built
+    project opened on the host dying on
+    `Failed to resolve import "@tailwindcss/vite"`. Renaming the repository
+    root puts every project in the same state at once.
+
+    `os.path.lexists`, NOT `Path.is_symlink()`, and this is measured rather
+    than assumed: on Windows `link_directory` makes a JUNCTION, and Python
+    reports `is_symlink() == False` for a junction — dangling or not. A repair
+    keyed on `is_symlink()` therefore never fires on Windows, which is the
+    platform this project ran on exclusively for seven milestones. (Node
+    disagrees with Python about the very same object: `lstat().isSymbolicLink()`
+    is True there, which is what `compiler/src/node-modules-link.ts` relies on.)
+    Measured on Windows: a junction has `lexists=True` whether or not it
+    resolves, and `os.unlink` removes a dangling one.
+
+    A real directory is never touched — that is a project that owns its own
+    dependencies, and replacing it with a link would discard a real install.
+    """
     from orchestrator.fixture_context import FIXTURE_DIR
 
     target = project_dir / "node_modules"
-    if not target.exists():
-        link_directory(target, FIXTURE_DIR / "node_modules")
+    source = FIXTURE_DIR / "node_modules"
+
+    # Present but unresolvable can only be a dangling link: a real file or
+    # directory that exists would satisfy `exists()` too. So this removes the
+    # LINK, never anything it pointed at.
+    if os.path.lexists(target) and not target.exists():
+        os.unlink(target)
+
+    if not os.path.lexists(target):
+        link_directory(target, source)
 
 
 # ---------- the flow ----------

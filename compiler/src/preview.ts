@@ -18,6 +18,8 @@ import { planApiPlugin } from "./plan-api.ts";
 import { regenApiPlugin } from "./regen-api.ts";
 import { ROUTE_SLUG } from "./route-slug.ts";
 import { bridgeShimPlugin } from "./shim/vite-plugin.ts";
+import { fixtureNodeModules } from "./fixture-path.ts";
+import { ensureNodeModulesLink } from "./node-modules-link.ts";
 
 export interface PreviewOptions {
   /**
@@ -160,6 +162,35 @@ export async function startPreviewServer(
   const configFile = join(root, "vite.config.ts");
   if (!existsSync(configFile)) {
     throw new Error(`No vite.config.ts found in "${root}"; cannot serve preview.`);
+  }
+
+  // X1. Before Vite loads the project's own `vite.config.ts` — which imports
+  // `@tailwindcss/vite` and therefore needs the project's `node_modules` to
+  // resolve. A generated project BORROWS the fixture's via a directory link
+  // holding an ABSOLUTE path, so the link only works in the layout that made
+  // it: a container-built project opened on the host, or any project after the
+  // repository root is renamed, has a dangling link and the server dies on
+  // `Failed to resolve import "@tailwindcss/vite"` — which surfaced to users as
+  // 500s the editor blamed on "its generation is still running".
+  //
+  // HERE, rather than in `server/src/preview-pool.ts` where it was first
+  // written: that import pulled compiler's source into server's stricter
+  // tsconfig (`exactOptionalPropertyTypes`, `moduleResolution: node16`) and
+  // broke its typecheck on pre-existing incompatibilities. server/ and
+  // compiler/ are deliberately decoupled — see `max-body-bytes.ts`, whose
+  // constant is duplicated rather than imported for the same reason. This spot
+  // needs no cross-package dependency and covers BOTH callers: the hosted
+  // pool's child and `npm run preview` locally.
+  //
+  // Local mode stays byte-identical: `fixtures/acme-landing` owns a REAL
+  // `node_modules` directory, so this reports "kept" and touches nothing.
+  const link = ensureNodeModulesLink(root, fixtureNodeModules());
+  if (link.action === "repaired") {
+    console.log(`preview: repaired a stale node_modules link (was ${link.staleTarget})`);
+  } else if (link.action === "unavailable") {
+    // Logged, never thrown: `createServer` below produces the real, actionable
+    // error, and an exception from a best-effort repair would replace it.
+    console.warn(`preview: could not link node_modules — ${link.reason}`);
   }
 
   const server = await createServer({
